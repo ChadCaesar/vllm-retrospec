@@ -19,7 +19,10 @@ def make_vllm_config() -> VllmConfig:
     )
     return cast(
         VllmConfig,
-        SimpleNamespace(speculative_config=speculative_config),
+        SimpleNamespace(
+            speculative_config=speculative_config,
+            scheduler_config=SimpleNamespace(max_num_seqs=8),
+        ),
     )
 
 
@@ -35,6 +38,10 @@ def test_retrospec_proposer_initialization():
     assert proposer.runner is runner
     assert proposer.model is None
     assert proposer.num_speculative_tokens == 64
+    assert proposer.max_batch_size == 8
+    assert proposer.policy.max_draft_tokens == 16
+    assert proposer.state.max_batch_size == 8
+    assert proposer.state.device == device
 
 
 def test_retrospec_proposer_loads_target_model():
@@ -57,5 +64,5 @@ def test_retrospec_proposer_scaffold_fails_explicitly():
         Mock(),
     )
 
-    with pytest.raises(NotImplementedError, match="next commit"):
+    with pytest.raises(NotImplementedError, match="not implemented"):
         proposer.propose()
