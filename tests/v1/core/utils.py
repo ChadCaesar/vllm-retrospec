@@ -6,6 +6,7 @@ import torch
 from tests.v1.kv_connector.unit.utils import MockKVConfig
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
@@ -57,6 +58,8 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    speculative_config: SpeculativeConfig | None = None,
+    device_config: DeviceConfig | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -115,8 +118,10 @@ def create_scheduler(
             kv_connector_extra_config={"shared_storage_path": "local_storage"},
         )
 
-    speculative_config: SpeculativeConfig | None = None
     if num_speculative_tokens is not None:
+        assert speculative_config is None, (
+            "Pass either num_speculative_tokens or speculative_config, not both."
+        )
         speculative_config = SpeculativeConfig(
             model="ngram", num_speculative_tokens=num_speculative_tokens
         )
@@ -139,6 +144,7 @@ def create_scheduler(
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
+        device_config=device_config or DeviceConfig(),
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests

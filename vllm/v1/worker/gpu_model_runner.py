@@ -157,6 +157,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.retrospec import RetroSpecProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -446,6 +447,7 @@ class GPUModelRunner(
         if self.speculative_config and get_pp_group().is_last_rank:
             self.drafter: (
                 NgramProposer  # noqa: F823
+                | RetroSpecProposer
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DraftModelProposer
@@ -463,6 +465,12 @@ class GPUModelRunner(
                 )
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.method == "retrospec":
+                self.drafter = RetroSpecProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
+                )
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -3964,6 +3972,9 @@ class GPUModelRunner(
             draft_token_ids = self.drafter.propose(
                 self.input_batch, sampled_token_ids, slot_mappings=slot_mappings
             )
+        elif spec_config.method == "retrospec":
+            assert isinstance(self.drafter, RetroSpecProposer)
+            draft_token_ids = self.drafter.propose()
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, MedusaProposer)
