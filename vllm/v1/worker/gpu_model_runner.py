@@ -3709,17 +3709,28 @@ class GPUModelRunner(
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
-            input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
-                spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
-                <= self.effective_drafter_max_model_len
-            )
+            if spec_config.method == "retrospec":
+                input_fits_in_drafter = spec_decode_common_attn_metadata is not None
+            else:
+                input_fits_in_drafter = (
+                    spec_decode_common_attn_metadata is not None
+                    and (
+                        spec_decode_common_attn_metadata.max_seq_len
+                        + self.num_spec_tokens
+                        <= self.effective_drafter_max_model_len
+                    )
+                )
             use_gpu_toks = (
-                spec_config.use_eagle() or spec_config.uses_draft_model()
+                spec_config.use_eagle()
+                or spec_config.uses_draft_model()
+                or spec_config.method == "retrospec"
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
-                # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
-                # as inputs, and does not need to wait for bookkeeping to finish.
-                assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+                # EAGLE, DraftModel, and RetroSpec can consume sampled tokens
+                # directly from the GPU before CPU bookkeeping finishes.
+                assert isinstance(
+                    self.drafter, EagleProposer | DraftModelProposer | RetroSpecProposer
+                )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
@@ -3900,7 +3911,7 @@ class GPUModelRunner(
 
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if isinstance(self._draft_token_ids, list):
-            return self._draft_token_ids, self.input_batch.req_ids
+            return self._draft_token_ids, self._draft_token_req_ids or []
         req_ids = self._draft_token_req_ids
         if req_ids is None:
             return [], []
@@ -3974,7 +3985,40 @@ class GPUModelRunner(
             )
         elif spec_config.method == "retrospec":
             assert isinstance(self.drafter, RetroSpecProposer)
-            draft_token_ids = self.drafter.propose()
+            assert not spec_config.disable_padded_drafter_batch
+            assert isinstance(sampled_token_ids, torch.Tensor)
+
+            next_token_ids, valid_sampled_tokens_count = (
+                self.drafter.prepare_next_token_ids_padded(
+                    common_attn_metadata,
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_mask.gpu,
+                )
+            )
+            self._copy_valid_sampled_token_count(
+                next_token_ids, valid_sampled_tokens_count
+            )
+
+            num_rejected_tokens_gpu = None
+            if spec_decode_metadata is not None:
+                (
+                    common_attn_metadata,
+                    _,
+                    num_rejected_tokens_gpu,
+                ) = self.drafter.prepare_inputs_padded(
+                    common_attn_metadata,
+                    spec_decode_metadata,
+                    valid_sampled_tokens_count,
+                )
+
+            draft_token_ids = self.drafter.propose(
+                next_token_ids,
+                sampling_metadata,
+                common_attn_metadata,
+                num_rejected_tokens_gpu,
+            )
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, MedusaProposer)
@@ -6085,8 +6129,11 @@ class GPUModelRunner(
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
+            or self.speculative_config.method == "retrospec"
         ):
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+            assert isinstance(
+                self.drafter, EagleProposer | DraftModelProposer | RetroSpecProposer
+            )
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
