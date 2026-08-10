@@ -77,6 +77,17 @@ def make_sampling_metadata(*, all_greedy: bool) -> SamplingMetadata:
     )
 
 
+def mock_sparse_draft_context(
+    proposer: RetroSpecProposer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        proposer.sparse_attention,
+        "draft_context",
+        lambda: nullcontext(),
+    )
+
+
 def test_retrospec_proposer_initialization():
     vllm_config = make_vllm_config()
     runner = make_runner()
@@ -105,14 +116,19 @@ def test_retrospec_proposer_loads_target_model():
     )
     target_model = Mock()
 
+    install = Mock()
+    proposer.sparse_attention.install = install
+    attention_layer = Mock()
+
     with patch(
         "vllm.v1.spec_decode.retrospec.proposer.get_layers_from_vllm_config",
-        return_value={"model.layers.0.self_attn.attn": Mock()},
+        return_value={"model.layers.0.self_attn.attn": attention_layer},
     ):
         proposer.load_model(target_model)
 
     assert proposer.model is target_model
     assert proposer.attn_layer_names == ["model.layers.0.self_attn.attn"]
+    install.assert_called_once_with({"model.layers.0.self_attn.attn": attention_layer})
 
 
 @pytest.mark.parametrize(
@@ -139,9 +155,9 @@ def test_retrospec_proposer_loads_target_model():
             "one-dimensional RoPE",
         ),
         (
-            make_vllm_config(retrospec_hit_attn_threshold=0.5),
+            make_vllm_config(retrospec_cache_mode="cpu_offload"),
             make_runner(),
-            "attention backend",
+            "CPU-offloaded KV cache",
         ),
     ],
 )
@@ -200,9 +216,11 @@ def test_propose_stops_requests_independently_on_draft_margin(monkeypatch):
             [token_base + i for i in range(batch_size)], dtype=torch.int32
         )
         draft_margin = torch.tensor(margins[draft_index])
-        return token_ids, draft_margin
+        hit_attn = torch.ones(batch_size)
+        return token_ids, draft_margin, hit_attn
 
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    mock_sparse_draft_context(proposer, monkeypatch)
 
     result = proposer.propose(
         torch.tensor([1, 2, 3], dtype=torch.int32),
@@ -230,9 +248,11 @@ def test_propose_stops_at_configured_max_draft_tokens(monkeypatch):
         return (
             torch.full((batch_size,), draft_index + 1, dtype=torch.int32),
             None,
+            torch.ones(batch_size),
         )
 
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    mock_sparse_draft_context(proposer, monkeypatch)
 
     result = proposer.propose(
         torch.tensor([1, 2], dtype=torch.int32),
@@ -263,9 +283,11 @@ def test_propose_respects_per_request_generation_limit(monkeypatch):
                 [token_base + i for i in range(batch_size)], dtype=torch.int32
             ),
             None,
+            torch.ones(batch_size),
         )
 
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    mock_sparse_draft_context(proposer, monkeypatch)
 
     result = proposer.propose(
         torch.tensor([1, 2, 3], dtype=torch.int32),
@@ -290,9 +312,14 @@ def test_propose_rolls_back_rejected_tokens_before_drafting(monkeypatch):
         active_mask,
         sampling_metadata,
     ):
-        return torch.tensor([draft_index + 1], dtype=torch.int32), None
+        return (
+            torch.tensor([draft_index + 1], dtype=torch.int32),
+            None,
+            torch.ones(batch_size),
+        )
 
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    mock_sparse_draft_context(proposer, monkeypatch)
 
     result = proposer.propose(
         torch.tensor([1], dtype=torch.int32),
@@ -340,6 +367,8 @@ def test_run_draft_step_preserves_attention_seq_lens_dtype(monkeypatch):
     proposer.runner.sampler = lambda **kwargs: SimpleNamespace(
         sampled_token_ids=torch.tensor([[1]], dtype=torch.int32)
     )
+    proposer.sparse_attention.begin_step = Mock()
+    proposer.sparse_attention.end_step = Mock(return_value=torch.ones(1))
     proposer.input_ids[0] = 1
     proposer.positions[0] = 3
     monkeypatch.setattr(
@@ -354,3 +383,47 @@ def test_run_draft_step_preserves_attention_seq_lens_dtype(monkeypatch):
         active_mask=torch.tensor([True]),
         sampling_metadata=make_sampling_metadata(all_greedy=True),
     )
+
+    proposer.sparse_attention.begin_step.assert_called_once()
+    proposer.sparse_attention.end_step.assert_called_once_with()
+
+
+def test_propose_stops_requests_independently_on_hit_attention(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_hit_attn_threshold=0.5),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    expected_masks = [
+        [True, True],
+        [True, False],
+    ]
+    hit_attn_values = [
+        [0.8, 0.4],
+        [0.3, 1.0],
+    ]
+
+    def fake_run_draft_step(
+        batch_size,
+        draft_index,
+        common_attn_metadata,
+        active_mask,
+        sampling_metadata,
+    ):
+        assert active_mask.tolist() == expected_masks[draft_index]
+        return (
+            torch.full((batch_size,), draft_index + 1, dtype=torch.int32),
+            None,
+            torch.tensor(hit_attn_values[draft_index]),
+        )
+
+    monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    mock_sparse_draft_context(proposer, monkeypatch)
+
+    result = proposer.propose(
+        torch.tensor([1, 2], dtype=torch.int32),
+        make_sampling_metadata(all_greedy=True),
+        make_common_metadata([1, 1]),
+    )
+
+    assert result == [[1, 2], [1]]

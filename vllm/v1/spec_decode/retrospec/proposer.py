@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.forward_context import set_forward_context
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.attention import Attention
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionMetadataBuilder, CommonAttentionMetadata
@@ -24,6 +24,7 @@ from vllm.v1.spec_decode.utils import (
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from .attention import RetroSpecSparseAttention
 from .decision import RetroSpecDecisionPolicy, RetroSpecMetrics
 from .state import RetroSpecBatchState, RetroSpecStage
 
@@ -47,6 +48,10 @@ class RetroSpecProposer:
             raise NotImplementedError(
                 "RetroSpec currently requires padded drafter batches."
             )
+        if config.retrospec_cache_mode != "gpu_reference":
+            raise NotImplementedError(
+                "RetroSpec CPU-offloaded KV cache is not implemented yet."
+            )
         if vllm_config.scheduler_config.async_scheduling:
             raise NotImplementedError(
                 "RetroSpec does not support async scheduling yet."
@@ -58,11 +63,6 @@ class RetroSpecProposer:
         if runner.uses_mrope or runner.uses_xdrope_dim > 0:
             raise NotImplementedError(
                 "RetroSpec currently supports standard one-dimensional RoPE only."
-            )
-        if config.retrospec_hit_attn_threshold is not None:
-            raise NotImplementedError(
-                "retrospec_hit_attn_threshold requires the RetroSpec attention "
-                "backend implemented in the next commit."
             )
 
         self.vllm_config = vllm_config
@@ -82,6 +82,8 @@ class RetroSpecProposer:
 
         self.policy = RetroSpecDecisionPolicy(config)
         self.state = RetroSpecBatchState(self.max_batch_size, device)
+        self.sparse_attention = RetroSpecSparseAttention(vllm_config, device)
+
         self.attn_metadata_builder: AttentionMetadataBuilder | None = None
         self.attn_layer_names: list[str] = []
 
@@ -116,9 +118,13 @@ class RetroSpecProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
         self.model = target_model
-        self.attn_layer_names = list(
-            get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys()
-        )
+
+        attention_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        if not attention_layers:
+            raise RuntimeError("No attention layers were registered for RetroSpec.")
+
+        self.attn_layer_names = list(attention_layers)
+        self.sparse_attention.install(attention_layers)
 
     def _get_attention_metadata_builder(self) -> AttentionMetadataBuilder:
         if self.attn_metadata_builder is not None:
@@ -264,7 +270,7 @@ class RetroSpecProposer:
         common_attn_metadata: CommonAttentionMetadata,
         active_mask: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         assert self.model is not None
 
         positions = self.positions[:batch_size]
@@ -319,6 +325,7 @@ class RetroSpecProposer:
             layer_name: slot_mapping for layer_name in self.attn_layer_names
         }
 
+        self.sparse_attention.begin_step(runnable_mask)
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -331,6 +338,8 @@ class RetroSpecProposer:
                 positions=clamped_positions,
                 inputs_embeds=None,
             )
+
+        hit_attn = self.sparse_attention.end_step()
 
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
@@ -351,7 +360,7 @@ class RetroSpecProposer:
         )
         sampled_token_ids = sampler_output.sampled_token_ids.view(-1).to(torch.int32)
 
-        return sampled_token_ids, draft_margin
+        return sampled_token_ids, draft_margin, hit_attn
 
     @torch.inference_mode()
     def propose(
@@ -382,64 +391,67 @@ class RetroSpecProposer:
         no_draft_space = self.positions[:batch_size] >= self.max_model_len - 1
         self.state.finish_requests(no_draft_space)
 
-        for draft_index in range(self.num_speculative_tokens):
-            draft_stage_mask = (
-                self.state.active_mask
-                & (self.state.stage == int(RetroSpecStage.DRAFT))
-                & (self.positions[:batch_size] < self.max_model_len - 1)
-            )
+        with self.sparse_attention.draft_context():
+            for draft_index in range(self.num_speculative_tokens):
+                draft_stage_mask = (
+                    self.state.active_mask
+                    & (self.state.stage == int(RetroSpecStage.DRAFT))
+                    & (self.positions[:batch_size] < self.max_model_len - 1)
+                )
 
-            if not draft_stage_mask.any().item():
-                break
+                if not draft_stage_mask.any().item():
+                    break
 
-            sampled_token_ids, draft_margin = self._run_draft_step(
-                batch_size,
-                draft_index,
-                common_attn_metadata,
-                draft_stage_mask,
-                sampling_metadata,
-            )
-
-            output_column = self._draft_token_ids[:batch_size, draft_index]
-            output_column.copy_(
-                torch.where(
+                sampled_token_ids, draft_margin, hit_attn = self._run_draft_step(
+                    batch_size,
+                    draft_index,
+                    common_attn_metadata,
                     draft_stage_mask,
-                    sampled_token_ids,
-                    torch.full_like(sampled_token_ids, -1),
+                    sampling_metadata,
                 )
-            )
 
-            emitted_counts = draft_stage_mask.to(torch.int32)
-            self.state.add_draft_counts(emitted_counts)
-            self.state.add_pending_counts(emitted_counts)
-
-            generation_limit_reached = draft_stage_mask & (
-                self.positions[:batch_size] + 1 >= self.max_model_len - 1
-            )
-
-            decision = self.policy.evaluate(
-                current_stage=RetroSpecStage.DRAFT,
-                request_stages=self.state.stage,
-                metrics=RetroSpecMetrics(draft_margin=draft_margin),
-                draft_counts=self.state.draft_counts,
-                pending_counts=self.state.pending_counts,
-                active_mask=self.state.active_mask,
-                generation_limit_reached=generation_limit_reached,
-            )
-            self.state.set_stages(decision.next_stage)
-
-            self.positions[:batch_size].add_(emitted_counts)
-
-            next_draft_mask = self.state.active_mask & (
-                self.state.stage == int(RetroSpecStage.DRAFT)
-            )
-            self.input_ids[:batch_size].copy_(
-                torch.where(
-                    next_draft_mask,
-                    sampled_token_ids,
-                    torch.zeros_like(sampled_token_ids),
+                output_column = self._draft_token_ids[:batch_size, draft_index]
+                output_column.copy_(
+                    torch.where(
+                        draft_stage_mask,
+                        sampled_token_ids,
+                        torch.full_like(sampled_token_ids, -1),
+                    )
                 )
-            )
+
+                emitted_counts = draft_stage_mask.to(torch.int32)
+                self.state.add_draft_counts(emitted_counts)
+                self.state.add_pending_counts(emitted_counts)
+
+                generation_limit_reached = draft_stage_mask & (
+                    self.positions[:batch_size] + 1 >= self.max_model_len - 1
+                )
+
+                decision = self.policy.evaluate(
+                    current_stage=RetroSpecStage.DRAFT,
+                    request_stages=self.state.stage,
+                    metrics=RetroSpecMetrics(
+                        draft_margin=draft_margin, hit_attn=hit_attn
+                    ),
+                    draft_counts=self.state.draft_counts,
+                    pending_counts=self.state.pending_counts,
+                    active_mask=self.state.active_mask,
+                    generation_limit_reached=generation_limit_reached,
+                )
+                self.state.set_stages(decision.next_stage)
+
+                self.positions[:batch_size].add_(emitted_counts)
+
+                next_draft_mask = self.state.active_mask & (
+                    self.state.stage == int(RetroSpecStage.DRAFT)
+                )
+                self.input_ids[:batch_size].copy_(
+                    torch.where(
+                        next_draft_mask,
+                        sampled_token_ids,
+                        torch.zeros_like(sampled_token_ids),
+                    )
+                )
 
         draft_counts = self.state.draft_counts.cpu().tolist()
         draft_token_ids = self._draft_token_ids[:batch_size].cpu().tolist()
