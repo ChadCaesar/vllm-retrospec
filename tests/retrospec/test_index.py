@@ -4,7 +4,10 @@
 import pytest
 import torch
 
-from vllm.v1.spec_decode.retrospec.index import RetroSpecBlockIndex
+from vllm.v1.spec_decode.retrospec.index import (
+    RetroSpecAttentionLevel,
+    RetroSpecBlockIndex,
+)
 
 
 def make_index() -> RetroSpecBlockIndex:
@@ -49,6 +52,68 @@ def test_select_builds_ordered_exact_and_estimation_zones():
     assert selection.estimation_keys[0, 0, 0, 0].item() == pytest.approx(1.0)
     assert selection.estimation_values[0, 0, 0, 0].item() == pytest.approx(10.0)
     assert 0.0 < selection.hit_attn.item() <= 1.0
+
+
+def test_expanded_zone_promotes_sparse_estimation_without_growing_coverage():
+    index = RetroSpecBlockIndex(
+        block_size=2,
+        num_speculative_tokens=1,
+        retrieval_ratio=0.2,
+        estimation_ratio=0.4,
+    )
+    scores = torch.arange(10, dtype=torch.float32).view(1, -1)
+    candidate_mask = torch.ones_like(scores, dtype=torch.bool)
+
+    sparse_exact, sparse_estimation, expanded_exact, expanded_estimation = (
+        index._select_zone_masks(scores, candidate_mask)
+    )
+
+    assert sparse_exact.sum().item() == 2
+    assert sparse_estimation.sum().item() == 4
+    assert expanded_exact.sum().item() == 4
+    assert expanded_estimation.sum().item() == 2
+    assert torch.all(sparse_exact <= expanded_exact)
+    assert torch.equal(
+        sparse_exact | sparse_estimation,
+        expanded_exact | expanded_estimation,
+    )
+    assert torch.equal(sparse_exact, scores >= 8)
+    assert torch.equal(expanded_exact, scores >= 6)
+
+
+def test_materialize_expanded_plan_preserves_logical_block_order():
+    index = make_index()
+    keys, values = make_cache()
+    block_table = torch.tensor([[5, 3, 1, 4, 2, 0]], dtype=torch.int32)
+
+    sparse = index.select(
+        query=torch.ones(1, 1, 1),
+        key_cache=keys,
+        value_cache=values,
+        block_table=block_table,
+        seq_lens=torch.tensor([11], dtype=torch.int32),
+        active_mask=torch.tensor([True]),
+        scale=1.0,
+    )
+    expanded = index.materialize(
+        sparse.plan,
+        RetroSpecAttentionLevel.EXPANDED,
+        keys,
+        values,
+        block_table,
+    )
+
+    sparse_logical = sparse.plan.sparse_exact_indices[sparse.plan.sparse_exact_mask]
+    expanded_logical = expanded.plan.expanded_exact_indices[
+        expanded.plan.expanded_exact_mask
+    ]
+    assert sparse_logical.tolist() == sorted(sparse_logical.tolist())
+    assert expanded_logical.tolist() == sorted(expanded_logical.tolist())
+    assert set(sparse_logical.tolist()) <= set(expanded_logical.tolist())
+    assert expanded.exact_block_table[0, :6].tolist() == [5, 3, 1, 4, 2, 0]
+    assert expanded.exact_seq_lens.tolist() == [11]
+    assert torch.count_nonzero(expanded.estimation_token_counts) == 0
+    assert expanded.attention_mass.item() >= sparse.attention_mass.item()
 
 
 def test_block_summary_ignores_stale_tokens_after_sequence_end():

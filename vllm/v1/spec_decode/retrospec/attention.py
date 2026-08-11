@@ -3,6 +3,7 @@
 
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from enum import IntEnum
 
 import torch
 
@@ -15,18 +16,32 @@ from vllm.v1.attention.backends.flash_attn import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
-from .index import RetroSpecAttentionSelection, RetroSpecBlockIndex
+from .index import (
+    RetroSpecAttentionLevel,
+    RetroSpecAttentionSelection,
+    RetroSpecBlockIndex,
+    RetroSpecSelectionPlan,
+)
 
 LayerForward = Callable[..., torch.Tensor]
+
+
+class RetroSpecAttentionMode(IntEnum):
+    PASSTHROUGH = 0
+    DRAFT = 1
+    SPARSE_VERIFY = 2
+    EXPANDED_VERIFY = 3
 
 
 class _RetroSpecLayerForward:
     def __init__(
         self,
         controller: "RetroSpecSparseAttention",
+        layer_name: str,
         original_forward: LayerForward,
     ) -> None:
         self.controller = controller
+        self.layer_name = layer_name
         self.original_forward = original_forward
 
     def __call__(
@@ -42,6 +57,7 @@ class _RetroSpecLayerForward:
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.controller.forward(
+            self.layer_name,
             self.original_forward,
             layer,
             query,
@@ -74,6 +90,7 @@ class RetroSpecSparseAttention:
         self.device = device
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.block_size = block_size
+        self.num_speculative_tokens = config.num_speculative_tokens
 
         self.index = RetroSpecBlockIndex(
             block_size=block_size,
@@ -82,18 +99,24 @@ class RetroSpecSparseAttention:
             estimation_ratio=config.retrospec_estimation_ratio,
         )
 
-        self.enabled = False
+        self.mode = RetroSpecAttentionMode.PASSTHROUGH
+        self.in_proposal = False
         self.step_active = False
+        self.step_index = -1
         self.active_mask: torch.Tensor | None = None
         self.batch_size = 0
-        self.hit_attn_layer_count = 0
 
-        self.hit_attn_sum = torch.zeros(
+        self.attention_mass_layer_count = 0
+        self.attention_mass_sum = torch.zeros(
             self.max_batch_size, dtype=torch.float32, device=device
         )
 
         self.original_forwards: dict[str, tuple[FlashAttentionImpl, LayerForward]] = {}
         self.forward_wrappers: dict[str, _RetroSpecLayerForward] = {}
+
+        self.selection_plans: list[dict[str, RetroSpecSelectionPlan]] = [
+            {} for _ in range(self.num_speculative_tokens)
+        ]
 
     @staticmethod
     def _validate_layer(
@@ -162,15 +185,17 @@ class RetroSpecSparseAttention:
 
         for layer_name, impl in validated_layers.items():
             original_forward = impl.forward
-            wrapper = _RetroSpecLayerForward(self, original_forward)
+            wrapper = _RetroSpecLayerForward(self, layer_name, original_forward)
 
             self.original_forwards[layer_name] = (impl, original_forward)
             self.forward_wrappers[layer_name] = wrapper
             impl.forward = wrapper  # type: ignore[method-assign]
 
     def uninstall(self) -> None:
-        if self.enabled:
-            raise RuntimeError("Cannot uninstall RetroSpec attention during drafting.")
+        if self.in_proposal:
+            raise RuntimeError(
+                "Cannot uninstall RetroSpec attention during a proposal."
+            )
 
         for impl, original_forward in self.original_forwards.values():
             impl.forward = original_forward  # type: ignore[method-assign]
@@ -179,30 +204,46 @@ class RetroSpecSparseAttention:
         self.forward_wrappers.clear()
 
     @contextmanager
-    def draft_context(self) -> Iterator[None]:
-        if self.enabled:
-            raise RuntimeError("RetroSpec draft attention context cannot be nested.")
+    def proposal_context(self) -> Iterator[None]:
+        if self.in_proposal:
+            raise RuntimeError("RetroSpec proposal context cannot be nested.")
         if not self.original_forwards:
-            raise RuntimeError("RetroSpec attention must be installed before drafting.")
+            raise RuntimeError(
+                "RetroSpec attention must be installed before proposing."
+            )
 
-        self.enabled = True
+        for plans in self.selection_plans:
+            plans.clear()
+
+        self.in_proposal = True
         try:
             yield
         finally:
-            self.enabled = False
+            self.in_proposal = False
+            self.mode = RetroSpecAttentionMode.PASSTHROUGH
             self.step_active = False
+            self.step_index = -1
             self.active_mask = None
             self.batch_size = 0
-            self.hit_attn_layer_count = 0
+            self.attention_mass_layer_count = 0
+
+            for plans in self.selection_plans:
+                plans.clear()
 
     def begin_step(
         self,
+        mode: RetroSpecAttentionMode,
+        step_index: int,
         active_mask: torch.Tensor,
     ) -> None:
-        if not self.enabled:
-            raise RuntimeError("begin_step must be called inside draft_context.")
+        if not self.in_proposal:
+            raise RuntimeError("begin_step must be called inside proposal_context.")
+        if mode == RetroSpecAttentionMode.PASSTHROUGH:
+            raise ValueError("PASSTHROUGH cannot be used as an active RetroSpec step.")
         if self.step_active:
-            raise RuntimeError("The previous RetroSpec draft step is still active.")
+            raise RuntimeError("The previous RetroSpec attention step is still active.")
+        if not 0 <= step_index < self.num_speculative_tokens:
+            raise ValueError("step_index is outside the speculative token range.")
         if active_mask.ndim != 1 or active_mask.dtype != torch.bool:
             raise ValueError("active_mask must be a one-dimensional boolean tensor.")
         if active_mask.device != self.device:
@@ -212,30 +253,37 @@ class RetroSpecSparseAttention:
         if active_mask.shape[0] > self.max_batch_size:
             raise ValueError("active_mask exceeds the configured maximum batch size.")
 
+        self.mode = mode
+        self.step_index = step_index
         self.batch_size = active_mask.shape[0]
         self.active_mask = active_mask
-        self.hit_attn_sum[: self.batch_size].zero_()
-        self.hit_attn_layer_count = 0
+
+        self.attention_mass_sum[: self.batch_size].zero_()
+        self.attention_mass_layer_count = 0
         self.step_active = True
 
     def end_step(self) -> torch.Tensor:
         if not self.step_active:
-            raise RuntimeError("No RetroSpec draft attention step is active.")
-        if self.hit_attn_layer_count == 0:
-            raise RuntimeError(
-                "No attention layer ran during the RetroSpec draft step."
-            )
+            raise RuntimeError("No RetroSpec attention step is active.")
+        if self.attention_mass_layer_count == 0:
+            raise RuntimeError("No attention layer ran during the RetroSpec step.")
 
-        hit_attn = self.hit_attn_sum[: self.batch_size] / self.hit_attn_layer_count
+        attention_mass = (
+            self.attention_mass_sum[: self.batch_size] / self.attention_mass_layer_count
+        )
 
+        self.mode = RetroSpecAttentionMode.PASSTHROUGH
         self.step_active = False
+        self.step_index = -1
         self.active_mask = None
         self.batch_size = 0
-        self.hit_attn_layer_count = 0
-        return hit_attn
+        self.attention_mass_layer_count = 0
+
+        return attention_mass
 
     def forward(
         self,
+        layer_name: str,
         original_forward: LayerForward,
         layer: torch.nn.Module,
         query: torch.Tensor,
@@ -247,7 +295,7 @@ class RetroSpecSparseAttention:
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if not self.enabled:
+        if self.mode == RetroSpecAttentionMode.PASSTHROUGH:
             return original_forward(
                 layer,
                 query,
@@ -261,7 +309,7 @@ class RetroSpecSparseAttention:
             )
 
         if not self.step_active or self.active_mask is None:
-            raise RuntimeError("RetroSpec attention ran without an active draft step.")
+            raise RuntimeError("RetroSpec attention ran without an active step.")
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
                 "RetroSpec sparse attention does not support fused output quantization."
@@ -269,7 +317,7 @@ class RetroSpecSparseAttention:
         if output is None:
             raise RuntimeError("RetroSpec FlashAttention requires an output buffer.")
         if attn_metadata is None:
-            raise RuntimeError("RetroSpec draft attention requires attention metadata.")
+            raise RuntimeError("RetroSpec attention requires attention metadata.")
 
         impl = getattr(layer, "impl", None)
         if not isinstance(impl, FlashAttentionImpl):
@@ -277,7 +325,9 @@ class RetroSpecSparseAttention:
                 "RetroSpec attention wrapper received an incompatible layer."
             )
 
-        return self._draft_forward(impl, layer, query, kv_cache, attn_metadata, output)
+        return self._sparse_forward(
+            layer_name, impl, layer, query, kv_cache, attn_metadata, output
+        )
 
     def _run_exact_attention(
         self,
@@ -391,8 +441,9 @@ class RetroSpecSparseAttention:
 
         return estimation_output, estimation_lse
 
-    def _draft_forward(
+    def _sparse_forward(
         self,
+        layer_name: str,
         impl: FlashAttentionImpl,
         layer: torch.nn.Module,
         query: torch.Tensor,
@@ -401,30 +452,49 @@ class RetroSpecSparseAttention:
         output: torch.Tensor,
     ) -> torch.Tensor:
         assert self.active_mask is not None
+        assert self.step_index >= 0
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         if num_actual_tokens != self.batch_size:
             raise RuntimeError(
-                "RetroSpec sparse draft attention requires exactly one "
-                "query token per request."
+                "RetroSpec attention requires exactly one query token per request."
             )
         if attn_metadata.max_query_len != 1:
-            raise RuntimeError(
-                "RetroSpec sparse draft attention requires max_query_len=1."
-            )
+            raise RuntimeError("RetroSpec attention requires max_query_len=1.")
 
         query = query[:num_actual_tokens]
         key_cache, value_cache = kv_cache.unbind(0)
 
-        selection = self.index.select(
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_table=attn_metadata.block_table,
-            seq_lens=attn_metadata.seq_lens,
-            active_mask=self.active_mask,
-            scale=impl.scale,
-        )
+        if self.mode == RetroSpecAttentionMode.DRAFT:
+            selection = self.index.select(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                self.active_mask,
+                impl.scale,
+            )
+            self.selection_plans[self.step_index][layer_name] = selection.plan
+        else:
+            try:
+                plan = self.selection_plans[self.step_index][layer_name]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"No draft selection plan for step "
+                    f"{self.step_index}, layer {layer_name!r}."
+                ) from exc
+
+            if self.mode == RetroSpecAttentionMode.SPARSE_VERIFY:
+                level = RetroSpecAttentionLevel.SPARSE
+            elif self.mode == RetroSpecAttentionMode.EXPANDED_VERIFY:
+                level = RetroSpecAttentionLevel.EXPANDED
+            else:
+                raise RuntimeError(f"Unexpected RetroSpec attention mode: {self.mode}")
+
+            selection = self.index.materialize(
+                plan, level, key_cache, value_cache, attn_metadata.block_table
+            )
 
         exact_output, exact_lse = self._run_exact_attention(
             impl, layer, query, key_cache, value_cache, attn_metadata, selection
@@ -441,7 +511,7 @@ class RetroSpecSparseAttention:
             estimation_lse,
         )
 
-        self.hit_attn_sum[: self.batch_size].add_(selection.hit_attn)
-        self.hit_attn_layer_count += 1
+        self.attention_mass_sum[: self.batch_size].add_(selection.attention_mass)
+        self.attention_mass_layer_count += 1
 
         return output

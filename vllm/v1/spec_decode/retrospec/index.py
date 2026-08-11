@@ -2,9 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from enum import IntEnum
 from math import ceil
 
 import torch
+
+
+class RetroSpecAttentionLevel(IntEnum):
+    SPARSE = 0
+    EXPANDED = 1
+
+
+@dataclass(frozen=True)
+class RetroSpecSelectionPlan:
+    sparse_exact_indices: torch.Tensor
+    sparse_exact_mask: torch.Tensor
+    sparse_estimation_indices: torch.Tensor
+    sparse_estimation_mask: torch.Tensor
+
+    expanded_exact_indices: torch.Tensor
+    expanded_exact_mask: torch.Tensor
+    expanded_estimation_indices: torch.Tensor
+    expanded_estimation_mask: torch.Tensor
+
+    valid_token_counts: torch.Tensor
+    sparse_attn: torch.Tensor
+    expanded_attn: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -16,7 +39,12 @@ class RetroSpecAttentionSelection:
     estimation_values: torch.Tensor
     estimation_token_counts: torch.Tensor
 
-    hit_attn: torch.Tensor
+    attention_mass: torch.Tensor
+    plan: RetroSpecSelectionPlan
+
+    @property
+    def hit_attn(self) -> torch.Tensor:
+        return self.plan.sparse_attn
 
 
 class RetroSpecBlockIndex:
@@ -238,12 +266,32 @@ class RetroSpecBlockIndex:
 
         return head_probabilities.mean(dim=(1, 2))
 
+    @staticmethod
+    def _mask_rank_range(
+        ranked_indices: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        start_counts: torch.Tensor,
+        end_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, max_num_blocks = candidate_mask.shape
+        rank_positions = torch.arange(
+            max_num_blocks, dtype=torch.int64, device=candidate_mask.device
+        ).expand(batch_size, -1)
+
+        selected_by_rank = (rank_positions >= start_counts.unsqueeze(1)) & (
+            rank_positions < end_counts.unsqueeze(1)
+        )
+
+        selected_mask = torch.zeros_like(candidate_mask)
+        selected_mask.scatter_(1, ranked_indices, selected_by_rank)
+        selected_mask &= candidate_mask
+        return selected_mask
+
     def _select_zone_masks(
         self,
         block_scores: torch.Tensor,
         candidate_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, max_num_blocks = candidate_mask.shape
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         candidate_counts = candidate_mask.sum(dim=1)
 
         retrieval_counts = torch.ceil(
@@ -258,29 +306,41 @@ class RetroSpecBlockIndex:
             estimation_counts, candidate_counts - retrieval_counts
         )
 
+        total_compute_counts = retrieval_counts + estimation_counts
+
+        # Expanded verification promotes up to another retrieval budget from
+        # estimation into exact computation. The total covered area is unchanged.
+        expanded_retrieval_counts = torch.minimum(
+            retrieval_counts * 2, total_compute_counts
+        )
         ranking_scores = block_scores.masked_fill(~candidate_mask, float("-inf"))
         ranked_indices = torch.argsort(ranking_scores, dim=1, descending=True)
 
-        rank_positions = torch.arange(
-            max_num_blocks,
-            dtype=torch.int64,
-            device=block_scores.device,
-        ).expand(batch_size, -1)
+        zero_counts = torch.zeros_like(retrieval_counts)
 
-        retrieval_by_rank = rank_positions < retrieval_counts.unsqueeze(1)
-        estimation_by_rank = (rank_positions >= retrieval_counts.unsqueeze(1)) & (
-            rank_positions < (retrieval_counts + estimation_counts).unsqueeze(1)
+        sparse_retrieval_mask = self._mask_rank_range(
+            ranked_indices, candidate_mask, zero_counts, retrieval_counts
+        )
+        sparse_estimation_mask = self._mask_rank_range(
+            ranked_indices, candidate_mask, retrieval_counts, total_compute_counts
         )
 
-        retrieval_mask = torch.zeros_like(candidate_mask)
-        retrieval_mask.scatter_(1, ranked_indices, retrieval_by_rank)
-        retrieval_mask &= candidate_mask
+        expanded_retrieval_mask = self._mask_rank_range(
+            ranked_indices, candidate_mask, zero_counts, expanded_retrieval_counts
+        )
+        expanded_estimation_mask = self._mask_rank_range(
+            ranked_indices,
+            candidate_mask,
+            expanded_retrieval_counts,
+            total_compute_counts,
+        )
 
-        estimation_mask = torch.zeros_like(candidate_mask)
-        estimation_mask.scatter_(1, ranked_indices, estimation_by_rank)
-        estimation_mask &= candidate_mask
-
-        return retrieval_mask, estimation_mask
+        return (
+            sparse_retrieval_mask,
+            sparse_estimation_mask,
+            expanded_retrieval_mask,
+            expanded_estimation_mask,
+        )
 
     @staticmethod
     def _pack_logical_indices(
@@ -301,38 +361,14 @@ class RetroSpecBlockIndex:
         safe_indices = packed_indices.clamp(min=0, max=max_num_blocks - 1)
         return safe_indices, packed_mask
 
-    def _build_exact_selection(
-        self,
-        block_table: torch.Tensor,
-        valid_token_counts: torch.Tensor,
-        exact_mask: torch.Tensor,
-        logical_block_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        packed_indices, packed_mask = self._pack_logical_indices(
-            exact_mask, logical_block_ids
-        )
-
-        exact_block_table = block_table.gather(1, packed_indices)
-        exact_block_table = exact_block_table.masked_fill(~packed_mask, 0)
-        exact_block_table = exact_block_table.to(dtype=torch.int32).contiguous()
-
-        exact_seq_lens = (valid_token_counts * exact_mask).sum(dim=1)
-        exact_seq_lens = exact_seq_lens.to(dtype=torch.int32).contiguous()
-
-        return exact_block_table, exact_seq_lens
-
+    @staticmethod
     def _build_estimation_selection(
-        self,
         key_centroids: torch.Tensor,
         value_means: torch.Tensor,
         valid_token_counts: torch.Tensor,
-        estimation_mask: torch.Tensor,
-        logical_block_ids: torch.Tensor,
+        packed_indices: torch.Tensor,
+        packed_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        packed_indices, packed_mask = self._pack_logical_indices(
-            estimation_mask, logical_block_ids
-        )
-
         batch_size, max_num_blocks = packed_indices.shape
         num_kv_heads = key_centroids.shape[2]
         head_size = key_centroids.shape[3]
@@ -352,7 +388,124 @@ class RetroSpecBlockIndex:
         return (
             estimation_keys.contiguous(),
             estimation_values.contiguous(),
-            estimation_token_counts.to(torch.int32).contiguous(),
+            estimation_token_counts.to(dtype=torch.int32).contiguous(),
+        )
+
+    def _build_plan(
+        self,
+        logical_block_ids: torch.Tensor,
+        valid_token_counts: torch.Tensor,
+        forced_exact_mask: torch.Tensor,
+        sparse_retrieval_mask: torch.Tensor,
+        sparse_estimation_mask: torch.Tensor,
+        expanded_retrieval_mask: torch.Tensor,
+        expanded_estimation_mask: torch.Tensor,
+        sparse_attn: torch.Tensor,
+        expanded_attn: torch.Tensor,
+    ) -> RetroSpecSelectionPlan:
+        sparse_exact_indices, sparse_exact_mask = self._pack_logical_indices(
+            forced_exact_mask | sparse_retrieval_mask, logical_block_ids
+        )
+        (
+            sparse_estimation_indices,
+            sparse_estimation_packed_mask,
+        ) = self._pack_logical_indices(sparse_estimation_mask, logical_block_ids)
+
+        expanded_exact_indices, expanded_exact_mask = self._pack_logical_indices(
+            forced_exact_mask | expanded_retrieval_mask,
+            logical_block_ids,
+        )
+        (
+            expanded_estimation_indices,
+            expanded_estimation_packed_mask,
+        ) = self._pack_logical_indices(expanded_estimation_mask, logical_block_ids)
+
+        return RetroSpecSelectionPlan(
+            sparse_exact_indices=sparse_exact_indices,
+            sparse_exact_mask=sparse_exact_mask,
+            sparse_estimation_indices=sparse_estimation_indices,
+            sparse_estimation_mask=sparse_estimation_packed_mask,
+            expanded_exact_indices=expanded_exact_indices,
+            expanded_exact_mask=expanded_exact_mask,
+            expanded_estimation_indices=expanded_estimation_indices,
+            expanded_estimation_mask=expanded_estimation_packed_mask,
+            valid_token_counts=valid_token_counts,
+            sparse_attn=sparse_attn,
+            expanded_attn=expanded_attn,
+        )
+
+    def _materialize_from_means(
+        self,
+        plan: RetroSpecSelectionPlan,
+        level: RetroSpecAttentionLevel,
+        block_table: torch.Tensor,
+        key_centroids: torch.Tensor,
+        value_means: torch.Tensor,
+    ) -> RetroSpecAttentionSelection:
+        if level == RetroSpecAttentionLevel.SPARSE:
+            exact_indices = plan.sparse_exact_indices
+            exact_mask = plan.sparse_exact_mask
+            estimation_indices = plan.sparse_estimation_indices
+            estimation_mask = plan.sparse_estimation_mask
+            attention_mass = plan.sparse_attn
+        elif level == RetroSpecAttentionLevel.EXPANDED:
+            exact_indices = plan.expanded_exact_indices
+            exact_mask = plan.expanded_exact_mask
+            estimation_indices = plan.expanded_estimation_indices
+            estimation_mask = plan.expanded_estimation_mask
+            attention_mass = plan.expanded_attn
+        else:
+            raise ValueError(f"Unsupported RetroSpec attention level: {level}")
+
+        exact_block_table = block_table.gather(1, exact_indices)
+        exact_block_table.masked_fill_(~exact_mask, 0)
+        exact_block_table = exact_block_table.to(torch.int32).contiguous()
+
+        exact_token_counts = plan.valid_token_counts.gather(1, exact_indices)
+        exact_token_counts *= exact_mask
+        exact_seq_lens = exact_token_counts.sum(dim=1).to(torch.int32).contiguous()
+
+        (
+            estimation_keys,
+            estimation_values,
+            estimation_token_counts,
+        ) = self._build_estimation_selection(
+            key_centroids,
+            value_means,
+            plan.valid_token_counts,
+            estimation_indices,
+            estimation_mask,
+        )
+
+        return RetroSpecAttentionSelection(
+            exact_block_table=exact_block_table,
+            exact_seq_lens=exact_seq_lens,
+            estimation_keys=estimation_keys,
+            estimation_values=estimation_values,
+            estimation_token_counts=estimation_token_counts,
+            attention_mass=attention_mass,
+            plan=plan,
+        )
+
+    def materialize(
+        self,
+        plan: RetroSpecSelectionPlan,
+        level: RetroSpecAttentionLevel,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> RetroSpecAttentionSelection:
+        valid_block_mask = plan.valid_token_counts > 0
+
+        key_centroids = self._compute_block_means(
+            key_cache, block_table, valid_block_mask, plan.valid_token_counts
+        )
+        value_means = self._compute_block_means(
+            value_cache, block_table, valid_block_mask, plan.valid_token_counts
+        )
+
+        return self._materialize_from_means(
+            plan, level, block_table, key_centroids, value_means
         )
 
     def select(
@@ -379,58 +532,56 @@ class RetroSpecBlockIndex:
         key_centroids = self._compute_block_means(
             key_cache, block_table, valid_block_mask, valid_token_counts
         )
+        value_means = self._compute_block_means(
+            value_cache, block_table, valid_block_mask, valid_token_counts
+        )
 
         candidate_mask = valid_block_mask & ~forced_exact_mask
         block_scores = self._score_blocks(
-            query,
-            key_centroids,
-            candidate_mask,
-            valid_token_counts,
-            scale,
-        )
-
-        retrieval_mask, estimation_mask = self._select_zone_masks(
-            block_scores, candidate_mask
-        )
-        exact_mask = forced_exact_mask | retrieval_mask
-
-        value_means = self._compute_block_means(
-            value_cache,
-            block_table,
-            valid_block_mask,
-            valid_token_counts,
-        )
-
-        exact_block_table, exact_seq_lens = self._build_exact_selection(
-            block_table,
-            valid_token_counts,
-            exact_mask,
-            logical_block_ids,
+            query, key_centroids, candidate_mask, valid_token_counts, scale
         )
 
         (
-            estimation_keys,
-            estimation_values,
-            estimation_token_counts,
-        ) = self._build_estimation_selection(
-            key_centroids,
-            value_means,
-            valid_token_counts,
-            estimation_mask,
-            logical_block_ids,
-        )
+            sparse_retrieval_mask,
+            sparse_estimation_mask,
+            expanded_retrieval_mask,
+            expanded_estimation_mask,
+        ) = self._select_zone_masks(block_scores, candidate_mask)
 
-        hit_attn = (block_scores * retrieval_mask).sum(dim=1)
+        sparse_attn = (block_scores * sparse_retrieval_mask).sum(dim=1)
+        expanded_attn = (block_scores * expanded_retrieval_mask).sum(dim=1)
 
         has_candidates = candidate_mask.any(dim=1)
-        hit_attn = torch.where(has_candidates, hit_attn, torch.ones_like(hit_attn))
-        hit_attn = torch.where(active_mask, hit_attn, torch.ones_like(hit_attn))
+        sparse_attn = torch.where(
+            has_candidates, sparse_attn, torch.ones_like(sparse_attn)
+        )
+        expanded_attn = torch.where(
+            has_candidates, expanded_attn, torch.ones_like(expanded_attn)
+        )
 
-        return RetroSpecAttentionSelection(
-            exact_block_table=exact_block_table,
-            exact_seq_lens=exact_seq_lens,
-            estimation_keys=estimation_keys,
-            estimation_values=estimation_values,
-            estimation_token_counts=estimation_token_counts,
-            hit_attn=hit_attn,
+        sparse_attn = torch.where(
+            active_mask, sparse_attn, torch.ones_like(sparse_attn)
+        )
+        expanded_attn = torch.where(
+            active_mask, expanded_attn, torch.ones_like(expanded_attn)
+        )
+
+        plan = self._build_plan(
+            logical_block_ids,
+            valid_token_counts,
+            forced_exact_mask,
+            sparse_retrieval_mask,
+            sparse_estimation_mask,
+            expanded_retrieval_mask,
+            expanded_estimation_mask,
+            sparse_attn,
+            expanded_attn,
+        )
+
+        return self._materialize_from_means(
+            plan,
+            RetroSpecAttentionLevel.SPARSE,
+            block_table,
+            key_centroids,
+            value_means,
         )
