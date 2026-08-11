@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -30,6 +31,12 @@ from .state import RetroSpecBatchState, RetroSpecStage
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+
+@dataclass(frozen=True)
+class RetroSpecVerificationResult:
+    verified_counts: torch.Tensor
+    require_full: torch.Tensor
 
 
 class RetroSpecProposer:
@@ -428,30 +435,37 @@ class RetroSpecProposer:
     def _verify_draft_tokens(
         self,
         batch_size: int,
+        round_start_counts: torch.Tensor,
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
-    ) -> torch.Tensor:
+    ) -> RetroSpecVerificationResult:
         draft_counts = self.state.draft_counts
         verified_counts = torch.zeros_like(draft_counts)
+        require_full = torch.zeros_like(self.state.active_mask)
 
         verification_active = self.state.active_mask & (draft_counts > 0)
+        round_end_counts = round_start_counts + draft_counts
 
-        for draft_index in range(self.num_speculative_tokens):
-            step_mask = verification_active & (draft_counts > draft_index)
+        for token_index in range(self.num_speculative_tokens):
+            step_mask = (
+                verification_active
+                & (round_start_counts <= token_index)
+                & (token_index < round_end_counts)
+            )
             if not step_mask.any().item():
-                break
+                continue
 
-            if draft_index == 0:
+            if token_index == 0:
                 verify_input_ids = self.proposal_input_ids[:batch_size]
             else:
-                verify_input_ids = self._draft_token_ids[:batch_size, draft_index - 1]
+                verify_input_ids = self._draft_token_ids[:batch_size, token_index - 1]
 
             self.state.set_stage(step_mask, RetroSpecStage.SPARSE_VERIFY)
 
-            (sparse_token_ids, sparse_margin, retrieval_attn) = (
+            sparse_token_ids, sparse_margin, retrieval_attn = (
                 self._run_verification_step(
                     batch_size,
-                    draft_index,
+                    token_index,
                     verify_input_ids,
                     step_mask,
                     common_attn_metadata,
@@ -460,49 +474,55 @@ class RetroSpecProposer:
                 )
             )
 
-            expected_token_ids = self._draft_token_ids[:batch_size, draft_index].clone()
-
+            expected_token_ids = self._draft_token_ids[:batch_size, token_index].clone()
             sparse_token_changed = step_mask & (sparse_token_ids != expected_token_ids)
 
             generation_limit_reached = step_mask & (
-                self.proposal_start_positions[:batch_size] + draft_index + 1
+                self.proposal_start_positions[:batch_size] + token_index + 1
                 >= self.max_model_len - 1
+            )
+
+            # Include the current token in the pending count evaluated by the
+            # policy because this token is retained after sparse verification.
+            candidate_pending_counts = (
+                round_start_counts
+                + verified_counts
+                + step_mask.to(dtype=verified_counts.dtype)
             )
 
             sparse_decision = self.policy.evaluate(
                 current_stage=RetroSpecStage.SPARSE_VERIFY,
                 request_stages=self.state.stage,
                 metrics=RetroSpecMetrics(
-                    sparse_margin=sparse_margin, retrieval_attn=retrieval_attn
+                    sparse_margin=sparse_margin,
+                    retrieval_attn=retrieval_attn,
                 ),
                 draft_counts=draft_counts,
-                pending_counts=self.state.pending_counts,
+                pending_counts=candidate_pending_counts,
                 active_mask=self.state.active_mask,
                 sparse_token_changed=sparse_token_changed,
                 generation_limit_reached=generation_limit_reached,
             )
             self.state.set_stages(sparse_decision.next_stage)
+            require_full |= sparse_decision.require_full
 
             expanded_mask = step_mask & sparse_decision.require_expanded
-
             final_token_ids = sparse_token_ids
             expanded_failed = torch.zeros_like(step_mask)
 
             if expanded_mask.any().item():
                 self.state.set_stage(expanded_mask, RetroSpecStage.EXPANDED_VERIFY)
 
-                (
-                    expanded_token_ids,
-                    expanded_margin,
-                    expanded_attn,
-                ) = self._run_verification_step(
-                    batch_size,
-                    draft_index,
-                    verify_input_ids,
-                    expanded_mask,
-                    common_attn_metadata,
-                    sampling_metadata,
-                    RetroSpecAttentionMode.EXPANDED_VERIFY,
+                expanded_token_ids, expanded_margin, expanded_attn = (
+                    self._run_verification_step(
+                        batch_size,
+                        token_index,
+                        verify_input_ids,
+                        expanded_mask,
+                        common_attn_metadata,
+                        sampling_metadata,
+                        RetroSpecAttentionMode.EXPANDED_VERIFY,
+                    )
                 )
 
                 expanded_token_changed = expanded_mask & (
@@ -513,36 +533,42 @@ class RetroSpecProposer:
                     current_stage=RetroSpecStage.EXPANDED_VERIFY,
                     request_stages=self.state.stage,
                     metrics=RetroSpecMetrics(
-                        expanded_margin=expanded_margin, expanded_attn=expanded_attn
+                        expanded_margin=expanded_margin,
+                        expanded_attn=expanded_attn,
                     ),
                     draft_counts=draft_counts,
-                    pending_counts=self.state.pending_counts,
+                    pending_counts=candidate_pending_counts,
                     active_mask=self.state.active_mask,
                     expanded_token_changed=expanded_token_changed,
                     generation_limit_reached=generation_limit_reached,
                 )
                 self.state.set_stages(expanded_decision.next_stage)
+                require_full |= expanded_decision.require_full
 
                 final_token_ids = torch.where(
-                    expanded_mask, expanded_token_ids, sparse_token_ids
+                    expanded_mask,
+                    expanded_token_ids,
+                    sparse_token_ids,
                 )
                 expanded_failed = expanded_mask & expanded_decision.require_full
 
-            output_column = self._draft_token_ids[:batch_size, draft_index]
+            output_column = self._draft_token_ids[:batch_size, token_index]
             output_column.copy_(torch.where(step_mask, final_token_ids, output_column))
 
-            verified_counts.add_(step_mask.to(torch.int32))
+            # Retain the current token even when verification corrected it.
+            verified_counts.add_(step_mask.to(dtype=verified_counts.dtype))
 
-            # Match the original RetroSpec behavior: include the current
-            # corrected token, then stop this request's verification prefix
-            # after sparse-token change or failed expanded verification.
-            stop_mask = sparse_token_changed | expanded_failed
+            # A sparse correction ends this round. If expanded verification
+            # succeeds, another round may still extend the pending prefix.
+            stop_mask = (
+                sparse_token_changed | expanded_failed | sparse_decision.require_full
+            )
             verification_active &= ~stop_mask
 
-        has_verified_tokens = verified_counts > 0
-        self.state.set_stage(has_verified_tokens, RetroSpecStage.FULL_VERIFY)
-
-        return verified_counts
+        return RetroSpecVerificationResult(
+            verified_counts=verified_counts,
+            require_full=require_full,
+        )
 
     @torch.inference_mode()
     def propose(
@@ -576,75 +602,165 @@ class RetroSpecProposer:
         self.state.finish_requests(no_draft_space)
 
         with self.sparse_attention.proposal_context():
-            for draft_index in range(self.num_speculative_tokens):
-                draft_stage_mask = (
+            while True:
+                draft_round_mask = (
                     self.state.active_mask
                     & (self.state.stage == int(RetroSpecStage.DRAFT))
+                    & (self.state.pending_counts < self.policy.pending_limit)
                     & (self.positions[:batch_size] < self.max_model_len - 1)
                 )
-
-                if not draft_stage_mask.any().item():
+                if not draft_round_mask.any().item():
                     break
 
-                (sampled_token_ids, draft_margin, hit_attn) = self._run_draft_step(
+                # Append this round after the existing pending prefix.
+                round_start_counts = self.state.pending_counts.clone()
+
+                # Draft counts are local to this round.
+                self.state.reset_draft_counts(self.state.active_mask)
+
+                for token_index in range(self.num_speculative_tokens):
+                    next_token_indices = round_start_counts + self.state.draft_counts
+
+                    draft_stage_mask = (
+                        draft_round_mask
+                        & self.state.active_mask
+                        & (self.state.stage == int(RetroSpecStage.DRAFT))
+                        & (next_token_indices == token_index)
+                        & (next_token_indices < self.policy.pending_limit)
+                        & (self.positions[:batch_size] < self.max_model_len - 1)
+                    )
+                    if not draft_stage_mask.any().item():
+                        continue
+
+                    sampled_token_ids, draft_margin, hit_attn = self._run_draft_step(
+                        batch_size,
+                        token_index,
+                        common_attn_metadata,
+                        draft_stage_mask,
+                        sampling_metadata,
+                    )
+
+                    output_column = self._draft_token_ids[:batch_size, token_index]
+                    output_column.copy_(
+                        torch.where(
+                            draft_stage_mask,
+                            sampled_token_ids,
+                            output_column,
+                        )
+                    )
+
+                    emitted_counts = draft_stage_mask.to(torch.int32)
+                    self.state.add_draft_counts(emitted_counts)
+
+                    # Draft tokens are not pending until sparse verification.
+                    # Only provide the projected count to the decision policy.
+                    projected_pending_counts = (
+                        round_start_counts + self.state.draft_counts
+                    )
+
+                    generation_limit_reached = draft_stage_mask & (
+                        self.positions[:batch_size] + 1 >= self.max_model_len - 1
+                    )
+
+                    decision = self.policy.evaluate(
+                        current_stage=RetroSpecStage.DRAFT,
+                        request_stages=self.state.stage,
+                        metrics=RetroSpecMetrics(
+                            draft_margin=draft_margin,
+                            hit_attn=hit_attn,
+                        ),
+                        draft_counts=self.state.draft_counts,
+                        pending_counts=projected_pending_counts,
+                        active_mask=self.state.active_mask,
+                        generation_limit_reached=generation_limit_reached,
+                    )
+                    self.state.set_stages(decision.next_stage)
+
+                    self.positions[:batch_size].add_(emitted_counts)
+
+                    # Sampled IDs are meaningful only for rows that ran this
+                    # step and remain in the draft stage.
+                    continue_draft_mask = draft_stage_mask & (
+                        self.state.stage == int(RetroSpecStage.DRAFT)
+                    )
+                    self.input_ids[:batch_size].copy_(
+                        torch.where(
+                            continue_draft_mask,
+                            sampled_token_ids,
+                            self.input_ids[:batch_size],
+                        )
+                    )
+
+                verification = self._verify_draft_tokens(
                     batch_size,
-                    draft_index,
+                    round_start_counts,
                     common_attn_metadata,
-                    draft_stage_mask,
                     sampling_metadata,
                 )
 
-                output_column = self._draft_token_ids[:batch_size, draft_index]
-                output_column.copy_(
-                    torch.where(
-                        draft_stage_mask,
-                        sampled_token_ids,
-                        torch.full_like(sampled_token_ids, -1),
-                    )
+                # Discard the unverified suffix of the current round.
+                updated_pending_counts = torch.where(
+                    draft_round_mask,
+                    round_start_counts + verification.verified_counts,
+                    self.state.pending_counts,
+                )
+                self.state.set_pending_counts(updated_pending_counts)
+
+                # Verification can stop early. Roll positions back so a later
+                # draft round overwrites KV slots belonging to discarded tokens.
+                self.positions[:batch_size].copy_(
+                    self.proposal_start_positions[:batch_size]
+                    + self.state.pending_counts
                 )
 
-                emitted_counts = draft_stage_mask.to(torch.int32)
-                self.state.add_draft_counts(emitted_counts)
-                self.state.add_pending_counts(emitted_counts)
-
-                generation_limit_reached = draft_stage_mask & (
-                    self.positions[:batch_size] + 1 >= self.max_model_len - 1
+                can_defer_full = (
+                    draft_round_mask
+                    & self.state.active_mask
+                    & (verification.verified_counts > 0)
+                    & ~verification.require_full
+                    & (self.state.pending_counts < self.policy.pending_limit)
+                    & (self.positions[:batch_size] < self.max_model_len - 1)
                 )
 
-                decision = self.policy.evaluate(
-                    current_stage=RetroSpecStage.DRAFT,
-                    request_stages=self.state.stage,
-                    metrics=RetroSpecMetrics(
-                        draft_margin=draft_margin, hit_attn=hit_attn
-                    ),
-                    draft_counts=self.state.draft_counts,
-                    pending_counts=self.state.pending_counts,
-                    active_mask=self.state.active_mask,
-                    generation_limit_reached=generation_limit_reached,
+                require_full = (
+                    draft_round_mask & (self.state.pending_counts > 0) & ~can_defer_full
                 )
-                self.state.set_stages(decision.next_stage)
 
-                self.positions[:batch_size].add_(emitted_counts)
+                self.state.set_stage(can_defer_full, RetroSpecStage.DRAFT)
+                self.state.set_stage(require_full, RetroSpecStage.FULL_VERIFY)
 
-                next_draft_mask = self.state.active_mask & (
-                    self.state.stage == int(RetroSpecStage.DRAFT)
+                empty_round = draft_round_mask & (self.state.pending_counts == 0)
+                if empty_round.any().item():
+                    self.state.finish_requests(empty_round)
+
+                # Continue drafting from the final token in the pending prefix.
+                safe_last_indices = (self.state.pending_counts - 1).clamp(
+                    min=0,
+                    max=self.num_speculative_tokens - 1,
+                )
+                last_pending_tokens = (
+                    self._draft_token_ids[:batch_size]
+                    .gather(1, safe_last_indices.unsqueeze(1))
+                    .squeeze(1)
+                )
+
+                next_round_input_ids = torch.where(
+                    self.state.pending_counts > 0,
+                    last_pending_tokens,
+                    self.proposal_input_ids[:batch_size],
                 )
                 self.input_ids[:batch_size].copy_(
                     torch.where(
-                        next_draft_mask,
-                        sampled_token_ids,
-                        torch.zeros_like(sampled_token_ids),
+                        can_defer_full,
+                        next_round_input_ids,
+                        self.input_ids[:batch_size],
                     )
                 )
 
-            verified_counts = self._verify_draft_tokens(
-                batch_size, common_attn_metadata, sampling_metadata
-            )
-
-        draft_counts_cpu = verified_counts.cpu().tolist()
-        draft_token_ids = self._draft_token_ids[:batch_size].cpu().tolist()
+        pending_counts_cpu = self.state.pending_counts.cpu().tolist()
+        pending_token_ids = self._draft_token_ids[:batch_size].cpu().tolist()
 
         return [
-            token_ids[:draft_count]
-            for token_ids, draft_count in zip(draft_token_ids, draft_counts_cpu)
+            token_ids[:pending_count]
+            for token_ids, pending_count in zip(pending_token_ids, pending_counts_cpu)
         ]

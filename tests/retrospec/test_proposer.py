@@ -16,6 +16,7 @@ from vllm.v1.spec_decode.retrospec import (
     RetroSpecAttentionMode,
     RetroSpecProposer,
 )
+from vllm.v1.spec_decode.retrospec.proposer import RetroSpecVerificationResult
 from vllm.v1.spec_decode.retrospec.state import RetroSpecStage
 
 
@@ -93,7 +94,10 @@ def mock_proposal_execution(
     monkeypatch.setattr(
         proposer,
         "_verify_draft_tokens",
-        lambda *args: proposer.state.draft_counts.clone(),
+        lambda *args: RetroSpecVerificationResult(
+            verified_counts=proposer.state.draft_counts.clone(),
+            require_full=proposer.state.active_mask.clone(),
+        ),
     )
 
 
@@ -442,11 +446,13 @@ def initialize_verification(
     proposer: RetroSpecProposer,
     draft_token_ids: torch.Tensor,
     draft_counts: torch.Tensor,
+    pending_counts: torch.Tensor | None = None,
 ) -> None:
     batch_size = draft_token_ids.shape[0]
     proposer.state.begin_batch(batch_size)
     proposer.state.add_draft_counts(draft_counts)
-    proposer.state.add_pending_counts(draft_counts)
+    if pending_counts is not None:
+        proposer.state.set_pending_counts(pending_counts)
     proposer._draft_token_ids[:batch_size].copy_(draft_token_ids)
     proposer.proposal_input_ids[:batch_size].copy_(
         torch.arange(7, 7 + batch_size, dtype=torch.int32)
@@ -482,16 +488,18 @@ def test_verify_unchanged_sparse_tokens_keeps_complete_prefix(monkeypatch):
         )
 
     monkeypatch.setattr(proposer, "_run_verification_step", fake_run_verification_step)
-    verified_counts = proposer._verify_draft_tokens(
+    verification = proposer._verify_draft_tokens(
         1,
+        torch.zeros(1, dtype=torch.int32),
         make_common_metadata([1]),
         make_sampling_metadata(all_greedy=True),
     )
 
-    assert verified_counts.tolist() == [3]
+    assert verification.verified_counts.tolist() == [3]
+    assert not verification.require_full.any()
     assert proposer._draft_token_ids[0, :3].tolist() == [10, 20, 30]
     assert observed_inputs == [[7], [10], [20]]
-    assert proposer.state.stage.tolist() == [int(RetroSpecStage.FULL_VERIFY)]
+    assert proposer.state.stage.tolist() == [int(RetroSpecStage.DRAFT)]
 
 
 def test_sparse_token_change_is_corrected_and_truncates_prefix(monkeypatch):
@@ -516,13 +524,15 @@ def test_sparse_token_change_is_corrected_and_truncates_prefix(monkeypatch):
         return torch.tensor([11], dtype=torch.int32), None, torch.ones(1)
 
     monkeypatch.setattr(proposer, "_run_verification_step", fake_run_verification_step)
-    verified_counts = proposer._verify_draft_tokens(
+    verification = proposer._verify_draft_tokens(
         1,
+        torch.zeros(1, dtype=torch.int32),
         make_common_metadata([1]),
         make_sampling_metadata(all_greedy=True),
     )
 
-    assert verified_counts.tolist() == [1]
+    assert verification.verified_counts.tolist() == [1]
+    assert not verification.require_full.any()
     assert proposer._draft_token_ids[0, 0].item() == 11
     assert observed_modes == [
         RetroSpecAttentionMode.SPARSE_VERIFY,
@@ -567,16 +577,18 @@ def test_expanded_verification_passes_or_stops_requests_independently(
         return token_ids, margin, torch.ones(batch_size)
 
     monkeypatch.setattr(proposer, "_run_verification_step", fake_run_verification_step)
-    verified_counts = proposer._verify_draft_tokens(
+    verification = proposer._verify_draft_tokens(
         2,
+        torch.zeros(2, dtype=torch.int32),
         make_common_metadata([1, 1]),
         make_sampling_metadata(all_greedy=True),
     )
 
-    assert verified_counts.tolist() == [3, 1]
+    assert verification.verified_counts.tolist() == [3, 1]
+    assert verification.require_full.tolist() == [False, True]
     assert expanded_masks == [[True, True], [True, False], [True, False]]
     assert proposer.state.stage.tolist() == [
-        int(RetroSpecStage.FULL_VERIFY),
+        int(RetroSpecStage.DRAFT),
         int(RetroSpecStage.FULL_VERIFY),
     ]
 
@@ -609,14 +621,189 @@ def test_expanded_token_change_replaces_current_token_before_truncation(
         return torch.tensor([99]), None, torch.ones(1)
 
     monkeypatch.setattr(proposer, "_run_verification_step", fake_run_verification_step)
-    verified_counts = proposer._verify_draft_tokens(
+    verification = proposer._verify_draft_tokens(
         1,
+        torch.zeros(1, dtype=torch.int32),
         make_common_metadata([1]),
         make_sampling_metadata(all_greedy=True),
     )
 
-    assert verified_counts.tolist() == [1]
+    assert verification.verified_counts.tolist() == [1]
+    assert verification.require_full.tolist() == [True]
     assert proposer._draft_token_ids[0, 0].item() == 99
+
+
+def test_verify_only_processes_current_logical_draft_interval(monkeypatch):
+    proposer = RetroSpecProposer(make_vllm_config(), torch.device("cpu"), make_runner())
+    initialize_verification(
+        proposer,
+        torch.tensor([[10, 20, 30, 40]], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+        pending_counts=torch.tensor([2], dtype=torch.int32),
+    )
+    observed_indices: list[int] = []
+    observed_inputs: list[list[int]] = []
+
+    def fake_run_verification_step(
+        batch_size,
+        draft_index,
+        input_ids,
+        active_mask,
+        common_attn_metadata,
+        sampling_metadata,
+        attention_mode,
+    ):
+        assert attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY
+        observed_indices.append(draft_index)
+        observed_inputs.append(input_ids[:batch_size].tolist())
+        return (
+            proposer._draft_token_ids[:batch_size, draft_index].clone(),
+            None,
+            torch.ones(batch_size),
+        )
+
+    monkeypatch.setattr(proposer, "_run_verification_step", fake_run_verification_step)
+    verification = proposer._verify_draft_tokens(
+        1,
+        torch.tensor([2], dtype=torch.int32),
+        make_common_metadata([1]),
+        make_sampling_metadata(all_greedy=True),
+    )
+
+    assert observed_indices == [2, 3]
+    assert observed_inputs == [[20], [30]]
+    assert verification.verified_counts.tolist() == [2]
+    assert verification.require_full.tolist() == [True]
+
+
+def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_max_draft_tokens=2),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    round_starts: list[list[int]] = []
+
+    def fake_run_draft_step(
+        batch_size,
+        draft_index,
+        common_attn_metadata,
+        active_mask,
+        sampling_metadata,
+    ):
+        return (
+            torch.full((batch_size,), draft_index + 1, dtype=torch.int32),
+            None,
+            torch.ones(batch_size),
+        )
+
+    def fake_verify(
+        batch_size,
+        round_start_counts,
+        common_attn_metadata,
+        sampling_metadata,
+    ):
+        round_starts.append(round_start_counts.tolist())
+        verified_counts = proposer.state.draft_counts.clone()
+        require_full = (
+            round_start_counts + verified_counts >= proposer.policy.pending_limit
+        )
+        return RetroSpecVerificationResult(verified_counts, require_full)
+
+    monkeypatch.setattr(
+        proposer.sparse_attention, "proposal_context", lambda: nullcontext()
+    )
+    monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)
+
+    result = proposer.propose(
+        torch.tensor([7], dtype=torch.int32),
+        make_sampling_metadata(all_greedy=True),
+        make_common_metadata([2]),
+    )
+
+    assert round_starts == [[0], [2]]
+    assert result == [[1, 2, 3, 4]]
+    assert proposer.state.pending_counts.tolist() == [4]
+    assert proposer.state.stage.tolist() == [int(RetroSpecStage.FULL_VERIFY)]
+
+
+def test_propose_handles_different_round_offsets_in_one_buffer(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_max_draft_tokens=2),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    round_starts: list[list[int]] = []
+    draft_calls: list[tuple[int, list[bool], list[int]]] = []
+    verified_by_round = [
+        torch.tensor([1, 2], dtype=torch.int32),
+        torch.tensor([2, 2], dtype=torch.int32),
+        torch.tensor([1, 0], dtype=torch.int32),
+    ]
+
+    def fake_run_draft_step(
+        batch_size,
+        draft_index,
+        common_attn_metadata,
+        active_mask,
+        sampling_metadata,
+    ):
+        draft_calls.append(
+            (
+                draft_index,
+                active_mask.tolist(),
+                proposer.positions[:batch_size].tolist(),
+            )
+        )
+        return (
+            torch.tensor(
+                [draft_index * 10 + row for row in range(batch_size)],
+                dtype=torch.int32,
+            ),
+            None,
+            torch.ones(batch_size),
+        )
+
+    def fake_verify(
+        batch_size,
+        round_start_counts,
+        common_attn_metadata,
+        sampling_metadata,
+    ):
+        round_index = len(round_starts)
+        round_starts.append(round_start_counts.tolist())
+        verified_counts = verified_by_round[round_index]
+        require_full = (
+            round_start_counts + verified_counts >= proposer.policy.pending_limit
+        )
+        return RetroSpecVerificationResult(verified_counts, require_full)
+
+    monkeypatch.setattr(
+        proposer.sparse_attention, "proposal_context", lambda: nullcontext()
+    )
+    monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)
+
+    result = proposer.propose(
+        torch.tensor([7, 8], dtype=torch.int32),
+        make_sampling_metadata(all_greedy=True),
+        make_common_metadata([2, 4]),
+    )
+
+    assert round_starts == [[0, 0], [1, 2], [3, 4]]
+    assert [(index, mask) for index, mask, _ in draft_calls] == [
+        (0, [True, True]),
+        (1, [True, True]),
+        (1, [True, False]),
+        (2, [True, True]),
+        (3, [False, True]),
+        (3, [True, False]),
+    ]
+    assert draft_calls[2][2] == [3, 6]
+    assert draft_calls[-1][2] == [5, 8]
+    assert result == [[0, 10, 20, 30], [1, 11, 21, 31]]
+    assert proposer.state.pending_counts.tolist() == [4, 4]
 
 
 @pytest.mark.parametrize(

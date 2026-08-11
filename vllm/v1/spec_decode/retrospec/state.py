@@ -100,6 +100,10 @@ class RetroSpecBatchState:
 
         self.stage.copy_(stages.to(dtype=self.stage.dtype))
 
+    def reset_draft_counts(self, mask: torch.Tensor) -> None:
+        self._validate_mask(mask)
+        self.draft_counts.masked_fill_(mask, 0)
+
     def add_draft_counts(self, counts: torch.Tensor) -> None:
         self._validate_counts("counts", counts)
         self.draft_counts.add_(counts)
@@ -107,6 +111,10 @@ class RetroSpecBatchState:
     def add_pending_counts(self, counts: torch.Tensor) -> None:
         self._validate_counts("counts", counts)
         self.pending_counts.add_(counts)
+
+    def set_pending_counts(self, counts: torch.Tensor) -> None:
+        self._validate_counts("counts", counts)
+        self.pending_counts.copy_(counts.to(self.pending_counts.dtype))
 
     def finish_requests(self, mask: torch.Tensor) -> None:
         self._validate_mask(mask)

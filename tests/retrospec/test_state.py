@@ -141,6 +141,27 @@ def test_add_counts_accumulates_per_request():
     assert state.pending_counts.tolist() == [0, 2, 1]
 
 
+def test_reset_draft_counts_only_clears_selected_requests():
+    state = make_state()
+    state.begin_batch(3)
+    state.add_draft_counts(torch.tensor([1, 2, 3], dtype=torch.int32))
+
+    state.reset_draft_counts(torch.tensor([True, False, True]))
+
+    assert state.draft_counts.tolist() == [0, 2, 0]
+
+
+def test_set_pending_counts_replaces_all_request_counts():
+    state = make_state()
+    state.begin_batch(3)
+    state.add_pending_counts(torch.tensor([1, 2, 3], dtype=torch.int32))
+
+    state.set_pending_counts(torch.tensor([3, 1, 2], dtype=torch.int64))
+
+    assert state.pending_counts.dtype == torch.int32
+    assert state.pending_counts.tolist() == [3, 1, 2]
+
+
 def test_finish_requests_clears_only_selected_requests():
     state = make_state()
     state.begin_batch(3)
