@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -27,7 +28,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from .attention import RetroSpecAttentionMode, RetroSpecSparseAttention
 from .decision import RetroSpecDecisionPolicy, RetroSpecMetrics
-from .state import RetroSpecBatchState, RetroSpecStage
+from .state import RetroSpecBatchState, RetroSpecIndexUpdateState, RetroSpecStage
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -90,7 +91,12 @@ class RetroSpecProposer:
         self.policy = RetroSpecDecisionPolicy(config)
         self.state = RetroSpecBatchState(self.max_batch_size, device)
         self.sparse_attention = RetroSpecSparseAttention(vllm_config, device)
-
+        self.index_update_state = RetroSpecIndexUpdateState(
+            max_batch_size=self.max_batch_size,
+            update_interval=config.retrospec_index_update_interval,
+            device=device,
+            pin_memory=is_pin_memory_available(),
+        )
         self.attn_metadata_builder: AttentionMetadataBuilder | None = None
         self.attn_layer_names: list[str] = []
 
@@ -128,6 +134,9 @@ class RetroSpecProposer:
             pin_memory=is_pin_memory_available(),
             with_numpy=True,
         )
+
+    def remove_requests(self, request_ids: Collection[str]) -> None:
+        self.index_update_state.remove_requests(request_ids)
 
     def load_model(self, target_model: nn.Module) -> None:
         self.model = target_model
@@ -489,6 +498,13 @@ class RetroSpecProposer:
                 + verified_counts
                 + step_mask.to(dtype=verified_counts.dtype)
             )
+            candidate_positions = (
+                self.proposal_start_positions[:batch_size] + candidate_pending_counts
+            )
+            index_update_required = self.index_update_state.requires_update(
+                candidate_positions,
+                step_mask,
+            )
 
             sparse_decision = self.policy.evaluate(
                 current_stage=RetroSpecStage.SPARSE_VERIFY,
@@ -502,6 +518,7 @@ class RetroSpecProposer:
                 active_mask=self.state.active_mask,
                 sparse_token_changed=sparse_token_changed,
                 generation_limit_reached=generation_limit_reached,
+                index_update_required=index_update_required,
             )
             self.state.set_stages(sparse_decision.next_stage)
             require_full |= sparse_decision.require_full
@@ -541,6 +558,7 @@ class RetroSpecProposer:
                     active_mask=self.state.active_mask,
                     expanded_token_changed=expanded_token_changed,
                     generation_limit_reached=generation_limit_reached,
+                    index_update_required=index_update_required,
                 )
                 self.state.set_stages(expanded_decision.next_stage)
                 require_full |= expanded_decision.require_full
@@ -573,6 +591,8 @@ class RetroSpecProposer:
     @torch.inference_mode()
     def propose(
         self,
+        request_ids: list[str],
+        committed_positions: list[int],
         next_token_ids: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         common_attn_metadata: CommonAttentionMetadata,
@@ -585,7 +605,13 @@ class RetroSpecProposer:
             )
 
         batch_size = common_attn_metadata.batch_size()
+        if len(request_ids) != batch_size:
+            raise ValueError("request_ids must match the proposal batch size")
+        if len(committed_positions) != batch_size:
+            raise ValueError("committed_positions must match the proposal batch size")
+
         self.state.begin_batch(batch_size)
+        self.index_update_state.begin_batch(request_ids, committed_positions)
 
         self._draft_token_ids[:batch_size].fill_(-1)
         self.input_ids[:batch_size].copy_(next_token_ids)
@@ -662,17 +688,22 @@ class RetroSpecProposer:
                         self.positions[:batch_size] + 1 >= self.max_model_len - 1
                     )
 
+                    index_update_required = self.index_update_state.requires_update(
+                        self.positions[:batch_size] + 1,
+                        draft_stage_mask,
+                    )
+
                     decision = self.policy.evaluate(
                         current_stage=RetroSpecStage.DRAFT,
                         request_stages=self.state.stage,
                         metrics=RetroSpecMetrics(
-                            draft_margin=draft_margin,
-                            hit_attn=hit_attn,
+                            draft_margin=draft_margin, hit_attn=hit_attn
                         ),
                         draft_counts=self.state.draft_counts,
                         pending_counts=projected_pending_counts,
                         active_mask=self.state.active_mask,
                         generation_limit_reached=generation_limit_reached,
+                        index_update_required=index_update_required,
                     )
                     self.state.set_stages(decision.next_stage)
 

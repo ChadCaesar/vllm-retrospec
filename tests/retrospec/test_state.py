@@ -11,6 +11,7 @@ from vllm.v1.spec_decode.retrospec.decision import (
 )
 from vllm.v1.spec_decode.retrospec.state import (
     RetroSpecBatchState,
+    RetroSpecIndexUpdateState,
     RetroSpecStage,
 )
 
@@ -20,6 +21,135 @@ def make_state(max_batch_size: int = 4) -> RetroSpecBatchState:
         max_batch_size=max_batch_size,
         device=torch.device("cpu"),
     )
+
+
+def make_index_update_state(
+    max_batch_size: int = 4,
+    update_interval: int = 4,
+) -> RetroSpecIndexUpdateState:
+    return RetroSpecIndexUpdateState(
+        max_batch_size=max_batch_size,
+        update_interval=update_interval,
+        device=torch.device("cpu"),
+        pin_memory=False,
+    )
+
+
+def test_index_update_state_initializes_boundaries_from_committed_positions():
+    state = make_index_update_state(update_interval=4)
+
+    state.begin_batch(["a", "b"], [10, 20])
+
+    assert state.batch_size == 2
+    assert state.next_update_positions.tolist() == [14, 24]
+
+
+def test_index_update_state_detects_exact_boundary_for_active_requests():
+    state = make_index_update_state(update_interval=4)
+    state.begin_batch(["a", "b"], [10, 20])
+
+    required = state.requires_update(
+        torch.tensor([14, 25], dtype=torch.int64),
+        torch.tensor([True, False]),
+    )
+
+    assert required.tolist() == [True, False]
+
+
+def test_index_update_state_preserves_boundaries_across_batch_reordering():
+    state = make_index_update_state(update_interval=4)
+    state.begin_batch(["a", "b"], [10, 20])
+
+    state.begin_batch(["b", "a"], [21, 11])
+
+    assert state.next_update_positions.tolist() == [24, 14]
+
+
+def test_index_update_state_advances_crossed_intervals():
+    state = make_index_update_state(update_interval=4)
+    state.begin_batch(["a"], [10])
+
+    state.begin_batch(["a"], [22])
+
+    assert state.next_update_positions.tolist() == [26]
+
+
+def test_index_update_state_retains_preempted_request_boundary():
+    state = make_index_update_state(update_interval=4)
+    state.begin_batch(["a", "b"], [10, 20])
+    state.begin_batch(["b"], [21])
+
+    state.begin_batch(["a", "b"], [11, 22])
+
+    assert state.next_update_positions.tolist() == [14, 24]
+
+
+def test_index_update_state_removal_resets_reused_request_id():
+    state = make_index_update_state(update_interval=4)
+    state.begin_batch(["a"], [10])
+    state.remove_requests({"a"})
+
+    state.begin_batch(["a"], [100])
+
+    assert state.next_update_positions.tolist() == [104]
+
+
+@pytest.mark.parametrize(
+    ("request_ids", "committed_positions", "message"),
+    [
+        (["a", "b"], [1], "same length"),
+        (["a", "a"], [1, 2], "unique"),
+        (["a"], [-1], "non-negative"),
+    ],
+)
+def test_index_update_state_rejects_invalid_batches(
+    request_ids: list[str],
+    committed_positions: list[int],
+    message: str,
+):
+    state = make_index_update_state(max_batch_size=2)
+
+    with pytest.raises(ValueError, match=message):
+        state.begin_batch(request_ids, committed_positions)
+
+
+def test_index_update_state_rejects_oversized_batch():
+    state = make_index_update_state(max_batch_size=1)
+
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        state.begin_batch(["a", "b"], [1, 2])
+
+
+@pytest.mark.parametrize(
+    ("candidate_positions", "active_mask", "message"),
+    [
+        (
+            torch.tensor([1], dtype=torch.int64),
+            torch.tensor([True, True]),
+            "candidate_positions",
+        ),
+        (
+            torch.tensor([1, 2], dtype=torch.float32),
+            torch.tensor([True, True]),
+            "integer dtype",
+        ),
+        (
+            torch.tensor([1, 2], dtype=torch.int64),
+            torch.tensor([1, 0], dtype=torch.int32),
+            "torch.bool",
+        ),
+    ],
+)
+def test_index_update_state_rejects_invalid_update_inputs(
+    candidate_positions: torch.Tensor,
+    active_mask: torch.Tensor,
+    message: str,
+):
+    state = make_index_update_state(max_batch_size=2)
+    state.begin_batch(["a", "b"], [1, 2])
+
+    with pytest.raises(ValueError, match=message):
+        state.requires_update(candidate_positions, active_mask)
 
 
 def test_state_initialization():

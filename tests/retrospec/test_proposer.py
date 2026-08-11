@@ -82,6 +82,31 @@ def make_sampling_metadata(*, all_greedy: bool) -> SamplingMetadata:
     )
 
 
+def run_proposal(
+    proposer: RetroSpecProposer,
+    next_token_ids: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+    common_attn_metadata: CommonAttentionMetadata,
+    num_rejected_tokens_gpu: torch.Tensor | None = None,
+    request_ids: list[str] | None = None,
+    committed_positions: list[int] | None = None,
+) -> list[list[int]]:
+    batch_size = common_attn_metadata.batch_size()
+    if request_ids is None:
+        request_ids = [f"request-{index}" for index in range(batch_size)]
+    if committed_positions is None:
+        committed_positions = common_attn_metadata.seq_lens.tolist()
+
+    return proposer.propose(
+        request_ids=request_ids,
+        committed_positions=committed_positions,
+        next_token_ids=next_token_ids,
+        sampling_metadata=sampling_metadata,
+        common_attn_metadata=common_attn_metadata,
+        num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+    )
+
+
 def mock_proposal_execution(
     proposer: RetroSpecProposer,
     monkeypatch: pytest.MonkeyPatch,
@@ -191,7 +216,8 @@ def test_propose_rejects_random_sampling():
     )
 
     with pytest.raises(NotImplementedError, match="greedy decoding only"):
-        proposer.propose(
+        run_proposal(
+            proposer,
             torch.tensor([1], dtype=torch.int32),
             make_sampling_metadata(all_greedy=False),
             make_common_metadata([1]),
@@ -235,7 +261,8 @@ def test_propose_stops_requests_independently_on_draft_margin(monkeypatch):
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     mock_proposal_execution(proposer, monkeypatch)
 
-    result = proposer.propose(
+    result = run_proposal(
+        proposer,
         torch.tensor([1, 2, 3], dtype=torch.int32),
         make_sampling_metadata(all_greedy=True),
         make_common_metadata([1, 1, 1]),
@@ -267,7 +294,8 @@ def test_propose_stops_at_configured_max_draft_tokens(monkeypatch):
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     mock_proposal_execution(proposer, monkeypatch)
 
-    result = proposer.propose(
+    result = run_proposal(
+        proposer,
         torch.tensor([1, 2], dtype=torch.int32),
         make_sampling_metadata(all_greedy=True),
         make_common_metadata([1, 1]),
@@ -302,7 +330,8 @@ def test_propose_respects_per_request_generation_limit(monkeypatch):
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     mock_proposal_execution(proposer, monkeypatch)
 
-    result = proposer.propose(
+    result = run_proposal(
+        proposer,
         torch.tensor([1, 2, 3], dtype=torch.int32),
         make_sampling_metadata(all_greedy=True),
         make_common_metadata([4, 3, 5]),
@@ -334,7 +363,8 @@ def test_propose_rolls_back_rejected_tokens_before_drafting(monkeypatch):
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     mock_proposal_execution(proposer, monkeypatch)
 
-    result = proposer.propose(
+    result = run_proposal(
+        proposer,
         torch.tensor([1], dtype=torch.int32),
         make_sampling_metadata(all_greedy=True),
         make_common_metadata([5]),
@@ -433,7 +463,8 @@ def test_propose_stops_requests_independently_on_hit_attention(monkeypatch):
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     mock_proposal_execution(proposer, monkeypatch)
 
-    result = proposer.propose(
+    result = run_proposal(
+        proposer,
         torch.tensor([1, 2], dtype=torch.int32),
         make_sampling_metadata(all_greedy=True),
         make_common_metadata([1, 1]),
@@ -450,6 +481,10 @@ def initialize_verification(
 ) -> None:
     batch_size = draft_token_ids.shape[0]
     proposer.state.begin_batch(batch_size)
+    proposer.index_update_state.begin_batch(
+        [f"request-{index}" for index in range(batch_size)],
+        [1] * batch_size,
+    )
     proposer.state.add_draft_counts(draft_counts)
     if pending_counts is not None:
         proposer.state.set_pending_counts(pending_counts)
@@ -458,6 +493,104 @@ def initialize_verification(
         torch.arange(7, 7 + batch_size, dtype=torch.int32)
     )
     proposer.proposal_start_positions[:batch_size].fill_(1)
+
+
+def test_propose_stops_draft_at_index_update_boundary(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_index_update_interval=2),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    observed_indices: list[int] = []
+
+    def fake_run_draft_step(
+        batch_size,
+        draft_index,
+        common_attn_metadata,
+        active_mask,
+        sampling_metadata,
+    ):
+        observed_indices.append(draft_index)
+        return (
+            torch.full((batch_size,), draft_index + 1, dtype=torch.int32),
+            None,
+            torch.ones(batch_size),
+        )
+
+    monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    mock_proposal_execution(proposer, monkeypatch)
+
+    result = run_proposal(
+        proposer,
+        torch.tensor([7], dtype=torch.int32),
+        make_sampling_metadata(all_greedy=True),
+        make_common_metadata([1]),
+        committed_positions=[1],
+    )
+
+    assert observed_indices == [0, 1]
+    assert result == [[1, 2]]
+
+
+def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_index_update_interval=2),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    initialize_verification(
+        proposer,
+        torch.tensor([[10, 20, 30, -1]], dtype=torch.int32),
+        torch.tensor([3], dtype=torch.int32),
+    )
+    observed_indices: list[int] = []
+
+    def fake_run_verification_step(
+        batch_size,
+        draft_index,
+        input_ids,
+        active_mask,
+        common_attn_metadata,
+        sampling_metadata,
+        attention_mode,
+    ):
+        observed_indices.append(draft_index)
+        return (
+            proposer._draft_token_ids[:batch_size, draft_index].clone(),
+            None,
+            torch.ones(batch_size),
+        )
+
+    monkeypatch.setattr(
+        proposer,
+        "_run_verification_step",
+        fake_run_verification_step,
+    )
+
+    verification = proposer._verify_draft_tokens(
+        1,
+        torch.zeros(1, dtype=torch.int32),
+        make_common_metadata([1]),
+        make_sampling_metadata(all_greedy=True),
+    )
+
+    assert observed_indices == [0, 1]
+    assert verification.verified_counts.tolist() == [2]
+    assert verification.require_full.tolist() == [True]
+
+
+def test_remove_requests_resets_proposer_index_update_boundary():
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_index_update_interval=4),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer.index_update_state.begin_batch(["request"], [10])
+
+    proposer.remove_requests({"request"})
+    proposer.index_update_state.begin_batch(["request"], [100])
+
+    assert proposer.index_update_state.next_update_positions.tolist() == [104]
 
 
 def test_verify_unchanged_sparse_tokens_keeps_complete_prefix(monkeypatch):
@@ -716,7 +849,8 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)
 
-    result = proposer.propose(
+    result = run_proposal(
+        proposer,
         torch.tensor([7], dtype=torch.int32),
         make_sampling_metadata(all_greedy=True),
         make_common_metadata([2]),
@@ -785,7 +919,8 @@ def test_propose_handles_different_round_offsets_in_one_buffer(monkeypatch):
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)
 
-    result = proposer.propose(
+    result = run_proposal(
+        proposer,
         torch.tensor([7, 8], dtype=torch.int32),
         make_sampling_metadata(all_greedy=True),
         make_common_metadata([2, 4]),

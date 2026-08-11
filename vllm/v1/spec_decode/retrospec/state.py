@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Collection, Sequence
 from enum import IntEnum
 
 import torch
@@ -12,6 +13,128 @@ class RetroSpecStage(IntEnum):
     SPARSE_VERIFY = 2
     EXPANDED_VERIFY = 3
     FULL_VERIFY = 4
+
+
+class RetroSpecIndexUpdateState:
+    """Track the next index-update boundary for each request.
+
+    Positions are sequence lengths rather than zero-based token positions.
+    Request state is stored by request ID so batch reordering and preemption
+    do not associate an update boundary with the wrong request.
+    """
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        update_interval: int,
+        device: torch.device,
+        pin_memory: bool,
+    ) -> None:
+        if max_batch_size <= 0:
+            raise ValueError("max_batch_size must be greater than zero")
+        if update_interval <= 0:
+            raise ValueError("update_interval must be greater than zero")
+
+        self.max_batch_size = max_batch_size
+        self.update_interval = update_interval
+        self.device = device
+        self.pin_memory = pin_memory
+
+        self._next_update_by_request: dict[str, int] = {}
+
+        self._next_update_positions_cpu = torch.empty(
+            max_batch_size,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        self._next_update_positions = torch.empty(
+            max_batch_size,
+            dtype=torch.int64,
+            device=device,
+        )
+
+        self.batch_size = 0
+
+    @property
+    def next_update_positions(self) -> torch.Tensor:
+        return self._next_update_positions[: self.batch_size]
+
+    def begin_batch(
+        self,
+        request_ids: Sequence[str],
+        committed_positions: Sequence[int],
+    ) -> None:
+        batch_size = len(request_ids)
+
+        if batch_size > self.max_batch_size:
+            raise ValueError(
+                f"batch size {batch_size} exceeds maximum {self.max_batch_size}"
+            )
+        if len(committed_positions) != batch_size:
+            raise ValueError(
+                "committed_positions must have the same length as request_ids"
+            )
+        if len(set(request_ids)) != batch_size:
+            raise ValueError("request_ids must be unique within a batch")
+
+        self.batch_size = batch_size
+
+        for request_index, (request_id, position) in enumerate(
+            zip(request_ids, committed_positions)
+        ):
+            if position < 0:
+                raise ValueError("committed positions must be non-negative")
+
+            next_update_position = self._next_update_by_request.get(request_id)
+
+            if next_update_position is None:
+                # The current prompt and committed output are already covered
+                # by the index available when the request first enters RetroSpec.
+                next_update_position = position + self.update_interval
+            elif position >= next_update_position:
+                # A previous full-verification pass committed enough tokens to
+                # cross one or more index-update boundaries.
+                crossed_intervals = (
+                    position - next_update_position
+                ) // self.update_interval + 1
+                next_update_position += crossed_intervals * self.update_interval
+
+            self._next_update_by_request[request_id] = next_update_position
+            self._next_update_positions_cpu[request_index] = next_update_position
+
+        if batch_size == 0:
+            return
+
+        self._next_update_positions[:batch_size].copy_(
+            self._next_update_positions_cpu[:batch_size],
+            non_blocking=self.pin_memory,
+        )
+
+    def requires_update(
+        self,
+        candidate_positions: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if candidate_positions.shape != (self.batch_size,):
+            raise ValueError("candidate_positions must match the current batch size")
+        if candidate_positions.device != self.device:
+            raise ValueError("candidate_positions must be on the state device")
+        if candidate_positions.dtype not in (torch.int32, torch.int64):
+            raise ValueError("candidate_positions must use an integer dtype")
+
+        if active_mask.shape != (self.batch_size,):
+            raise ValueError("active_mask must match the current batch size")
+        if active_mask.device != self.device:
+            raise ValueError("active_mask must be on the state device")
+        if active_mask.dtype != torch.bool:
+            raise ValueError("active_mask must have dtype torch.bool")
+
+        return active_mask & (candidate_positions >= self.next_update_positions)
+
+    def remove_requests(self, request_ids: Collection[str]) -> None:
+        for request_id in request_ids:
+            self._next_update_by_request.pop(request_id, None)
 
 
 class RetroSpecBatchState:

@@ -889,6 +889,9 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        if isinstance(self.drafter, RetroSpecProposer):
+            self.drafter.remove_requests(scheduler_output.finished_req_ids)
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -4013,7 +4016,15 @@ class GPUModelRunner(
                     valid_sampled_tokens_count,
                 )
 
+            request_ids = self.input_batch.req_ids
+            committed_positions = [
+                self.requests[request_id].num_computed_tokens
+                for request_id in request_ids
+            ]
+
             draft_token_ids = self.drafter.propose(
+                request_ids,
+                committed_positions,
                 next_token_ids,
                 sampling_metadata,
                 common_attn_metadata,
