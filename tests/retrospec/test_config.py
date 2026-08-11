@@ -26,6 +26,10 @@ def test_retrospec_defaults():
     assert config.retrospec_retrieval_ratio == pytest.approx(0.018)
     assert config.retrospec_estimation_ratio == pytest.approx(0.232)
     assert config.retrospec_cache_ratio == pytest.approx(0.0)
+    assert config.retrospec_index_mode == "block_mean"
+    assert config.retrospec_index_segment_size == 1024
+    assert config.retrospec_blocks_per_cluster == 4
+    assert config.retrospec_kmeans_iterations == 10
     assert config.retrospec_index_update_interval == 1024
     assert config.retrospec_min_draft_tokens == 1
     assert config.retrospec_max_draft_tokens == 16
@@ -103,6 +107,10 @@ def test_retrospec_requires_eager():
         ("retrospec_estimation_ratio", 1.0),
         ("retrospec_cache_ratio", -0.01),
         ("retrospec_cache_ratio", 1.01),
+        ("retrospec_index_mode", "invalid"),
+        ("retrospec_index_segment_size", 0),
+        ("retrospec_blocks_per_cluster", 0),
+        ("retrospec_kmeans_iterations", 0),
         ("retrospec_index_update_interval", 0),
         ("num_speculative_tokens", 0),
         ("retrospec_min_draft_tokens", 0),
@@ -154,6 +162,10 @@ def test_retrospec_clears_prompt_lookup_fields():
         ("retrospec_retrieval_ratio", 0.02),
         ("retrospec_estimation_ratio", 0.25),
         ("retrospec_cache_ratio", 0.1),
+        ("retrospec_index_mode", "segmented_cluster"),
+        ("retrospec_index_segment_size", 2048),
+        ("retrospec_blocks_per_cluster", 8),
+        ("retrospec_kmeans_iterations", 5),
         ("retrospec_index_update_interval", 2048),
         ("retrospec_min_draft_tokens", 2),
         ("retrospec_max_draft_tokens", 20),

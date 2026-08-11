@@ -244,7 +244,7 @@ class RetroSpecBlockIndex:
             batch_size, num_kv_heads, num_queries_per_kv, head_size
         )
 
-        logits = torch.einsum("bhgd,bmhd->bhgm", grouped_query, key_centroids)
+        logits = torch.einsum("bhgd,bmhd->bhgm", grouped_query, key_centroids.float())
         logits *= scale
 
         # A centroid represents valid_token_counts equivalent keys.

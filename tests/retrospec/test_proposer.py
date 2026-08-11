@@ -114,7 +114,7 @@ def mock_proposal_execution(
     monkeypatch.setattr(
         proposer.sparse_attention,
         "proposal_context",
-        lambda: nullcontext(),
+        lambda _request_ids: nullcontext(),
     )
     monkeypatch.setattr(
         proposer,
@@ -844,7 +844,9 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
         return RetroSpecVerificationResult(verified_counts, require_full)
 
     monkeypatch.setattr(
-        proposer.sparse_attention, "proposal_context", lambda: nullcontext()
+        proposer.sparse_attention,
+        "proposal_context",
+        lambda _request_ids: nullcontext(),
     )
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)
@@ -914,7 +916,9 @@ def test_propose_handles_different_round_offsets_in_one_buffer(monkeypatch):
         return RetroSpecVerificationResult(verified_counts, require_full)
 
     monkeypatch.setattr(
-        proposer.sparse_attention, "proposal_context", lambda: nullcontext()
+        proposer.sparse_attention,
+        "proposal_context",
+        lambda _request_ids: nullcontext(),
     )
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from enum import IntEnum
 
@@ -22,6 +22,7 @@ from .index import (
     RetroSpecBlockIndex,
     RetroSpecSelectionPlan,
 )
+from .segmented_index import RetroSpecSegmentedBlockIndex
 
 LayerForward = Callable[..., torch.Tensor]
 
@@ -92,12 +93,30 @@ class RetroSpecSparseAttention:
         self.block_size = block_size
         self.num_speculative_tokens = config.num_speculative_tokens
 
-        self.index = RetroSpecBlockIndex(
-            block_size=block_size,
-            num_speculative_tokens=config.num_speculative_tokens,
-            retrieval_ratio=config.retrospec_retrieval_ratio,
-            estimation_ratio=config.retrospec_estimation_ratio,
-        )
+        if config.retrospec_index_mode == "block_mean":
+            self.index = RetroSpecBlockIndex(
+                block_size=block_size,
+                num_speculative_tokens=config.num_speculative_tokens,
+                retrieval_ratio=config.retrospec_retrieval_ratio,
+                estimation_ratio=config.retrospec_estimation_ratio,
+            )
+        else:
+            self.index = RetroSpecSegmentedBlockIndex(
+                block_size=block_size,
+                num_speculative_tokens=config.num_speculative_tokens,
+                retrieval_ratio=config.retrospec_retrieval_ratio,
+                estimation_ratio=config.retrospec_estimation_ratio,
+                segment_size_tokens=config.retrospec_index_segment_size,
+                blocks_per_cluster=config.retrospec_blocks_per_cluster,
+                num_kmeans_iterations=config.retrospec_kmeans_iterations,
+            )
+
+        self.proposal_request_ids: tuple[str, ...] = ()
+
+        self.prefill_index_active = False
+        self.prefill_request_ids: tuple[str, ...] = ()
+        self.prefill_seq_lens: tuple[int, ...] = ()
+        self.prefill_build_rows: tuple[int, ...] = ()
 
         self.mode = RetroSpecAttentionMode.PASSTHROUGH
         self.in_proposal = False
@@ -117,6 +136,49 @@ class RetroSpecSparseAttention:
         self.selection_plans: list[dict[str, RetroSpecSelectionPlan]] = [
             {} for _ in range(self.num_speculative_tokens)
         ]
+
+    @contextmanager
+    def prefill_index_context(
+        self,
+        request_ids: Sequence[str],
+        seq_lens: Sequence[int],
+        build_rows: Sequence[int],
+    ) -> Iterator[None]:
+        if self.in_proposal:
+            raise RuntimeError("Cannot build a prefill index during a proposal")
+        if self.prefill_index_active:
+            raise RuntimeError("RetroSpec prefill index context cannot be nested")
+
+        self.prefill_index_active = True
+        self.prefill_request_ids = tuple(request_ids)
+        self.prefill_seq_lens = tuple(seq_lens)
+        self.prefill_build_rows = tuple(build_rows)
+
+        try:
+            yield
+        finally:
+            self.prefill_index_active = False
+            self.prefill_request_ids = ()
+            self.prefill_seq_lens = ()
+            self.prefill_build_rows = ()
+
+    def needs_index_update(
+        self,
+        request_id: str,
+        seq_len: int,
+    ) -> bool:
+        if not isinstance(self.index, RetroSpecSegmentedBlockIndex):
+            return False
+
+        return self.index.needs_update(
+            request_id,
+            seq_len,
+            tuple(self.original_forwards),
+        )
+
+    def remove_requests(self, request_ids: Sequence[str]) -> None:
+        if isinstance(self.index, RetroSpecSegmentedBlockIndex):
+            self.index.remove_requests(request_ids)
 
     @staticmethod
     def _validate_layer(
@@ -204,13 +266,19 @@ class RetroSpecSparseAttention:
         self.forward_wrappers.clear()
 
     @contextmanager
-    def proposal_context(self) -> Iterator[None]:
+    def proposal_context(
+        self,
+        request_ids: Sequence[str],
+    ) -> Iterator[None]:
         if self.in_proposal:
             raise RuntimeError("RetroSpec proposal context cannot be nested.")
         if not self.original_forwards:
             raise RuntimeError(
                 "RetroSpec attention must be installed before proposing."
             )
+        self.proposal_request_ids = tuple(request_ids)
+        if isinstance(self.index, RetroSpecSegmentedBlockIndex):
+            self.index.begin_proposal(request_ids)
 
         for plans in self.selection_plans:
             plans.clear()
@@ -226,6 +294,10 @@ class RetroSpecSparseAttention:
             self.active_mask = None
             self.batch_size = 0
             self.attention_mass_layer_count = 0
+
+            if isinstance(self.index, RetroSpecSegmentedBlockIndex):
+                self.index.end_proposal()
+            self.proposal_request_ids = ()
 
             for plans in self.selection_plans:
                 plans.clear()
@@ -296,7 +368,7 @@ class RetroSpecSparseAttention:
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.mode == RetroSpecAttentionMode.PASSTHROUGH:
-            return original_forward(
+            result = original_forward(
                 layer,
                 query,
                 key,
@@ -307,6 +379,27 @@ class RetroSpecSparseAttention:
                 output_scale,
                 output_block_scale,
             )
+
+            if (
+                self.prefill_index_active
+                and self.prefill_build_rows
+                and isinstance(
+                    self.index,
+                    RetroSpecSegmentedBlockIndex,
+                )
+            ):
+                key_cache, value_cache = kv_cache.unbind(0)
+                self.index.build_or_update(
+                    layer_name=layer_name,
+                    request_ids=self.prefill_request_ids,
+                    seq_lens=self.prefill_seq_lens,
+                    rows=self.prefill_build_rows,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_table=attn_metadata.block_table,
+                )
+
+            return result
 
         if not self.step_active or self.active_mask is None:
             raise RuntimeError("RetroSpec attention ran without an active step.")
@@ -398,7 +491,9 @@ class RetroSpecSparseAttention:
         )
 
         logits = torch.einsum(
-            "bhgd,bmhd->bhgm", grouped_query, selection.estimation_keys
+            "bhgd,bmhd->bhgm",
+            grouped_query,
+            selection.estimation_keys.float(),
         )
         logits *= impl.scale
 
@@ -429,7 +524,9 @@ class RetroSpecSparseAttention:
         weights.masked_fill_(~estimation_mask[:, None, None, :], 0.0)
 
         estimation_output = torch.einsum(
-            "bhgm,bmhd->bhgd", weights, selection.estimation_values
+            "bhgm,bmhd->bhgd",
+            weights,
+            selection.estimation_values.float(),
         )
         estimation_output = estimation_output.reshape(
             batch_size, num_query_heads, head_size
@@ -466,15 +563,31 @@ class RetroSpecSparseAttention:
         key_cache, value_cache = kv_cache.unbind(0)
 
         if self.mode == RetroSpecAttentionMode.DRAFT:
-            selection = self.index.select(
-                query,
-                key_cache,
-                value_cache,
-                attn_metadata.block_table,
-                attn_metadata.seq_lens,
-                self.active_mask,
-                impl.scale,
-            )
+            if isinstance(
+                self.index,
+                RetroSpecSegmentedBlockIndex,
+            ):
+                selection = self.index.select_segmented(
+                    request_ids=self.proposal_request_ids,
+                    layer_name=layer_name,
+                    query=query,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_table=attn_metadata.block_table,
+                    seq_lens=attn_metadata.seq_lens,
+                    active_mask=self.active_mask,
+                    scale=impl.scale,
+                )
+            else:
+                selection = self.index.select(
+                    query,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    self.active_mask,
+                    impl.scale,
+                )
             self.selection_plans[self.step_index][layer_name] = selection.plan
         else:
             try:

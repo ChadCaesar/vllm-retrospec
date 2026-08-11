@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from functools import reduce
@@ -890,7 +890,10 @@ class GPUModelRunner(
         new/resumed/paused/finished request in the batch.
         """
         if isinstance(self.drafter, RetroSpecProposer):
-            self.drafter.remove_requests(scheduler_output.finished_req_ids)
+            removed_req_ids = scheduler_output.finished_req_ids | (
+                scheduler_output.preempted_req_ids or set()
+            )
+            self.drafter.remove_requests(removed_req_ids)
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
@@ -3529,9 +3532,40 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        retrospec_index_context = nullcontext()
+        retrospec_index_rows: list[int] = []
+
+        if isinstance(self.drafter, RetroSpecProposer):
+            index_seq_lens = [
+                self.requests[request_id].num_computed_tokens
+                + int(num_scheduled_tokens_np[row])
+                for row, request_id in enumerate(req_ids)
+            ]
+
+            retrospec_index_rows = [
+                row
+                for row, request_id in enumerate(req_ids)
+                if self.drafter.needs_index_update(
+                    request_id,
+                    index_seq_lens[row],
+                )
+            ]
+
+            if retrospec_index_rows:
+                retrospec_index_context = self.drafter.prefill_index_context(
+                    request_ids=req_ids,
+                    seq_lens=index_seq_lens,
+                    build_rows=retrospec_index_rows,
+                )
+
+                # Index construction contains dynamic k-means iterations and
+                # must not be captured as part of a CUDA graph.
+                cudagraph_mode = CUDAGraphMode.NONE
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
+            retrospec_index_context,
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -3541,7 +3575,7 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
+                skip_compiled=has_encoder_input or bool(retrospec_index_rows),
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,

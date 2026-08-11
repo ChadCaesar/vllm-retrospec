@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -136,7 +136,31 @@ class RetroSpecProposer:
         )
 
     def remove_requests(self, request_ids: Collection[str]) -> None:
+        request_ids = tuple(request_ids)
         self.index_update_state.remove_requests(request_ids)
+        self.sparse_attention.remove_requests(request_ids)
+
+    def needs_index_update(
+        self,
+        request_id: str,
+        seq_len: int,
+    ) -> bool:
+        return self.sparse_attention.needs_index_update(
+            request_id,
+            seq_len,
+        )
+
+    def prefill_index_context(
+        self,
+        request_ids: Sequence[str],
+        seq_lens: Sequence[int],
+        build_rows: Sequence[int],
+    ):
+        return self.sparse_attention.prefill_index_context(
+            request_ids,
+            seq_lens,
+            build_rows,
+        )
 
     def load_model(self, target_model: nn.Module) -> None:
         self.model = target_model
@@ -627,7 +651,7 @@ class RetroSpecProposer:
         no_draft_space = self.positions[:batch_size] >= self.max_model_len - 1
         self.state.finish_requests(no_draft_space)
 
-        with self.sparse_attention.proposal_context():
+        with self.sparse_attention.proposal_context(request_ids):
             while True:
                 draft_round_mask = (
                     self.state.active_mask
