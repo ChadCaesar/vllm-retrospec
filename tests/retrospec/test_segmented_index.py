@@ -61,8 +61,13 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     assert not index.needs_update("request", 10, ["layer"])
     record = index._indices["layer"]["request"]
     assert record.indexed_end == 3
-    assert record.logical_block_ids.tolist() == [1, 2]
-    assert record.cluster_token_counts.tolist() == [2, 2]
+    assert record.num_clusters == 2
+    assert len(record.segments) == 1
+
+    segment = record.segments[0]
+    assert segment.logical_block_ids.tolist() == [1, 2]
+    assert segment.block_cluster_ids.tolist() == [0, 1]
+    assert segment.cluster_token_counts.tolist() == [2, 2]
 
     index.begin_proposal(["request"])
     try:
@@ -154,20 +159,31 @@ def test_segmented_index_appends_complete_segments_and_handles_rollback():
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
 
     build_index(index, 10, keys, values, block_table)
+    first_segment = index._indices["layer"]["request"].segments[0]
     assert index.needs_update("request", 14, ["layer"])
 
     build_index(index, 14, keys, values, block_table)
     record = index._indices["layer"]["request"]
     assert record.indexed_end == 5
-    assert record.logical_block_ids.tolist() == [1, 2, 3, 4]
-    assert record.block_cluster_ids.tolist() == [0, 1, 2, 3]
+    assert record.num_clusters == 4
+    assert len(record.segments) == 2
+    assert record.segments[0] is first_segment
+
+    logical_block_ids = torch.cat(
+        [segment.logical_block_ids for segment in record.segments]
+    )
+    block_cluster_ids = torch.cat(
+        [segment.block_cluster_ids for segment in record.segments]
+    )
+    assert logical_block_ids.tolist() == [1, 2, 3, 4]
+    assert block_cluster_ids.tolist() == [0, 1, 2, 3]
 
     assert index.needs_update("request", 6, ["layer"])
     build_index(index, 6, keys, values, block_table)
     record = index._indices["layer"]["request"]
     assert record.indexed_end == 1
-    assert record.logical_block_ids.numel() == 0
-    assert record.cluster_keys.numel() == 0
+    assert record.num_clusters == 0
+    assert record.segments == []
 
 
 def test_segmented_index_removes_finished_request_state():
@@ -180,6 +196,93 @@ def test_segmented_index_removes_finished_request_state():
 
     assert "request" not in index._indices["layer"]
     assert index.needs_update("request", 10, ["layer"])
+
+
+def test_segmented_index_reuses_packed_index_until_update():
+    index = make_index()
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+
+    index.begin_proposal(["request"])
+    try:
+        first = index._pack_indices("layer", ["request"], keys, block_table)
+    finally:
+        index.end_proposal()
+
+    index.begin_proposal(["request"])
+    try:
+        second = index._pack_indices("layer", ["request"], keys, block_table)
+    finally:
+        index.end_proposal()
+
+    assert second is first
+
+    build_index(index, 14, keys, values, block_table)
+
+    index.begin_proposal(["request"])
+    try:
+        after_update = index._pack_indices("layer", ["request"], keys, block_table)
+    finally:
+        index.end_proposal()
+
+    assert after_update is not first
+
+
+def test_removing_request_invalidates_packed_index():
+    index = make_index()
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+
+    packed = index._pack_indices("layer", ["request"], keys, block_table)
+    assert "layer" in index._packed_index_cache
+
+    index.remove_requests(["request"])
+
+    assert "request" not in index._indices["layer"]
+    assert "layer" not in index._packed_index_cache
+
+    rebuilt = index._pack_indices("layer", ["request"], keys, block_table)
+    assert rebuilt is not packed
+    assert not rebuilt.cluster_mask.any()
+
+
+def test_packed_index_cache_tracks_request_order_and_block_table_width():
+    index = make_index()
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).repeat(2, 1)
+    index.build_or_update(
+        layer_name="layer",
+        request_ids=["long", "short"],
+        seq_lens=[10, 3],
+        rows=[0, 1],
+        key_cache=keys,
+        value_cache=values,
+        block_table=block_table,
+    )
+
+    original = index._pack_indices("layer", ["long", "short"], keys, block_table)
+    reordered = index._pack_indices("layer", ["short", "long"], keys, block_table)
+    narrower = index._pack_indices("layer", ["long", "short"], keys, block_table[:, :5])
+
+    assert reordered is not original
+    assert not reordered.cluster_mask[0].any()
+    assert reordered.cluster_mask[1].any()
+    assert narrower is not reordered
+    assert narrower.indexed_block_mask.shape == (2, 5)
+
+
+def test_segmented_index_proposal_lifecycle_tracks_empty_batches():
+    index = make_index()
+
+    index.begin_proposal([])
+    with pytest.raises(RuntimeError, match="already active"):
+        index.begin_proposal([])
+    index.end_proposal()
+
+    with pytest.raises(RuntimeError, match="not active"):
+        index.end_proposal()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -27,14 +27,20 @@ class RetroSpecSegmentedSelectionPlan(RetroSpecSelectionPlan):
 
 
 @dataclass(frozen=True)
-class _RequestLayerIndex:
+class _RequestLayerSegment:
     logical_block_ids: torch.Tensor
     block_cluster_ids: torch.Tensor
 
+    cluster_start: int
     cluster_keys: torch.Tensor
     cluster_values: torch.Tensor
     cluster_token_counts: torch.Tensor
 
+
+@dataclass
+class _RequestLayerIndex:
+    segments: list[_RequestLayerSegment]
+    num_clusters: int
     indexed_end: int
 
 
@@ -47,6 +53,13 @@ class _PackedSegmentedIndex:
     cluster_values: torch.Tensor
     cluster_token_counts: torch.Tensor
     cluster_mask: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _PackedSegmentedIndexCacheEntry:
+    request_ids: tuple[str, ...]
+    max_num_blocks: int
+    packed: _PackedSegmentedIndex
 
 
 class RetroSpecSegmentedBlockIndex(RetroSpecBlockIndex):
@@ -88,10 +101,13 @@ class RetroSpecSegmentedBlockIndex(RetroSpecBlockIndex):
         # layer_name -> request_id -> index
         self._indices: dict[str, dict[str, _RequestLayerIndex]] = {}
 
+        self._proposal_active = False
         self._proposal_request_ids: tuple[str, ...] = ()
-        self._proposal_packed_indices: dict[
+
+        # Each layer retains only the most recently packed request batch.
+        self._packed_index_cache: dict[
             str,
-            _PackedSegmentedIndex,
+            _PackedSegmentedIndexCacheEntry,
         ] = {}
 
     def _desired_indexed_end(self, seq_len: int) -> int:
@@ -127,59 +143,37 @@ class RetroSpecSegmentedBlockIndex(RetroSpecBlockIndex):
         return False
 
     def remove_requests(self, request_ids: Sequence[str]) -> None:
-        for layer_indices in self._indices.values():
+        request_ids = tuple(request_ids)
+
+        for layer_name, layer_indices in self._indices.items():
+            layer_changed = False
+
             for request_id in request_ids:
-                layer_indices.pop(request_id, None)
+                if layer_indices.pop(request_id, None) is not None:
+                    layer_changed = True
+
+            if layer_changed:
+                self._packed_index_cache.pop(layer_name, None)
 
     def begin_proposal(self, request_ids: Sequence[str]) -> None:
-        if self._proposal_request_ids:
+        if self._proposal_active:
             raise RuntimeError("Segmented-index proposal is already active")
 
+        self._proposal_active = True
         self._proposal_request_ids = tuple(request_ids)
-        self._proposal_packed_indices.clear()
 
     def end_proposal(self) -> None:
+        if not self._proposal_active:
+            raise RuntimeError("Segmented-index proposal is not active")
+
+        self._proposal_active = False
         self._proposal_request_ids = ()
-        self._proposal_packed_indices.clear()
 
     @staticmethod
-    def _empty_index(
-        key_cache: torch.Tensor,
-        indexed_end: int = 1,
-    ) -> _RequestLayerIndex:
-        num_kv_heads = key_cache.shape[2]
-        head_size = key_cache.shape[3]
-
+    def _empty_index(indexed_end: int = 1) -> _RequestLayerIndex:
         return _RequestLayerIndex(
-            logical_block_ids=torch.empty(
-                0,
-                dtype=torch.int64,
-                device=key_cache.device,
-            ),
-            block_cluster_ids=torch.empty(
-                0,
-                dtype=torch.int64,
-                device=key_cache.device,
-            ),
-            cluster_keys=torch.empty(
-                0,
-                num_kv_heads,
-                head_size,
-                dtype=key_cache.dtype,
-                device=key_cache.device,
-            ),
-            cluster_values=torch.empty(
-                0,
-                num_kv_heads,
-                head_size,
-                dtype=key_cache.dtype,
-                device=key_cache.device,
-            ),
-            cluster_token_counts=torch.empty(
-                0,
-                dtype=torch.int32,
-                device=key_cache.device,
-            ),
+            segments=[],
+            num_clusters=0,
             indexed_end=indexed_end,
         )
 
@@ -193,33 +187,35 @@ class RetroSpecSegmentedBlockIndex(RetroSpecBlockIndex):
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
     ) -> None:
-        """Build missing prefill segments or append newly stable segments."""
+        """Build missing segments or append newly stable segments."""
         if len(request_ids) != len(seq_lens):
             raise ValueError("request_ids and seq_lens must have equal length")
+        if block_table.shape[0] != len(request_ids):
+            raise ValueError("block_table batch size does not match request_ids")
 
         layer_indices = self._indices.setdefault(layer_name, {})
+        layer_changed = False
 
         for row in rows:
             request_id = request_ids[row]
             seq_len = seq_lens[row]
             desired_end = self._desired_indexed_end(seq_len)
 
-            previous = layer_indices.get(request_id)
-            if previous is not None and desired_end < previous.indexed_end:
+            record = layer_indices.get(request_id)
+            if record is not None and desired_end < record.indexed_end:
                 # A sequence-length rollback means the request was recomputed
                 # with a new paged-KV allocation. Discard summaries derived
                 # from the old physical blocks before rebuilding the index.
-                previous = None
-                layer_indices.pop(request_id)
+                record = self._empty_index()
+                layer_indices[request_id] = record
+                layer_changed = True
 
-            indexed_start = 1 if previous is None else previous.indexed_end
+            indexed_start = 1 if record is None else record.indexed_end
 
             if desired_end <= indexed_start:
-                if previous is None:
-                    layer_indices[request_id] = self._empty_index(
-                        key_cache,
-                        indexed_end=1,
-                    )
+                if record is None:
+                    layer_indices[request_id] = self._empty_index()
+                    layer_changed = True
                 continue
 
             num_new_blocks = desired_end - indexed_start
@@ -303,49 +299,29 @@ class RetroSpecSegmentedBlockIndex(RetroSpecBlockIndex):
                 torch.int32
             )
 
-            if previous is None:
-                cluster_offset = 0
-                previous = self._empty_index(key_cache)
-            else:
-                cluster_offset = previous.cluster_keys.shape[0]
+            if record is None:
+                record = self._empty_index()
+                layer_indices[request_id] = record
 
-            block_cluster_ids = local_assignments + cluster_offset
+            cluster_start = record.num_clusters
+            block_cluster_ids = local_assignments + cluster_start
 
-            layer_indices[request_id] = _RequestLayerIndex(
-                logical_block_ids=torch.cat(
-                    [
-                        previous.logical_block_ids,
-                        logical_block_ids,
-                    ]
-                ),
-                block_cluster_ids=torch.cat(
-                    [
-                        previous.block_cluster_ids,
-                        block_cluster_ids,
-                    ]
-                ),
-                cluster_keys=torch.cat(
-                    [
-                        previous.cluster_keys,
-                        cluster_keys,
-                    ]
-                ),
-                cluster_values=torch.cat(
-                    [
-                        previous.cluster_values,
-                        cluster_values,
-                    ]
-                ),
-                cluster_token_counts=torch.cat(
-                    [
-                        previous.cluster_token_counts,
-                        cluster_token_counts,
-                    ]
-                ),
-                indexed_end=desired_end,
+            record.segments.append(
+                _RequestLayerSegment(
+                    logical_block_ids=logical_block_ids,
+                    block_cluster_ids=block_cluster_ids,
+                    cluster_start=cluster_start,
+                    cluster_keys=cluster_keys,
+                    cluster_values=cluster_values,
+                    cluster_token_counts=cluster_token_counts,
+                )
             )
+            record.num_clusters += num_new_clusters
+            record.indexed_end = desired_end
+            layer_changed = True
 
-        self._proposal_packed_indices.pop(layer_name, None)
+        if layer_changed:
+            self._packed_index_cache.pop(layer_name, None)
 
     def _pack_indices(
         self,
@@ -354,19 +330,31 @@ class RetroSpecSegmentedBlockIndex(RetroSpecBlockIndex):
         key_cache: torch.Tensor,
         block_table: torch.Tensor,
     ) -> _PackedSegmentedIndex:
-        cached = self._proposal_packed_indices.get(layer_name)
-        if cached is not None:
-            return cached
-
         batch_size, max_num_blocks = block_table.shape
+        request_ids = tuple(request_ids)
+
+        if len(request_ids) != batch_size:
+            raise ValueError("request_ids batch size does not match block_table")
+
+        cached = self._packed_index_cache.get(layer_name)
+        if (
+            cached is not None
+            and cached.request_ids == request_ids
+            and cached.max_num_blocks == max_num_blocks
+        ):
+            return cached.packed
+
         layer_indices = self._indices.get(layer_name, {})
 
         records = [layer_indices.get(request_id) for request_id in request_ids]
         max_num_clusters = max(
             1,
             max(
-                (record.cluster_keys.shape[0] if record is not None else 0)
-                for record in records
+                (
+                    record.num_clusters if record is not None else 0
+                    for record in records
+                ),
+                default=0,
             ),
         )
 
@@ -412,18 +400,27 @@ class RetroSpecSegmentedBlockIndex(RetroSpecBlockIndex):
             if record is None:
                 continue
 
-            valid_blocks = record.logical_block_ids < max_num_blocks
-            logical_block_ids = record.logical_block_ids[valid_blocks]
-            cluster_ids = record.block_cluster_ids[valid_blocks]
+            for segment in record.segments:
+                valid_blocks = segment.logical_block_ids < max_num_blocks
+                logical_block_ids = segment.logical_block_ids[valid_blocks]
+                segment_cluster_ids = segment.block_cluster_ids[valid_blocks]
 
-            indexed_block_mask[row, logical_block_ids] = True
-            block_cluster_ids[row, logical_block_ids] = cluster_ids
+                indexed_block_mask[row, logical_block_ids] = True
+                block_cluster_ids[row, logical_block_ids] = segment_cluster_ids
 
-            num_clusters = record.cluster_keys.shape[0]
-            cluster_keys[row, :num_clusters].copy_(record.cluster_keys)
-            cluster_values[row, :num_clusters].copy_(record.cluster_values)
-            cluster_token_counts[row, :num_clusters].copy_(record.cluster_token_counts)
-            cluster_mask[row, :num_clusters].copy_(record.cluster_token_counts > 0)
+                cluster_start = segment.cluster_start
+                cluster_end = cluster_start + segment.cluster_keys.shape[0]
+
+                cluster_keys[row, cluster_start:cluster_end].copy_(segment.cluster_keys)
+                cluster_values[row, cluster_start:cluster_end].copy_(
+                    segment.cluster_values
+                )
+                cluster_token_counts[row, cluster_start:cluster_end].copy_(
+                    segment.cluster_token_counts
+                )
+                cluster_mask[row, cluster_start:cluster_end].copy_(
+                    segment.cluster_token_counts > 0
+                )
 
         packed = _PackedSegmentedIndex(
             indexed_block_mask=indexed_block_mask,
@@ -433,7 +430,11 @@ class RetroSpecSegmentedBlockIndex(RetroSpecBlockIndex):
             cluster_token_counts=cluster_token_counts,
             cluster_mask=cluster_mask,
         )
-        self._proposal_packed_indices[layer_name] = packed
+        self._packed_index_cache[layer_name] = _PackedSegmentedIndexCacheEntry(
+            request_ids=request_ids,
+            max_num_blocks=max_num_blocks,
+            packed=packed,
+        )
         return packed
 
     @staticmethod
