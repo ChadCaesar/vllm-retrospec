@@ -19,6 +19,10 @@ from vllm.v1.spec_decode.retrospec.index import (
     RetroSpecAttentionSelection,
     RetroSpecSelectionPlan,
 )
+from vllm.v1.spec_decode.retrospec.segmented_index import (
+    RetroSpecTokenAttentionSelection,
+    RetroSpecTokenSelectionPlan,
+)
 
 
 def make_controller(
@@ -78,6 +82,48 @@ def make_selection(batch_size: int = 2) -> RetroSpecAttentionSelection:
         estimation_token_counts=torch.empty(batch_size, 0, dtype=torch.int32),
         attention_mass=torch.ones(batch_size),
         plan=make_plan(batch_size),
+    )
+
+
+def make_token_plan(
+    batch_size: int,
+    num_kv_heads: int,
+    exact_width: int,
+    estimation_width: int,
+) -> RetroSpecTokenSelectionPlan:
+    exact_indices = torch.zeros(
+        batch_size,
+        num_kv_heads,
+        exact_width,
+        dtype=torch.int64,
+    )
+    exact_mask = torch.zeros_like(exact_indices, dtype=torch.bool)
+    estimation_keys = torch.zeros(
+        batch_size,
+        num_kv_heads,
+        estimation_width,
+        1,
+    )
+    estimation_counts = torch.zeros(
+        batch_size,
+        num_kv_heads,
+        estimation_width,
+        dtype=torch.int32,
+    )
+
+    return RetroSpecTokenSelectionPlan(
+        sparse_exact_token_indices=exact_indices,
+        sparse_exact_token_mask=exact_mask,
+        sparse_estimation_keys=estimation_keys,
+        sparse_estimation_values=estimation_keys.clone(),
+        sparse_estimation_token_counts=estimation_counts,
+        expanded_exact_token_indices=exact_indices,
+        expanded_exact_token_mask=exact_mask,
+        expanded_estimation_keys=estimation_keys,
+        expanded_estimation_values=estimation_keys.clone(),
+        expanded_estimation_token_counts=estimation_counts,
+        sparse_attn=torch.ones(batch_size),
+        expanded_attn=torch.ones(batch_size),
     )
 
 
@@ -254,6 +300,70 @@ def test_estimation_attention_weights_centroids_by_token_count():
     assert output[1, 0, 0].item() == pytest.approx(0.0)
     assert lse[0, 0].item() == pytest.approx(torch.log(torch.tensor(4.0)).item())
     assert torch.isneginf(lse[0, 1])
+
+
+def test_grouped_reference_attention_keeps_kv_heads_independent():
+    controller = make_controller("segmented_cluster")
+    impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
+    query = torch.zeros(1, 4, 1, dtype=torch.bfloat16)
+    keys = torch.zeros(1, 2, 2, 1, dtype=torch.bfloat16)
+    values = torch.tensor(
+        [[[[2.0], [4.0]], [[10.0], [20.0]]]],
+        dtype=torch.bfloat16,
+    )
+    token_counts = torch.ones(1, 2, 2, dtype=torch.int32)
+
+    output, lse = controller._run_grouped_reference_attention(
+        impl,
+        query,
+        keys,
+        values,
+        token_counts,
+    )
+
+    assert output[0, :, 0].tolist() == pytest.approx([3.0, 3.0, 15.0, 15.0])
+    assert lse[:, 0].tolist() == pytest.approx(
+        [torch.log(torch.tensor(2.0)).item()] * 4
+    )
+
+
+def test_token_estimation_attention_uses_per_head_cluster_sizes():
+    controller = make_controller("segmented_cluster")
+    impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
+    plan = make_token_plan(
+        batch_size=1,
+        num_kv_heads=2,
+        exact_width=0,
+        estimation_width=2,
+    )
+    selection = RetroSpecTokenAttentionSelection(
+        exact_keys=torch.empty(1, 2, 0, 1),
+        exact_values=torch.empty(1, 2, 0, 1),
+        exact_token_mask=torch.empty(1, 2, 0, dtype=torch.bool),
+        exact_token_counts=torch.zeros(1, 2, dtype=torch.int32),
+        estimation_keys=torch.zeros(1, 2, 2, 1, dtype=torch.bfloat16),
+        estimation_values=torch.tensor(
+            [[[[2.0], [4.0]], [[10.0], [20.0]]]],
+            dtype=torch.bfloat16,
+        ),
+        estimation_token_counts=torch.tensor(
+            [[[1, 3], [3, 1]]],
+            dtype=torch.int32,
+        ),
+        attention_mass=torch.ones(1),
+        plan=plan,
+    )
+
+    output, lse = controller._run_estimation_attention(
+        impl,
+        torch.zeros(1, 4, 1, dtype=torch.bfloat16),
+        selection,
+    )
+
+    assert output[0, :, 0].tolist() == pytest.approx([3.5, 3.5, 12.5, 12.5])
+    assert lse[:, 0].tolist() == pytest.approx(
+        [torch.log(torch.tensor(4.0)).item()] * 4
+    )
 
 
 def test_verification_reuses_draft_selection_plan_without_reranking():

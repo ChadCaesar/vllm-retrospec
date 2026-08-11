@@ -42,6 +42,46 @@ def test_segmented_kmeans_returns_empty_tensors_for_empty_input():
     assert cluster_sizes.dtype == torch.int32
 
 
+def test_segmented_kmeans_clusters_groups_independently():
+    features = torch.tensor(
+        [
+            [[1.0], [1.0], [-1.0], [-1.0]],
+            [[1.0], [-1.0], [1.0], [-1.0]],
+        ]
+    )
+
+    assignments, cluster_sizes = segmented_kmeans_assignments(
+        features,
+        segment_size=4,
+        items_per_cluster=2,
+        num_iterations=2,
+    )
+
+    assert assignments.shape == (2, 4)
+    assert cluster_sizes.shape == (2, 2)
+    assert assignments[0].tolist() == [0, 0, 1, 1]
+    assert assignments[1].tolist() == [0, 1, 0, 1]
+    assert cluster_sizes.tolist() == [[2, 2], [2, 2]]
+
+    for group in range(2):
+        assert torch.equal(
+            torch.bincount(assignments[group], minlength=2).to(torch.int32),
+            cluster_sizes[group],
+        )
+
+
+def test_segmented_kmeans_returns_grouped_empty_tensors():
+    assignments, cluster_sizes = segmented_kmeans_assignments(
+        torch.empty(3, 0, 2),
+        segment_size=4,
+        items_per_cluster=2,
+        num_iterations=1,
+    )
+
+    assert assignments.shape == (3, 0)
+    assert cluster_sizes.shape == (3, 0)
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

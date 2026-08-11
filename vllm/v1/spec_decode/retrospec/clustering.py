@@ -15,23 +15,32 @@ def segmented_kmeans_assignments(
 
     Args:
         features:
-            Tensor with shape [num_items, feature_size]. One item represents
-            one complete vLLM KV block.
+            Either [num_items, feature_size] or
+            [num_groups, num_items, feature_size].
+
+            The grouped form is used by token-level RetroSpec, where one
+            group represents one KV head.
         segment_size:
-            Number of blocks in one independently clustered segment.
+            Number of items in one independently clustered segment.
         items_per_cluster:
-            Target average number of blocks assigned to one cluster.
+            Target average number of items assigned to one cluster.
         num_iterations:
             Number of k-means iterations.
 
     Returns:
         assignments:
-            Global cluster ID for every input block, shape [num_items].
+            Cluster ID for every item. The shape is [num_items] for an
+            ungrouped input or [num_groups, num_items] for a grouped input.
+            Cluster IDs are local to each group.
         cluster_sizes:
-            Number of blocks assigned to each cluster.
+            Number of items assigned to each cluster. The shape is
+            [num_clusters] or [num_groups, num_clusters].
     """
-    if features.ndim != 2:
-        raise ValueError("features must have shape [num_items, feature_size]")
+    if features.ndim not in (2, 3):
+        raise ValueError(
+            "features must have shape [num_items, feature_size] or "
+            "[num_groups, num_items, feature_size]"
+        )
     if segment_size <= 0:
         raise ValueError("segment_size must be greater than zero")
     if items_per_cluster <= 0:
@@ -39,12 +48,29 @@ def segmented_kmeans_assignments(
     if num_iterations <= 0:
         raise ValueError("num_iterations must be greater than zero")
 
-    num_items, feature_size = features.shape
+    grouped_input = features.ndim == 3
+    if not grouped_input:
+        features = features.unsqueeze(0)
+
+    num_groups, num_items, feature_size = features.shape
+
     if num_items == 0:
-        return (
-            torch.empty(0, dtype=torch.int64, device=features.device),
-            torch.empty(0, dtype=torch.int32, device=features.device),
+        assignments = torch.empty(
+            num_groups,
+            0,
+            dtype=torch.int64,
+            device=features.device,
         )
+        cluster_sizes = torch.empty(
+            num_groups,
+            0,
+            dtype=torch.int32,
+            device=features.device,
+        )
+        if grouped_input:
+            return assignments, cluster_sizes
+        return assignments.squeeze(0), cluster_sizes.squeeze(0)
+
     if num_items % segment_size != 0:
         raise ValueError("num_items must be divisible by segment_size")
     if segment_size % items_per_cluster != 0:
@@ -53,17 +79,23 @@ def segmented_kmeans_assignments(
     num_segments = num_items // segment_size
     clusters_per_segment = segment_size // items_per_cluster
 
-    data = features.float().view(num_segments, segment_size, feature_size)
+    data = features.float().reshape(
+        num_groups * num_segments,
+        segment_size,
+        feature_size,
+    )
 
-    # RetroInfer centers every segment before clustering. This reduces the
-    # influence of segment-level key offsets on the inner-product assignment.
+    # Each temporal segment is centered independently. The assignments still
+    # refer to the original, uncentered KV vectors.
     segment_means = data.mean(dim=1, keepdim=True)
     centered_data = data - segment_means
 
     initial_indices = (
         (
             torch.arange(
-                clusters_per_segment, dtype=torch.float32, device=features.device
+                clusters_per_segment,
+                dtype=torch.float32,
+                device=features.device,
             )
             + 0.5
         )
@@ -74,26 +106,37 @@ def segmented_kmeans_assignments(
 
     centroids = centered_data.index_select(1, initial_indices).contiguous()
     assignments = torch.zeros(
-        num_segments, segment_size, dtype=torch.int64, device=features.device
+        num_groups * num_segments,
+        segment_size,
+        dtype=torch.int64,
+        device=features.device,
     )
 
     for iteration in range(num_iterations):
-        scores = torch.einsum("snd,skd->snk", centered_data, centroids)
+        scores = torch.einsum("gsd,gcd->gsc", centered_data, centroids)
         assignments = scores.argmax(dim=-1)
 
-        expanded_assignments = assignments.unsqueeze(-1).expand(-1, -1, feature_size)
+        expanded_assignments = assignments.unsqueeze(-1).expand(
+            -1,
+            -1,
+            feature_size,
+        )
 
         centroid_sums = torch.zeros(
-            num_segments,
+            num_groups * num_segments,
             clusters_per_segment,
             feature_size,
             dtype=torch.float32,
             device=features.device,
         )
-        centroid_sums.scatter_add_(dim=1, index=expanded_assignments, src=centered_data)
+        centroid_sums.scatter_add_(
+            dim=1,
+            index=expanded_assignments,
+            src=centered_data,
+        )
 
         cluster_sizes = torch.zeros(
-            num_segments,
+            num_groups * num_segments,
             clusters_per_segment,
             dtype=torch.int32,
             device=features.device,
@@ -104,18 +147,28 @@ def segmented_kmeans_assignments(
             src=torch.ones_like(assignments, dtype=torch.int32),
         )
 
-        nonempty = cluster_sizes > 0
         updated_centroids = centroid_sums / cluster_sizes.clamp_min(1).unsqueeze(-1)
+        centroids = torch.where(
+            (cluster_sizes > 0).unsqueeze(-1),
+            updated_centroids,
+            centroids,
+        )
 
-        # Keep the previous centroid when a cluster is temporarily empty.
-        centroids = torch.where(nonempty.unsqueeze(-1), updated_centroids, centroids)
-
-        # RetroInfer normalizes centroids during intermediate iterations, then
-        # keeps the final centroid as the actual arithmetic mean.
         if iteration + 1 < num_iterations:
             centroids = F.normalize(centroids, dim=-1)
 
-    cluster_offsets = (
+    assignments = assignments.view(
+        num_groups,
+        num_segments,
+        segment_size,
+    )
+    cluster_sizes = cluster_sizes.view(
+        num_groups,
+        num_segments,
+        clusters_per_segment,
+    )
+
+    segment_offsets = (
         torch.arange(
             num_segments,
             dtype=torch.int64,
@@ -123,9 +176,12 @@ def segmented_kmeans_assignments(
         )
         * clusters_per_segment
     )
-    assignments = assignments + cluster_offsets.unsqueeze(1)
+    assignments += segment_offsets[None, :, None]
 
-    return (
-        assignments.reshape(-1).contiguous(),
-        cluster_sizes.reshape(-1).contiguous(),
-    )
+    assignments = assignments.reshape(num_groups, num_items).contiguous()
+    cluster_sizes = cluster_sizes.reshape(num_groups, -1).contiguous()
+
+    if grouped_input:
+        return assignments, cluster_sizes
+
+    return assignments.squeeze(0), cluster_sizes.squeeze(0)

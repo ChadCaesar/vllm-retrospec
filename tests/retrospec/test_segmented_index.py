@@ -6,15 +6,15 @@ import torch
 
 from vllm.v1.spec_decode.retrospec.index import RetroSpecAttentionLevel
 from vllm.v1.spec_decode.retrospec.segmented_index import (
-    RetroSpecSegmentedBlockIndex,
+    RetroSpecSegmentedTokenIndex,
 )
 
 
 def make_index(
     segment_size_tokens: int = 4,
     blocks_per_cluster: int = 1,
-) -> RetroSpecSegmentedBlockIndex:
-    return RetroSpecSegmentedBlockIndex(
+) -> RetroSpecSegmentedTokenIndex:
+    return RetroSpecSegmentedTokenIndex(
         block_size=2,
         num_speculative_tokens=1,
         retrieval_ratio=0.5,
@@ -25,8 +25,11 @@ def make_index(
     )
 
 
-def make_cache(num_blocks: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
-    keys = torch.empty(num_blocks, 2, 1, 1)
+def make_cache(
+    num_blocks: int = 8,
+    num_kv_heads: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    keys = torch.empty(num_blocks, 2, num_kv_heads, 1)
     values = torch.empty_like(keys)
     for block_id in range(num_blocks):
         keys[block_id].fill_(float(block_id))
@@ -35,7 +38,7 @@ def make_cache(num_blocks: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def build_index(
-    index: RetroSpecSegmentedBlockIndex,
+    index: RetroSpecSegmentedTokenIndex,
     seq_len: int,
     keys: torch.Tensor,
     values: torch.Tensor,
@@ -60,14 +63,14 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
 
     assert not index.needs_update("request", 10, ["layer"])
     record = index._indices["layer"]["request"]
-    assert record.indexed_end == 3
+    assert record.indexed_end == 6
     assert record.num_clusters == 2
     assert len(record.segments) == 1
 
     segment = record.segments[0]
-    assert segment.logical_block_ids.tolist() == [1, 2]
-    assert segment.block_cluster_ids.tolist() == [0, 1]
-    assert segment.cluster_token_counts.tolist() == [2, 2]
+    assert segment.logical_token_ids.tolist() == [2, 3, 4, 5]
+    assert segment.token_cluster_ids.tolist() == [[0, 0, 1, 1]]
+    assert segment.cluster_token_counts.tolist() == [[2, 2]]
 
     index.begin_proposal(["request"])
     try:
@@ -92,16 +95,55 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     finally:
         index.end_proposal()
 
-    assert sparse.exact_block_table[0, :4].tolist() == [0, 2, 3, 4]
-    assert sparse.exact_seq_lens.tolist() == [8]
-    assert sparse.estimation_token_counts[0, 0].item() == 2
+    assert sparse.exact_token_counts.tolist() == [[8]]
+    assert sparse.exact_keys[0, 0, :, 0].tolist() == pytest.approx(
+        [0.0, 0.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]
+    )
+    assert sparse.exact_values[0, 0, :, 0].tolist() == pytest.approx(
+        [0.0, 0.0, 20.0, 20.0, 30.0, 30.0, 40.0, 40.0]
+    )
+    assert sparse.estimation_token_counts[0, 0, 0].item() == 2
     assert sparse.estimation_keys[0, 0, 0, 0].item() == pytest.approx(1.0)
     assert sparse.estimation_values[0, 0, 0, 0].item() == pytest.approx(10.0)
 
-    assert expanded.exact_block_table[0, :5].tolist() == [0, 1, 2, 3, 4]
-    assert expanded.exact_seq_lens.tolist() == [10]
+    assert expanded.exact_token_counts.tolist() == [[10]]
+    assert expanded.exact_keys[0, 0, :, 0].tolist() == pytest.approx(
+        [0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]
+    )
     assert torch.count_nonzero(expanded.estimation_token_counts) == 0
     assert expanded.attention_mass.item() >= sparse.attention_mass.item()
+
+
+def test_segmented_index_clusters_each_kv_head_independently():
+    index = make_index()
+    keys, values = make_cache(num_kv_heads=2)
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+
+    # Indexed logical tokens are 2..5. Head zero separates the two blocks,
+    # while head one has alternating features and therefore a different
+    # token-to-cluster assignment.
+    keys[1, :, 0, 0] = torch.tensor([1.0, 1.0])
+    keys[2, :, 0, 0] = torch.tensor([-1.0, -1.0])
+    keys[1, :, 1, 0] = torch.tensor([1.0, -1.0])
+    keys[2, :, 1, 0] = torch.tensor([1.0, -1.0])
+
+    build_index(index, 10, keys, values, block_table)
+    segment = index._indices["layer"]["request"].segments[0]
+
+    assert segment.token_cluster_ids.shape == (2, 4)
+    assert segment.token_cluster_ids[0].tolist() == [0, 0, 1, 1]
+    assert segment.token_cluster_ids[1].tolist() == [0, 1, 0, 1]
+    assert segment.cluster_token_counts.tolist() == [[2, 2], [2, 2]]
+
+    selected_clusters = torch.tensor([[[True, False], [True, False]]])
+    packed = index._pack_indices("layer", ["request"], keys, block_table)
+    selected_tokens = index._expand_cluster_mask_to_tokens(
+        selected_clusters,
+        packed,
+    )
+
+    assert torch.nonzero(selected_tokens[0, 0]).flatten().tolist() == [2, 3]
+    assert torch.nonzero(selected_tokens[0, 1]).flatten().tolist() == [2, 4]
 
 
 def test_segmented_index_excludes_empty_clusters_from_selection():
@@ -113,8 +155,8 @@ def test_segmented_index_excludes_empty_clusters_from_selection():
 
     packed = index._pack_indices("layer", ["request"], keys, block_table)
 
-    assert packed.cluster_token_counts.tolist() == [[8, 0]]
-    assert packed.cluster_mask.tolist() == [[True, False]]
+    assert packed.cluster_token_counts.tolist() == [[[8, 0]]]
+    assert packed.cluster_mask.tolist() == [[[True, False]]]
 
 
 def test_segmented_index_handles_mixed_long_and_short_requests():
@@ -147,8 +189,8 @@ def test_segmented_index_handles_mixed_long_and_short_requests():
     finally:
         index.end_proposal()
 
-    assert selection.exact_seq_lens.tolist() == [8, 3]
-    assert selection.exact_block_table[1, :2].tolist() == [0, 1]
+    assert selection.exact_token_counts.tolist() == [[8], [3]]
+    assert selection.exact_token_mask[1, 0, :3].all()
     assert torch.count_nonzero(selection.estimation_token_counts[1]) == 0
     assert selection.attention_mass.tolist()[1] == pytest.approx(1.0)
 
@@ -164,24 +206,25 @@ def test_segmented_index_appends_complete_segments_and_handles_rollback():
 
     build_index(index, 14, keys, values, block_table)
     record = index._indices["layer"]["request"]
-    assert record.indexed_end == 5
+    assert record.indexed_end == 10
     assert record.num_clusters == 4
     assert len(record.segments) == 2
     assert record.segments[0] is first_segment
 
-    logical_block_ids = torch.cat(
-        [segment.logical_block_ids for segment in record.segments]
+    logical_token_ids = torch.cat(
+        [segment.logical_token_ids for segment in record.segments]
     )
-    block_cluster_ids = torch.cat(
-        [segment.block_cluster_ids for segment in record.segments]
+    token_cluster_ids = torch.cat(
+        [segment.token_cluster_ids for segment in record.segments],
+        dim=1,
     )
-    assert logical_block_ids.tolist() == [1, 2, 3, 4]
-    assert block_cluster_ids.tolist() == [0, 1, 2, 3]
+    assert logical_token_ids.tolist() == list(range(2, 10))
+    assert token_cluster_ids.tolist() == [[0, 0, 1, 1, 2, 2, 3, 3]]
 
     assert index.needs_update("request", 6, ["layer"])
     build_index(index, 6, keys, values, block_table)
     record = index._indices["layer"]["request"]
-    assert record.indexed_end == 1
+    assert record.indexed_end == 2
     assert record.num_clusters == 0
     assert record.segments == []
 
@@ -204,27 +247,12 @@ def test_segmented_index_reuses_packed_index_until_update():
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 10, keys, values, block_table)
 
-    index.begin_proposal(["request"])
-    try:
-        first = index._pack_indices("layer", ["request"], keys, block_table)
-    finally:
-        index.end_proposal()
-
-    index.begin_proposal(["request"])
-    try:
-        second = index._pack_indices("layer", ["request"], keys, block_table)
-    finally:
-        index.end_proposal()
-
+    first = index._pack_indices("layer", ["request"], keys, block_table)
+    second = index._pack_indices("layer", ["request"], keys, block_table)
     assert second is first
 
     build_index(index, 14, keys, values, block_table)
-
-    index.begin_proposal(["request"])
-    try:
-        after_update = index._pack_indices("layer", ["request"], keys, block_table)
-    finally:
-        index.end_proposal()
+    after_update = index._pack_indices("layer", ["request"], keys, block_table)
 
     assert after_update is not first
 
@@ -264,13 +292,18 @@ def test_packed_index_cache_tracks_request_order_and_block_table_width():
 
     original = index._pack_indices("layer", ["long", "short"], keys, block_table)
     reordered = index._pack_indices("layer", ["short", "long"], keys, block_table)
-    narrower = index._pack_indices("layer", ["long", "short"], keys, block_table[:, :5])
+    narrower = index._pack_indices(
+        "layer",
+        ["long", "short"],
+        keys,
+        block_table[:, :5],
+    )
 
     assert reordered is not original
     assert not reordered.cluster_mask[0].any()
     assert reordered.cluster_mask[1].any()
     assert narrower is not reordered
-    assert narrower.indexed_block_mask.shape == (2, 5)
+    assert narrower.indexed_token_mask.shape == (2, 10)
 
 
 def test_segmented_index_proposal_lifecycle_tracks_empty_batches():
@@ -292,7 +325,11 @@ def test_segmented_index_builds_and_selects_on_cuda():
     keys, values = make_cache()
     keys = keys.to(device=device, dtype=torch.bfloat16)
     values = values.to(device=device, dtype=torch.bfloat16)
-    block_table = torch.arange(7, dtype=torch.int32, device=device).view(1, -1)
+    block_table = torch.arange(
+        7,
+        dtype=torch.int32,
+        device=device,
+    ).view(1, -1)
     build_index(index, 10, keys, values, block_table)
 
     index.begin_proposal(["request"])
@@ -312,9 +349,9 @@ def test_segmented_index_builds_and_selects_on_cuda():
     finally:
         index.end_proposal()
 
-    assert selection.exact_block_table.device.type == "cuda"
-    assert selection.exact_seq_lens.tolist() == [8]
-    assert selection.estimation_token_counts[0, 0].item() == 2
+    assert selection.exact_keys.device.type == "cuda"
+    assert selection.exact_token_counts.tolist() == [[8]]
+    assert selection.estimation_token_counts[0, 0, 0].item() == 2
 
 
 @pytest.mark.parametrize(
@@ -322,6 +359,7 @@ def test_segmented_index_builds_and_selects_on_cuda():
     [
         ({"segment_size_tokens": 3}, "divisible by block_size"),
         ({"segment_size_tokens": 4, "blocks_per_cluster": 3}, "divisible"),
+        ({"blocks_per_cluster": 0}, "positive"),
         ({"num_kmeans_iterations": 0}, "positive"),
     ],
 )
@@ -338,4 +376,4 @@ def test_segmented_index_rejects_invalid_configuration(kwargs, message):
     values.update(kwargs)
 
     with pytest.raises(ValueError, match=message):
-        RetroSpecSegmentedBlockIndex(**values)
+        RetroSpecSegmentedTokenIndex(**values)

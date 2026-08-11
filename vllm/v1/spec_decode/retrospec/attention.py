@@ -22,7 +22,14 @@ from .index import (
     RetroSpecBlockIndex,
     RetroSpecSelectionPlan,
 )
-from .segmented_index import RetroSpecSegmentedBlockIndex
+from .segmented_index import (
+    RetroSpecSegmentedTokenIndex,
+    RetroSpecTokenAttentionSelection,
+    RetroSpecTokenSelectionPlan,
+)
+
+RetroSpecSelection = RetroSpecAttentionSelection | RetroSpecTokenAttentionSelection
+RetroSpecPlan = RetroSpecSelectionPlan | RetroSpecTokenSelectionPlan
 
 LayerForward = Callable[..., torch.Tensor]
 
@@ -101,7 +108,7 @@ class RetroSpecSparseAttention:
                 estimation_ratio=config.retrospec_estimation_ratio,
             )
         else:
-            self.index = RetroSpecSegmentedBlockIndex(
+            self.index = RetroSpecSegmentedTokenIndex(
                 block_size=block_size,
                 num_speculative_tokens=config.num_speculative_tokens,
                 retrieval_ratio=config.retrospec_retrieval_ratio,
@@ -133,7 +140,7 @@ class RetroSpecSparseAttention:
         self.original_forwards: dict[str, tuple[FlashAttentionImpl, LayerForward]] = {}
         self.forward_wrappers: dict[str, _RetroSpecLayerForward] = {}
 
-        self.selection_plans: list[dict[str, RetroSpecSelectionPlan]] = [
+        self.selection_plans: list[dict[str, RetroSpecPlan]] = [
             {} for _ in range(self.num_speculative_tokens)
         ]
 
@@ -167,7 +174,7 @@ class RetroSpecSparseAttention:
         request_id: str,
         seq_len: int,
     ) -> bool:
-        if not isinstance(self.index, RetroSpecSegmentedBlockIndex):
+        if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
             return False
 
         return self.index.needs_update(
@@ -177,7 +184,7 @@ class RetroSpecSparseAttention:
         )
 
     def remove_requests(self, request_ids: Sequence[str]) -> None:
-        if isinstance(self.index, RetroSpecSegmentedBlockIndex):
+        if isinstance(self.index, RetroSpecSegmentedTokenIndex):
             self.index.remove_requests(request_ids)
 
     @staticmethod
@@ -277,7 +284,7 @@ class RetroSpecSparseAttention:
                 "RetroSpec attention must be installed before proposing."
             )
         self.proposal_request_ids = tuple(request_ids)
-        if isinstance(self.index, RetroSpecSegmentedBlockIndex):
+        if isinstance(self.index, RetroSpecSegmentedTokenIndex):
             self.index.begin_proposal(request_ids)
 
         for plans in self.selection_plans:
@@ -295,7 +302,7 @@ class RetroSpecSparseAttention:
             self.batch_size = 0
             self.attention_mass_layer_count = 0
 
-            if isinstance(self.index, RetroSpecSegmentedBlockIndex):
+            if isinstance(self.index, RetroSpecSegmentedTokenIndex):
                 self.index.end_proposal()
             self.proposal_request_ids = ()
 
@@ -385,7 +392,7 @@ class RetroSpecSparseAttention:
                 and self.prefill_build_rows
                 and isinstance(
                     self.index,
-                    RetroSpecSegmentedBlockIndex,
+                    RetroSpecSegmentedTokenIndex,
                 )
             ):
                 key_cache, value_cache = kv_cache.unbind(0)
@@ -422,6 +429,109 @@ class RetroSpecSparseAttention:
             layer_name, impl, layer, query, kv_cache, attn_metadata, output
         )
 
+    @staticmethod
+    def _run_grouped_reference_attention(
+        impl: FlashAttentionImpl,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        token_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reference attention over per-KV-head packed vectors.
+
+        Args:
+            query:
+                [batch, num_query_heads, head_size]
+            keys/values:
+                [batch, num_kv_heads, max_num_vectors, head_size]
+            token_counts:
+                [batch, num_kv_heads, max_num_vectors]. A value of one
+                represents an exact token. A value larger than one represents
+                an estimation centroid for that many tokens.
+        """
+        batch_size, num_query_heads, head_size = query.shape
+        num_kv_heads = keys.shape[1]
+
+        if values.shape != keys.shape:
+            raise ValueError("Reference attention keys and values must match")
+        if token_counts.shape != keys.shape[:3]:
+            raise ValueError("Reference attention token counts do not match keys")
+        if num_query_heads % num_kv_heads != 0:
+            raise ValueError(
+                "The number of query heads must be divisible by the number of KV heads"
+            )
+
+        num_queries_per_kv = num_query_heads // num_kv_heads
+        grouped_query = query.float().view(
+            batch_size,
+            num_kv_heads,
+            num_queries_per_kv,
+            head_size,
+        )
+
+        logits = torch.einsum(
+            "bhgd,bhmd->bhgm",
+            grouped_query,
+            keys.float(),
+        )
+        logits *= impl.scale
+
+        token_counts_float = token_counts.float()
+        valid_mask = token_counts > 0
+
+        # Exact tokens have count one and therefore receive no correction.
+        # Estimation centroids receive the same log(cluster_size) correction
+        # as the existing RetroSpec estimation path.
+        logits += torch.log(token_counts_float.clamp_min(1)).unsqueeze(2)
+        logits.masked_fill_(
+            ~valid_mask.unsqueeze(2),
+            float("-inf"),
+        )
+
+        has_vectors = valid_mask.any(dim=2)
+        safe_logits = torch.where(
+            has_vectors[:, :, None, None],
+            logits,
+            torch.zeros_like(logits),
+        )
+
+        output_lse = torch.logsumexp(safe_logits, dim=-1)
+        output_lse = torch.where(
+            has_vectors[:, :, None],
+            output_lse,
+            torch.full_like(output_lse, float("-inf")),
+        )
+
+        safe_normalizer = torch.where(
+            has_vectors[:, :, None],
+            output_lse,
+            torch.zeros_like(output_lse),
+        )
+        weights = torch.exp(logits - safe_normalizer.unsqueeze(-1))
+        weights.masked_fill_(
+            ~valid_mask.unsqueeze(2),
+            0.0,
+        )
+
+        attention_output = torch.einsum(
+            "bhgm,bhmd->bhgd",
+            weights,
+            values.float(),
+        )
+        attention_output = attention_output.reshape(
+            batch_size,
+            num_query_heads,
+            head_size,
+        ).to(query.dtype)
+
+        output_lse = output_lse.reshape(
+            batch_size,
+            num_query_heads,
+        )
+        output_lse = output_lse.transpose(0, 1).contiguous()
+
+        return attention_output, output_lse
+
     def _run_exact_attention(
         self,
         impl: FlashAttentionImpl,
@@ -430,12 +540,21 @@ class RetroSpecSparseAttention:
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
-        selection: RetroSpecAttentionSelection,
+        selection: RetroSpecSelection,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The FlashAttention function is platform-specific and is not defined
-        # by fa_utils on CPU. Import it only on the GPU execution path so that
-        # RetroSpec state and policy tests remain importable on CPU.
-        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+        if isinstance(selection, RetroSpecTokenAttentionSelection):
+            return self._run_grouped_reference_attention(
+                impl,
+                query,
+                selection.exact_keys,
+                selection.exact_values,
+                selection.exact_token_mask.to(torch.int32),
+            )
+
+        # block_mean mode continues to use paged FlashAttention.
+        from vllm.v1.attention.backends.fa_utils import (
+            flash_attn_varlen_func,
+        )
 
         batch_size = query.shape[0]
         descale_shape = (batch_size, impl.num_kv_heads)
@@ -471,72 +590,50 @@ class RetroSpecSparseAttention:
 
         return exact_output, exact_lse
 
-    @staticmethod
+    @classmethod
     def _run_estimation_attention(
+        cls,
         impl: FlashAttentionImpl,
         query: torch.Tensor,
-        selection: RetroSpecAttentionSelection,
+        selection: RetroSpecSelection,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, num_query_heads, head_size = query.shape
-        num_kv_heads = selection.estimation_keys.shape[2]
+        if isinstance(selection, RetroSpecTokenAttentionSelection):
+            estimation_keys = selection.estimation_keys
+            estimation_values = selection.estimation_values
+            estimation_token_counts = selection.estimation_token_counts
+        else:
+            # Existing block_mean layout:
+            # [batch, estimates, kv_heads, head_size]
+            #
+            # Reference grouped layout:
+            # [batch, kv_heads, estimates, head_size]
+            estimation_keys = selection.estimation_keys.permute(
+                0,
+                2,
+                1,
+                3,
+            ).contiguous()
+            estimation_values = selection.estimation_values.permute(
+                0,
+                2,
+                1,
+                3,
+            ).contiguous()
 
-        if num_query_heads % num_kv_heads != 0:
-            raise ValueError(
-                "The number of query heads must be divisible by the number of KV heads."
+            num_kv_heads = estimation_keys.shape[1]
+            estimation_token_counts = (
+                selection.estimation_token_counts[:, None, :]
+                .expand(-1, num_kv_heads, -1)
+                .contiguous()
             )
 
-        num_queries_per_kv = num_query_heads // num_kv_heads
-        grouped_query = query.float().view(
-            batch_size, num_kv_heads, num_queries_per_kv, head_size
+        return cls._run_grouped_reference_attention(
+            impl,
+            query,
+            estimation_keys,
+            estimation_values,
+            estimation_token_counts,
         )
-
-        logits = torch.einsum(
-            "bhgd,bmhd->bhgm",
-            grouped_query,
-            selection.estimation_keys.float(),
-        )
-        logits *= impl.scale
-
-        token_counts = selection.estimation_token_counts.float()
-        estimation_mask = token_counts > 0
-
-        logits += torch.log(token_counts.clamp_min(1))[:, None, None, :]
-        logits.masked_fill_(~estimation_mask[:, None, None, :], float("-inf"))
-
-        has_estimation = estimation_mask.any(dim=1)
-        safe_logits = torch.where(
-            has_estimation[:, None, None, None], logits, torch.zeros_like(logits)
-        )
-
-        estimation_lse = torch.logsumexp(safe_logits, dim=-1)
-        estimation_lse = torch.where(
-            has_estimation[:, None, None],
-            estimation_lse,
-            torch.full_like(estimation_lse, float("-inf")),
-        )
-
-        safe_normalizer = torch.where(
-            has_estimation[:, None, None],
-            estimation_lse,
-            torch.zeros_like(estimation_lse),
-        )
-        weights = torch.exp(logits - safe_normalizer.unsqueeze(-1))
-        weights.masked_fill_(~estimation_mask[:, None, None, :], 0.0)
-
-        estimation_output = torch.einsum(
-            "bhgm,bmhd->bhgd",
-            weights,
-            selection.estimation_values.float(),
-        )
-        estimation_output = estimation_output.reshape(
-            batch_size, num_query_heads, head_size
-        )
-        estimation_output = estimation_output.to(query.dtype)
-
-        estimation_lse = estimation_lse.reshape(batch_size, num_query_heads)
-        estimation_lse = estimation_lse.transpose(0, 1).contiguous()
-
-        return estimation_output, estimation_lse
 
     def _sparse_forward(
         self,
@@ -565,7 +662,7 @@ class RetroSpecSparseAttention:
         if self.mode == RetroSpecAttentionMode.DRAFT:
             if isinstance(
                 self.index,
-                RetroSpecSegmentedBlockIndex,
+                RetroSpecSegmentedTokenIndex,
             ):
                 selection = self.index.select_segmented(
                     request_ids=self.proposal_request_ids,
