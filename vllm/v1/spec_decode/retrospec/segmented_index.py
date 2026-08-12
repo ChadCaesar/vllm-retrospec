@@ -6,6 +6,10 @@ from dataclasses import dataclass
 
 import torch
 
+from .cluster_store import (
+    RetroSpecClusterPageStore,
+    RetroSpecClusterPageTable,
+)
 from .clustering import segmented_kmeans_assignments
 from .index import (
     RetroSpecAttentionLevel,
@@ -16,14 +20,19 @@ from .index import (
 
 @dataclass(frozen=True)
 class RetroSpecTokenSelectionPlan:
-    sparse_exact_token_indices: torch.Tensor
-    sparse_exact_token_mask: torch.Tensor
+    layer_name: str
+
+    primary_exact_token_indices: torch.Tensor
+    primary_exact_token_mask: torch.Tensor
+
+    sparse_exact_page_ids: torch.Tensor
+    sparse_exact_page_token_counts: torch.Tensor
     sparse_estimation_keys: torch.Tensor
     sparse_estimation_values: torch.Tensor
     sparse_estimation_token_counts: torch.Tensor
 
-    expanded_exact_token_indices: torch.Tensor
-    expanded_exact_token_mask: torch.Tensor
+    expanded_exact_page_ids: torch.Tensor
+    expanded_exact_page_token_counts: torch.Tensor
     expanded_estimation_keys: torch.Tensor
     expanded_estimation_values: torch.Tensor
     expanded_estimation_token_counts: torch.Tensor
@@ -53,13 +62,14 @@ class RetroSpecTokenAttentionSelection:
 
 @dataclass(frozen=True)
 class _RequestLayerSegment:
-    logical_token_ids: torch.Tensor
-    token_cluster_ids: torch.Tensor
+    indexed_start: int
+    indexed_end: int
 
     cluster_start: int
     cluster_keys: torch.Tensor
     cluster_values: torch.Tensor
     cluster_token_counts: torch.Tensor
+    cluster_pages: RetroSpecClusterPageTable
 
 
 @dataclass
@@ -72,12 +82,14 @@ class _RequestLayerIndex:
 @dataclass(frozen=True)
 class _PackedSegmentedIndex:
     indexed_token_mask: torch.Tensor
-    token_cluster_ids: torch.Tensor
 
     cluster_keys: torch.Tensor
     cluster_values: torch.Tensor
     cluster_token_counts: torch.Tensor
     cluster_mask: torch.Tensor
+
+    cluster_page_ids: torch.Tensor
+    cluster_page_token_counts: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -88,7 +100,7 @@ class _PackedSegmentedIndexCacheEntry:
 
 
 class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
-    """Reference token-level segmented index backed by the main KV cache."""
+    """Token-level segmented index backed by private cluster KV pages."""
 
     def __init__(
         self,
@@ -124,6 +136,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self.segment_size_tokens = segment_size_tokens
         self.tokens_per_cluster = tokens_per_cluster
         self.num_kmeans_iterations = num_kmeans_iterations
+        self.cluster_store = RetroSpecClusterPageStore(page_size=block_size)
 
         # layer_name -> request_id -> token-level index
         self._indices: dict[str, dict[str, _RequestLayerIndex]] = {}
@@ -176,8 +189,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             layer_changed = False
 
             for request_id in request_ids:
-                if layer_indices.pop(request_id, None) is not None:
-                    layer_changed = True
+                record = layer_indices.pop(request_id, None)
+                if record is None:
+                    continue
+
+                self._free_record(layer_name, record)
+                layer_changed = True
 
             if layer_changed:
                 self._packed_index_cache.pop(layer_name, None)
@@ -208,6 +225,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             num_clusters=0,
             indexed_end=indexed_end,
         )
+
+    def _free_record(
+        self,
+        layer_name: str,
+        record: _RequestLayerIndex,
+    ) -> None:
+        for segment in record.segments:
+            self.cluster_store.free(layer_name, segment.cluster_pages)
 
     @staticmethod
     def _cluster_means(
@@ -252,7 +277,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
     ) -> None:
-        """Build missing complete token segments from the main paged KV cache."""
+        """Cluster stable tokens and copy them into private cluster pages."""
         if len(request_ids) != len(seq_lens):
             raise ValueError("request_ids and seq_lens must have equal length")
         if block_table.shape[0] != len(request_ids):
@@ -275,6 +300,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
             record = layer_indices.get(request_id)
             if record is not None and desired_end < record.indexed_end:
+                # The cached packed view owns page IDs from this record. Drop
+                # it before releasing pages so an exception while rebuilding
+                # cannot leave a cache entry that refers to freed storage.
+                self._packed_index_cache.pop(layer_name, None)
+                self._free_record(layer_name, record)
                 record = self._empty_index()
                 layer_indices[request_id] = record
                 layer_changed = True
@@ -311,8 +341,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 .to(torch.int64)
             )
 
-            key_blocks = key_cache.index_select(0, physical_block_ids)
-            value_blocks = value_cache.index_select(0, physical_block_ids)
+            key_blocks = key_cache.index_select(
+                0,
+                physical_block_ids,
+            )
+            value_blocks = value_cache.index_select(
+                0,
+                physical_block_ids,
+            )
 
             num_kv_heads = key_cache.shape[2]
             head_size = key_cache.shape[3]
@@ -354,28 +390,29 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 cluster_token_counts,
             )
 
+            cluster_pages = self.cluster_store.store_clusters(
+                layer_name=layer_name,
+                token_keys=token_keys,
+                token_values=token_values,
+                assignments=local_assignments,
+                cluster_token_counts=cluster_token_counts,
+            )
+
             if record is None:
                 record = self._empty_index()
                 layer_indices[request_id] = record
 
             cluster_start = record.num_clusters
-            token_cluster_ids = local_assignments + cluster_start
-
-            logical_token_ids = torch.arange(
-                indexed_start,
-                desired_end,
-                dtype=torch.int64,
-                device=block_table.device,
-            )
 
             record.segments.append(
                 _RequestLayerSegment(
-                    logical_token_ids=logical_token_ids,
-                    token_cluster_ids=token_cluster_ids,
+                    indexed_start=indexed_start,
+                    indexed_end=desired_end,
                     cluster_start=cluster_start,
                     cluster_keys=cluster_keys,
                     cluster_values=cluster_values,
                     cluster_token_counts=cluster_token_counts,
+                    cluster_pages=cluster_pages,
                 )
             )
             record.num_clusters += cluster_token_counts.shape[1]
@@ -420,6 +457,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 default=0,
             ),
         )
+        max_pages_per_cluster = max(
+            (
+                segment.cluster_pages.page_ids.shape[2]
+                for record in records
+                if record is not None
+                for segment in record.segments
+            ),
+            default=0,
+        )
 
         num_kv_heads = key_cache.shape[2]
         head_size = key_cache.shape[3]
@@ -428,12 +474,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             batch_size,
             max_num_tokens,
             dtype=torch.bool,
-            device=key_cache.device,
-        )
-        token_cluster_ids = torch.full(
-            (batch_size, num_kv_heads, max_num_tokens),
-            -1,
-            dtype=torch.int64,
             device=key_cache.device,
         )
 
@@ -461,42 +501,84 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             device=key_cache.device,
         )
 
+        cluster_page_ids = torch.full(
+            (
+                batch_size,
+                num_kv_heads,
+                max_num_clusters,
+                max_pages_per_cluster,
+            ),
+            -1,
+            dtype=torch.int64,
+            device=key_cache.device,
+        )
+        cluster_page_token_counts = torch.zeros(
+            cluster_page_ids.shape,
+            dtype=torch.int32,
+            device=key_cache.device,
+        )
+
         for row, record in enumerate(records):
             if record is None:
                 continue
 
             for segment in record.segments:
-                valid_tokens = segment.logical_token_ids < max_num_tokens
-                logical_token_ids = segment.logical_token_ids[valid_tokens]
-
-                indexed_token_mask[row, logical_token_ids] = True
-                token_cluster_ids[row, :, logical_token_ids] = (
-                    segment.token_cluster_ids[:, valid_tokens]
+                indexed_end = min(
+                    segment.indexed_end,
+                    max_num_tokens,
                 )
+                if indexed_end > segment.indexed_start:
+                    indexed_token_mask[
+                        row,
+                        segment.indexed_start : indexed_end,
+                    ] = True
 
                 cluster_start = segment.cluster_start
                 cluster_end = cluster_start + segment.cluster_keys.shape[1]
 
-                cluster_keys[row, :, cluster_start:cluster_end].copy_(
-                    segment.cluster_keys
-                )
-                cluster_values[row, :, cluster_start:cluster_end].copy_(
-                    segment.cluster_values
-                )
-                cluster_token_counts[row, :, cluster_start:cluster_end].copy_(
-                    segment.cluster_token_counts
-                )
-                cluster_mask[row, :, cluster_start:cluster_end].copy_(
-                    segment.cluster_token_counts > 0
-                )
+                cluster_keys[
+                    row,
+                    :,
+                    cluster_start:cluster_end,
+                ].copy_(segment.cluster_keys)
+                cluster_values[
+                    row,
+                    :,
+                    cluster_start:cluster_end,
+                ].copy_(segment.cluster_values)
+                cluster_token_counts[
+                    row,
+                    :,
+                    cluster_start:cluster_end,
+                ].copy_(segment.cluster_token_counts)
+                cluster_mask[
+                    row,
+                    :,
+                    cluster_start:cluster_end,
+                ].copy_(segment.cluster_token_counts > 0)
+
+                segment_page_width = segment.cluster_pages.page_ids.shape[2]
+                cluster_page_ids[
+                    row,
+                    :,
+                    cluster_start:cluster_end,
+                    :segment_page_width,
+                ].copy_(segment.cluster_pages.page_ids)
+                cluster_page_token_counts[
+                    row,
+                    :,
+                    cluster_start:cluster_end,
+                    :segment_page_width,
+                ].copy_(segment.cluster_pages.page_token_counts)
 
         packed = _PackedSegmentedIndex(
             indexed_token_mask=indexed_token_mask,
-            token_cluster_ids=token_cluster_ids,
             cluster_keys=cluster_keys,
             cluster_values=cluster_values,
             cluster_token_counts=cluster_token_counts,
             cluster_mask=cluster_mask,
+            cluster_page_ids=cluster_page_ids,
+            cluster_page_token_counts=cluster_page_token_counts,
         )
         self._packed_index_cache[layer_name] = _PackedSegmentedIndexCacheEntry(
             request_ids=request_ids,
@@ -618,19 +700,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         )
 
     @staticmethod
-    def _expand_cluster_mask_to_tokens(
-        selected_clusters: torch.Tensor,
-        packed: _PackedSegmentedIndex,
-    ) -> torch.Tensor:
-        safe_cluster_ids = packed.token_cluster_ids.clamp_min(0)
-        selected_tokens = selected_clusters.gather(
-            dim=2,
-            index=safe_cluster_ids,
-        )
-
-        return selected_tokens & packed.indexed_token_mask.unsqueeze(1)
-
-    @staticmethod
     def _pack_mask_indices(
         mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -693,6 +762,49 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         )
 
     @staticmethod
+    def _build_cluster_page_selection(
+        cluster_page_ids: torch.Tensor,
+        cluster_page_token_counts: torch.Tensor,
+        packed_cluster_indices: torch.Tensor,
+        packed_cluster_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_kv_heads, _, max_pages = cluster_page_ids.shape
+        max_selected_clusters = packed_cluster_indices.shape[2]
+
+        page_indices = packed_cluster_indices.unsqueeze(-1).expand(
+            batch_size,
+            num_kv_heads,
+            max_selected_clusters,
+            max_pages,
+        )
+
+        selected_page_ids = cluster_page_ids.gather(
+            dim=2,
+            index=page_indices,
+        )
+        selected_page_token_counts = cluster_page_token_counts.gather(
+            dim=2,
+            index=page_indices,
+        )
+
+        valid_pages = (
+            packed_cluster_mask.unsqueeze(-1)
+            & (selected_page_ids >= 0)
+            & (selected_page_token_counts > 0)
+        )
+
+        selected_page_ids.masked_fill_(~valid_pages, -1)
+        selected_page_token_counts.masked_fill_(
+            ~valid_pages,
+            0,
+        )
+
+        return (
+            selected_page_ids.contiguous(),
+            selected_page_token_counts.contiguous(),
+        )
+
+    @staticmethod
     def _build_estimation_selection(
         cluster_keys: torch.Tensor,
         cluster_values: torch.Tensor,
@@ -736,6 +848,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
     def _make_plan(
         self,
+        layer_name: str,
         forced_exact_mask: torch.Tensor,
         sparse_retrieval_clusters: torch.Tensor,
         sparse_estimation_clusters: torch.Tensor,
@@ -745,34 +858,54 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         expanded_attn: torch.Tensor,
         packed: _PackedSegmentedIndex,
     ) -> RetroSpecTokenSelectionPlan:
-        sparse_retrieval_tokens = self._expand_cluster_mask_to_tokens(
-            sparse_retrieval_clusters,
-            packed,
-        )
-        expanded_retrieval_tokens = self._expand_cluster_mask_to_tokens(
-            expanded_retrieval_clusters,
-            packed,
-        )
-
+        num_kv_heads = packed.cluster_keys.shape[1]
         per_head_forced_exact = forced_exact_mask.unsqueeze(1).expand(
             -1,
-            packed.cluster_keys.shape[1],
+            num_kv_heads,
             -1,
         )
 
-        sparse_exact_token_indices, sparse_exact_token_mask = self._pack_mask_indices(
-            per_head_forced_exact | sparse_retrieval_tokens
+        (
+            primary_exact_token_indices,
+            primary_exact_token_mask,
+        ) = self._pack_mask_indices(per_head_forced_exact)
+
+        (
+            sparse_retrieval_indices,
+            sparse_retrieval_mask,
+        ) = self._pack_mask_indices(sparse_retrieval_clusters)
+        (
+            expanded_retrieval_indices,
+            expanded_retrieval_mask,
+        ) = self._pack_mask_indices(expanded_retrieval_clusters)
+
+        (
+            sparse_exact_page_ids,
+            sparse_exact_page_token_counts,
+        ) = self._build_cluster_page_selection(
+            packed.cluster_page_ids,
+            packed.cluster_page_token_counts,
+            sparse_retrieval_indices,
+            sparse_retrieval_mask,
         )
-        expanded_exact_token_indices, expanded_exact_token_mask = (
-            self._pack_mask_indices(per_head_forced_exact | expanded_retrieval_tokens)
+        (
+            expanded_exact_page_ids,
+            expanded_exact_page_token_counts,
+        ) = self._build_cluster_page_selection(
+            packed.cluster_page_ids,
+            packed.cluster_page_token_counts,
+            expanded_retrieval_indices,
+            expanded_retrieval_mask,
         )
 
-        sparse_estimation_indices, sparse_estimation_mask = self._pack_mask_indices(
-            sparse_estimation_clusters
-        )
-        expanded_estimation_indices, expanded_estimation_mask = self._pack_mask_indices(
-            expanded_estimation_clusters
-        )
+        (
+            sparse_estimation_indices,
+            sparse_estimation_mask,
+        ) = self._pack_mask_indices(sparse_estimation_clusters)
+        (
+            expanded_estimation_indices,
+            expanded_estimation_mask,
+        ) = self._pack_mask_indices(expanded_estimation_clusters)
 
         (
             sparse_estimation_keys,
@@ -798,13 +931,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         )
 
         return RetroSpecTokenSelectionPlan(
-            sparse_exact_token_indices=sparse_exact_token_indices,
-            sparse_exact_token_mask=sparse_exact_token_mask,
+            layer_name=layer_name,
+            primary_exact_token_indices=primary_exact_token_indices,
+            primary_exact_token_mask=primary_exact_token_mask,
+            sparse_exact_page_ids=sparse_exact_page_ids,
+            sparse_exact_page_token_counts=sparse_exact_page_token_counts,
             sparse_estimation_keys=sparse_estimation_keys,
             sparse_estimation_values=sparse_estimation_values,
             sparse_estimation_token_counts=sparse_estimation_token_counts,
-            expanded_exact_token_indices=expanded_exact_token_indices,
-            expanded_exact_token_mask=expanded_exact_token_mask,
+            expanded_exact_page_ids=expanded_exact_page_ids,
+            expanded_exact_page_token_counts=expanded_exact_page_token_counts,
             expanded_estimation_keys=expanded_estimation_keys,
             expanded_estimation_values=expanded_estimation_values,
             expanded_estimation_token_counts=expanded_estimation_token_counts,
@@ -865,15 +1001,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         block_table: torch.Tensor,
     ) -> RetroSpecTokenAttentionSelection:
         if level == RetroSpecAttentionLevel.SPARSE:
-            exact_token_indices = plan.sparse_exact_token_indices
-            exact_token_mask = plan.sparse_exact_token_mask
+            exact_page_ids = plan.sparse_exact_page_ids
+            exact_page_token_counts = plan.sparse_exact_page_token_counts
             estimation_keys = plan.sparse_estimation_keys
             estimation_values = plan.sparse_estimation_values
             estimation_token_counts = plan.sparse_estimation_token_counts
             attention_mass = plan.sparse_attn
         elif level == RetroSpecAttentionLevel.EXPANDED:
-            exact_token_indices = plan.expanded_exact_token_indices
-            exact_token_mask = plan.expanded_exact_token_mask
+            exact_page_ids = plan.expanded_exact_page_ids
+            exact_page_token_counts = plan.expanded_exact_page_token_counts
             estimation_keys = plan.expanded_estimation_keys
             estimation_values = plan.expanded_estimation_values
             estimation_token_counts = plan.expanded_estimation_token_counts
@@ -881,19 +1017,68 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         else:
             raise ValueError(f"Unsupported RetroSpec attention level: {level}")
 
-        exact_keys = self._gather_selected_tokens(
+        primary_keys = self._gather_selected_tokens(
             key_cache,
             block_table,
-            exact_token_indices,
-            exact_token_mask,
+            plan.primary_exact_token_indices,
+            plan.primary_exact_token_mask,
         )
-        exact_values = self._gather_selected_tokens(
+        primary_values = self._gather_selected_tokens(
             value_cache,
             block_table,
-            exact_token_indices,
-            exact_token_mask,
+            plan.primary_exact_token_indices,
+            plan.primary_exact_token_mask,
         )
-        exact_token_counts = exact_token_mask.sum(dim=2).to(torch.int32)
+
+        batch_size, num_kv_heads = plan.primary_exact_token_indices.shape[:2]
+        head_size = key_cache.shape[3]
+
+        if exact_page_ids.numel() == 0:
+            clustered_keys = torch.empty(
+                batch_size,
+                num_kv_heads,
+                0,
+                head_size,
+                dtype=key_cache.dtype,
+                device=key_cache.device,
+            )
+            clustered_values = torch.empty_like(clustered_keys)
+            clustered_mask = torch.empty(
+                batch_size,
+                num_kv_heads,
+                0,
+                dtype=torch.bool,
+                device=key_cache.device,
+            )
+        else:
+            (
+                clustered_keys,
+                clustered_values,
+                clustered_mask,
+            ) = self.cluster_store.gather_pages(
+                plan.layer_name,
+                exact_page_ids,
+                exact_page_token_counts,
+            )
+
+        exact_keys = torch.cat(
+            (primary_keys, clustered_keys),
+            dim=2,
+        ).contiguous()
+        exact_values = torch.cat(
+            (primary_values, clustered_values),
+            dim=2,
+        ).contiguous()
+        exact_token_mask = torch.cat(
+            (
+                plan.primary_exact_token_mask,
+                clustered_mask,
+            ),
+            dim=2,
+        ).contiguous()
+        exact_token_counts = exact_token_mask.sum(
+            dim=2,
+        ).to(torch.int32)
 
         return RetroSpecTokenAttentionSelection(
             exact_keys=exact_keys,
@@ -999,6 +1184,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         )
 
         plan = self._make_plan(
+            layer_name=layer_name,
             forced_exact_mask=forced_exact_mask,
             sparse_retrieval_clusters=sparse_retrieval_clusters,
             sparse_estimation_clusters=sparse_estimation_clusters,

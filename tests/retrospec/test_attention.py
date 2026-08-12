@@ -110,15 +110,26 @@ def make_token_plan(
         estimation_width,
         dtype=torch.int32,
     )
+    page_ids = torch.empty(
+        batch_size,
+        num_kv_heads,
+        0,
+        0,
+        dtype=torch.int64,
+    )
+    page_token_counts = torch.empty_like(page_ids, dtype=torch.int32)
 
     return RetroSpecTokenSelectionPlan(
-        sparse_exact_token_indices=exact_indices,
-        sparse_exact_token_mask=exact_mask,
+        layer_name="layer",
+        primary_exact_token_indices=exact_indices,
+        primary_exact_token_mask=exact_mask,
+        sparse_exact_page_ids=page_ids,
+        sparse_exact_page_token_counts=page_token_counts,
         sparse_estimation_keys=estimation_keys,
         sparse_estimation_values=estimation_keys.clone(),
         sparse_estimation_token_counts=estimation_counts,
-        expanded_exact_token_indices=exact_indices,
-        expanded_exact_token_mask=exact_mask,
+        expanded_exact_page_ids=page_ids,
+        expanded_exact_page_token_counts=page_token_counts,
         expanded_estimation_keys=estimation_keys,
         expanded_estimation_values=estimation_keys.clone(),
         expanded_estimation_token_counts=estimation_counts,
