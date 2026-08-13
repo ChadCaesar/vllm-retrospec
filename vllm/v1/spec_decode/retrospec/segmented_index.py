@@ -3,6 +3,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import ceil
 
 import torch
 
@@ -96,6 +97,21 @@ class _PackedSegmentedIndexCacheEntry:
     request_ids: tuple[str, ...]
     max_num_tokens: int
     packed: _PackedSegmentedIndex
+
+
+@dataclass(frozen=True)
+class _PackedClusterZones:
+    sparse_retrieval_indices: torch.Tensor
+    sparse_retrieval_mask: torch.Tensor
+
+    sparse_estimation_indices: torch.Tensor
+    sparse_estimation_mask: torch.Tensor
+
+    expanded_retrieval_indices: torch.Tensor
+    expanded_retrieval_mask: torch.Tensor
+
+    expanded_estimation_indices: torch.Tensor
+    expanded_estimation_mask: torch.Tensor
 
 
 class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
@@ -676,60 +692,204 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         # probabilities preserves the ranking used by RetroInfer.
         return probabilities.mean(dim=2)
 
+    def _maximum_zone_widths(
+        self,
+        num_clusters: int,
+    ) -> tuple[int, int, int]:
+        """Return synchronization-free capacities for cluster zones."""
+        if num_clusters <= 0:
+            raise ValueError("num_clusters must be positive")
+
+        max_retrieval = min(
+            ceil(num_clusters * self.retrieval_ratio),
+            num_clusters,
+        )
+        max_estimation = min(
+            ceil(num_clusters * self.estimation_ratio),
+            num_clusters - max_retrieval,
+        )
+        max_total_compute = max_retrieval + max_estimation
+        max_expanded_retrieval = min(
+            max_retrieval * 2,
+            max_total_compute,
+        )
+
+        return (
+            max_retrieval,
+            max_estimation,
+            max_expanded_retrieval,
+        )
+
+    @staticmethod
+    def _slice_rank_range(
+        ranked_indices: torch.Tensor,
+        start_counts: torch.Tensor,
+        end_counts: torch.Tensor,
+        output_width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather a variable rank interval into a fixed-width tensor."""
+        if output_width < 0:
+            raise ValueError("output_width must be non-negative")
+
+        if output_width == 0:
+            return (
+                ranked_indices[..., :0].contiguous(),
+                torch.empty_like(
+                    ranked_indices[..., :0],
+                    dtype=torch.bool,
+                ),
+            )
+
+        rank_offsets = torch.arange(
+            output_width,
+            dtype=torch.int64,
+            device=ranked_indices.device,
+        )
+        rank_positions = start_counts.unsqueeze(-1) + rank_offsets
+
+        selected_mask = rank_positions < end_counts.unsqueeze(-1)
+        safe_rank_positions = rank_positions.clamp(
+            min=0,
+            max=ranked_indices.shape[-1] - 1,
+        )
+        selected_indices = ranked_indices.gather(
+            dim=2,
+            index=safe_rank_positions,
+        )
+
+        return (
+            selected_indices.contiguous(),
+            selected_mask.contiguous(),
+        )
+
     def _select_cluster_zones(
         self,
         cluster_scores: torch.Tensor,
         cluster_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size, num_kv_heads, num_clusters = cluster_scores.shape
+    ) -> _PackedClusterZones:
+        """Rank relevant clusters once and return compact zone indices."""
+        if cluster_scores.shape != cluster_mask.shape:
+            raise ValueError("Cluster scores and mask must have equal shapes")
+        if cluster_scores.ndim != 3:
+            raise ValueError(
+                "Cluster scores must have shape [batch, num_kv_heads, num_clusters]"
+            )
 
-        flat_scores = cluster_scores.reshape(
-            batch_size * num_kv_heads,
-            num_clusters,
+        num_clusters = cluster_scores.shape[2]
+        (
+            max_retrieval,
+            max_estimation,
+            max_expanded_retrieval,
+        ) = self._maximum_zone_widths(num_clusters)
+
+        max_total_compute = max_retrieval + max_estimation
+
+        candidate_counts = cluster_mask.sum(
+            dim=2,
+            dtype=torch.int64,
         )
-        flat_mask = cluster_mask.reshape(
-            batch_size * num_kv_heads,
-            num_clusters,
+
+        retrieval_counts = torch.ceil(
+            candidate_counts.float() * self.retrieval_ratio
+        ).to(torch.int64)
+        retrieval_counts = torch.minimum(
+            retrieval_counts,
+            candidate_counts,
         )
 
-        zone_masks = self._select_zone_masks(flat_scores, flat_mask)
+        estimation_counts = torch.ceil(
+            candidate_counts.float() * self.estimation_ratio
+        ).to(torch.int64)
+        estimation_counts = torch.minimum(
+            estimation_counts,
+            candidate_counts - retrieval_counts,
+        )
 
-        return tuple(
-            mask.view(batch_size, num_kv_heads, num_clusters) for mask in zone_masks
+        total_compute_counts = retrieval_counts + estimation_counts
+        expanded_retrieval_counts = torch.minimum(
+            retrieval_counts * 2,
+            total_compute_counts,
+        )
+
+        ranking_scores = cluster_scores.masked_fill(
+            ~cluster_mask,
+            float("-inf"),
+        )
+
+        # Only the retrieval + estimation prefix is needed. Sorting all
+        # clusters would perform unnecessary work on the ignored suffix.
+        ranked_indices = torch.topk(
+            ranking_scores,
+            k=max_total_compute,
+            dim=2,
+            largest=True,
+            sorted=True,
+        ).indices
+
+        zero_counts = torch.zeros_like(retrieval_counts)
+
+        (
+            sparse_retrieval_indices,
+            sparse_retrieval_mask,
+        ) = self._slice_rank_range(
+            ranked_indices,
+            zero_counts,
+            retrieval_counts,
+            max_retrieval,
+        )
+        (
+            sparse_estimation_indices,
+            sparse_estimation_mask,
+        ) = self._slice_rank_range(
+            ranked_indices,
+            retrieval_counts,
+            total_compute_counts,
+            max_estimation,
+        )
+        (
+            expanded_retrieval_indices,
+            expanded_retrieval_mask,
+        ) = self._slice_rank_range(
+            ranked_indices,
+            zero_counts,
+            expanded_retrieval_counts,
+            max_expanded_retrieval,
+        )
+        (
+            expanded_estimation_indices,
+            expanded_estimation_mask,
+        ) = self._slice_rank_range(
+            ranked_indices,
+            expanded_retrieval_counts,
+            total_compute_counts,
+            max_estimation,
+        )
+
+        return _PackedClusterZones(
+            sparse_retrieval_indices=sparse_retrieval_indices,
+            sparse_retrieval_mask=sparse_retrieval_mask,
+            sparse_estimation_indices=sparse_estimation_indices,
+            sparse_estimation_mask=sparse_estimation_mask,
+            expanded_retrieval_indices=expanded_retrieval_indices,
+            expanded_retrieval_mask=expanded_retrieval_mask,
+            expanded_estimation_indices=expanded_estimation_indices,
+            expanded_estimation_mask=expanded_estimation_mask,
         )
 
     @staticmethod
-    def _pack_mask_indices(
+    def _pack_bounded_mask_indices(
         mask: torch.Tensor,
+        output_width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pack True positions along the final dimension."""
+        """Pack True positions using a synchronization-free upper bound."""
+        if output_width < 0:
+            raise ValueError("output_width must be non-negative")
+
         max_num_items = mask.shape[-1]
         leading_shape = mask.shape[:-1]
+        output_width = min(output_width, max_num_items)
 
-        flat_mask = mask.reshape(-1, max_num_items)
-        logical_ids = torch.arange(
-            max_num_items,
-            dtype=torch.int64,
-            device=mask.device,
-        ).expand(flat_mask.shape[0], -1)
-
-        sentinel = torch.full_like(logical_ids, max_num_items)
-        sorted_indices = (
-            torch.where(
-                flat_mask,
-                logical_ids,
-                sentinel,
-            )
-            .sort(dim=1)
-            .values
-        )
-
-        packed_counts = flat_mask.sum(dim=1)
-        max_packed_count = (
-            int(packed_counts.max().item()) if packed_counts.numel() else 0
-        )
-
-        if max_packed_count == 0:
+        if output_width == 0:
             empty_shape = (*leading_shape, 0)
             return (
                 torch.empty(
@@ -744,21 +904,69 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 ),
             )
 
-        packed_indices = sorted_indices[:, :max_packed_count]
-        packed_indices.clamp_(min=0, max=max_num_items - 1)
-
-        packed_positions = torch.arange(
-            max_packed_count,
+        logical_indices = torch.arange(
+            max_num_items,
             dtype=torch.int64,
             device=mask.device,
         )
-        packed_mask = packed_positions.unsqueeze(0) < packed_counts.unsqueeze(1)
-
-        output_shape = (*leading_shape, max_packed_count)
-        return (
-            packed_indices.view(output_shape).contiguous(),
-            packed_mask.view(output_shape).contiguous(),
+        sentinel = torch.full(
+            (),
+            max_num_items,
+            dtype=torch.int64,
+            device=mask.device,
         )
+
+        candidates = torch.where(
+            mask,
+            logical_indices,
+            sentinel,
+        )
+
+        packed_indices = torch.topk(
+            candidates,
+            k=output_width,
+            dim=-1,
+            largest=False,
+            sorted=True,
+        ).values
+
+        packed_mask = packed_indices < max_num_items
+        packed_indices.clamp_(
+            min=0,
+            max=max_num_items - 1,
+        )
+
+        return (
+            packed_indices.contiguous(),
+            packed_mask.contiguous(),
+        )
+
+    @staticmethod
+    def _sum_selected_scores(
+        cluster_scores: torch.Tensor,
+        selected_indices: torch.Tensor,
+        selected_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sum probability mass represented by a compact retrieval zone."""
+        if selected_indices.shape != selected_mask.shape:
+            raise ValueError("Selected cluster indices and mask must match")
+
+        if selected_indices.shape[2] == 0:
+            return torch.zeros(
+                cluster_scores.shape[:2],
+                dtype=cluster_scores.dtype,
+                device=cluster_scores.device,
+            )
+
+        selected_scores = cluster_scores.gather(
+            dim=2,
+            index=selected_indices,
+        )
+        selected_scores.masked_fill_(
+            ~selected_mask,
+            0.0,
+        )
+        return selected_scores.sum(dim=2)
 
     @staticmethod
     def _build_cluster_page_selection(
@@ -849,10 +1057,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self,
         layer_name: str,
         forced_exact_mask: torch.Tensor,
-        sparse_retrieval_clusters: torch.Tensor,
-        sparse_estimation_clusters: torch.Tensor,
-        expanded_retrieval_clusters: torch.Tensor,
-        expanded_estimation_clusters: torch.Tensor,
+        cluster_zones: _PackedClusterZones,
         sparse_attn: torch.Tensor,
         expanded_attn: torch.Tensor,
         packed: _PackedSegmentedIndex,
@@ -864,19 +1069,22 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             -1,
         )
 
+        # With an up-to-date segmented index, the exact primary zone consists
+        # of the sink block, an incomplete segment, recent blocks and the
+        # current partial block. This expression is a synchronization-free
+        # upper bound for that union.
+        max_primary_exact_tokens = min(
+            forced_exact_mask.shape[1],
+            self.segment_size_tokens + (self.num_recent_blocks + 1) * self.block_size,
+        )
+
         (
             primary_exact_token_indices,
             primary_exact_token_mask,
-        ) = self._pack_mask_indices(per_head_forced_exact)
-
-        (
-            sparse_retrieval_indices,
-            sparse_retrieval_mask,
-        ) = self._pack_mask_indices(sparse_retrieval_clusters)
-        (
-            expanded_retrieval_indices,
-            expanded_retrieval_mask,
-        ) = self._pack_mask_indices(expanded_retrieval_clusters)
+        ) = self._pack_bounded_mask_indices(
+            per_head_forced_exact,
+            max_primary_exact_tokens,
+        )
 
         (
             sparse_exact_page_ids,
@@ -884,8 +1092,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         ) = self._build_cluster_page_selection(
             packed.cluster_page_ids,
             packed.cluster_page_token_counts,
-            sparse_retrieval_indices,
-            sparse_retrieval_mask,
+            cluster_zones.sparse_retrieval_indices,
+            cluster_zones.sparse_retrieval_mask,
         )
         (
             expanded_exact_page_ids,
@@ -893,18 +1101,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         ) = self._build_cluster_page_selection(
             packed.cluster_page_ids,
             packed.cluster_page_token_counts,
-            expanded_retrieval_indices,
-            expanded_retrieval_mask,
+            cluster_zones.expanded_retrieval_indices,
+            cluster_zones.expanded_retrieval_mask,
         )
-
-        (
-            sparse_estimation_indices,
-            sparse_estimation_mask,
-        ) = self._pack_mask_indices(sparse_estimation_clusters)
-        (
-            expanded_estimation_indices,
-            expanded_estimation_mask,
-        ) = self._pack_mask_indices(expanded_estimation_clusters)
 
         (
             sparse_estimation_keys,
@@ -914,8 +1113,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             packed.cluster_keys,
             packed.cluster_values,
             packed.cluster_token_counts,
-            sparse_estimation_indices,
-            sparse_estimation_mask,
+            cluster_zones.sparse_estimation_indices,
+            cluster_zones.sparse_estimation_mask,
         )
         (
             expanded_estimation_keys,
@@ -925,8 +1124,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             packed.cluster_keys,
             packed.cluster_values,
             packed.cluster_token_counts,
-            expanded_estimation_indices,
-            expanded_estimation_mask,
+            cluster_zones.expanded_estimation_indices,
+            cluster_zones.expanded_estimation_mask,
         )
 
         return RetroSpecTokenSelectionPlan(
@@ -1160,19 +1359,20 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             scale,
         )
 
-        (
-            sparse_retrieval_clusters,
-            sparse_estimation_clusters,
-            expanded_retrieval_clusters,
-            expanded_estimation_clusters,
-        ) = self._select_cluster_zones(
+        cluster_zones = self._select_cluster_zones(
             cluster_scores,
             packed.cluster_mask,
         )
 
-        sparse_attn_by_head = (cluster_scores * sparse_retrieval_clusters).sum(dim=2)
-        expanded_attn_by_head = (cluster_scores * expanded_retrieval_clusters).sum(
-            dim=2
+        sparse_attn_by_head = self._sum_selected_scores(
+            cluster_scores,
+            cluster_zones.sparse_retrieval_indices,
+            cluster_zones.sparse_retrieval_mask,
+        )
+        expanded_attn_by_head = self._sum_selected_scores(
+            cluster_scores,
+            cluster_zones.expanded_retrieval_indices,
+            cluster_zones.expanded_retrieval_mask,
         )
 
         has_clusters = packed.cluster_mask.any(dim=2)
@@ -1204,10 +1404,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         plan = self._make_plan(
             layer_name=layer_name,
             forced_exact_mask=forced_exact_mask,
-            sparse_retrieval_clusters=sparse_retrieval_clusters,
-            sparse_estimation_clusters=sparse_estimation_clusters,
-            expanded_retrieval_clusters=expanded_retrieval_clusters,
-            expanded_estimation_clusters=expanded_estimation_clusters,
+            cluster_zones=cluster_zones,
             sparse_attn=sparse_attn,
             expanded_attn=expanded_attn,
             packed=packed,

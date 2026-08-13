@@ -13,12 +13,14 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 def make_index(
     segment_size_tokens: int = 4,
     blocks_per_cluster: int = 1,
+    retrieval_ratio: float = 0.5,
+    estimation_ratio: float = 0.5,
 ) -> RetroSpecSegmentedTokenIndex:
     return RetroSpecSegmentedTokenIndex(
         block_size=2,
         num_speculative_tokens=1,
-        retrieval_ratio=0.5,
-        estimation_ratio=0.5,
+        retrieval_ratio=retrieval_ratio,
+        estimation_ratio=estimation_ratio,
         segment_size_tokens=segment_size_tokens,
         blocks_per_cluster=blocks_per_cluster,
         num_kmeans_iterations=2,
@@ -112,18 +114,22 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     finally:
         index.end_proposal()
 
-    sparse_keys, sparse_values, _ = materialize_reference(
+    sparse_keys, sparse_values, sparse_mask = materialize_reference(
         index, sparse, keys, values, block_table
     )
-    expanded_keys, _, _ = materialize_reference(
+    expanded_keys, _, expanded_mask = materialize_reference(
         index, expanded, keys, values, block_table
     )
 
+    sparse_keys = sparse_keys[0, 0, sparse_mask[0, 0], 0]
+    sparse_values = sparse_values[0, 0, sparse_mask[0, 0], 0]
+    expanded_keys = expanded_keys[0, 0, expanded_mask[0, 0], 0]
+
     assert sparse.exact_token_counts.tolist() == [[8]]
-    assert sparse_keys[0, 0, :, 0].tolist() == pytest.approx(
+    assert sparse_keys.tolist() == pytest.approx(
         [0.0, 0.0, 3.0, 3.0, 4.0, 4.0, 2.0, 2.0]
     )
-    assert sparse_values[0, 0, :, 0].tolist() == pytest.approx(
+    assert sparse_values.tolist() == pytest.approx(
         [0.0, 0.0, 30.0, 30.0, 40.0, 40.0, 20.0, 20.0]
     )
     assert sparse.estimation_token_counts[0, 0, 0].item() == 2
@@ -131,8 +137,8 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     assert sparse.estimation_values[0, 0, 0, 0].item() == pytest.approx(10.0)
 
     assert expanded.exact_token_counts.tolist() == [[10]]
-    assert expanded_keys[0, 0, :, 0].tolist() == pytest.approx(
-        [0.0, 0.0, 3.0, 3.0, 4.0, 4.0, 1.0, 1.0, 2.0, 2.0]
+    assert expanded_keys.tolist() == pytest.approx(
+        [0.0, 0.0, 3.0, 3.0, 4.0, 4.0, 2.0, 2.0, 1.0, 1.0]
     )
     assert torch.count_nonzero(expanded.estimation_token_counts) == 0
     assert expanded.attention_mass.item() >= sparse.attention_mass.item()
@@ -179,6 +185,124 @@ def test_segmented_index_excludes_empty_clusters_from_selection():
 
     assert packed.cluster_token_counts.tolist() == [[[8, 0]]]
     assert packed.cluster_mask.tolist() == [[[True, False]]]
+
+
+@pytest.mark.parametrize(
+    ("retrieval_ratio", "estimation_ratio"),
+    [(0.3, 0.4), (0.5, 0.5), (0.7, 0.0)],
+)
+def test_compact_cluster_zones_match_full_mask_selection(
+    retrieval_ratio: float,
+    estimation_ratio: float,
+):
+    index = make_index(
+        retrieval_ratio=retrieval_ratio,
+        estimation_ratio=estimation_ratio,
+    )
+    cluster_scores = torch.tensor(
+        [
+            [
+                [0.12, 0.91, 0.33, 0.74, 0.28, 0.65, 0.47],
+                [0.82, 0.13, 0.71, 0.24, 0.63, 0.35, 0.56],
+                [0.42, 0.73, 0.14, 0.85, 0.26, 0.97, 0.38],
+            ],
+            [
+                [0.19, 0.81, 0.32, 0.76, 0.25, 0.68, 0.43],
+                [0.88, 0.17, 0.69, 0.21, 0.64, 0.36, 0.52],
+                [0.41, 0.72, 0.15, 0.86, 0.27, 0.93, 0.39],
+            ],
+        ]
+    )
+    cluster_mask = torch.tensor(
+        [
+            [
+                [True, True, True, True, True, True, True],
+                [True, False, True, False, True, False, True],
+                [False, False, False, False, False, False, False],
+            ],
+            [
+                [False, True, False, False, False, False, False],
+                [True, True, True, True, True, False, False],
+                [False, True, True, False, True, True, False],
+            ],
+        ]
+    )
+
+    zones = index._select_cluster_zones(cluster_scores, cluster_mask)
+    expected_zones = index._select_zone_masks(
+        cluster_scores.flatten(0, 1),
+        cluster_mask.flatten(0, 1),
+    )
+
+    packed_zones = (
+        (zones.sparse_retrieval_indices, zones.sparse_retrieval_mask),
+        (zones.sparse_estimation_indices, zones.sparse_estimation_mask),
+        (zones.expanded_retrieval_indices, zones.expanded_retrieval_mask),
+        (zones.expanded_estimation_indices, zones.expanded_estimation_mask),
+    )
+    for (indices, mask), expected in zip(packed_zones, expected_zones):
+        expected = expected.view_as(cluster_mask)
+        for batch_id in range(cluster_scores.shape[0]):
+            for head_id in range(cluster_scores.shape[1]):
+                actual_indices = indices[batch_id, head_id][mask[batch_id, head_id]]
+                expected_indices = torch.nonzero(
+                    expected[batch_id, head_id], as_tuple=False
+                ).flatten()
+                assert (
+                    actual_indices.sort().values.tolist() == expected_indices.tolist()
+                )
+
+    sparse_mass = index._sum_selected_scores(
+        cluster_scores,
+        zones.sparse_retrieval_indices,
+        zones.sparse_retrieval_mask,
+    )
+    expected_sparse_mass = (
+        cluster_scores * expected_zones[0].view_as(cluster_mask)
+    ).sum(dim=2)
+    torch.testing.assert_close(sparse_mass, expected_sparse_mass)
+
+
+def test_bounded_mask_packing_uses_fixed_width_and_preserves_valid_indices():
+    mask = torch.tensor(
+        [
+            [[False, True, False, True, False, True]],
+            [[True, False, False, False, False, False]],
+        ]
+    )
+
+    indices, packed_mask = RetroSpecSegmentedTokenIndex._pack_bounded_mask_indices(
+        mask, output_width=4
+    )
+
+    assert indices.shape == (2, 1, 4)
+    assert packed_mask.tolist() == [
+        [[True, True, True, False]],
+        [[True, False, False, False]],
+    ]
+    assert indices[0, 0, packed_mask[0, 0]].tolist() == [1, 3, 5]
+    assert indices[1, 0, packed_mask[1, 0]].tolist() == [0]
+
+
+def test_primary_exact_capacity_covers_every_up_to_date_layout():
+    index = make_index(segment_size_tokens=8)
+    max_num_tokens = 128
+    capacity = min(
+        max_num_tokens,
+        index.segment_size_tokens + (index.num_recent_blocks + 1) * index.block_size,
+    )
+
+    for seq_len in range(1, max_num_tokens + 1):
+        block_table = torch.empty(1, max_num_tokens // index.block_size)
+        _, valid_mask, forced_exact_mask = index._build_token_layout(
+            block_table,
+            torch.tensor([seq_len], dtype=torch.int32),
+        )
+        indexed_mask = torch.zeros_like(valid_mask)
+        indexed_mask[:, index.block_size : index._desired_indexed_end(seq_len)] = True
+        forced_exact_mask |= valid_mask & ~indexed_mask
+
+        assert forced_exact_mask.sum().item() <= capacity
 
 
 def test_segmented_index_handles_mixed_long_and_short_requests():
@@ -308,17 +432,15 @@ def test_indexed_tokens_are_materialized_from_secondary_pages():
     finally:
         index.end_proposal()
 
-    expanded_keys, expanded_values, _ = materialize_reference(
+    expanded_keys, expanded_values, expanded_mask = materialize_reference(
         index, expanded, keys, values, block_table
     )
 
-    assert expanded_keys[0, 0, -4:, 0].tolist() == [1.0, 1.0, 2.0, 2.0]
-    assert expanded_values[0, 0, -4:, 0].tolist() == [
-        10.0,
-        10.0,
-        20.0,
-        20.0,
-    ]
+    expanded_keys = expanded_keys[0, 0, expanded_mask[0, 0], 0]
+    expanded_values = expanded_values[0, 0, expanded_mask[0, 0], 0]
+
+    assert sorted(expanded_keys[-4:].tolist()) == [1.0, 1.0, 2.0, 2.0]
+    assert sorted(expanded_values[-4:].tolist()) == [10.0, 10.0, 20.0, 20.0]
 
 
 def test_segmented_index_removes_finished_request_state():
