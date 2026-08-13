@@ -11,6 +11,7 @@ from .cluster_scoring import reduce_grouped_cluster_scores
 from .cluster_store import (
     RetroSpecClusterPageStore,
     RetroSpecClusterPageTable,
+    RetroSpecClusterStorageMode,
 )
 from .clustering import segmented_kmeans_assignments
 from .index import (
@@ -137,6 +138,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         segment_size_tokens: int,
         blocks_per_cluster: int,
         num_kmeans_iterations: int,
+        cache_mode: RetroSpecClusterStorageMode = "gpu_reference",
+        pin_memory: bool = False,
     ) -> None:
         super().__init__(
             block_size=block_size,
@@ -162,7 +165,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self.segment_size_tokens = segment_size_tokens
         self.tokens_per_cluster = tokens_per_cluster
         self.num_kmeans_iterations = num_kmeans_iterations
-        self.cluster_store = RetroSpecClusterPageStore(page_size=block_size)
+        self.cluster_store = RetroSpecClusterPageStore(
+            page_size=block_size,
+            storage_mode=cache_mode,
+            pin_memory=pin_memory,
+        )
 
         # layer_name -> request_id -> token-level index
         self._indices: dict[str, dict[str, _RequestLayerIndex]] = {}

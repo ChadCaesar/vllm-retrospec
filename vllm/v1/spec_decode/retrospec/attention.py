@@ -9,6 +9,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention import Attention
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionImpl,
@@ -121,6 +122,11 @@ class RetroSpecSparseAttention:
                 segment_size_tokens=config.retrospec_index_segment_size,
                 blocks_per_cluster=config.retrospec_blocks_per_cluster,
                 num_kmeans_iterations=config.retrospec_kmeans_iterations,
+                cache_mode=config.retrospec_cache_mode,
+                pin_memory=(
+                    config.retrospec_cache_mode == "cpu_offload"
+                    and is_pin_memory_available()
+                ),
             )
 
         self.exact_execution_buffer: RetroSpecExactExecutionBuffer | None = None

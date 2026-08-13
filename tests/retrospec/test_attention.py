@@ -24,6 +24,7 @@ from vllm.v1.spec_decode.retrospec.index import (
     RetroSpecSelectionPlan,
 )
 from vllm.v1.spec_decode.retrospec.segmented_index import (
+    RetroSpecSegmentedTokenIndex,
     RetroSpecTokenAttentionSelection,
     RetroSpecTokenSelectionPlan,
 )
@@ -31,6 +32,7 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 
 def make_controller(
     index_mode: str = "block_mean",
+    cache_mode: str = "gpu_reference",
 ) -> RetroSpecSparseAttention:
     config = cast(
         VllmConfig,
@@ -44,6 +46,7 @@ def make_controller(
                 retrospec_index_segment_size=4,
                 retrospec_blocks_per_cluster=1,
                 retrospec_kmeans_iterations=2,
+                retrospec_cache_mode=cache_mode,
             ),
             scheduler_config=SimpleNamespace(max_num_seqs=4),
             cache_config=SimpleNamespace(block_size=2),
@@ -57,6 +60,33 @@ def mark_installed(controller: RetroSpecSparseAttention) -> None:
         tuple[FlashAttentionImpl, Any],
         (object(), Mock()),
     )
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "pin_memory_available", "expected_pin_memory"),
+    [
+        ("gpu_reference", True, False),
+        ("cpu_offload", False, False),
+        ("cpu_offload", True, True),
+    ],
+)
+def test_segmented_attention_configures_cluster_backing_store(
+    cache_mode: str,
+    pin_memory_available: bool,
+    expected_pin_memory: bool,
+):
+    with patch(
+        "vllm.v1.spec_decode.retrospec.attention.is_pin_memory_available",
+        return_value=pin_memory_available,
+    ):
+        controller = make_controller(
+            index_mode="segmented_cluster",
+            cache_mode=cache_mode,
+        )
+
+    assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
+    assert controller.index.cluster_store.storage_mode == cache_mode
+    assert controller.index.cluster_store.pin_memory is expected_pin_memory
 
 
 def make_plan(batch_size: int, width: int = 0) -> RetroSpecSelectionPlan:
