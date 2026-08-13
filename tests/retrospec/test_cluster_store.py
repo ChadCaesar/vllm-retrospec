@@ -375,12 +375,14 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     )
 
     access = store.admit_resident_clusters("layer", table.page_ids)
+    resident_cache = store._resident_caches["layer"]
 
     assert store.resident_capacity("layer") == 3
     assert store.num_resident_pages("layer") == 3
     assert store.num_resident_clusters("layer") == 2
     assert access.hit_cluster_mask.tolist() == [[True, True], [False, False]]
     assert access.miss_cluster_mask.tolist() == [[False, False], [True, True]]
+    assert len(resident_cache._pending_copy_batches) == 1
 
     cache_keys, cache_values = store.get_resident_page_storage("layer")
     backing_keys, backing_values = store.get_page_storage("layer")
@@ -397,6 +399,7 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     )
 
     store.free("layer", table)
+    assert resident_cache.num_pending_copy_batches == 0
     assert store.resident_capacity("layer") == 0
     assert store.num_resident_pages("layer") == 0
     assert store.num_resident_clusters("layer") == 0

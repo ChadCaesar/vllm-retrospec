@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Collection
 from dataclasses import dataclass
 from math import prod
@@ -9,6 +9,15 @@ from math import prod
 import torch
 
 _ClusterKey = tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _PendingCopyBatch:
+    """Keep asynchronous H2D copy resources alive until completion."""
+
+    ready_event: torch.cuda.Event
+    backing_key_pages: torch.Tensor
+    backing_value_pages: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -61,20 +70,13 @@ class RetroSpecResidentClusterCache:
         self._logical_capacity = 0
         self._physical_capacity = 0
 
-        self._cluster_to_slots: dict[
-            _ClusterKey,
-            tuple[int, ...],
-        ] = {}
-        self._page_to_cluster: dict[
-            int,
-            _ClusterKey,
-        ] = {}
-        self._lru: OrderedDict[
-            _ClusterKey,
-            None,
-        ] = OrderedDict()
-
+        self._cluster_to_slots: dict[_ClusterKey, tuple[int, ...]] = {}
+        self._page_to_cluster: dict[int, _ClusterKey] = {}
+        self._lru: OrderedDict[_ClusterKey, None] = OrderedDict()
         self._free_slots: set[int] = set()
+
+        self._copy_stream = torch.cuda.Stream(device=device)
+        self._pending_copy_batches: deque[_PendingCopyBatch] = deque()
 
     @property
     def capacity(self) -> int:
@@ -94,9 +96,71 @@ class RetroSpecResidentClusterCache:
     def num_resident_clusters(self) -> int:
         return len(self._cluster_to_slots)
 
+    @property
+    def num_pending_copy_batches(self) -> int:
+        """Number of submitted copy batches not yet reaped by the host."""
+        self._reap_completed_copy_batches()
+        return len(self._pending_copy_batches)
+
+    def _reap_completed_copy_batches(self) -> None:
+        """Release source tensors belonging to completed copy batches."""
+        while (
+            self._pending_copy_batches
+            and self._pending_copy_batches[0].ready_event.query()
+        ):
+            self._pending_copy_batches.popleft()
+
+    def _record_copy_batch(
+        self,
+        backing_key_pages: torch.Tensor,
+        backing_value_pages: torch.Tensor,
+    ) -> None:
+        ready_event = torch.cuda.Event()
+        ready_event.record(self._copy_stream)
+
+        self._pending_copy_batches.append(
+            _PendingCopyBatch(
+                ready_event=ready_event,
+                backing_key_pages=backing_key_pages,
+                backing_value_pages=backing_value_pages,
+            )
+        )
+
+    def wait_for_pending_copies(
+        self,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Make a CUDA consumer stream wait for all submitted cache copies.
+
+        This only inserts a device-side dependency. It does not block the CPU.
+        """
+        self._reap_completed_copy_batches()
+        if not self._pending_copy_batches:
+            return
+
+        consumer_stream = (
+            torch.cuda.current_stream(self.device) if stream is None else stream
+        )
+        consumer_stream.wait_event(self._pending_copy_batches[-1].ready_event)
+
+    def synchronize_pending_copies(self) -> None:
+        """Synchronize pending copies before CPU backing pages are reused."""
+        self._reap_completed_copy_batches()
+        if not self._pending_copy_batches:
+            return
+
+        # Every batch uses one copy stream, so completion of the final event also
+        # implies completion of all earlier batches.
+        self._pending_copy_batches[-1].ready_event.synchronize()
+        self._pending_copy_batches.clear()
+
     def _grow_storage(self, required_capacity: int) -> None:
         if required_capacity <= self._physical_capacity:
             return
+
+        # Old resident tensors may still be destinations of H2D copies. Make the
+        # current stream wait before copying them into the enlarged allocation.
+        self.wait_for_pending_copies()
 
         new_key_pages = torch.empty(
             required_capacity,
@@ -361,6 +425,10 @@ class RetroSpecResidentClusterCache:
             raise ValueError("Backing key dtype does not match resident cache")
         if value_pages.dtype != self.dtype:
             raise ValueError("Backing value dtype does not match resident cache")
+        if key_pages.device != value_pages.device:
+            raise ValueError("Backing key and value pages must use one device")
+        if key_pages.device.type != "cpu":
+            raise ValueError("Resident cache admission requires CPU backing pages")
 
     def _copy_cluster_to_slots(
         self,
@@ -369,47 +437,17 @@ class RetroSpecResidentClusterCache:
         backing_key_pages: torch.Tensor,
         backing_value_pages: torch.Tensor,
     ) -> None:
-        logical_page_ids = torch.tensor(
-            cluster_key,
-            dtype=torch.int64,
-            device=backing_key_pages.device,
-        )
-        resident_slot_ids = torch.tensor(
-            slots,
-            dtype=torch.int64,
-            device=self.device,
-        )
-
-        source_keys = backing_key_pages.index_select(
-            0,
-            logical_page_ids,
-        )
-        source_values = backing_value_pages.index_select(
-            0,
-            logical_page_ids,
-        )
-
-        # Commit 19 provides the synchronous correctness path. Commit 20
-        # replaces this staging with stream/event-managed asynchronous copies.
-        resident_keys = source_keys.to(
-            device=self.device,
-            non_blocking=False,
-        )
-        resident_values = source_values.to(
-            device=self.device,
-            non_blocking=False,
-        )
-
-        self.key_pages.index_copy_(
-            0,
-            resident_slot_ids,
-            resident_keys,
-        )
-        self.value_pages.index_copy_(
-            0,
-            resident_slot_ids,
-            resident_values,
-        )
+        """Enqueue one complete cluster on the dedicated copy stream."""
+        with torch.cuda.stream(self._copy_stream):
+            for logical_page_id, slot_id in zip(cluster_key, slots):
+                self.key_pages[slot_id].copy_(
+                    backing_key_pages[logical_page_id],
+                    non_blocking=True,
+                )
+                self.value_pages[slot_id].copy_(
+                    backing_value_pages[logical_page_id],
+                    non_blocking=True,
+                )
 
     def admit(
         self,
@@ -418,21 +456,21 @@ class RetroSpecResidentClusterCache:
         backing_key_pages: torch.Tensor,
         backing_value_pages: torch.Tensor,
     ) -> RetroSpecResidentPageAccess:
-        """Synchronously admit a priority-ordered cluster prefix.
+        """Asynchronously admit a priority-ordered cluster prefix.
 
         Clusters already resident are protected and moved to MRU. Missing
         clusters are admitted in input order while complete clusters fit in the
         active page capacity. Lower-priority clusters are left as misses.
+
+        Newly admitted clusters become logically resident after their complete
+        copy has been submitted. Consumers must call wait_for_pending_copies()
+        before reading resident storage.
         """
         self._validate_backing_pages(
             backing_key_pages,
             backing_value_pages,
         )
-        (
-            _,
-            cluster_keys,
-            _,
-        ) = self._parse_clusters(
+        _, cluster_keys, _ = self._parse_clusters(
             page_ids,
             allocated_page_ids,
         )
@@ -456,57 +494,84 @@ class RetroSpecResidentClusterCache:
             if cluster_key not in self._cluster_to_slots:
                 continue
 
-            self._lru.move_to_end(
-                cluster_key,
-                last=True,
-            )
+            self._lru.move_to_end(cluster_key, last=True)
             protected_clusters.add(cluster_key)
             protected_page_count += len(cluster_key)
 
-        for cluster_key in requested_clusters:
-            if cluster_key in self._cluster_to_slots:
-                continue
+        copy_batch_started = False
+        copy_scheduled = False
 
-            cluster_page_count = len(cluster_key)
-            if cluster_page_count > self._logical_capacity:
-                continue
+        try:
+            for cluster_key in requested_clusters:
+                if cluster_key in self._cluster_to_slots:
+                    continue
 
-            if protected_page_count + cluster_page_count > self._logical_capacity:
-                break
+                cluster_page_count = len(cluster_key)
+                if cluster_page_count > self._logical_capacity:
+                    continue
 
-            while self.num_resident_pages + cluster_page_count > self._logical_capacity:
-                if not self._evict_oldest_unprotected(protected_clusters):
+                if protected_page_count + cluster_page_count > self._logical_capacity:
                     break
 
-            if self.num_resident_pages + cluster_page_count > self._logical_capacity:
-                break
+                while (
+                    self.num_resident_pages + cluster_page_count
+                    > self._logical_capacity
+                ):
+                    if not self._evict_oldest_unprotected(protected_clusters):
+                        break
 
-            slots = tuple(sorted(self._free_slots)[:cluster_page_count])
-            if len(slots) != cluster_page_count:
-                raise RuntimeError("Resident cache does not have enough free GPU slots")
+                if (
+                    self.num_resident_pages + cluster_page_count
+                    > self._logical_capacity
+                ):
+                    break
 
-            for slot_id in slots:
-                self._free_slots.remove(slot_id)
+                slots = tuple(sorted(self._free_slots)[:cluster_page_count])
+                if len(slots) != cluster_page_count:
+                    raise RuntimeError(
+                        "Resident cache does not have enough free GPU slots"
+                    )
 
-            try:
-                self._copy_cluster_to_slots(
-                    cluster_key,
-                    slots,
+                for slot_id in slots:
+                    self._free_slots.remove(slot_id)
+
+                if not copy_batch_started:
+                    self._reap_completed_copy_batches()
+
+                    # Copy-stream writes must not overwrite slots still being read
+                    # by work previously submitted to the compute stream.
+                    current_stream = torch.cuda.current_stream(self.device)
+                    self._copy_stream.wait_stream(current_stream)
+                    copy_batch_started = True
+
+                copy_scheduled = True
+                try:
+                    self._copy_cluster_to_slots(
+                        cluster_key,
+                        slots,
+                        backing_key_pages,
+                        backing_value_pages,
+                    )
+                except Exception:
+                    self._free_slots.update(slots)
+                    raise
+
+                # Publish the cluster only after every page copy has been
+                # successfully submitted to the copy stream.
+                self._cluster_to_slots[cluster_key] = slots
+                self._lru[cluster_key] = None
+
+                for logical_page_id in cluster_key:
+                    self._page_to_cluster[logical_page_id] = cluster_key
+
+                protected_clusters.add(cluster_key)
+                protected_page_count += cluster_page_count
+        finally:
+            if copy_scheduled:
+                self._record_copy_batch(
                     backing_key_pages,
                     backing_value_pages,
                 )
-            except Exception:
-                self._free_slots.update(slots)
-                raise
-
-            self._cluster_to_slots[cluster_key] = slots
-            self._lru[cluster_key] = None
-
-            for logical_page_id in cluster_key:
-                self._page_to_cluster[logical_page_id] = cluster_key
-
-            protected_clusters.add(cluster_key)
-            protected_page_count += cluster_page_count
 
         return self.lookup(
             page_ids,
@@ -518,7 +583,13 @@ class RetroSpecResidentClusterCache:
         self,
         logical_page_ids: torch.Tensor,
     ) -> None:
-        """Evict clusters owning any released logical page."""
+        """Evict clusters owning any released logical page.
+
+        Backing-page release may allow the CPU allocator to immediately reuse the
+        same memory, so pending H2D reads must finish before invalidation returns.
+        """
+        self.synchronize_pending_copies()
+
         page_ids_cpu = logical_page_ids.detach().to(
             device="cpu",
             dtype=torch.int64,

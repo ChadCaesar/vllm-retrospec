@@ -284,8 +284,8 @@ class RetroSpecClusterPageStore:
     gpu_reference stores complete cluster pages on the model CUDA device.
 
     cpu_offload stores complete cluster pages in CPU memory. When supported,
-    pinned memory is used so later commits can issue asynchronous host-to-device
-    transfers into a bounded GPU page cache.
+    pinned memory enables asynchronous host-to-device admission into a bounded
+    GPU resident cluster cache.
     """
 
     def __init__(
@@ -799,7 +799,12 @@ class RetroSpecClusterPageStore:
         layer_name: str,
         page_ids: torch.Tensor,
     ) -> RetroSpecResidentPageAccess:
-        """Synchronously admit selected cluster pages into the GPU cache."""
+        """Asynchronously admit selected clusters into the GPU cache.
+
+        The returned mapping may reference copies still in flight. A consumer must
+        obtain resident storage through get_resident_page_storage(), which inserts
+        the required CUDA stream dependency.
+        """
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
         return resident_cache.admit(
@@ -813,8 +818,14 @@ class RetroSpecClusterPageStore:
         self,
         layer_name: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return GPU slot storage used by resident cluster pages."""
+        """Return resident GPU pages after waiting on pending H2D copies.
+
+        The wait is inserted into the current CUDA stream and does not block the
+        CPU thread.
+        """
         _, resident_cache = self._get_or_create_resident_cache(layer_name)
+        resident_cache.wait_for_pending_copies()
+
         return (
             resident_cache.key_pages,
             resident_cache.value_pages,

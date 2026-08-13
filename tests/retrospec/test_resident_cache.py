@@ -37,6 +37,7 @@ def assert_cached_pages_match_backing(
     backing_keys: torch.Tensor,
     backing_values: torch.Tensor,
 ) -> None:
+    cache.wait_for_pending_copies()
     valid = logical_page_ids >= 0
     logical_ids = logical_page_ids[valid].to(torch.int64)
     slot_ids = cache_page_ids[valid].to(device="cuda", dtype=torch.int64)
@@ -48,6 +49,84 @@ def assert_cached_pages_match_backing(
     torch.testing.assert_close(
         cache.value_pages.index_select(0, slot_ids).cpu(),
         backing_values.index_select(0, logical_ids),
+    )
+
+
+def test_resident_cache_records_copy_batch_and_retains_sources():
+    cache = make_cache(capacity=2)
+    backing_keys, backing_values = make_backing_pages()
+    page_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+
+    access = cache.admit(
+        page_ids,
+        {0, 1},
+        backing_keys,
+        backing_values,
+    )
+
+    assert len(cache._pending_copy_batches) == 1
+    pending = cache._pending_copy_batches[0]
+    assert pending.backing_key_pages is backing_keys
+    assert pending.backing_value_pages is backing_values
+
+    cache.synchronize_pending_copies()
+    assert cache.num_pending_copy_batches == 0
+    assert_cached_pages_match_backing(
+        cache,
+        page_ids,
+        access.cache_page_ids,
+        backing_keys,
+        backing_values,
+    )
+
+
+def test_resident_cache_waits_on_explicit_consumer_stream():
+    cache = make_cache(capacity=2)
+    backing_keys, backing_values = make_backing_pages()
+    page_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    access = cache.admit(
+        page_ids,
+        {0, 1},
+        backing_keys,
+        backing_values,
+    )
+
+    consumer_stream = torch.cuda.Stream()
+    cache.wait_for_pending_copies(consumer_stream)
+    with torch.cuda.stream(consumer_stream):
+        slot_ids = access.cache_page_ids[0].to(
+            device="cuda",
+            dtype=torch.int64,
+        )
+        copied_keys = cache.key_pages.index_select(0, slot_ids).clone()
+        copied_values = cache.value_pages.index_select(0, slot_ids).clone()
+    consumer_stream.synchronize()
+
+    torch.testing.assert_close(copied_keys.cpu(), backing_keys[:2])
+    torch.testing.assert_close(copied_values.cpu(), backing_values[:2])
+
+
+def test_resident_cache_growth_preserves_inflight_admission():
+    cache = make_cache(capacity=2)
+    backing_keys, backing_values = make_backing_pages()
+    page_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    access = cache.admit(
+        page_ids,
+        {0, 1},
+        backing_keys,
+        backing_values,
+    )
+
+    cache.resize(4)
+
+    assert cache.capacity == 4
+    assert cache.physical_capacity == 4
+    assert_cached_pages_match_backing(
+        cache,
+        page_ids,
+        access.cache_page_ids,
+        backing_keys,
+        backing_values,
     )
 
 
@@ -146,8 +225,10 @@ def test_resident_cache_invalidation_prevents_stale_page_reuse():
     backing_keys, backing_values = make_backing_pages()
     page_ids = torch.tensor([[0, 1]], dtype=torch.int64)
     cache.admit(page_ids, {0, 1}, backing_keys, backing_values)
+    assert len(cache._pending_copy_batches) == 1
 
     cache.invalidate(torch.tensor([0]))
+    assert cache.num_pending_copy_batches == 0
     assert cache.num_resident_pages == 0
     assert cache.lookup(page_ids, {0, 1}).miss_cluster_mask.item()
 
