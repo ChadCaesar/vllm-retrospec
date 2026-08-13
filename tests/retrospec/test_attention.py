@@ -9,7 +9,10 @@ import pytest
 import torch
 
 from vllm.config import VllmConfig
-from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+from vllm.v1.attention.backends.flash_attn import (
+    FlashAttentionImpl,
+    FlashAttentionMetadata,
+)
 from vllm.v1.spec_decode.retrospec.attention import (
     RetroSpecAttentionMode,
     RetroSpecSparseAttention,
@@ -336,6 +339,169 @@ def test_grouped_reference_attention_keeps_kv_heads_independent():
     assert lse[:, 0].tolist() == pytest.approx(
         [torch.log(torch.tensor(2.0)).item()] * 4
     )
+
+
+def test_grouped_flash_exact_attention_handles_an_empty_batch():
+    impl = cast(
+        FlashAttentionImpl,
+        SimpleNamespace(scale=1.0, vllm_flash_attn_version=2),
+    )
+    query = torch.empty(0, 4, 8, dtype=torch.bfloat16)
+    keys = torch.empty(0, 2, 3, 8, dtype=torch.bfloat16)
+    values = torch.empty_like(keys)
+    token_mask = torch.empty(0, 2, 3, dtype=torch.bool)
+
+    output, lse = RetroSpecSparseAttention._run_grouped_flash_exact_attention(
+        impl,
+        query,
+        keys,
+        values,
+        token_mask,
+    )
+
+    assert output.shape == query.shape
+    assert lse.shape == (4, 0)
+
+
+def test_grouped_flash_exact_attention_handles_no_selected_tokens():
+    impl = cast(
+        FlashAttentionImpl,
+        SimpleNamespace(scale=1.0, vllm_flash_attn_version=2),
+    )
+    query = torch.ones(2, 4, 8, dtype=torch.bfloat16)
+    keys = torch.ones(2, 2, 3, 8, dtype=torch.bfloat16)
+    values = torch.ones_like(keys)
+    token_mask = torch.zeros(2, 2, 3, dtype=torch.bool)
+
+    output, lse = RetroSpecSparseAttention._run_grouped_flash_exact_attention(
+        impl,
+        query,
+        keys,
+        values,
+        token_mask,
+    )
+
+    assert not output.any()
+    assert torch.isneginf(lse).all()
+
+
+def test_token_exact_attention_uses_reference_fallback_on_cpu():
+    controller = make_controller("segmented_cluster")
+    impl = cast(
+        FlashAttentionImpl,
+        SimpleNamespace(scale=1.0, vllm_flash_attn_version=2),
+    )
+    plan = make_token_plan(
+        batch_size=1,
+        num_kv_heads=2,
+        exact_width=2,
+        estimation_width=0,
+    )
+    selection = RetroSpecTokenAttentionSelection(
+        exact_keys=torch.ones(1, 2, 2, 8, dtype=torch.bfloat16),
+        exact_values=torch.ones(1, 2, 2, 8, dtype=torch.bfloat16),
+        exact_token_mask=torch.ones(1, 2, 2, dtype=torch.bool),
+        exact_token_counts=torch.full((1, 2), 2, dtype=torch.int32),
+        estimation_keys=torch.empty(1, 2, 0, 8, dtype=torch.bfloat16),
+        estimation_values=torch.empty(1, 2, 0, 8, dtype=torch.bfloat16),
+        estimation_token_counts=torch.empty(1, 2, 0, dtype=torch.int32),
+        attention_mass=torch.ones(1),
+        plan=plan,
+    )
+    query = torch.ones(1, 4, 8, dtype=torch.bfloat16)
+    expected = (
+        torch.ones_like(query),
+        torch.zeros(4, 1, dtype=torch.float32),
+    )
+
+    with (
+        patch.object(
+            controller,
+            "_run_grouped_reference_attention",
+            return_value=expected,
+        ) as reference_attention,
+        patch.object(
+            controller,
+            "_run_grouped_flash_exact_attention",
+        ) as flash_attention,
+    ):
+        result = controller._run_exact_attention(
+            impl,
+            Mock(),
+            query,
+            torch.empty(0),
+            torch.empty(0),
+            cast(FlashAttentionMetadata, SimpleNamespace()),
+            selection,
+        )
+
+    assert result is expected
+    reference_attention.assert_called_once()
+    flash_attention.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_grouped_flash_exact_attention_matches_reference_on_cuda():
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+
+    batch_size = 2
+    num_query_heads = 4
+    num_kv_heads = 2
+    head_size = 64
+    max_num_vectors = 5
+    scale = head_size**-0.5
+
+    impl = cast(
+        FlashAttentionImpl,
+        SimpleNamespace(scale=scale, vllm_flash_attn_version=2),
+    )
+    query = torch.randn(
+        batch_size,
+        num_query_heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    keys = torch.randn(
+        batch_size,
+        num_kv_heads,
+        max_num_vectors,
+        head_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    values = torch.randn_like(keys)
+    token_mask = torch.tensor(
+        [
+            [[True, True, True, False, False], [False] * 5],
+            [[True, True, True, True, False], [True, False, False, False, False]],
+        ],
+        dtype=torch.bool,
+        device=device,
+    )
+
+    output, lse = RetroSpecSparseAttention._run_grouped_flash_exact_attention(
+        impl,
+        query,
+        keys,
+        values,
+        token_mask,
+    )
+    reference_output, reference_lse = (
+        RetroSpecSparseAttention._run_grouped_reference_attention(
+            impl,
+            query,
+            keys,
+            values,
+            token_mask.to(torch.int32),
+        )
+    )
+
+    torch.testing.assert_close(output, reference_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, reference_lse, atol=1e-4, rtol=1e-4)
+    assert not output[0, 2:].any()
+    assert torch.isneginf(lse[2:, 0]).all()
 
 
 def test_token_estimation_attention_uses_per_head_cluster_sizes():

@@ -437,7 +437,7 @@ class RetroSpecSparseAttention:
         values: torch.Tensor,
         token_counts: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reference attention over per-KV-head packed vectors.
+        """Reference grouped attention for weighted centroids and CPU fallback.
 
         Args:
             query:
@@ -532,6 +532,213 @@ class RetroSpecSparseAttention:
 
         return attention_output, output_lse
 
+    @staticmethod
+    def _run_grouped_flash_exact_attention(
+        impl: FlashAttentionImpl,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        token_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run exact attention as one variable-length sequence per KV head.
+
+        Each request/KV-head pair becomes an independent FlashAttention
+        sequence. The query heads served by that KV head remain grouped as
+        FlashAttention GQA heads.
+        """
+        if values.shape != keys.shape:
+            raise ValueError("Exact attention keys and values must match")
+        if token_mask.shape != keys.shape[:3]:
+            raise ValueError("Exact attention token mask does not match keys")
+        if token_mask.dtype != torch.bool:
+            raise ValueError("Exact attention token mask must be boolean")
+
+        batch_size, num_query_heads, head_size = query.shape
+        key_batch_size, num_kv_heads, max_num_vectors, key_head_size = keys.shape
+
+        if key_batch_size != batch_size:
+            raise ValueError("Exact attention batch size does not match query")
+        if key_head_size != head_size:
+            raise ValueError("Exact attention head size does not match query")
+        if num_query_heads % num_kv_heads != 0:
+            raise ValueError(
+                "The number of query heads must be divisible by the number of KV heads"
+            )
+
+        if batch_size == 0:
+            empty_lse = torch.empty(
+                num_query_heads,
+                0,
+                dtype=torch.float32,
+                device=query.device,
+            )
+            return torch.empty_like(query), empty_lse
+
+        num_queries_per_kv = num_query_heads // num_kv_heads
+        num_grouped_sequences = batch_size * num_kv_heads
+
+        # Turn every request/KV-head pair into one independent sequence:
+        #
+        # [batch, query_heads, dim]
+        #     -> [batch, kv_heads, queries_per_kv, dim]
+        #     -> [batch * kv_heads, queries_per_kv, dim]
+        grouped_query = (
+            query.reshape(
+                batch_size,
+                num_kv_heads,
+                num_queries_per_kv,
+                head_size,
+            )
+            .reshape(
+                num_grouped_sequences,
+                num_queries_per_kv,
+                head_size,
+            )
+            .contiguous()
+        )
+
+        # Commit 11 materializes selected pages with internal page-tail padding.
+        # Remove those invalid positions before passing K/V to FlashAttention.
+        flat_token_mask = token_mask.reshape(-1)
+        packed_keys = (
+            keys.reshape(
+                batch_size * num_kv_heads * max_num_vectors,
+                head_size,
+            )[flat_token_mask]
+            .view(-1, 1, head_size)
+            .contiguous()
+        )
+        packed_values = (
+            values.reshape(
+                batch_size * num_kv_heads * max_num_vectors,
+                head_size,
+            )[flat_token_mask]
+            .view(-1, 1, head_size)
+            .contiguous()
+        )
+
+        exact_seq_lens = token_mask.sum(
+            dim=2,
+            dtype=torch.int32,
+        ).reshape(-1)
+
+        max_exact_seq_len = int(exact_seq_lens.max().item())
+        if max_exact_seq_len == 0:
+            empty_lse = torch.full(
+                (num_query_heads, batch_size),
+                float("-inf"),
+                dtype=torch.float32,
+                device=query.device,
+            )
+            return torch.zeros_like(query), empty_lse
+
+        # Every grouped sequence has exactly one query token.
+        cu_seqlens_q = torch.arange(
+            num_grouped_sequences + 1,
+            dtype=torch.int32,
+            device=query.device,
+        )
+        cu_seqlens_k = torch.zeros(
+            num_grouped_sequences + 1,
+            dtype=torch.int32,
+            device=query.device,
+        )
+        torch.cumsum(
+            exact_seq_lens,
+            dim=0,
+            out=cu_seqlens_k[1:],
+        )
+
+        # Keep this import local. fa_utils does not expose a working
+        # FlashAttention function on CPU-only platforms.
+        from vllm.v1.attention.backends.fa_utils import (
+            flash_attn_varlen_func,
+        )
+
+        grouped_output, grouped_lse = flash_attn_varlen_func(
+            q=grouped_query,
+            k=packed_keys,
+            v=packed_values,
+            out=None,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=1,
+            max_seqlen_k=max_exact_seq_len,
+            softmax_scale=impl.scale,
+            causal=False,
+            alibi_slopes=None,
+            window_size=[-1, -1],
+            block_table=None,
+            softcap=0.0,
+            return_softmax_lse=True,
+            scheduler_metadata=None,
+            fa_version=impl.vllm_flash_attn_version,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            num_splits=0,
+            s_aux=None,
+        )
+
+        # FlashAttention output:
+        #
+        #   [batch * kv_heads, queries_per_kv, dim]
+        #
+        # Restore the original vLLM query-head layout:
+        #
+        #   [batch, query_heads, dim]
+        exact_output = (
+            grouped_output.reshape(
+                batch_size,
+                num_kv_heads,
+                num_queries_per_kv,
+                head_size,
+            )
+            .reshape(
+                batch_size,
+                num_query_heads,
+                head_size,
+            )
+            .contiguous()
+        )
+
+        # FlashAttention LSE has logical shape:
+        #
+        #   [queries_per_kv, batch * kv_heads]
+        #
+        # FlashAttention backends may expose strides that differ from the
+        # contiguous layout consumed by vLLM's merge kernels. Mirror the merge
+        # kernels' raw-storage interpretation before applying PyTorch reshapes;
+        # otherwise request, KV-head, and query-head dimensions are mixed.
+        grouped_lse = grouped_lse.as_strided(
+            (num_queries_per_kv, num_grouped_sequences),
+            (num_grouped_sequences, 1),
+        )
+        grouped_lse.masked_fill_(
+            exact_seq_lens.unsqueeze(0) == 0,
+            float("-inf"),
+        )
+
+        # merge_attn_states expects:
+        #
+        #   [query_heads, batch]
+        exact_lse = (
+            grouped_lse.transpose(0, 1)
+            .reshape(
+                batch_size,
+                num_kv_heads,
+                num_queries_per_kv,
+            )
+            .reshape(
+                batch_size,
+                num_query_heads,
+            )
+            .transpose(0, 1)
+            .contiguous()
+        )
+
+        return exact_output, exact_lse
+
     def _run_exact_attention(
         self,
         impl: FlashAttentionImpl,
@@ -543,15 +750,30 @@ class RetroSpecSparseAttention:
         selection: RetroSpecSelection,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if isinstance(selection, RetroSpecTokenAttentionSelection):
-            return self._run_grouped_reference_attention(
+            # FlashAttention only supports the production fp16/bf16 GPU path.
+            # Keep the grouped reference implementation for CPU unit tests and
+            # unsupported debugging dtypes.
+            if query.device.type != "cuda" or query.dtype not in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                return self._run_grouped_reference_attention(
+                    impl,
+                    query,
+                    selection.exact_keys,
+                    selection.exact_values,
+                    selection.exact_token_mask.to(torch.int32),
+                )
+
+            return self._run_grouped_flash_exact_attention(
                 impl,
                 query,
                 selection.exact_keys,
                 selection.exact_values,
-                selection.exact_token_mask.to(torch.int32),
+                selection.exact_token_mask,
             )
 
-        # block_mean mode continues to use paged FlashAttention.
+        # block_mean mode continues to use the primary vLLM paged KV cache.
         from vllm.v1.attention.backends.fa_utils import (
             flash_attn_varlen_func,
         )
