@@ -126,6 +126,7 @@ def _reduce_grouped_cluster_scores_kernel(
     cluster_token_counts,
     softmax_lse,
     output,
+    ranking_output,
     scale,
     num_clusters,
     logits_stride_0,
@@ -144,7 +145,11 @@ def _reduce_grouped_cluster_scores_kernel(
     output_stride_0,
     output_stride_1,
     output_stride_2,
+    ranking_stride_0,
+    ranking_stride_1,
+    ranking_stride_2,
     QUERIES_PER_KV: tl.constexpr,
+    WRITE_RANKING: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
@@ -215,7 +220,8 @@ def _reduce_grouped_cluster_scores_kernel(
         score_sum += probabilities
 
     cluster_scores = score_sum / QUERIES_PER_KV
-    cluster_scores = tl.where(
+
+    probability_scores = tl.where(
         valid_clusters,
         cluster_scores,
         0.0,
@@ -228,9 +234,50 @@ def _reduce_grouped_cluster_scores_kernel(
     )
     tl.store(
         output + output_offsets,
-        cluster_scores,
+        probability_scores,
         mask=cluster_in_bounds,
     )
+
+    if WRITE_RANKING:
+        ranking_scores = tl.where(
+            valid_clusters,
+            cluster_scores,
+            float("-inf"),
+        )
+        ranking_offsets = (
+            batch_idx * ranking_stride_0
+            + kv_head_idx * ranking_stride_1
+            + cluster_offsets * ranking_stride_2
+        )
+        tl.store(
+            ranking_output + ranking_offsets,
+            ranking_scores,
+            mask=cluster_in_bounds,
+        )
+
+
+def _prepare_float_output(
+    output: torch.Tensor | None,
+    shape: tuple[int, ...],
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    """Allocate or validate a reusable float32 output tensor."""
+    if output is None:
+        return torch.empty(
+            shape,
+            dtype=torch.float32,
+            device=device,
+        )
+
+    if output.shape != shape:
+        raise ValueError(f"{name} has an unexpected shape")
+    if output.dtype != torch.float32:
+        raise ValueError(f"{name} must use float32")
+    if output.device != device:
+        raise ValueError(f"{name} must be on the logits device")
+
+    return output
 
 
 def reduce_grouped_cluster_scores(
@@ -238,6 +285,9 @@ def reduce_grouped_cluster_scores(
     cluster_mask: torch.Tensor,
     cluster_token_counts: torch.Tensor,
     scale: float,
+    output: torch.Tensor | None = None,
+    softmax_lse: torch.Tensor | None = None,
+    ranking_output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Normalize grouped cluster logits and average GQA probabilities.
 
@@ -253,6 +303,13 @@ def reduce_grouped_cluster_scores(
             same shape as cluster_mask.
         scale:
             Query-key attention scale.
+        output:
+            Optional reusable float32 probability-score output.
+        softmax_lse:
+            Optional reusable float32 grouped softmax workspace.
+        ranking_output:
+            Optional reusable float32 ranking output. Invalid clusters are
+            written as negative infinity.
 
     Returns:
         Float32 cluster probabilities with shape
@@ -275,15 +332,20 @@ def reduce_grouped_cluster_scores(
         raise ValueError("cluster_token_counts must use an integral dtype")
 
     batch_size, num_kv_heads, queries_per_kv, num_clusters = logits.shape
-    expected_metadata_shape = (
+    metadata_shape = (
         batch_size,
         num_kv_heads,
         num_clusters,
     )
+    lse_shape = (
+        batch_size,
+        num_kv_heads,
+        queries_per_kv,
+    )
 
-    if cluster_mask.shape != expected_metadata_shape:
+    if cluster_mask.shape != metadata_shape:
         raise ValueError("cluster_mask shape does not match cluster logits")
-    if cluster_token_counts.shape != expected_metadata_shape:
+    if cluster_token_counts.shape != metadata_shape:
         raise ValueError("cluster_token_counts shape does not match cluster logits")
     if queries_per_kv <= 0:
         raise ValueError("queries_per_kv must be positive")
@@ -295,24 +357,45 @@ def reduce_grouped_cluster_scores(
     ):
         raise ValueError("Cluster scoring tensors must be on one CUDA device")
 
-    output = torch.empty(
-        expected_metadata_shape,
-        dtype=torch.float32,
-        device=logits.device,
+    output = _prepare_float_output(
+        output,
+        metadata_shape,
+        logits.device,
+        "output",
     )
+    softmax_lse = _prepare_float_output(
+        softmax_lse,
+        lse_shape,
+        logits.device,
+        "softmax_lse",
+    )
+
+    if ranking_output is not None:
+        ranking_output = _prepare_float_output(
+            ranking_output,
+            metadata_shape,
+            logits.device,
+            "ranking_output",
+        )
+
+    reusable_outputs = [
+        ("output", output),
+        ("softmax_lse", softmax_lse),
+    ]
+    if ranking_output is not None:
+        reusable_outputs.append(("ranking_output", ranking_output))
+
+    for name, tensor in reusable_outputs:
+        if torch._C._overlaps(logits, tensor):
+            raise ValueError(f"logits and {name} must not overlap")
+
+    for index, (name, tensor) in enumerate(reusable_outputs):
+        for other_name, other_tensor in reusable_outputs[index + 1 :]:
+            if torch._C._overlaps(tensor, other_tensor):
+                raise ValueError(f"{name} and {other_name} must not overlap")
 
     if batch_size == 0:
         return output
-
-    softmax_lse = torch.empty(
-        (
-            batch_size,
-            num_kv_heads,
-            queries_per_kv,
-        ),
-        dtype=torch.float32,
-        device=logits.device,
-    )
 
     block_c = 256
 
@@ -346,6 +429,9 @@ def reduce_grouped_cluster_scores(
         num_warps=4,
     )
 
+    write_ranking = ranking_output is not None
+    ranking_buffer = output if ranking_output is None else ranking_output
+
     _reduce_grouped_cluster_scores_kernel[
         (
             batch_size,
@@ -358,6 +444,7 @@ def reduce_grouped_cluster_scores(
         cluster_token_counts,
         softmax_lse,
         output,
+        ranking_buffer,
         scale,
         num_clusters,
         logits.stride(0),
@@ -376,7 +463,11 @@ def reduce_grouped_cluster_scores(
         output.stride(0),
         output.stride(1),
         output.stride(2),
+        ranking_buffer.stride(0),
+        ranking_buffer.stride(1),
+        ranking_buffer.stride(2),
         QUERIES_PER_KV=queries_per_kv,
+        WRITE_RANKING=write_ranking,
         BLOCK_C=block_c,
         num_warps=4,
     )

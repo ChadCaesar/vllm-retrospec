@@ -180,6 +180,120 @@ def test_fused_cluster_scores_handle_empty_batch():
     assert output.dtype == torch.float32
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_cluster_scores_reuse_outputs_and_write_ranking_scores():
+    torch.manual_seed(23)
+    device = torch.device("cuda")
+    logits = torch.randn(2, 2, 4, 19, device=device)
+    cluster_mask = torch.rand(2, 2, 19, device=device) > 0.25
+    cluster_mask[..., 0] = True
+    cluster_token_counts = torch.randint(
+        1,
+        33,
+        (2, 2, 19),
+        dtype=torch.int32,
+        device=device,
+    )
+    cluster_token_counts[..., -1] = 0
+
+    output = torch.empty(2, 2, 19, device=device)
+    softmax_lse = torch.empty(2, 2, 4, device=device)
+    ranking_output = torch.empty(2, 2, 19, device=device)
+    data_ptrs = (
+        output.data_ptr(),
+        softmax_lse.data_ptr(),
+        ranking_output.data_ptr(),
+    )
+
+    expected = reference_cluster_scores(
+        logits,
+        cluster_mask,
+        cluster_token_counts,
+        scale=0.125,
+    )
+    actual = reduce_grouped_cluster_scores(
+        logits,
+        cluster_mask,
+        cluster_token_counts,
+        scale=0.125,
+        output=output,
+        softmax_lse=softmax_lse,
+        ranking_output=ranking_output,
+    )
+    torch.cuda.synchronize()
+
+    valid_clusters = cluster_mask & (cluster_token_counts > 0)
+    assert actual is output
+    assert data_ptrs == (
+        output.data_ptr(),
+        softmax_lse.data_ptr(),
+        ranking_output.data_ptr(),
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(
+        ranking_output[valid_clusters],
+        expected[valid_clusters],
+        atol=2e-6,
+        rtol=2e-5,
+    )
+    assert torch.isneginf(ranking_output[~valid_clusters]).all()
+    assert torch.isfinite(softmax_lse).all()
+
+    second_logits = torch.randn_like(logits)
+    second_expected = reference_cluster_scores(
+        second_logits,
+        cluster_mask,
+        cluster_token_counts,
+        scale=0.125,
+    )
+    second_actual = reduce_grouped_cluster_scores(
+        second_logits,
+        cluster_mask,
+        cluster_token_counts,
+        scale=0.125,
+        output=output,
+        softmax_lse=softmax_lse,
+        ranking_output=ranking_output,
+    )
+    torch.cuda.synchronize()
+
+    assert second_actual is output
+    assert data_ptrs == (
+        output.data_ptr(),
+        softmax_lse.data_ptr(),
+        ranking_output.data_ptr(),
+    )
+    torch.testing.assert_close(second_actual, second_expected, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_cluster_scores_reject_overlapping_outputs():
+    logits = torch.randn(1, 2, 4, 17, device="cuda")
+    cluster_mask = torch.ones(1, 2, 17, dtype=torch.bool, device="cuda")
+    cluster_token_counts = torch.ones(1, 2, 17, dtype=torch.int32, device="cuda")
+    shared_output = torch.empty(1, 2, 17, device="cuda")
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        reduce_grouped_cluster_scores(
+            logits,
+            cluster_mask,
+            cluster_token_counts,
+            scale=0.125,
+            output=shared_output,
+            ranking_output=shared_output,
+        )
+
+    single_query_logits = torch.randn(1, 2, 1, 17, device="cuda")
+    with pytest.raises(ValueError, match="logits and output must not overlap"):
+        reduce_grouped_cluster_scores(
+            single_query_logits,
+            cluster_mask,
+            cluster_token_counts,
+            scale=0.125,
+            output=single_query_logits[:, :, 0],
+        )
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -242,3 +356,163 @@ def test_cluster_logits_float32_cpu_fallback_matches_reference():
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tensor_core_cluster_logits_reuse_output():
+    torch.manual_seed(29)
+    query = torch.randn(2, 8, 64, dtype=torch.float16, device="cuda")
+    cluster_keys = torch.randn(
+        2,
+        2,
+        31,
+        64,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    output = torch.empty(2, 2, 4, 31, device="cuda")
+
+    actual = RetroSpecSegmentedTokenIndex._compute_cluster_logits(
+        query,
+        cluster_keys,
+        output,
+    )
+    expected = torch.einsum(
+        "bhgd,bhcd->bhgc",
+        query.float().view(2, 2, 4, 64),
+        cluster_keys.float(),
+    )
+    torch.cuda.synchronize()
+
+    assert actual is output
+    torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cluster_selection_workspace_is_reused_and_resized():
+    index = RetroSpecSegmentedTokenIndex(
+        block_size=16,
+        num_speculative_tokens=4,
+        retrieval_ratio=0.25,
+        estimation_ratio=0.25,
+        segment_size_tokens=256,
+        blocks_per_cluster=2,
+        num_kmeans_iterations=2,
+    )
+    query = torch.randn(2, 8, 64, dtype=torch.float16, device="cuda")
+    cluster_keys = torch.randn(
+        2,
+        2,
+        23,
+        64,
+        dtype=torch.float16,
+        device="cuda",
+    )
+
+    first = index._get_cluster_selection_workspace(query, cluster_keys)
+    second = index._get_cluster_selection_workspace(query, cluster_keys)
+
+    assert second is first
+    assert first.logits.shape == (2, 2, 4, 23)
+    assert first.scores.shape == (2, 2, 23)
+    assert first.softmax_lse.shape == (2, 2, 4)
+    assert first.topk_indices.shape == (2, 2, 12)
+
+    larger_cluster_keys = torch.randn(
+        2,
+        2,
+        29,
+        64,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    resized = index._get_cluster_selection_workspace(
+        query,
+        larger_cluster_keys,
+    )
+
+    assert resized is not first
+    assert resized.logits.shape == (2, 2, 4, 29)
+    assert resized.scores.shape == (2, 2, 29)
+    assert resized.topk_indices.shape == (2, 2, 16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_workspace_cluster_selection_matches_allocating_path():
+    torch.manual_seed(31)
+    index = RetroSpecSegmentedTokenIndex(
+        block_size=16,
+        num_speculative_tokens=4,
+        retrieval_ratio=0.3,
+        estimation_ratio=0.4,
+        segment_size_tokens=256,
+        blocks_per_cluster=2,
+        num_kmeans_iterations=2,
+    )
+    query = torch.randn(2, 8, 64, dtype=torch.float16, device="cuda")
+    cluster_keys = torch.randn(
+        2,
+        2,
+        37,
+        64,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    cluster_mask = torch.rand(2, 2, 37, device="cuda") > 0.3
+    cluster_mask[..., 0] = True
+    cluster_token_counts = torch.randint(
+        1,
+        17,
+        (2, 2, 37),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    cluster_token_counts.masked_fill_(~cluster_mask, 0)
+
+    workspace = index._get_cluster_selection_workspace(query, cluster_keys)
+    workspace_scores = index._score_clusters(
+        query,
+        cluster_keys,
+        cluster_mask,
+        cluster_token_counts,
+        scale=0.125,
+        workspace=workspace,
+    )
+    workspace_zones = index._select_cluster_zones(
+        workspace_scores,
+        cluster_mask,
+        workspace,
+    )
+
+    reference_scores = index._score_clusters(
+        query,
+        cluster_keys,
+        cluster_mask,
+        cluster_token_counts,
+        scale=0.125,
+    )
+    reference_zones = index._select_cluster_zones(
+        reference_scores,
+        cluster_mask,
+    )
+    torch.cuda.synchronize()
+
+    assert workspace_scores is workspace.scores
+    torch.testing.assert_close(
+        workspace_scores,
+        reference_scores,
+        atol=2e-6,
+        rtol=2e-5,
+    )
+    for field_name in workspace_zones.__dataclass_fields__:
+        torch.testing.assert_close(
+            getattr(workspace_zones, field_name),
+            getattr(reference_zones, field_name),
+        )
+
+    with pytest.raises(ValueError, match="do not belong"):
+        index._select_cluster_zones(
+            workspace_scores.clone(),
+            cluster_mask,
+            workspace,
+        )

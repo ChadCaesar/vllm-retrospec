@@ -115,6 +115,16 @@ class _PackedClusterZones:
     expanded_estimation_mask: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _ClusterSelectionWorkspace:
+    logits: torch.Tensor
+    scores: torch.Tensor
+    softmax_lse: torch.Tensor
+    ranking_scores: torch.Tensor
+    topk_values: torch.Tensor
+    topk_indices: torch.Tensor
+
+
 class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
     """Token-level segmented index backed by private cluster KV pages."""
 
@@ -161,10 +171,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self._proposal_request_ids: tuple[str, ...] = ()
 
         # Each layer retains only the most recently packed request batch.
-        self._packed_index_cache: dict[
-            str,
-            _PackedSegmentedIndexCacheEntry,
-        ] = {}
+        self._packed_index_cache: dict[str, _PackedSegmentedIndexCacheEntry] = {}
+
+        # Shared across model layers. Selection results are copied into each
+        # plan before the workspace is reused.
+        self._cluster_selection_workspace: _ClusterSelectionWorkspace | None = None
 
     def _desired_indexed_end(self, seq_len: int) -> int:
         """Return the exclusive logical-token boundary covered by clustering."""
@@ -647,6 +658,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
     def _compute_cluster_logits(
         query: torch.Tensor,
         cluster_keys: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute raw grouped query-centroid dot products."""
         if query.ndim != 3:
@@ -660,7 +672,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             )
 
         batch_size, num_query_heads, head_size = query.shape
-        key_batch_size, num_kv_heads, num_clusters, key_head_size = cluster_keys.shape
+        (
+            key_batch_size,
+            num_kv_heads,
+            num_clusters,
+            key_head_size,
+        ) = cluster_keys.shape
 
         if key_batch_size != batch_size:
             raise ValueError("Cluster key batch size does not match query")
@@ -678,6 +695,23 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             raise ValueError("Query and cluster keys must be on one device")
 
         queries_per_kv = num_query_heads // num_kv_heads
+        output_shape = (
+            batch_size,
+            num_kv_heads,
+            queries_per_kv,
+            num_clusters,
+        )
+
+        if output is not None:
+            if output.shape != output_shape:
+                raise ValueError("Cluster-logit output has an unexpected shape")
+            if output.dtype != torch.float32:
+                raise ValueError("Cluster-logit output must use float32")
+            if output.device != query.device:
+                raise ValueError("Cluster-logit output must be on the query device")
+            if not output.is_contiguous():
+                raise ValueError("Cluster-logit output must be contiguous")
+
         grouped_query = query.reshape(
             batch_size * num_kv_heads,
             queries_per_kv,
@@ -688,6 +722,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             num_clusters,
             head_size,
         )
+        transposed_cluster_keys = flattened_cluster_keys.transpose(1, 2)
+
+        flat_output = None
+        if output is not None:
+            flat_output = output.view(
+                batch_size * num_kv_heads,
+                queries_per_kv,
+                num_clusters,
+            )
 
         can_use_tensor_core_bmm = (
             query.device.type == "cuda"
@@ -696,23 +739,40 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         )
 
         if can_use_tensor_core_bmm:
-            flat_logits = torch.bmm(
-                grouped_query,
-                flattened_cluster_keys.transpose(1, 2),
-                out_dtype=torch.float32,
-            )
+            if flat_output is None:
+                flat_logits = torch.bmm(
+                    grouped_query,
+                    transposed_cluster_keys,
+                    out_dtype=torch.float32,
+                )
+            else:
+                torch.bmm(
+                    grouped_query,
+                    transposed_cluster_keys,
+                    out_dtype=torch.float32,
+                    out=flat_output,
+                )
+                flat_logits = flat_output
         else:
-            flat_logits = torch.bmm(
-                grouped_query.float(),
-                flattened_cluster_keys.float().transpose(1, 2),
-            )
+            grouped_query_float = grouped_query.float()
+            cluster_keys_float = transposed_cluster_keys.float()
 
-        return flat_logits.view(
-            batch_size,
-            num_kv_heads,
-            queries_per_kv,
-            num_clusters,
-        )
+            if flat_output is None:
+                flat_logits = torch.bmm(
+                    grouped_query_float,
+                    cluster_keys_float,
+                )
+            else:
+                torch.bmm(
+                    grouped_query_float,
+                    cluster_keys_float,
+                    out=flat_output,
+                )
+                flat_logits = flat_output
+
+        if output is not None:
+            return output
+        return flat_logits.view(output_shape)
 
     @staticmethod
     def _reduce_cluster_scores_reference(
@@ -755,11 +815,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         cluster_mask: torch.Tensor,
         cluster_token_counts: torch.Tensor,
         scale: float,
+        workspace: _ClusterSelectionWorkspace | None = None,
     ) -> torch.Tensor:
         """Score clusters with a fused CUDA reduction when available."""
         logits = cls._compute_cluster_logits(
             query,
             cluster_keys,
+            None if workspace is None else workspace.logits,
         )
 
         if logits.device.type == "cuda":
@@ -768,7 +830,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 cluster_mask,
                 cluster_token_counts,
                 scale,
+                None if workspace is None else workspace.scores,
+                None if workspace is None else workspace.softmax_lse,
+                None if workspace is None else workspace.ranking_scores,
             )
+
+        if workspace is not None:
+            raise ValueError("Cluster selection workspace is CUDA-only")
 
         return cls._reduce_cluster_scores_reference(
             logits,
@@ -804,6 +872,106 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             max_estimation,
             max_expanded_retrieval,
         )
+
+    def _get_cluster_selection_workspace(
+        self,
+        query: torch.Tensor,
+        cluster_keys: torch.Tensor,
+    ) -> _ClusterSelectionWorkspace:
+        """Return a reusable CUDA workspace for cluster selection."""
+        if query.device.type != "cuda":
+            raise ValueError("Cluster selection workspace requires CUDA")
+        if cluster_keys.device != query.device:
+            raise ValueError("Query and cluster keys must be on one CUDA device")
+
+        batch_size, num_query_heads, _ = query.shape
+        num_kv_heads = cluster_keys.shape[1]
+        num_clusters = cluster_keys.shape[2]
+
+        if num_kv_heads <= 0:
+            raise ValueError("Cluster keys must contain at least one KV head")
+        if num_query_heads % num_kv_heads != 0:
+            raise ValueError(
+                "The number of query heads must be divisible by the number of KV heads"
+            )
+
+        queries_per_kv = num_query_heads // num_kv_heads
+        (
+            max_retrieval,
+            max_estimation,
+            _,
+        ) = self._maximum_zone_widths(num_clusters)
+        max_total_compute = max_retrieval + max_estimation
+
+        logits_shape = (
+            batch_size,
+            num_kv_heads,
+            queries_per_kv,
+            num_clusters,
+        )
+        scores_shape = (
+            batch_size,
+            num_kv_heads,
+            num_clusters,
+        )
+        lse_shape = (
+            batch_size,
+            num_kv_heads,
+            queries_per_kv,
+        )
+        topk_shape = (
+            batch_size,
+            num_kv_heads,
+            max_total_compute,
+        )
+
+        workspace = self._cluster_selection_workspace
+        if (
+            workspace is not None
+            and workspace.logits.device == query.device
+            and workspace.logits.shape == logits_shape
+            and workspace.scores.shape == scores_shape
+            and workspace.softmax_lse.shape == lse_shape
+            and workspace.ranking_scores.shape == scores_shape
+            and workspace.topk_values.shape == topk_shape
+            and workspace.topk_indices.shape == topk_shape
+        ):
+            return workspace
+
+        workspace = _ClusterSelectionWorkspace(
+            logits=torch.empty(
+                logits_shape,
+                dtype=torch.float32,
+                device=query.device,
+            ),
+            scores=torch.empty(
+                scores_shape,
+                dtype=torch.float32,
+                device=query.device,
+            ),
+            softmax_lse=torch.empty(
+                lse_shape,
+                dtype=torch.float32,
+                device=query.device,
+            ),
+            ranking_scores=torch.empty(
+                scores_shape,
+                dtype=torch.float32,
+                device=query.device,
+            ),
+            topk_values=torch.empty(
+                topk_shape,
+                dtype=torch.float32,
+                device=query.device,
+            ),
+            topk_indices=torch.empty(
+                topk_shape,
+                dtype=torch.int64,
+                device=query.device,
+            ),
+        )
+        self._cluster_selection_workspace = workspace
+        return workspace
 
     @staticmethod
     def _slice_rank_range(
@@ -851,6 +1019,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self,
         cluster_scores: torch.Tensor,
         cluster_mask: torch.Tensor,
+        workspace: _ClusterSelectionWorkspace | None = None,
     ) -> _PackedClusterZones:
         """Rank relevant clusters once and return compact zone indices."""
         if cluster_scores.shape != cluster_mask.shape:
@@ -896,20 +1065,53 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             total_compute_counts,
         )
 
-        ranking_scores = cluster_scores.masked_fill(
-            ~cluster_mask,
-            float("-inf"),
-        )
+        if workspace is None:
+            ranking_scores = cluster_scores.masked_fill(
+                ~cluster_mask,
+                float("-inf"),
+            )
+            ranked_indices = torch.topk(
+                ranking_scores,
+                k=max_total_compute,
+                dim=2,
+                largest=True,
+                sorted=True,
+            ).indices
+        else:
+            if cluster_scores is not workspace.scores:
+                raise ValueError(
+                    "Workspace ranking scores do not belong to cluster scores"
+                )
+            expected_topk_shape = (
+                cluster_scores.shape[0],
+                cluster_scores.shape[1],
+                max_total_compute,
+            )
+            if workspace.ranking_scores.shape != cluster_scores.shape:
+                raise ValueError(
+                    "Workspace ranking-score shape does not match cluster scores"
+                )
+            if workspace.topk_values.shape != expected_topk_shape:
+                raise ValueError(
+                    "Workspace top-k value shape does not match selection width"
+                )
+            if workspace.topk_indices.shape != expected_topk_shape:
+                raise ValueError(
+                    "Workspace top-k index shape does not match selection width"
+                )
 
-        # Only the retrieval + estimation prefix is needed. Sorting all
-        # clusters would perform unnecessary work on the ignored suffix.
-        ranked_indices = torch.topk(
-            ranking_scores,
-            k=max_total_compute,
-            dim=2,
-            largest=True,
-            sorted=True,
-        ).indices
+            torch.topk(
+                workspace.ranking_scores,
+                k=max_total_compute,
+                dim=2,
+                largest=True,
+                sorted=True,
+                out=(
+                    workspace.topk_values,
+                    workspace.topk_indices,
+                ),
+            )
+            ranked_indices = workspace.topk_indices
 
         zero_counts = torch.zeros_like(retrieval_counts)
 
@@ -1436,17 +1638,26 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         # in the exact steady zone.
         forced_exact_mask |= valid_token_mask & ~packed.indexed_token_mask
 
+        workspace = None
+        if query.device.type == "cuda":
+            workspace = self._get_cluster_selection_workspace(
+                query,
+                packed.cluster_keys,
+            )
+
         cluster_scores = self._score_clusters(
             query,
             packed.cluster_keys,
             packed.cluster_mask,
             packed.cluster_token_counts,
             scale,
+            workspace,
         )
 
         cluster_zones = self._select_cluster_zones(
             cluster_scores,
             packed.cluster_mask,
+            workspace,
         )
 
         sparse_attn_by_head = self._sum_selected_scores(
