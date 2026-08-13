@@ -168,8 +168,10 @@ class SpeculativeConfig:
     retrospec_estimation_ratio: float = Field(default=0.232, ge=0, lt=1)
     """Fraction of indexed retrieval units represented by K/V summaries."""
     retrospec_cache_ratio: float = Field(default=0.0, ge=0, le=1)
-    """Fraction of offloaded retrieval units retained in the GPU cache.
-    This field is unused by the GPU-reference implementation."""
+    """Fraction of offloaded cluster pages retained in the GPU resident cache.
+    A value of zero automatically provisions approximately three sparse
+    retrieval zones, matching RetroInfer. This field is unused by the
+    GPU-reference implementation."""
 
     retrospec_index_mode: Literal["block_mean", "segmented_cluster"] = "block_mean"
     """Block-selection index used by RetroSpec sparse attention."""

@@ -139,6 +139,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         blocks_per_cluster: int,
         num_kmeans_iterations: int,
         cache_mode: RetroSpecClusterStorageMode = "gpu_reference",
+        cache_ratio: float = 0.0,
         pin_memory: bool = False,
     ) -> None:
         super().__init__(
@@ -165,10 +166,20 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self.segment_size_tokens = segment_size_tokens
         self.tokens_per_cluster = tokens_per_cluster
         self.num_kmeans_iterations = num_kmeans_iterations
+        effective_cache_ratio = cache_ratio
+        if cache_mode == "cpu_offload" and cache_ratio == 0.0:
+            # RetroInfer uses three sparse retrieval zones when an explicit
+            # cache ratio is not supplied.
+            effective_cache_ratio = min(
+                retrieval_ratio * 3.0,
+                1.0,
+            )
+
         self.cluster_store = RetroSpecClusterPageStore(
             page_size=block_size,
             storage_mode=cache_mode,
             pin_memory=pin_memory,
+            cache_ratio=effective_cache_ratio,
         )
 
         # layer_name -> request_id -> token-level index

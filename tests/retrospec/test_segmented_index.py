@@ -4,6 +4,9 @@
 import pytest
 import torch
 
+from vllm.v1.spec_decode.retrospec.cluster_store import (
+    RetroSpecClusterStorageMode,
+)
 from vllm.v1.spec_decode.retrospec.index import RetroSpecAttentionLevel
 from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecSegmentedTokenIndex,
@@ -15,6 +18,8 @@ def make_index(
     blocks_per_cluster: int = 1,
     retrieval_ratio: float = 0.5,
     estimation_ratio: float = 0.5,
+    cache_mode: RetroSpecClusterStorageMode = "gpu_reference",
+    cache_ratio: float = 0.0,
 ) -> RetroSpecSegmentedTokenIndex:
     return RetroSpecSegmentedTokenIndex(
         block_size=2,
@@ -24,6 +29,8 @@ def make_index(
         segment_size_tokens=segment_size_tokens,
         blocks_per_cluster=blocks_per_cluster,
         num_kmeans_iterations=2,
+        cache_mode=cache_mode,
+        cache_ratio=cache_ratio,
     )
 
 
@@ -37,6 +44,28 @@ def make_cache(
         keys[block_id].fill_(float(block_id))
         values[block_id].fill_(float(block_id * 10))
     return keys, values
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "cache_ratio", "expected_cache_ratio"),
+    [
+        ("gpu_reference", 0.0, 0.0),
+        ("cpu_offload", 0.0, 0.6),
+        ("cpu_offload", 0.35, 0.35),
+    ],
+)
+def test_segmented_index_configures_resident_cache_ratio(
+    cache_mode: RetroSpecClusterStorageMode,
+    cache_ratio: float,
+    expected_cache_ratio: float,
+):
+    index = make_index(
+        retrieval_ratio=0.2,
+        cache_mode=cache_mode,
+        cache_ratio=cache_ratio,
+    )
+
+    assert index.cluster_store.cache_ratio == pytest.approx(expected_cache_ratio)
 
 
 def build_index(

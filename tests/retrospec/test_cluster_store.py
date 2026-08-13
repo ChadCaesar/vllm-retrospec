@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -144,6 +146,29 @@ def test_cluster_store_releases_pages_when_packing_fails():
         )
 
     assert store.num_allocated_pages("layer") == 0
+
+
+def test_cluster_store_releases_pages_when_resident_resize_fails():
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    first = store.store_clusters(
+        "layer", keys, values, assignments, cluster_token_counts
+    )
+    allocated_before = store.num_allocated_pages("layer")
+    store._resident_caches["layer"] = Mock(
+        resize=Mock(side_effect=RuntimeError("resident resize failed"))
+    )
+
+    with pytest.raises(RuntimeError, match="resident resize failed"):
+        store.store_clusters("layer", keys, values, assignments, cluster_token_counts)
+
+    assert store.num_allocated_pages("layer") == allocated_before
+    del store._resident_caches["layer"]
+    store.free("layer", first)
 
 
 def test_cluster_store_handles_empty_clusters():
@@ -328,6 +353,64 @@ def test_cpu_backing_store_keeps_metadata_on_cuda_and_pages_pinned():
         12.0,
         14.0,
     ]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for the resident cluster cache",
+)
+def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store.store_clusters(
+        "layer",
+        keys.cuda(),
+        values.cuda(),
+        assignments.cuda(),
+        cluster_token_counts.cuda(),
+    )
+
+    access = store.admit_resident_clusters("layer", table.page_ids)
+
+    assert store.resident_capacity("layer") == 3
+    assert store.num_resident_pages("layer") == 3
+    assert store.num_resident_clusters("layer") == 2
+    assert access.hit_cluster_mask.tolist() == [[True, True], [False, False]]
+    assert access.miss_cluster_mask.tolist() == [[False, False], [True, True]]
+
+    cache_keys, cache_values = store.get_resident_page_storage("layer")
+    backing_keys, backing_values = store.get_page_storage("layer")
+    valid = access.cache_page_ids >= 0
+    slots = access.cache_page_ids[valid].to(torch.int64)
+    logical_ids = table.page_ids[valid].cpu().to(torch.int64)
+    torch.testing.assert_close(
+        cache_keys.index_select(0, slots).cpu(),
+        backing_keys.index_select(0, logical_ids),
+    )
+    torch.testing.assert_close(
+        cache_values.index_select(0, slots).cpu(),
+        backing_values.index_select(0, logical_ids),
+    )
+
+    store.free("layer", table)
+    assert store.resident_capacity("layer") == 0
+    assert store.num_resident_pages("layer") == 0
+    assert store.num_resident_clusters("layer") == 0
+
+
+def test_gpu_reference_store_rejects_resident_cache_operations():
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store.store_clusters(
+        "layer", keys, values, assignments, cluster_token_counts
+    )
+
+    with pytest.raises(RuntimeError, match="only used by CPU-backed"):
+        store.lookup_resident_pages("layer", table.page_ids)
 
 
 def test_cluster_store_rejects_invalid_storage_metadata():

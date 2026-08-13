@@ -2,9 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from math import ceil
 from typing import Literal
 
 import torch
+
+from .resident_cache import (
+    RetroSpecResidentClusterCache,
+    RetroSpecResidentPageAccess,
+)
 
 RetroSpecClusterStorageMode = Literal[
     "gpu_reference",
@@ -92,6 +98,11 @@ class _LayerClusterPagePool:
     @property
     def num_allocated_pages(self) -> int:
         return len(self._allocated_page_ids)
+
+    @property
+    def allocated_page_ids(self) -> set[int]:
+        """Return allocator-owned IDs for internal membership checks."""
+        return self._allocated_page_ids
 
     def _grow(self, required_capacity: int) -> None:
         old_capacity = self.capacity
@@ -282,6 +293,7 @@ class RetroSpecClusterPageStore:
         page_size: int,
         storage_mode: RetroSpecClusterStorageMode = "gpu_reference",
         pin_memory: bool = False,
+        cache_ratio: float = 0.0,
     ) -> None:
         if page_size <= 0:
             raise ValueError("page_size must be positive")
@@ -292,13 +304,21 @@ class RetroSpecClusterPageStore:
             raise ValueError(
                 f"Unsupported RetroSpec cluster storage mode: {storage_mode}"
             )
+        if not 0.0 <= cache_ratio <= 1.0:
+            raise ValueError("cache_ratio must be between zero and one")
 
         self.page_size = page_size
         self.storage_mode = storage_mode
         self.pin_memory = pin_memory if storage_mode == "cpu_offload" else False
+        self.cache_ratio = cache_ratio
+
         self._layer_pools: dict[
             str,
             _LayerClusterPagePool,
+        ] = {}
+        self._resident_caches: dict[
+            str,
+            RetroSpecResidentClusterCache,
         ] = {}
 
     @property
@@ -349,6 +369,65 @@ class RetroSpecClusterPageStore:
             raise ValueError("Cluster metadata device changed for an existing layer")
 
         return pool
+
+    def _resident_target_capacity(
+        self,
+        pool: _LayerClusterPagePool,
+    ) -> int:
+        if not self.is_cpu_backed:
+            return 0
+        if pool.num_allocated_pages == 0:
+            return 0
+
+        return min(
+            pool.num_allocated_pages,
+            ceil(pool.num_allocated_pages * self.cache_ratio),
+        )
+
+    def _resize_resident_cache(
+        self,
+        layer_name: str,
+        pool: _LayerClusterPagePool,
+    ) -> None:
+        resident_cache = self._resident_caches.get(layer_name)
+        if resident_cache is None:
+            return
+
+        resident_cache.resize(self._resident_target_capacity(pool))
+
+    def _get_or_create_resident_cache(
+        self,
+        layer_name: str,
+    ) -> tuple[
+        _LayerClusterPagePool,
+        RetroSpecResidentClusterCache,
+    ]:
+        if not self.is_cpu_backed:
+            raise RuntimeError(
+                "Resident GPU cache is only used by CPU-backed cluster storage"
+            )
+
+        pool = self._layer_pools.get(layer_name)
+        if pool is None:
+            raise RuntimeError(
+                f"No RetroSpec page pool exists for layer {layer_name!r}"
+            )
+        if pool.metadata_device.type != "cuda":
+            raise RuntimeError("Resident cluster cache requires CUDA metadata")
+
+        resident_cache = self._resident_caches.get(layer_name)
+        if resident_cache is None:
+            resident_cache = RetroSpecResidentClusterCache(
+                page_size=self.page_size,
+                head_size=pool.head_size,
+                dtype=pool.dtype,
+                device=pool.metadata_device,
+            )
+            self._resident_caches[layer_name] = resident_cache
+
+        resident_cache.resize(self._resident_target_capacity(pool))
+
+        return pool, resident_cache
 
     @staticmethod
     def _move_to_storage(
@@ -579,6 +658,14 @@ class RetroSpecClusterPageStore:
                 "Cluster page construction did not consume all allocated pages"
             )
 
+        try:
+            self._resize_resident_cache(layer_name, pool)
+        except Exception:
+            # Keep allocation transactional if growing the GPU resident cache
+            # fails, for example because the device is out of memory.
+            pool.free(allocated_storage_page_ids)
+            raise
+
         return RetroSpecClusterPageTable(
             page_ids=page_ids,
             page_token_counts=page_token_counts,
@@ -595,7 +682,15 @@ class RetroSpecClusterPageStore:
                 f"No RetroSpec page pool exists for layer {layer_name!r}"
             )
 
+        resident_cache = self._resident_caches.get(layer_name)
+        if resident_cache is not None:
+            resident_cache.invalidate(page_table.page_ids)
+
         pool.free(page_table.page_ids)
+        self._resize_resident_cache(
+            layer_name,
+            pool,
+        )
 
     def gather_pages(
         self,
@@ -683,6 +778,68 @@ class RetroSpecClusterPageStore:
             )
 
         return pool.storage_device
+
+    def lookup_resident_pages(
+        self,
+        layer_name: str,
+        page_ids: torch.Tensor,
+        touch: bool = True,
+    ) -> RetroSpecResidentPageAccess:
+        """Resolve logical cluster pages against resident GPU slots."""
+        pool, resident_cache = self._get_or_create_resident_cache(layer_name)
+
+        return resident_cache.lookup(
+            page_ids,
+            pool.allocated_page_ids,
+            touch,
+        )
+
+    def admit_resident_clusters(
+        self,
+        layer_name: str,
+        page_ids: torch.Tensor,
+    ) -> RetroSpecResidentPageAccess:
+        """Synchronously admit selected cluster pages into the GPU cache."""
+        pool, resident_cache = self._get_or_create_resident_cache(layer_name)
+
+        return resident_cache.admit(
+            page_ids,
+            pool.allocated_page_ids,
+            pool.key_pages,
+            pool.value_pages,
+        )
+
+    def get_resident_page_storage(
+        self,
+        layer_name: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return GPU slot storage used by resident cluster pages."""
+        _, resident_cache = self._get_or_create_resident_cache(layer_name)
+        return (
+            resident_cache.key_pages,
+            resident_cache.value_pages,
+        )
+
+    def resident_capacity(
+        self,
+        layer_name: str,
+    ) -> int:
+        _, resident_cache = self._get_or_create_resident_cache(layer_name)
+        return resident_cache.capacity
+
+    def num_resident_pages(
+        self,
+        layer_name: str,
+    ) -> int:
+        resident_cache = self._resident_caches.get(layer_name)
+        return 0 if resident_cache is None else resident_cache.num_resident_pages
+
+    def num_resident_clusters(
+        self,
+        layer_name: str,
+    ) -> int:
+        resident_cache = self._resident_caches.get(layer_name)
+        return 0 if resident_cache is None else resident_cache.num_resident_clusters
 
     def num_allocated_pages(
         self,

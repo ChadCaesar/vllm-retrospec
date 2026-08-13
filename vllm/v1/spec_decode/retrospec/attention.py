@@ -123,6 +123,7 @@ class RetroSpecSparseAttention:
                 blocks_per_cluster=config.retrospec_blocks_per_cluster,
                 num_kmeans_iterations=config.retrospec_kmeans_iterations,
                 cache_mode=config.retrospec_cache_mode,
+                cache_ratio=config.retrospec_cache_ratio,
                 pin_memory=(
                     config.retrospec_cache_mode == "cpu_offload"
                     and is_pin_memory_available()

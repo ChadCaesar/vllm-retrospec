@@ -33,6 +33,7 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 def make_controller(
     index_mode: str = "block_mean",
     cache_mode: str = "gpu_reference",
+    cache_ratio: float = 0.0,
 ) -> RetroSpecSparseAttention:
     config = cast(
         VllmConfig,
@@ -47,6 +48,7 @@ def make_controller(
                 retrospec_blocks_per_cluster=1,
                 retrospec_kmeans_iterations=2,
                 retrospec_cache_mode=cache_mode,
+                retrospec_cache_ratio=cache_ratio,
             ),
             scheduler_config=SimpleNamespace(max_num_seqs=4),
             cache_config=SimpleNamespace(block_size=2),
@@ -63,17 +65,25 @@ def mark_installed(controller: RetroSpecSparseAttention) -> None:
 
 
 @pytest.mark.parametrize(
-    ("cache_mode", "pin_memory_available", "expected_pin_memory"),
+    (
+        "cache_mode",
+        "cache_ratio",
+        "pin_memory_available",
+        "expected_pin_memory",
+        "expected_cache_ratio",
+    ),
     [
-        ("gpu_reference", True, False),
-        ("cpu_offload", False, False),
-        ("cpu_offload", True, True),
+        ("gpu_reference", 0.0, True, False, 0.0),
+        ("cpu_offload", 0.0, False, False, 0.75),
+        ("cpu_offload", 0.4, True, True, 0.4),
     ],
 )
 def test_segmented_attention_configures_cluster_backing_store(
     cache_mode: str,
+    cache_ratio: float,
     pin_memory_available: bool,
     expected_pin_memory: bool,
+    expected_cache_ratio: float,
 ):
     with patch(
         "vllm.v1.spec_decode.retrospec.attention.is_pin_memory_available",
@@ -82,11 +92,15 @@ def test_segmented_attention_configures_cluster_backing_store(
         controller = make_controller(
             index_mode="segmented_cluster",
             cache_mode=cache_mode,
+            cache_ratio=cache_ratio,
         )
 
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
     assert controller.index.cluster_store.storage_mode == cache_mode
     assert controller.index.cluster_store.pin_memory is expected_pin_memory
+    assert controller.index.cluster_store.cache_ratio == pytest.approx(
+        expected_cache_ratio
+    )
 
 
 def make_plan(batch_size: int, width: int = 0) -> RetroSpecSelectionPlan:
