@@ -7,6 +7,7 @@ from math import ceil
 
 import torch
 
+from .cluster_scoring import reduce_grouped_cluster_scores
 from .cluster_store import (
     RetroSpecClusterPageStore,
     RetroSpecClusterPageTable,
@@ -643,54 +644,138 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         return logical_token_ids, valid_token_mask, forced_exact_mask
 
     @staticmethod
-    def _score_clusters(
+    def _compute_cluster_logits(
         query: torch.Tensor,
         cluster_keys: torch.Tensor,
-        cluster_mask: torch.Tensor,
-        cluster_token_counts: torch.Tensor,
-        scale: float,
     ) -> torch.Tensor:
-        batch_size, num_query_heads, head_size = query.shape
-        num_kv_heads = cluster_keys.shape[1]
+        """Compute raw grouped query-centroid dot products."""
+        if query.ndim != 3:
+            raise ValueError(
+                "query must have shape [batch, num_query_heads, head_size]"
+            )
+        if cluster_keys.ndim != 4:
+            raise ValueError(
+                "cluster_keys must have shape "
+                "[batch, num_kv_heads, num_clusters, head_size]"
+            )
 
+        batch_size, num_query_heads, head_size = query.shape
+        key_batch_size, num_kv_heads, num_clusters, key_head_size = cluster_keys.shape
+
+        if key_batch_size != batch_size:
+            raise ValueError("Cluster key batch size does not match query")
+        if key_head_size != head_size:
+            raise ValueError("Cluster key head size does not match query")
+        if num_kv_heads <= 0:
+            raise ValueError("Cluster keys must contain at least one KV head")
+        if num_clusters <= 0:
+            raise ValueError("Cluster keys must contain at least one cluster slot")
         if num_query_heads % num_kv_heads != 0:
             raise ValueError(
                 "The number of query heads must be divisible by the number of KV heads"
             )
+        if cluster_keys.device != query.device:
+            raise ValueError("Query and cluster keys must be on one device")
 
-        num_queries_per_kv = num_query_heads // num_kv_heads
-        grouped_query = query.float().view(
-            batch_size,
-            num_kv_heads,
-            num_queries_per_kv,
+        queries_per_kv = num_query_heads // num_kv_heads
+        grouped_query = query.reshape(
+            batch_size * num_kv_heads,
+            queries_per_kv,
+            head_size,
+        )
+        flattened_cluster_keys = cluster_keys.reshape(
+            batch_size * num_kv_heads,
+            num_clusters,
             head_size,
         )
 
-        logits = torch.einsum(
-            "bhgd,bhcd->bhgc",
-            grouped_query,
-            cluster_keys.float(),
+        can_use_tensor_core_bmm = (
+            query.device.type == "cuda"
+            and query.dtype == cluster_keys.dtype
+            and query.dtype in (torch.float16, torch.bfloat16)
         )
-        logits *= scale
-        logits += torch.log(cluster_token_counts.clamp_min(1).float()).unsqueeze(2)
+
+        if can_use_tensor_core_bmm:
+            flat_logits = torch.bmm(
+                grouped_query,
+                flattened_cluster_keys.transpose(1, 2),
+                out_dtype=torch.float32,
+            )
+        else:
+            flat_logits = torch.bmm(
+                grouped_query.float(),
+                flattened_cluster_keys.float().transpose(1, 2),
+            )
+
+        return flat_logits.view(
+            batch_size,
+            num_kv_heads,
+            queries_per_kv,
+            num_clusters,
+        )
+
+    @staticmethod
+    def _reduce_cluster_scores_reference(
+        logits: torch.Tensor,
+        cluster_mask: torch.Tensor,
+        cluster_token_counts: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        """Reference grouped softmax and GQA probability reduction."""
+        logits.mul_(scale)
+        logits.add_(torch.log(cluster_token_counts.clamp_min(1).float()).unsqueeze(2))
         logits.masked_fill_(
             ~cluster_mask.unsqueeze(2),
             float("-inf"),
         )
 
-        has_clusters = cluster_mask.any(dim=-1)
+        has_clusters = cluster_mask.any(dim=2)
         safe_logits = torch.where(
             has_clusters[:, :, None, None],
             logits,
             torch.zeros_like(logits),
         )
 
-        probabilities = torch.softmax(safe_logits, dim=-1)
-        probabilities.masked_fill_(~cluster_mask.unsqueeze(2), 0.0)
+        probabilities = torch.softmax(
+            safe_logits,
+            dim=3,
+        )
+        probabilities.masked_fill_(
+            ~cluster_mask.unsqueeze(2),
+            0.0,
+        )
 
-        # The same KV head serves a group of query heads. Averaging their
-        # probabilities preserves the ranking used by RetroInfer.
         return probabilities.mean(dim=2)
+
+    @classmethod
+    def _score_clusters(
+        cls,
+        query: torch.Tensor,
+        cluster_keys: torch.Tensor,
+        cluster_mask: torch.Tensor,
+        cluster_token_counts: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        """Score clusters with a fused CUDA reduction when available."""
+        logits = cls._compute_cluster_logits(
+            query,
+            cluster_keys,
+        )
+
+        if logits.device.type == "cuda":
+            return reduce_grouped_cluster_scores(
+                logits,
+                cluster_mask,
+                cluster_token_counts,
+                scale,
+            )
+
+        return cls._reduce_cluster_scores_reference(
+            logits,
+            cluster_mask,
+            cluster_token_counts,
+            scale,
+        )
 
     def _maximum_zone_widths(
         self,
