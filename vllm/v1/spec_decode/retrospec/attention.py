@@ -31,6 +31,7 @@ from .segmented_index import (
     RetroSpecTokenAttentionSelection,
     RetroSpecTokenSelectionPlan,
 )
+from .weighted_attention import merge_weighted_estimation
 
 RetroSpecSelection = RetroSpecAttentionSelection | RetroSpecTokenAttentionSelection
 RetroSpecPlan = RetroSpecSelectionPlan | RetroSpecTokenSelectionPlan
@@ -776,6 +777,51 @@ class RetroSpecSparseAttention:
 
         return exact_output, exact_lse
 
+    @staticmethod
+    def _get_grouped_estimation(
+        selection: RetroSpecSelection,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return estimation tensors in grouped KV-head layout."""
+        if isinstance(selection, RetroSpecTokenAttentionSelection):
+            return (
+                selection.estimation_keys,
+                selection.estimation_values,
+                selection.estimation_token_counts,
+            )
+
+        # block_mean stores centroids as:
+        #
+        #   [batch, estimates, kv_heads, head_size]
+        #
+        # Both the reference and fused weighted paths consume:
+        #
+        #   [batch, kv_heads, estimates, head_size]
+        estimation_keys = selection.estimation_keys.permute(
+            0,
+            2,
+            1,
+            3,
+        ).contiguous()
+        estimation_values = selection.estimation_values.permute(
+            0,
+            2,
+            1,
+            3,
+        ).contiguous()
+
+        num_kv_heads = estimation_keys.shape[1]
+        estimation_token_counts = (
+            selection.estimation_token_counts[:, None, :]
+            .expand(-1, num_kv_heads, -1)
+            .contiguous()
+        )
+
+        return (
+            estimation_keys,
+            estimation_values,
+            estimation_token_counts,
+        )
+
     @classmethod
     def _run_estimation_attention(
         cls,
@@ -783,35 +829,12 @@ class RetroSpecSparseAttention:
         query: torch.Tensor,
         selection: RetroSpecSelection,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(selection, RetroSpecTokenAttentionSelection):
-            estimation_keys = selection.estimation_keys
-            estimation_values = selection.estimation_values
-            estimation_token_counts = selection.estimation_token_counts
-        else:
-            # Existing block_mean layout:
-            # [batch, estimates, kv_heads, head_size]
-            #
-            # Reference grouped layout:
-            # [batch, kv_heads, estimates, head_size]
-            estimation_keys = selection.estimation_keys.permute(
-                0,
-                2,
-                1,
-                3,
-            ).contiguous()
-            estimation_values = selection.estimation_values.permute(
-                0,
-                2,
-                1,
-                3,
-            ).contiguous()
-
-            num_kv_heads = estimation_keys.shape[1]
-            estimation_token_counts = (
-                selection.estimation_token_counts[:, None, :]
-                .expand(-1, num_kv_heads, -1)
-                .contiguous()
-            )
+        """Run the reference weighted-centroid attention path."""
+        (
+            estimation_keys,
+            estimation_values,
+            estimation_token_counts,
+        ) = cls._get_grouped_estimation(selection)
 
         return cls._run_grouped_reference_attention(
             impl,
@@ -893,19 +916,51 @@ class RetroSpecSparseAttention:
             )
 
         exact_output, exact_lse = self._run_exact_attention(
-            impl, layer, query, key_cache, value_cache, attn_metadata, selection
-        )
-        estimation_output, estimation_lse = self._run_estimation_attention(
-            impl, query, selection
+            impl,
+            layer,
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            selection,
         )
 
-        merge_attn_states(
-            output[:num_actual_tokens],
-            exact_output,
-            exact_lse,
-            estimation_output,
-            estimation_lse,
+        can_use_fused_estimation = query.device.type == "cuda" and query.dtype in (
+            torch.float16,
+            torch.bfloat16,
         )
+
+        if can_use_fused_estimation:
+            (
+                estimation_keys,
+                estimation_values,
+                estimation_token_counts,
+            ) = self._get_grouped_estimation(selection)
+
+            merge_weighted_estimation(
+                output=output[:num_actual_tokens],
+                query=query,
+                estimation_keys=estimation_keys,
+                estimation_values=estimation_values,
+                estimation_token_counts=estimation_token_counts,
+                exact_output=exact_output,
+                exact_lse=exact_lse,
+                scale=impl.scale,
+            )
+        else:
+            estimation_output, estimation_lse = self._run_estimation_attention(
+                impl,
+                query,
+                selection,
+            )
+
+            merge_attn_states(
+                output[:num_actual_tokens],
+                exact_output,
+                exact_lse,
+                estimation_output,
+                estimation_lse,
+            )
 
         self.attention_mass_sum[: self.batch_size].add_(selection.attention_mass)
         self.attention_mass_layer_count += 1

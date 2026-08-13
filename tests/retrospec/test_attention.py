@@ -633,6 +633,47 @@ def test_token_estimation_attention_uses_per_head_cluster_sizes():
     )
 
 
+def test_get_grouped_estimation_converts_block_layout():
+    selection = RetroSpecAttentionSelection(
+        exact_block_table=torch.empty(1, 0, dtype=torch.int32),
+        exact_seq_lens=torch.zeros(1, dtype=torch.int32),
+        estimation_keys=torch.arange(12, dtype=torch.float32).view(1, 3, 2, 2),
+        estimation_values=torch.arange(12, 24, dtype=torch.float32).view(1, 3, 2, 2),
+        estimation_token_counts=torch.tensor([[1, 2, 3]], dtype=torch.int32),
+        attention_mass=torch.ones(1),
+        plan=make_plan(1),
+    )
+
+    keys, values, counts = RetroSpecSparseAttention._get_grouped_estimation(selection)
+
+    assert keys.shape == (1, 2, 3, 2)
+    assert keys.dtype == torch.float32
+    assert values.shape == keys.shape
+    assert counts.tolist() == [[[1, 2, 3], [1, 2, 3]]]
+    assert keys[0, 0, :, 0].tolist() == [0, 4, 8]
+    assert keys[0, 1, :, 0].tolist() == [2, 6, 10]
+
+
+def test_get_grouped_estimation_keeps_token_layout():
+    plan = make_token_plan(1, 2, exact_width=0, estimation_width=3)
+    selection = RetroSpecTokenAttentionSelection(
+        exact_page_ids=plan.sparse_exact_page_ids,
+        exact_page_token_counts=plan.sparse_exact_page_token_counts,
+        exact_token_counts=torch.zeros(1, 2, dtype=torch.int32),
+        estimation_keys=torch.randn(1, 2, 3, 4),
+        estimation_values=torch.randn(1, 2, 3, 4),
+        estimation_token_counts=torch.ones(1, 2, 3, dtype=torch.int32),
+        attention_mass=torch.ones(1),
+        plan=plan,
+    )
+
+    keys, values, counts = RetroSpecSparseAttention._get_grouped_estimation(selection)
+
+    assert keys is selection.estimation_keys
+    assert values is selection.estimation_values
+    assert counts is selection.estimation_token_counts
+
+
 def test_verification_reuses_draft_selection_plan_without_reranking():
     controller = make_controller()
     mark_installed(controller)
