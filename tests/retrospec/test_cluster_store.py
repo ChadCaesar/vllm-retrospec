@@ -55,6 +55,10 @@ def test_cluster_store_packs_per_head_clusters_across_pages():
     ]
     assert store.num_allocated_pages("layer") == 6
 
+    key_pages, value_pages = store.get_page_storage("layer")
+    assert key_pages.shape[1:] == (2, 1)
+    assert value_pages.shape == key_pages.shape
+
     gathered_keys, gathered_values, token_mask = store.gather_pages(
         "layer",
         table.page_ids.unsqueeze(0),
@@ -166,6 +170,13 @@ def test_cluster_store_handles_empty_clusters():
     assert gathered_values.shape == gathered_keys.shape
     assert token_mask.shape == (1, 1, 0)
     assert store.num_allocated_pages("layer") == 0
+
+
+def test_cluster_store_rejects_storage_access_before_allocation():
+    store = RetroSpecClusterPageStore(page_size=2)
+
+    with pytest.raises(RuntimeError, match="No RetroSpec page pool"):
+        store.get_page_storage("missing")
 
 
 @pytest.mark.parametrize("page_size", [0, -1])

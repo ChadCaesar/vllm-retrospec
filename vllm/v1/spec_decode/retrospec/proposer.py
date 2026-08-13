@@ -376,6 +376,16 @@ class RetroSpecProposer:
 
         self.sparse_attention.begin_step(attention_mode, step_index, runnable_mask)
 
+        # Verification inputs can contain the -1 sentinel for rows that did
+        # not produce a token at this draft position. The padded model call
+        # still embeds every row, so replace inactive IDs with a valid token;
+        # their output is ignored by the active mask.
+        safe_input_ids = torch.where(
+            runnable_mask,
+            input_ids[:batch_size],
+            torch.zeros_like(input_ids[:batch_size]),
+        )
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -384,7 +394,7 @@ class RetroSpecProposer:
             slot_mapping=per_layer_slot_mapping,
         ):
             hidden_states = self.model(
-                input_ids=input_ids[:batch_size],
+                input_ids=safe_input_ids,
                 positions=clamped_positions,
                 inputs_embeds=None,
             )

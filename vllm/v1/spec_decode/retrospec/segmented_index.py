@@ -43,9 +43,8 @@ class RetroSpecTokenSelectionPlan:
 
 @dataclass(frozen=True)
 class RetroSpecTokenAttentionSelection:
-    exact_keys: torch.Tensor
-    exact_values: torch.Tensor
-    exact_token_mask: torch.Tensor
+    exact_page_ids: torch.Tensor
+    exact_page_token_counts: torch.Tensor
     exact_token_counts: torch.Tensor
 
     estimation_keys: torch.Tensor
@@ -996,9 +995,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self,
         plan: RetroSpecTokenSelectionPlan,
         level: RetroSpecAttentionLevel,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        block_table: torch.Tensor,
     ) -> RetroSpecTokenAttentionSelection:
         if level == RetroSpecAttentionLevel.SPARSE:
             exact_page_ids = plan.sparse_exact_page_ids
@@ -1017,6 +1013,43 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         else:
             raise ValueError(f"Unsupported RetroSpec attention level: {level}")
 
+        primary_token_counts = plan.primary_exact_token_mask.sum(
+            dim=2,
+            dtype=torch.int32,
+        )
+        clustered_token_counts = exact_page_token_counts.sum(
+            dim=(2, 3),
+            dtype=torch.int32,
+        )
+        exact_token_counts = (
+            primary_token_counts + clustered_token_counts
+        ).contiguous()
+
+        return RetroSpecTokenAttentionSelection(
+            exact_page_ids=exact_page_ids,
+            exact_page_token_counts=exact_page_token_counts,
+            exact_token_counts=exact_token_counts,
+            estimation_keys=estimation_keys,
+            estimation_values=estimation_values,
+            estimation_token_counts=estimation_token_counts,
+            attention_mass=attention_mass,
+            plan=plan,
+        )
+
+    def materialize_exact_reference(
+        self,
+        selection: RetroSpecTokenAttentionSelection,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Materialize exact KV for CPU tests and unsupported CUDA dtypes."""
+        plan = selection.plan
+
         primary_keys = self._gather_selected_tokens(
             key_cache,
             block_table,
@@ -1033,7 +1066,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         batch_size, num_kv_heads = plan.primary_exact_token_indices.shape[:2]
         head_size = key_cache.shape[3]
 
-        if exact_page_ids.numel() == 0:
+        if selection.exact_page_ids.numel() == 0:
             clustered_keys = torch.empty(
                 batch_size,
                 num_kv_heads,
@@ -1051,14 +1084,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 device=key_cache.device,
             )
         else:
-            (
-                clustered_keys,
-                clustered_values,
-                clustered_mask,
-            ) = self.cluster_store.gather_pages(
-                plan.layer_name,
-                exact_page_ids,
-                exact_page_token_counts,
+            clustered_keys, clustered_values, clustered_mask = (
+                self.cluster_store.gather_pages(
+                    plan.layer_name,
+                    selection.exact_page_ids,
+                    selection.exact_page_token_counts,
+                )
             )
 
         exact_keys = torch.cat(
@@ -1076,21 +1107,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             ),
             dim=2,
         ).contiguous()
-        exact_token_counts = exact_token_mask.sum(
-            dim=2,
-        ).to(torch.int32)
 
-        return RetroSpecTokenAttentionSelection(
-            exact_keys=exact_keys,
-            exact_values=exact_values,
-            exact_token_mask=exact_token_mask,
-            exact_token_counts=exact_token_counts,
-            estimation_keys=estimation_keys,
-            estimation_values=estimation_values,
-            estimation_token_counts=estimation_token_counts,
-            attention_mass=attention_mass,
-            plan=plan,
-        )
+        return exact_keys, exact_values, exact_token_mask
 
     def select_segmented(
         self,
@@ -1198,9 +1216,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         return self._materialize_token_selection(
             plan,
             RetroSpecAttentionLevel.SPARSE,
-            key_cache,
-            value_cache,
-            block_table,
         )
 
     def materialize(
@@ -1214,10 +1229,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         if not isinstance(plan, RetroSpecTokenSelectionPlan):
             raise TypeError("Segmented token index requires a token selection plan")
 
-        return self._materialize_token_selection(
-            plan,
-            level,
-            key_cache,
-            value_cache,
-            block_table,
-        )
+        # These parameters remain in the common index interface. Exact KV is now
+        # gathered later by the reusable execution buffer.
+        del key_cache, value_cache, block_table
+
+        return self._materialize_token_selection(plan, level)

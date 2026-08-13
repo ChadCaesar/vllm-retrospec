@@ -456,6 +456,19 @@ class RetroSpecClusterPageStore:
             exact_token_mask.contiguous(),
         )
 
+    def get_page_storage(
+        self,
+        layer_name: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the physical page tensors used by fused execution packing."""
+        pool = self._layer_pools.get(layer_name)
+        if pool is None:
+            raise RuntimeError(
+                f"No RetroSpec page pool exists for layer {layer_name!r}"
+            )
+
+        return pool.key_pages, pool.value_pages
+
     def num_allocated_pages(self, layer_name: str) -> int:
         pool = self._layer_pools.get(layer_name)
         return 0 if pool is None else pool.num_allocated_pages

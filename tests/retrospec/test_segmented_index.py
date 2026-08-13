@@ -55,6 +55,21 @@ def build_index(
     )
 
 
+def materialize_reference(
+    index: RetroSpecSegmentedTokenIndex,
+    selection,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    block_table: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return index.materialize_exact_reference(
+        selection,
+        keys,
+        values,
+        block_table,
+    )
+
+
 def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     index = make_index()
     keys, values = make_cache()
@@ -97,11 +112,18 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     finally:
         index.end_proposal()
 
+    sparse_keys, sparse_values, _ = materialize_reference(
+        index, sparse, keys, values, block_table
+    )
+    expanded_keys, _, _ = materialize_reference(
+        index, expanded, keys, values, block_table
+    )
+
     assert sparse.exact_token_counts.tolist() == [[8]]
-    assert sparse.exact_keys[0, 0, :, 0].tolist() == pytest.approx(
+    assert sparse_keys[0, 0, :, 0].tolist() == pytest.approx(
         [0.0, 0.0, 3.0, 3.0, 4.0, 4.0, 2.0, 2.0]
     )
-    assert sparse.exact_values[0, 0, :, 0].tolist() == pytest.approx(
+    assert sparse_values[0, 0, :, 0].tolist() == pytest.approx(
         [0.0, 0.0, 30.0, 30.0, 40.0, 40.0, 20.0, 20.0]
     )
     assert sparse.estimation_token_counts[0, 0, 0].item() == 2
@@ -109,7 +131,7 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     assert sparse.estimation_values[0, 0, 0, 0].item() == pytest.approx(10.0)
 
     assert expanded.exact_token_counts.tolist() == [[10]]
-    assert expanded.exact_keys[0, 0, :, 0].tolist() == pytest.approx(
+    assert expanded_keys[0, 0, :, 0].tolist() == pytest.approx(
         [0.0, 0.0, 3.0, 3.0, 4.0, 4.0, 1.0, 1.0, 2.0, 2.0]
     )
     assert torch.count_nonzero(expanded.estimation_token_counts) == 0
@@ -189,8 +211,12 @@ def test_segmented_index_handles_mixed_long_and_short_requests():
     finally:
         index.end_proposal()
 
+    _, _, exact_token_mask = materialize_reference(
+        index, selection, keys, values, block_table
+    )
+
     assert selection.exact_token_counts.tolist() == [[8], [3]]
-    assert selection.exact_token_mask[1, 0, :3].all()
+    assert exact_token_mask[1, 0, :3].all()
     assert torch.count_nonzero(selection.estimation_token_counts[1]) == 0
     assert selection.attention_mass.tolist()[1] == pytest.approx(1.0)
 
@@ -282,8 +308,12 @@ def test_indexed_tokens_are_materialized_from_secondary_pages():
     finally:
         index.end_proposal()
 
-    assert expanded.exact_keys[0, 0, -4:, 0].tolist() == [1.0, 1.0, 2.0, 2.0]
-    assert expanded.exact_values[0, 0, -4:, 0].tolist() == [
+    expanded_keys, expanded_values, _ = materialize_reference(
+        index, expanded, keys, values, block_table
+    )
+
+    assert expanded_keys[0, 0, -4:, 0].tolist() == [1.0, 1.0, 2.0, 2.0]
+    assert expanded_values[0, 0, -4:, 0].tolist() == [
         10.0,
         10.0,
         20.0,
@@ -412,7 +442,7 @@ def test_segmented_index_builds_and_selects_on_cuda():
     finally:
         index.end_proposal()
 
-    assert selection.exact_keys.device.type == "cuda"
+    assert selection.exact_page_ids.device.type == "cuda"
     assert selection.exact_token_counts.tolist() == [[8]]
     assert selection.estimation_token_counts[0, 0, 0].item() == 2
 

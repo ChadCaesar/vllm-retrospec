@@ -431,6 +431,62 @@ def test_run_draft_step_preserves_attention_seq_lens_dtype(monkeypatch):
     proposer.sparse_attention.end_step.assert_called_once_with()
 
 
+def test_model_step_sanitizes_input_ids_for_inactive_rows(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    common_attn_metadata = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([3, 3], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=2,
+        max_query_len=1,
+        max_seq_len=3,
+        block_table_tensor=torch.tensor([[0], [1]], dtype=torch.int32),
+        slot_mapping=torch.tensor([0, 4], dtype=torch.int64),
+    )
+
+    class FakeBuilder:
+        def build_for_drafting(self, metadata, draft_index):
+            return SimpleNamespace()
+
+    class FakeModel(torch.nn.Module):
+        def forward(self, input_ids, positions, inputs_embeds):
+            assert input_ids.tolist() == [7, 0]
+            return torch.zeros((input_ids.shape[0], 4))
+
+        def compute_logits(self, hidden_states):
+            return torch.zeros((hidden_states.shape[0], 2))
+
+    proposer.model = FakeModel()
+    proposer.attn_layer_names = ["model.layers.0.self_attn.attn"]
+    proposer.attn_metadata_builder = cast(Any, FakeBuilder())
+    proposer.runner.sampler = lambda **kwargs: SimpleNamespace(
+        sampled_token_ids=torch.ones(2, 1, dtype=torch.int32)
+    )
+    proposer.sparse_attention.begin_step = Mock()
+    proposer.sparse_attention.end_step = Mock(return_value=torch.ones(2))
+    monkeypatch.setattr(
+        "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
+        lambda *args, **kwargs: nullcontext(),
+    )
+
+    proposer._run_model_step(
+        batch_size=2,
+        step_index=1,
+        input_ids=torch.tensor([7, -1], dtype=torch.int32),
+        positions=torch.tensor([3, 3], dtype=torch.int64),
+        active_mask=torch.tensor([True, False]),
+        common_attn_metadata=common_attn_metadata,
+        sampling_metadata=make_sampling_metadata(all_greedy=True),
+        attention_mode=RetroSpecAttentionMode.SPARSE_VERIFY,
+        compute_margin=False,
+    )
+
+
 def test_propose_stops_requests_independently_on_hit_attention(monkeypatch):
     proposer = RetroSpecProposer(
         make_vllm_config(retrospec_hit_attn_threshold=0.5),
