@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -78,6 +80,35 @@ def test_resident_cache_records_copy_batch_and_retains_sources():
         backing_keys,
         backing_values,
     )
+
+
+def test_resident_cache_returns_latest_pending_copy_event():
+    cache = make_cache(capacity=4)
+    backing_keys, backing_values = make_backing_pages()
+
+    # Prevent eager reaping so the assertion is deterministic even when the
+    # tiny test copies complete before the host asks for the event.
+    cache._reap_completed_copy_batches = Mock()
+
+    cache.admit(
+        torch.tensor([[0, 1]], dtype=torch.int64),
+        set(range(4)),
+        backing_keys,
+        backing_values,
+    )
+    first_event = cache._pending_copy_batches[-1].ready_event
+
+    cache.admit(
+        torch.tensor([[2, 3]], dtype=torch.int64),
+        set(range(4)),
+        backing_keys,
+        backing_values,
+    )
+    latest_event = cache._pending_copy_batches[-1].ready_event
+
+    assert latest_event is not first_event
+    assert cache.pending_copy_event() is latest_event
+    latest_event.synchronize()
 
 
 def test_resident_cache_waits_on_explicit_consumer_stream():

@@ -346,6 +346,7 @@ class RetroSpecExactExecutionBuffer:
         resident_value_pages: torch.Tensor | None,
         staging_key_pages: torch.Tensor | None,
         staging_value_pages: torch.Tensor | None,
+        resident_ready_event: torch.cuda.Event | None,
     ) -> RetroSpecExactExecution:
         """Pack primary and clustered exact KV into one reusable buffer."""
         if key_cache.shape != value_cache.shape:
@@ -612,6 +613,9 @@ class RetroSpecExactExecutionBuffer:
                 dtype=torch.int32,
                 out=page_prefix,
             )
+
+            if resident_ready_event is not None:
+                torch.cuda.current_stream(device).wait_event(resident_ready_event)
 
             page_pack_sources = (
                 (

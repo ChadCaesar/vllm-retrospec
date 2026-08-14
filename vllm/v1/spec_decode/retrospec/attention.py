@@ -729,6 +729,7 @@ class RetroSpecSparseAttention:
             resident_value_pages: torch.Tensor | None = None
             staging_key_pages: torch.Tensor | None = None
             staging_value_pages: torch.Tensor | None = None
+            resident_ready_event: torch.cuda.Event | None = None
 
             if selection.exact_page_ids.numel():
                 resolved_pages = self.index.cluster_store.resolve_cluster_pages(
@@ -743,6 +744,7 @@ class RetroSpecSparseAttention:
                 resident_value_pages = resolved_pages.resident_value_pages
                 staging_key_pages = resolved_pages.staging_key_pages
                 staging_value_pages = resolved_pages.staging_value_pages
+                resident_ready_event = resolved_pages.resident_ready_event
 
             execution = self.exact_execution_buffer.pack(
                 key_cache=key_cache,
@@ -757,6 +759,7 @@ class RetroSpecSparseAttention:
                 resident_value_pages=resident_value_pages,
                 staging_key_pages=staging_key_pages,
                 staging_value_pages=staging_value_pages,
+                resident_ready_event=resident_ready_event,
             )
 
             return self._run_grouped_flash_exact_attention(

@@ -141,6 +141,7 @@ def test_execution_buffer_packs_primary_and_cluster_tokens_on_cuda():
         resident_value_pages=cluster_values,
         staging_key_pages=cluster_keys[:0],
         staging_value_pages=cluster_values[:0],
+        resident_ready_event=None,
     )
     torch.cuda.synchronize()
 
@@ -211,6 +212,7 @@ def test_execution_buffer_preserves_order_across_resident_and_staging_pages():
         resident_value_pages=resident_values,
         staging_key_pages=staging_keys,
         staging_value_pages=staging_values,
+        resident_ready_event=None,
     )
     torch.cuda.synchronize()
 
@@ -238,6 +240,58 @@ def test_execution_buffer_preserves_order_across_resident_and_staging_pages():
     assert execution.exact_seq_lens.tolist() == [6]
     torch.testing.assert_close(execution.keys[:6], expected_keys)
     torch.testing.assert_close(execution.values[:6], expected_values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_execution_buffer_waits_for_resident_copy_event():
+    device = torch.device("cuda")
+    page_size = 2
+    head_size = 64
+    primary_keys, primary_values = _make_primary_cache(
+        1, page_size, 1, head_size, device
+    )
+    source_keys, source_values = _make_cluster_pages(1, page_size, head_size, device)
+    resident_keys = torch.zeros_like(source_keys)
+    resident_values = torch.zeros_like(source_values)
+
+    current_stream = torch.cuda.current_stream(device)
+    copy_stream = torch.cuda.Stream(device=device)
+    copy_stream.wait_stream(current_stream)
+    ready_event = torch.cuda.Event()
+
+    with torch.cuda.stream(copy_stream):
+        # Keep the producer behind the consumer long enough that omitting the
+        # event dependency would deterministically pack the zero-filled pages.
+        torch.cuda._sleep(20_000_000)
+        resident_keys.copy_(source_keys)
+        resident_values.copy_(source_values)
+        ready_event.record()
+
+    execution = RetroSpecExactExecutionBuffer(page_size).pack(
+        key_cache=primary_keys,
+        value_cache=primary_values,
+        block_table=torch.tensor([[0]], dtype=torch.int32, device=device),
+        primary_token_indices=torch.empty(1, 1, 0, dtype=torch.int64, device=device),
+        primary_token_mask=torch.empty(1, 1, 0, dtype=torch.bool, device=device),
+        resident_page_ids=torch.zeros(1, 1, 1, 1, dtype=torch.int64, device=device),
+        staging_page_ids=torch.full((1, 1, 1, 1), -1, dtype=torch.int64, device=device),
+        page_token_counts=torch.full(
+            (1, 1, 1, 1), page_size, dtype=torch.int32, device=device
+        ),
+        resident_key_pages=resident_keys,
+        resident_value_pages=resident_values,
+        staging_key_pages=source_keys[:0],
+        staging_value_pages=source_values[:0],
+        resident_ready_event=ready_event,
+    )
+    current_stream.synchronize()
+
+    torch.testing.assert_close(
+        execution.keys[:page_size], source_keys[0].view(page_size, 1, head_size)
+    )
+    torch.testing.assert_close(
+        execution.values[:page_size], source_values[0].view(page_size, 1, head_size)
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -285,6 +339,7 @@ def test_execution_buffer_packs_resolved_cpu_backing_pages():
         resident_value_pages=resolved.resident_value_pages,
         staging_key_pages=resolved.staging_key_pages,
         staging_value_pages=resolved.staging_value_pages,
+        resident_ready_event=resolved.resident_ready_event,
     )
     torch.cuda.synchronize()
 
@@ -320,6 +375,7 @@ def test_execution_buffer_handles_empty_batch_and_reuses_storage_on_cuda():
         resident_value_pages=None,
         staging_key_pages=None,
         staging_value_pages=None,
+        resident_ready_event=None,
     )
     first_pointer = first.keys.data_ptr()
 
@@ -336,6 +392,7 @@ def test_execution_buffer_handles_empty_batch_and_reuses_storage_on_cuda():
         resident_value_pages=None,
         staging_key_pages=None,
         staging_value_pages=None,
+        resident_ready_event=None,
     )
     empty = buffer.pack(
         key_cache=keys,
@@ -350,6 +407,7 @@ def test_execution_buffer_handles_empty_batch_and_reuses_storage_on_cuda():
         resident_value_pages=None,
         staging_key_pages=None,
         staging_value_pages=None,
+        resident_ready_event=None,
     )
     torch.cuda.synchronize()
 

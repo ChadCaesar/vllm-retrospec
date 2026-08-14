@@ -773,6 +773,7 @@ def test_exact_attention_resolves_resident_and_staging_pages():
     resident_values = resident_keys.clone()
     staging_keys = torch.ones(1, 2, 1, dtype=torch.float16, device=device)
     staging_values = staging_keys.clone()
+    resident_ready_event = torch.cuda.Event()
     resolved = RetroSpecResolvedClusterPages(
         resident_page_ids=resident_page_ids,
         staging_page_ids=staging_page_ids,
@@ -780,6 +781,7 @@ def test_exact_attention_resolves_resident_and_staging_pages():
         resident_value_pages=resident_values,
         staging_key_pages=staging_keys,
         staging_value_pages=staging_values,
+        resident_ready_event=resident_ready_event,
     )
     controller.index.cluster_store.resolve_cluster_pages = Mock(return_value=resolved)
 
@@ -824,6 +826,7 @@ def test_exact_attention_resolves_resident_and_staging_pages():
     assert call["resident_value_pages"] is resident_values
     assert call["staging_key_pages"] is staging_keys
     assert call["staging_value_pages"] is staging_values
+    assert call["resident_ready_event"] is resident_ready_event
 
 
 def test_verification_reuses_draft_selection_plan_without_reranking():

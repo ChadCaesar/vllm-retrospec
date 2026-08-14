@@ -37,14 +37,14 @@ class RetroSpecClusterPageTable:
 
 @dataclass(frozen=True)
 class RetroSpecResolvedClusterPages:
-    """GPU page sources resolving one logical cluster selection.
+    """Physical page sources for one exact-attention selection.
 
-    resident_page_ids and staging_page_ids have the same shape as the input
-    logical page table. Exactly one of them is non-negative for every valid
-    selected page.
+    Resident page IDs index the persistent GPU resident cache. Staging page
+    IDs index the temporary tensors owned by this result.
 
-    resident_page_ids address resident_key_pages and resident_value_pages.
-    staging_page_ids address staging_key_pages and staging_value_pages.
+    ``resident_ready_event`` is recorded on the resident-cache copy stream.
+    The execution path may perform work independent of resident pages before
+    waiting on this event.
     """
 
     resident_page_ids: torch.Tensor
@@ -55,6 +55,7 @@ class RetroSpecResolvedClusterPages:
 
     staging_key_pages: torch.Tensor
     staging_value_pages: torch.Tensor
+    resident_ready_event: torch.cuda.Event | None
 
 
 class _LayerClusterPagePool:
@@ -881,7 +882,12 @@ class RetroSpecClusterPageStore:
         layer_name: str,
         logical_page_ids: torch.Tensor,
     ) -> RetroSpecResolvedClusterPages:
-        """Resolve logical pages into GPU resident and staging page sources."""
+        """Resolve logical pages into GPU resident and staging page sources.
+
+        Resident-cache admission copies are asynchronous. This method returns
+        the latest resident-copy event instead of immediately waiting for it, so
+        callers can execute work that does not consume resident pages first.
+        """
         pool = self._layer_pools.get(layer_name)
         if pool is None:
             raise RuntimeError(
@@ -900,6 +906,7 @@ class RetroSpecClusterPageStore:
                 resident_value_pages=pool.value_pages,
                 staging_key_pages=pool.key_pages[:0],
                 staging_value_pages=pool.value_pages[:0],
+                resident_ready_event=None,
             )
 
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
@@ -921,10 +928,6 @@ class RetroSpecClusterPageStore:
             resident_access.miss_cluster_mask,
         )
 
-        # Staging copies were submitted on the current stream after admission.
-        # Insert the resident-copy event after staging so both H2D paths may overlap.
-        resident_cache.wait_for_pending_copies()
-
         return RetroSpecResolvedClusterPages(
             resident_page_ids=resident_access.cache_page_ids,
             staging_page_ids=staging_page_ids,
@@ -932,6 +935,7 @@ class RetroSpecClusterPageStore:
             resident_value_pages=resident_cache.value_pages,
             staging_key_pages=staging_key_pages,
             staging_value_pages=staging_value_pages,
+            resident_ready_event=resident_cache.pending_copy_event(),
         )
 
     def lookup_resident_pages(

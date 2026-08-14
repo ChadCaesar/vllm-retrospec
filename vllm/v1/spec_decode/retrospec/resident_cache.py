@@ -126,6 +126,23 @@ class RetroSpecResidentClusterCache:
             )
         )
 
+    def pending_copy_event(self) -> torch.cuda.Event | None:
+        """Return the latest outstanding resident-copy event.
+
+        Waiting for the latest event is sufficient because every admission copy
+        is submitted to the same CUDA copy stream. Stream ordering guarantees
+        that all earlier admission copies complete before the latest event.
+
+        Completed batches are reaped first so callers do not insert unnecessary
+        stream waits.
+        """
+        self._reap_completed_copy_batches()
+
+        if not self._pending_copy_batches:
+            return None
+
+        return self._pending_copy_batches[-1].ready_event
+
     def wait_for_pending_copies(
         self,
         stream: torch.cuda.Stream | None = None,
@@ -463,8 +480,8 @@ class RetroSpecResidentClusterCache:
         active page capacity. Lower-priority clusters are left as misses.
 
         Newly admitted clusters become logically resident after their complete
-        copy has been submitted. Consumers must call wait_for_pending_copies()
-        before reading resident storage.
+        copy has been submitted. Consumers must wait on pending_copy_event() or
+        call wait_for_pending_copies() before reading resident storage.
         """
         self._validate_backing_pages(
             backing_key_pages,

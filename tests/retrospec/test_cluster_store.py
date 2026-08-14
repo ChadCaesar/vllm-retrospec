@@ -484,6 +484,7 @@ def test_gpu_reference_store_resolves_without_staging():
     assert resolved.resident_value_pages is stored_values
     assert resolved.staging_key_pages.shape[0] == 0
     assert resolved.staging_value_pages.shape[0] == 0
+    assert resolved.resident_ready_event is None
 
 
 def test_gpu_reference_store_rejects_resident_cache_operations():
