@@ -192,11 +192,6 @@ def test_retrospec_proposer_loads_target_model():
             make_runner(uses_mrope=True),
             "one-dimensional RoPE",
         ),
-        (
-            make_vllm_config(retrospec_cache_mode="cpu_offload"),
-            make_runner(),
-            "CPU-offloaded KV cache",
-        ),
     ],
 )
 def test_retrospec_proposer_rejects_unsupported_features(
@@ -206,6 +201,19 @@ def test_retrospec_proposer_rejects_unsupported_features(
 ):
     with pytest.raises(NotImplementedError, match=message):
         RetroSpecProposer(config, torch.device("cpu"), runner)
+
+
+def test_retrospec_proposer_accepts_cpu_offloaded_cluster_pages():
+    proposer = RetroSpecProposer(
+        make_vllm_config(
+            retrospec_index_mode="segmented_cluster",
+            retrospec_cache_mode="cpu_offload",
+        ),
+        torch.device("cpu"),
+        make_runner(),
+    )
+
+    assert proposer.sparse_attention.index.cluster_store.is_cpu_backed
 
 
 def test_propose_rejects_random_sampling():

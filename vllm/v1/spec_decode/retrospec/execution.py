@@ -339,10 +339,13 @@ class RetroSpecExactExecutionBuffer:
         block_table: torch.Tensor,
         primary_token_indices: torch.Tensor,
         primary_token_mask: torch.Tensor,
-        page_ids: torch.Tensor,
+        resident_page_ids: torch.Tensor,
+        staging_page_ids: torch.Tensor,
         page_token_counts: torch.Tensor,
-        cluster_key_pages: torch.Tensor | None,
-        cluster_value_pages: torch.Tensor | None,
+        resident_key_pages: torch.Tensor | None,
+        resident_value_pages: torch.Tensor | None,
+        staging_key_pages: torch.Tensor | None,
+        staging_value_pages: torch.Tensor | None,
     ) -> RetroSpecExactExecution:
         """Pack primary and clustered exact KV into one reusable buffer."""
         if key_cache.shape != value_cache.shape:
@@ -360,27 +363,49 @@ class RetroSpecExactExecutionBuffer:
             raise ValueError(
                 "Primary token metadata must have shape [batch, kv_heads, tokens]"
             )
-        if page_ids.shape != page_token_counts.shape:
-            raise ValueError("Page ID and token-count shapes must match")
-        if page_ids.ndim != 4:
+        if resident_page_ids.shape != staging_page_ids.shape:
+            raise ValueError("Resident and staging page ID shapes must match")
+        if resident_page_ids.shape != page_token_counts.shape:
+            raise ValueError("Resolved page IDs and token-count shapes must match")
+        if resident_page_ids.ndim != 4:
             raise ValueError(
                 "Page metadata must have shape [batch, kv_heads, clusters, pages]"
             )
         if primary_token_mask.dtype != torch.bool:
             raise ValueError("Primary token mask must be boolean")
-        if primary_token_indices.dtype not in (torch.int32, torch.int64):
+        if primary_token_indices.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
             raise ValueError("Primary token indices must be integral")
-        if page_ids.dtype not in (torch.int32, torch.int64):
-            raise ValueError("Page IDs must be integral")
-        if page_token_counts.dtype not in (torch.int32, torch.int64):
+        if resident_page_ids.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError("Resident page IDs must be integral")
+        if staging_page_ids.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError("Staging page IDs must be integral")
+        if page_token_counts.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
             raise ValueError("Page token counts must be integral")
-        if block_table.dtype not in (torch.int32, torch.int64):
+        if block_table.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
             raise ValueError("Block table entries must be integral")
         if key_cache.device.type != "cuda":
             raise ValueError("Triton exact execution requires CUDA tensors")
 
         batch_size, num_kv_heads, max_primary_tokens = primary_token_indices.shape
-        if page_ids.shape[:2] != (batch_size, num_kv_heads):
+        if resident_page_ids.shape[:2] != (
+            batch_size,
+            num_kv_heads,
+        ):
             raise ValueError("Primary and clustered metadata batch shapes must match")
         if block_table.shape[0] != batch_size:
             raise ValueError("Block table batch size does not match exact metadata")
@@ -396,43 +421,77 @@ class RetroSpecExactExecutionBuffer:
             block_table,
             primary_token_indices,
             primary_token_mask,
-            page_ids,
+            resident_page_ids,
+            staging_page_ids,
             page_token_counts,
         ):
             if tensor.device != device:
                 raise ValueError("All exact execution tensors must be on one device")
 
-        max_page_slots = page_ids.shape[2] * page_ids.shape[3]
+        max_page_slots = resident_page_ids.shape[2] * resident_page_ids.shape[3]
+
+        page_sources = (
+            (
+                "Resident",
+                resident_key_pages,
+                resident_value_pages,
+            ),
+            (
+                "Staging",
+                staging_key_pages,
+                staging_value_pages,
+            ),
+        )
+
         if max_page_slots:
-            if cluster_key_pages is None or cluster_value_pages is None:
-                raise RuntimeError("Cluster page storage is required by the selection")
-            if cluster_key_pages.shape != cluster_value_pages.shape:
-                raise ValueError("Cluster key and value page shapes must match")
-            if cluster_key_pages.ndim != 3:
-                raise ValueError(
-                    "Cluster pages must have shape [pages, page_size, head_size]"
-                )
-            if cluster_key_pages.shape[1:] != (
-                self.page_size,
-                head_size,
-            ):
-                raise ValueError("Cluster page shape does not match execution layout")
-            if cluster_key_pages.dtype != dtype or cluster_value_pages.dtype != dtype:
-                raise ValueError("Cluster page dtype does not match primary KV")
-            if (
-                cluster_key_pages.device != device
-                or cluster_value_pages.device != device
-            ):
-                raise ValueError("Cluster pages must be on the execution device")
+            for (
+                source_name,
+                source_key_pages,
+                source_value_pages,
+            ) in page_sources:
+                if source_key_pages is None or source_value_pages is None:
+                    raise RuntimeError(
+                        f"{source_name} cluster page storage is required "
+                        "by the selection"
+                    )
+                if source_key_pages.shape != source_value_pages.shape:
+                    raise ValueError(
+                        f"{source_name} key and value page shapes must match"
+                    )
+                if source_key_pages.ndim != 3:
+                    raise ValueError(
+                        f"{source_name} pages must have shape "
+                        "[pages, page_size, head_size]"
+                    )
+                if source_key_pages.shape[1:] != (
+                    self.page_size,
+                    head_size,
+                ):
+                    raise ValueError(
+                        f"{source_name} page shape does not match execution layout"
+                    )
+                if source_key_pages.dtype != dtype or source_value_pages.dtype != dtype:
+                    raise ValueError(
+                        f"{source_name} page dtype does not match primary KV"
+                    )
+                if (
+                    source_key_pages.device != device
+                    or source_value_pages.device != device
+                ):
+                    raise ValueError(
+                        f"{source_name} pages must be on the execution device"
+                    )
 
-        self._check_or_set_configuration(dtype, device, head_size)
+        self._check_or_set_configuration(
+            dtype,
+            device,
+            head_size,
+        )
 
-        # The Triton kernels address selection metadata as flat arrays. The
-        # index normally produces contiguous tensors, but making that contract
-        # explicit here also keeps direct callers correct.
         primary_token_indices = primary_token_indices.contiguous()
         primary_token_mask = primary_token_mask.contiguous()
-        page_ids = page_ids.contiguous()
+        resident_page_ids = resident_page_ids.contiguous()
+        staging_page_ids = staging_page_ids.contiguous()
         page_token_counts = page_token_counts.contiguous()
 
         num_sequences = batch_size * num_kv_heads
@@ -491,6 +550,7 @@ class RetroSpecExactExecutionBuffer:
             primary_prefix = self._prefix_buffer[: primary_token_mask.numel()].view_as(
                 primary_token_mask
             )
+
             torch.cumsum(
                 primary_token_mask,
                 dim=2,
@@ -498,7 +558,12 @@ class RetroSpecExactExecutionBuffer:
                 out=primary_prefix,
             )
 
-            _pack_primary_exact_kernel[(num_sequences, max_primary_tokens)](
+            _pack_primary_exact_kernel[
+                (
+                    num_sequences,
+                    max_primary_tokens,
+                )
+            ](
                 key_cache,
                 value_cache,
                 block_table,
@@ -526,17 +591,21 @@ class RetroSpecExactExecutionBuffer:
             )
 
         if num_sequences and max_page_slots:
-            assert cluster_key_pages is not None
-            assert cluster_value_pages is not None
-
-            flat_page_ids = page_ids.reshape(
+            flat_resident_page_ids = resident_page_ids.reshape(
                 batch_size,
                 num_kv_heads,
                 max_page_slots,
             )
+            flat_staging_page_ids = staging_page_ids.reshape(
+                batch_size,
+                num_kv_heads,
+                max_page_slots,
+            )
+
             page_prefix = self._prefix_buffer[: page_token_counts.numel()].view_as(
                 flat_page_token_counts
             )
+
             torch.cumsum(
                 flat_page_token_counts,
                 dim=2,
@@ -544,33 +613,59 @@ class RetroSpecExactExecutionBuffer:
                 out=page_prefix,
             )
 
-            _pack_cluster_pages_kernel[
+            page_pack_sources = (
                 (
-                    num_sequences,
-                    max_page_slots,
-                    self.page_size,
-                )
-            ](
-                cluster_key_pages,
-                cluster_value_pages,
-                flat_page_ids,
-                flat_page_token_counts,
-                page_prefix,
-                primary_token_counts,
-                cu_seqlens_k,
-                execution_keys,
-                execution_values,
-                cluster_key_pages.stride(0),
-                cluster_key_pages.stride(1),
-                cluster_key_pages.stride(2),
-                cluster_value_pages.stride(0),
-                cluster_value_pages.stride(1),
-                cluster_value_pages.stride(2),
-                MAX_PAGE_SLOTS=max_page_slots,
-                PAGE_SIZE=self.page_size,
-                HEAD_SIZE=head_size,
-                BLOCK_D=block_d,
+                    resident_key_pages,
+                    resident_value_pages,
+                    flat_resident_page_ids,
+                ),
+                (
+                    staging_key_pages,
+                    staging_value_pages,
+                    flat_staging_page_ids,
+                ),
             )
+
+            for (
+                source_key_pages,
+                source_value_pages,
+                source_page_ids,
+            ) in page_pack_sources:
+                assert source_key_pages is not None
+                assert source_value_pages is not None
+
+                # An empty source means this selection contains no pages from
+                # that source. The other source still writes its positions.
+                if source_key_pages.shape[0] == 0:
+                    continue
+
+                _pack_cluster_pages_kernel[
+                    (
+                        num_sequences,
+                        max_page_slots,
+                        self.page_size,
+                    )
+                ](
+                    source_key_pages,
+                    source_value_pages,
+                    source_page_ids,
+                    flat_page_token_counts,
+                    page_prefix,
+                    primary_token_counts,
+                    cu_seqlens_k,
+                    execution_keys,
+                    execution_values,
+                    source_key_pages.stride(0),
+                    source_key_pages.stride(1),
+                    source_key_pages.stride(2),
+                    source_value_pages.stride(0),
+                    source_value_pages.stride(1),
+                    source_value_pages.stride(2),
+                    MAX_PAGE_SLOTS=max_page_slots,
+                    PAGE_SIZE=self.page_size,
+                    HEAD_SIZE=head_size,
+                    BLOCK_D=block_d,
+                )
 
         return RetroSpecExactExecution(
             keys=execution_keys,

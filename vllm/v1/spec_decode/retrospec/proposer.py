@@ -56,10 +56,6 @@ class RetroSpecProposer:
             raise NotImplementedError(
                 "RetroSpec currently requires padded drafter batches."
             )
-        if config.retrospec_cache_mode != "gpu_reference":
-            raise NotImplementedError(
-                "RetroSpec CPU-offloaded KV cache is not implemented yet."
-            )
         if vllm_config.scheduler_config.async_scheduling:
             raise NotImplementedError(
                 "RetroSpec does not support async scheduling yet."

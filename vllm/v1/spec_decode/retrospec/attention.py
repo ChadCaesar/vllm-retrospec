@@ -719,13 +719,30 @@ class RetroSpecSparseAttention:
                     "RetroSpec exact execution buffer is not initialized"
                 )
 
-            cluster_key_pages: torch.Tensor | None = None
-            cluster_value_pages: torch.Tensor | None = None
+            resident_page_ids = selection.exact_page_ids
+            staging_page_ids = torch.full_like(
+                selection.exact_page_ids,
+                -1,
+            )
+
+            resident_key_pages: torch.Tensor | None = None
+            resident_value_pages: torch.Tensor | None = None
+            staging_key_pages: torch.Tensor | None = None
+            staging_value_pages: torch.Tensor | None = None
 
             if selection.exact_page_ids.numel():
-                cluster_key_pages, cluster_value_pages = (
-                    self.index.cluster_store.get_page_storage(selection.plan.layer_name)
+                resolved_pages = self.index.cluster_store.resolve_cluster_pages(
+                    selection.plan.layer_name,
+                    selection.exact_page_ids,
                 )
+
+                resident_page_ids = resolved_pages.resident_page_ids
+                staging_page_ids = resolved_pages.staging_page_ids
+
+                resident_key_pages = resolved_pages.resident_key_pages
+                resident_value_pages = resolved_pages.resident_value_pages
+                staging_key_pages = resolved_pages.staging_key_pages
+                staging_value_pages = resolved_pages.staging_value_pages
 
             execution = self.exact_execution_buffer.pack(
                 key_cache=key_cache,
@@ -733,10 +750,13 @@ class RetroSpecSparseAttention:
                 block_table=attn_metadata.block_table,
                 primary_token_indices=(selection.plan.primary_exact_token_indices),
                 primary_token_mask=(selection.plan.primary_exact_token_mask),
-                page_ids=selection.exact_page_ids,
+                resident_page_ids=resident_page_ids,
+                staging_page_ids=staging_page_ids,
                 page_token_counts=(selection.exact_page_token_counts),
-                cluster_key_pages=cluster_key_pages,
-                cluster_value_pages=cluster_value_pages,
+                resident_key_pages=resident_key_pages,
+                resident_value_pages=resident_value_pages,
+                staging_key_pages=staging_key_pages,
+                staging_value_pages=staging_value_pages,
             )
 
             return self._run_grouped_flash_exact_attention(

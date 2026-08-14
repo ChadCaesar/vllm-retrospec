@@ -405,6 +405,87 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     assert store.num_resident_clusters("layer") == 0
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required to resolve cluster pages",
+)
+def test_cpu_backing_store_resolves_resident_and_staging_pages():
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store.store_clusters(
+        "layer",
+        keys.cuda(),
+        values.cuda(),
+        assignments.cuda(),
+        cluster_token_counts.cuda(),
+    )
+
+    resolved = store.resolve_cluster_pages("layer", table.page_ids)
+    torch.cuda.current_stream().synchronize()
+
+    valid_pages = table.page_ids >= 0
+    resident_pages = resolved.resident_page_ids >= 0
+    staging_pages = resolved.staging_page_ids >= 0
+
+    assert torch.equal(resident_pages | staging_pages, valid_pages)
+    assert not torch.any(resident_pages & staging_pages)
+    assert resident_pages.sum().item() == 3
+    assert staging_pages.sum().item() == 3
+
+    backing_keys, backing_values = store.get_page_storage("layer")
+    resident_slots = resolved.resident_page_ids[resident_pages].to(torch.int64)
+    resident_logical_ids = table.page_ids[resident_pages].cpu().to(torch.int64)
+    staging_slots = resolved.staging_page_ids[staging_pages].to(torch.int64)
+    staging_logical_ids = table.page_ids[staging_pages].cpu().to(torch.int64)
+
+    torch.testing.assert_close(
+        resolved.resident_key_pages.index_select(0, resident_slots).cpu(),
+        backing_keys.index_select(0, resident_logical_ids),
+    )
+    torch.testing.assert_close(
+        resolved.resident_value_pages.index_select(0, resident_slots).cpu(),
+        backing_values.index_select(0, resident_logical_ids),
+    )
+    torch.testing.assert_close(
+        resolved.staging_key_pages.index_select(0, staging_slots).cpu(),
+        backing_keys.index_select(0, staging_logical_ids),
+    )
+    torch.testing.assert_close(
+        resolved.staging_value_pages.index_select(0, staging_slots).cpu(),
+        backing_values.index_select(0, staging_logical_ids),
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required to resolve cluster pages",
+)
+def test_gpu_reference_store_resolves_without_staging():
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store.store_clusters(
+        "layer",
+        keys.cuda(),
+        values.cuda(),
+        assignments.cuda(),
+        cluster_token_counts.cuda(),
+    )
+
+    resolved = store.resolve_cluster_pages("layer", table.page_ids)
+    stored_keys, stored_values = store.get_page_storage("layer")
+
+    assert torch.equal(resolved.resident_page_ids, table.page_ids)
+    assert torch.all(resolved.staging_page_ids == -1)
+    assert resolved.resident_key_pages is stored_keys
+    assert resolved.resident_value_pages is stored_values
+    assert resolved.staging_key_pages.shape[0] == 0
+    assert resolved.staging_value_pages.shape[0] == 0
+
+
 def test_gpu_reference_store_rejects_resident_cache_operations():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()

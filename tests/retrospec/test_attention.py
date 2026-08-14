@@ -17,6 +17,9 @@ from vllm.v1.spec_decode.retrospec.attention import (
     RetroSpecAttentionMode,
     RetroSpecSparseAttention,
 )
+from vllm.v1.spec_decode.retrospec.cluster_store import (
+    RetroSpecResolvedClusterPages,
+)
 from vllm.v1.spec_decode.retrospec.execution import RetroSpecExactExecution
 from vllm.v1.spec_decode.retrospec.index import (
     RetroSpecAttentionLevel,
@@ -716,6 +719,111 @@ def test_get_grouped_estimation_keeps_token_layout():
     assert keys is selection.estimation_keys
     assert values is selection.estimation_values
     assert counts is selection.estimation_token_counts
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_exact_attention_resolves_resident_and_staging_pages():
+    controller = make_controller(
+        index_mode="segmented_cluster",
+        cache_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
+
+    device = torch.device("cuda")
+    page_ids = torch.tensor([[[[0, 1]]]], dtype=torch.int64, device=device)
+    page_counts = torch.tensor([[[[2, 1]]]], dtype=torch.int32, device=device)
+    plan = RetroSpecTokenSelectionPlan(
+        layer_name="layer",
+        primary_exact_token_indices=torch.empty(
+            1, 1, 0, dtype=torch.int64, device=device
+        ),
+        primary_exact_token_mask=torch.empty(1, 1, 0, dtype=torch.bool, device=device),
+        sparse_exact_page_ids=page_ids,
+        sparse_exact_page_token_counts=page_counts,
+        sparse_estimation_keys=torch.empty(1, 1, 0, 1, device=device),
+        sparse_estimation_values=torch.empty(1, 1, 0, 1, device=device),
+        sparse_estimation_token_counts=torch.empty(
+            1, 1, 0, dtype=torch.int32, device=device
+        ),
+        expanded_exact_page_ids=page_ids,
+        expanded_exact_page_token_counts=page_counts,
+        expanded_estimation_keys=torch.empty(1, 1, 0, 1, device=device),
+        expanded_estimation_values=torch.empty(1, 1, 0, 1, device=device),
+        expanded_estimation_token_counts=torch.empty(
+            1, 1, 0, dtype=torch.int32, device=device
+        ),
+        sparse_attn=torch.ones(1, device=device),
+        expanded_attn=torch.ones(1, device=device),
+    )
+    selection = RetroSpecTokenAttentionSelection(
+        exact_page_ids=page_ids,
+        exact_page_token_counts=page_counts,
+        exact_token_counts=torch.tensor([[3]], dtype=torch.int32, device=device),
+        estimation_keys=plan.sparse_estimation_keys,
+        estimation_values=plan.sparse_estimation_values,
+        estimation_token_counts=plan.sparse_estimation_token_counts,
+        attention_mass=torch.ones(1, device=device),
+        plan=plan,
+    )
+
+    resident_page_ids = torch.tensor([[[[0, -1]]]], dtype=torch.int64, device=device)
+    staging_page_ids = torch.tensor([[[[-1, 0]]]], dtype=torch.int64, device=device)
+    resident_keys = torch.zeros(1, 2, 1, dtype=torch.float16, device=device)
+    resident_values = resident_keys.clone()
+    staging_keys = torch.ones(1, 2, 1, dtype=torch.float16, device=device)
+    staging_values = staging_keys.clone()
+    resolved = RetroSpecResolvedClusterPages(
+        resident_page_ids=resident_page_ids,
+        staging_page_ids=staging_page_ids,
+        resident_key_pages=resident_keys,
+        resident_value_pages=resident_values,
+        staging_key_pages=staging_keys,
+        staging_value_pages=staging_values,
+    )
+    controller.index.cluster_store.resolve_cluster_pages = Mock(return_value=resolved)
+
+    execution = make_exact_execution(
+        torch.zeros(1, 1, 3, 1, dtype=torch.float16, device=device),
+        torch.zeros(1, 1, 3, 1, dtype=torch.float16, device=device),
+        torch.ones(1, 1, 3, dtype=torch.bool, device=device),
+    )
+    pack = Mock(return_value=execution)
+    controller.exact_execution_buffer = SimpleNamespace(pack=pack)
+    expected_output = (
+        torch.zeros(1, 1, 1, dtype=torch.float16, device=device),
+        torch.zeros(1, 1, dtype=torch.float32, device=device),
+    )
+    controller._run_grouped_flash_exact_attention = Mock(return_value=expected_output)
+
+    key_cache = torch.zeros(1, 2, 1, 1, dtype=torch.float16, device=device)
+    value_cache = key_cache.clone()
+    result = controller._run_exact_attention(
+        cast(FlashAttentionImpl, SimpleNamespace()),
+        cast(torch.nn.Module, SimpleNamespace()),
+        torch.zeros(1, 1, 1, dtype=torch.float16, device=device),
+        key_cache,
+        value_cache,
+        cast(
+            FlashAttentionMetadata,
+            SimpleNamespace(
+                block_table=torch.zeros(1, 1, dtype=torch.int32, device=device)
+            ),
+        ),
+        selection,
+    )
+
+    assert result is expected_output
+    controller.index.cluster_store.resolve_cluster_pages.assert_called_once_with(
+        "layer", page_ids
+    )
+    call = pack.call_args.kwargs
+    assert call["resident_page_ids"] is resident_page_ids
+    assert call["staging_page_ids"] is staging_page_ids
+    assert call["resident_key_pages"] is resident_keys
+    assert call["resident_value_pages"] is resident_values
+    assert call["staging_key_pages"] is staging_keys
+    assert call["staging_value_pages"] is staging_values
 
 
 def test_verification_reuses_draft_selection_plan_without_reranking():

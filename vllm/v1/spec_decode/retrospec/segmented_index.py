@@ -1596,6 +1596,20 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 )
             )
 
+            if clustered_keys.device != key_cache.device:
+                clustered_keys = clustered_keys.to(
+                    device=key_cache.device,
+                    non_blocking=False,
+                )
+                clustered_values = clustered_values.to(
+                    device=value_cache.device,
+                    non_blocking=False,
+                )
+                clustered_mask = clustered_mask.to(
+                    device=key_cache.device,
+                    non_blocking=False,
+                )
+
         exact_keys = torch.cat(
             (primary_keys, clustered_keys),
             dim=2,

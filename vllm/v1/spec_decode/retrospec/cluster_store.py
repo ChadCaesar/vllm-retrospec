@@ -35,6 +35,28 @@ class RetroSpecClusterPageTable:
     page_token_counts: torch.Tensor
 
 
+@dataclass(frozen=True)
+class RetroSpecResolvedClusterPages:
+    """GPU page sources resolving one logical cluster selection.
+
+    resident_page_ids and staging_page_ids have the same shape as the input
+    logical page table. Exactly one of them is non-negative for every valid
+    selected page.
+
+    resident_page_ids address resident_key_pages and resident_value_pages.
+    staging_page_ids address staging_key_pages and staging_value_pages.
+    """
+
+    resident_page_ids: torch.Tensor
+    staging_page_ids: torch.Tensor
+
+    resident_key_pages: torch.Tensor
+    resident_value_pages: torch.Tensor
+
+    staging_key_pages: torch.Tensor
+    staging_value_pages: torch.Tensor
+
+
 class _LayerClusterPagePool:
     """Growable cluster backing-page pool for one attention layer."""
 
@@ -778,6 +800,139 @@ class RetroSpecClusterPageStore:
             )
 
         return pool.storage_device
+
+    @staticmethod
+    def _stage_missing_pages(
+        pool: _LayerClusterPagePool,
+        logical_page_ids: torch.Tensor,
+        miss_cluster_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Copy non-resident selected pages into a temporary GPU page pool."""
+        if logical_page_ids.ndim < 1:
+            raise ValueError("Logical page IDs must have at least one dimension")
+        if miss_cluster_mask.shape != logical_page_ids.shape[:-1]:
+            raise ValueError("Miss-cluster mask does not match logical page IDs")
+        if pool.metadata_device.type != "cuda":
+            raise RuntimeError("Temporary cluster-page staging requires CUDA metadata")
+
+        logical_page_ids_cpu = logical_page_ids.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        )
+        miss_cluster_mask_cpu = miss_cluster_mask.detach().to(
+            device="cpu",
+            dtype=torch.bool,
+        )
+
+        missing_page_mask_cpu = miss_cluster_mask_cpu.unsqueeze(-1) & (
+            logical_page_ids_cpu >= 0
+        )
+
+        missing_page_mask = miss_cluster_mask.unsqueeze(-1) & (logical_page_ids >= 0)
+        staging_page_ids = torch.full_like(
+            logical_page_ids,
+            -1,
+            dtype=torch.int64,
+        )
+        num_staging_pages = int(missing_page_mask_cpu.sum().item())
+
+        if num_staging_pages:
+            staging_page_ids.masked_scatter_(
+                missing_page_mask,
+                torch.arange(
+                    num_staging_pages,
+                    dtype=torch.int64,
+                    device=pool.metadata_device,
+                ),
+            )
+
+        staging_shape = (
+            num_staging_pages,
+            pool.page_size,
+            pool.head_size,
+        )
+        staging_key_pages = torch.empty(
+            staging_shape,
+            dtype=pool.dtype,
+            device=pool.metadata_device,
+        )
+        staging_value_pages = torch.empty_like(staging_key_pages)
+
+        missing_logical_page_ids = logical_page_ids_cpu[missing_page_mask_cpu].tolist()
+
+        for staging_page_id, logical_page_id in enumerate(missing_logical_page_ids):
+            staging_key_pages[staging_page_id].copy_(
+                pool.key_pages[logical_page_id],
+                non_blocking=pool.pin_memory,
+            )
+            staging_value_pages[staging_page_id].copy_(
+                pool.value_pages[logical_page_id],
+                non_blocking=pool.pin_memory,
+            )
+
+        return (
+            staging_page_ids,
+            staging_key_pages,
+            staging_value_pages,
+        )
+
+    def resolve_cluster_pages(
+        self,
+        layer_name: str,
+        logical_page_ids: torch.Tensor,
+    ) -> RetroSpecResolvedClusterPages:
+        """Resolve logical pages into GPU resident and staging page sources."""
+        pool = self._layer_pools.get(layer_name)
+        if pool is None:
+            raise RuntimeError(
+                f"No RetroSpec page pool exists for layer {layer_name!r}"
+            )
+
+        if not self.is_cpu_backed:
+            staging_page_ids = torch.full_like(
+                logical_page_ids,
+                -1,
+            )
+            return RetroSpecResolvedClusterPages(
+                resident_page_ids=logical_page_ids,
+                staging_page_ids=staging_page_ids,
+                resident_key_pages=pool.key_pages,
+                resident_value_pages=pool.value_pages,
+                staging_key_pages=pool.key_pages[:0],
+                staging_value_pages=pool.value_pages[:0],
+            )
+
+        pool, resident_cache = self._get_or_create_resident_cache(layer_name)
+
+        resident_access = resident_cache.admit(
+            logical_page_ids,
+            pool.allocated_page_ids,
+            pool.key_pages,
+            pool.value_pages,
+        )
+
+        (
+            staging_page_ids,
+            staging_key_pages,
+            staging_value_pages,
+        ) = self._stage_missing_pages(
+            pool,
+            logical_page_ids,
+            resident_access.miss_cluster_mask,
+        )
+
+        # Staging copies were submitted on the current stream after admission.
+        # Insert the resident-copy event after staging so both H2D paths may overlap.
+        resident_cache.wait_for_pending_copies()
+
+        return RetroSpecResolvedClusterPages(
+            resident_page_ids=resident_access.cache_page_ids,
+            staging_page_ids=staging_page_ids,
+            resident_key_pages=resident_cache.key_pages,
+            resident_value_pages=resident_cache.value_pages,
+            staging_key_pages=staging_key_pages,
+            staging_value_pages=staging_value_pages,
+        )
 
     def lookup_resident_pages(
         self,
