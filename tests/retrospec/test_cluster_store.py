@@ -380,8 +380,8 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     assert store.resident_capacity("layer") == 3
     assert store.num_resident_pages("layer") == 3
     assert store.num_resident_clusters("layer") == 2
-    assert access.hit_cluster_mask.tolist() == [[True, True], [False, False]]
-    assert access.miss_cluster_mask.tolist() == [[False, False], [True, True]]
+    assert access.hit_cluster_mask.tolist() == [[True, False], [True, False]]
+    assert access.miss_cluster_mask.tolist() == [[False, True], [False, True]]
     assert len(resident_cache._pending_copy_batches) == 1
 
     cache_keys, cache_values = store.get_resident_page_storage("layer")
@@ -409,7 +409,7 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     not torch.cuda.is_available(),
     reason="CUDA is required to resolve cluster pages",
 )
-def test_cpu_backing_store_resolves_resident_and_staging_pages():
+def test_cpu_backing_store_stages_before_updating_resident_cache():
     store = RetroSpecClusterPageStore(
         page_size=2,
         storage_mode="cpu_offload",
@@ -433,31 +433,23 @@ def test_cpu_backing_store_resolves_resident_and_staging_pages():
 
     assert torch.equal(resident_pages | staging_pages, valid_pages)
     assert not torch.any(resident_pages & staging_pages)
-    assert resident_pages.sum().item() == 3
-    assert staging_pages.sum().item() == 3
+    assert resident_pages.sum().item() == 0
+    assert staging_pages.sum().item() == 6
     assert resolved.hit_cluster_mask.tolist() == [
-        [True, True],
+        [False, False],
         [False, False],
     ]
     assert resolved.miss_cluster_mask.tolist() == [
-        [False, False],
+        [True, True],
         [True, True],
     ]
+    assert store.num_resident_pages("layer") == 0
+    assert store.num_resident_clusters("layer") == 0
 
     backing_keys, backing_values = store.get_page_storage("layer")
-    resident_slots = resolved.resident_page_ids[resident_pages].to(torch.int64)
-    resident_logical_ids = table.page_ids[resident_pages].cpu().to(torch.int64)
     staging_slots = resolved.staging_page_ids[staging_pages].to(torch.int64)
     staging_logical_ids = table.page_ids[staging_pages].cpu().to(torch.int64)
 
-    torch.testing.assert_close(
-        resolved.resident_key_pages.index_select(0, resident_slots).cpu(),
-        backing_keys.index_select(0, resident_logical_ids),
-    )
-    torch.testing.assert_close(
-        resolved.resident_value_pages.index_select(0, resident_slots).cpu(),
-        backing_values.index_select(0, resident_logical_ids),
-    )
     torch.testing.assert_close(
         resolved.staging_key_pages.index_select(0, staging_slots).cpu(),
         backing_keys.index_select(0, staging_logical_ids),
@@ -465,6 +457,38 @@ def test_cpu_backing_store_resolves_resident_and_staging_pages():
     torch.testing.assert_close(
         resolved.staging_value_pages.index_select(0, staging_slots).cpu(),
         backing_values.index_select(0, staging_logical_ids),
+    )
+
+    access = store.admit_staged_clusters(
+        layer_name="layer",
+        logical_page_ids=table.page_ids,
+        staging_page_ids=resolved.staging_page_ids,
+        staging_key_pages=resolved.staging_key_pages,
+        staging_value_pages=resolved.staging_value_pages,
+    )
+
+    assert access.hit_cluster_mask.tolist() == [
+        [True, False],
+        [True, False],
+    ]
+    assert access.miss_cluster_mask.tolist() == [
+        [False, True],
+        [False, True],
+    ]
+    assert store.num_resident_pages("layer") == 3
+    assert store.num_resident_clusters("layer") == 2
+
+    resident_keys, resident_values = store.get_resident_page_storage("layer")
+    resident_pages = access.cache_page_ids >= 0
+    resident_slots = access.cache_page_ids[resident_pages].to(torch.int64)
+    resident_logical_ids = table.page_ids[resident_pages].cpu().to(torch.int64)
+    torch.testing.assert_close(
+        resident_keys.index_select(0, resident_slots).cpu(),
+        backing_keys.index_select(0, resident_logical_ids),
+    )
+    torch.testing.assert_close(
+        resident_values.index_select(0, resident_slots).cpu(),
+        backing_values.index_select(0, resident_logical_ids),
     )
 
 
@@ -496,7 +520,7 @@ def test_cpu_backing_store_resident_only_resolution_does_not_admit_misses():
     resolved = store.resolve_cluster_pages(
         "layer",
         table.page_ids,
-        admit_missing=False,
+        mode="resident_only",
     )
 
     assert torch.equal(
@@ -507,12 +531,12 @@ def test_cpu_backing_store_resident_only_resolution_does_not_admit_misses():
     assert resolved.staging_key_pages.shape[0] == 0
     assert resolved.staging_value_pages.shape[0] == 0
     assert resolved.hit_cluster_mask.tolist() == [
-        [True, True],
-        [False, False],
+        [True, False],
+        [True, False],
     ]
     assert resolved.miss_cluster_mask.tolist() == [
-        [False, False],
-        [True, True],
+        [False, True],
+        [False, True],
     ]
     assert store.num_resident_pages("layer") == resident_pages_before
     assert store.num_resident_clusters("layer") == resident_clusters_before
@@ -556,6 +580,13 @@ def test_gpu_reference_store_rejects_resident_cache_operations():
 
     with pytest.raises(RuntimeError, match="only used by CPU-backed"):
         store.lookup_resident_pages("layer", table.page_ids)
+
+    with pytest.raises(ValueError, match="Unsupported RetroSpec cluster resolve mode"):
+        store.resolve_cluster_pages(
+            "layer",
+            table.page_ids,
+            mode="invalid",  # type: ignore[arg-type]
+        )
 
 
 def test_cluster_store_rejects_invalid_storage_metadata():

@@ -531,6 +531,85 @@ def test_token_exact_attention_uses_reference_fallback_on_cpu():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
+    controller = make_controller(
+        index_mode="segmented_cluster",
+        cache_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
+    controller.mode = RetroSpecAttentionMode.SPARSE_VERIFY
+
+    device = torch.device("cuda")
+    page_ids = torch.tensor([[[[0]]]], dtype=torch.int64, device=device)
+    page_counts = torch.ones_like(page_ids, dtype=torch.int32)
+    base_plan = make_token_plan(1, 1, exact_width=0, estimation_width=0)
+    plan = replace(
+        base_plan,
+        sparse_exact_page_ids=page_ids,
+        sparse_exact_page_token_counts=page_counts,
+    )
+    selection = RetroSpecTokenAttentionSelection(
+        exact_page_ids=page_ids,
+        exact_page_token_counts=page_counts,
+        exact_token_counts=torch.ones(1, 1, dtype=torch.int32, device=device),
+        estimation_keys=plan.sparse_estimation_keys,
+        estimation_values=plan.sparse_estimation_values,
+        estimation_token_counts=plan.sparse_estimation_token_counts,
+        attention_mass=torch.ones(1, device=device),
+        plan=plan,
+        resolved_pages=None,
+    )
+    exact_keys = torch.ones(1, 1, 1, 1, device=device)
+    reference_exact = (
+        exact_keys,
+        exact_keys.clone(),
+        torch.ones(1, 1, 1, dtype=torch.bool, device=device),
+    )
+    expected = (
+        torch.ones(1, 1, 1, device=device),
+        torch.zeros(1, 1, device=device),
+    )
+    call_order: list[str] = []
+
+    with (
+        patch.object(
+            controller.index,
+            "materialize_exact_reference",
+            side_effect=lambda *_: call_order.append("materialize") or reference_exact,
+        ),
+        patch.object(
+            controller.index.cluster_store,
+            "admit_resident_clusters",
+            side_effect=lambda *_: call_order.append("admit"),
+        ) as admit,
+        patch.object(
+            controller,
+            "_run_grouped_reference_attention",
+            side_effect=lambda *_: call_order.append("attention") or expected,
+        ),
+    ):
+        result = controller._run_exact_attention(
+            cast(FlashAttentionImpl, SimpleNamespace()),
+            cast(torch.nn.Module, SimpleNamespace()),
+            torch.ones(1, 1, 1, dtype=torch.float32, device=device),
+            torch.empty(0, device=device),
+            torch.empty(0, device=device),
+            cast(
+                FlashAttentionMetadata,
+                SimpleNamespace(
+                    block_table=torch.empty(1, 0, dtype=torch.int32, device=device)
+                ),
+            ),
+            selection,
+        )
+
+    assert result is expected
+    admit.assert_called_once_with("layer", page_ids)
+    assert call_order == ["materialize", "admit", "attention"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_grouped_flash_exact_attention_matches_reference_on_cuda():
     device = torch.device("cuda")
     torch.manual_seed(0)
@@ -725,10 +804,19 @@ def test_get_grouped_estimation_keeps_token_layout():
     assert counts is selection.estimation_token_counts
 
 
-@pytest.mark.parametrize("pre_resolved", [False, True])
+@pytest.mark.parametrize(
+    ("pre_resolved", "attention_mode", "expect_admission"),
+    [
+        (False, RetroSpecAttentionMode.SPARSE_VERIFY, True),
+        (True, RetroSpecAttentionMode.SPARSE_VERIFY, True),
+        (True, RetroSpecAttentionMode.DRAFT, False),
+    ],
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_exact_attention_resolves_resident_and_staging_pages(
     pre_resolved: bool,
+    attention_mode: RetroSpecAttentionMode,
+    expect_admission: bool,
 ):
     controller = make_controller(
         index_mode="segmented_cluster",
@@ -736,10 +824,11 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         cache_ratio=0.5,
     )
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
+    controller.mode = attention_mode
 
     device = torch.device("cuda")
-    page_ids = torch.tensor([[[[0, 1]]]], dtype=torch.int64, device=device)
-    page_counts = torch.tensor([[[[2, 1]]]], dtype=torch.int32, device=device)
+    page_ids = torch.tensor([[[[0], [1]]]], dtype=torch.int64, device=device)
+    page_counts = torch.tensor([[[[2], [1]]]], dtype=torch.int32, device=device)
     plan = RetroSpecTokenSelectionPlan(
         layer_name="layer",
         primary_exact_token_indices=torch.empty(
@@ -775,8 +864,8 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         resolved_pages=None,
     )
 
-    resident_page_ids = torch.tensor([[[[0, -1]]]], dtype=torch.int64, device=device)
-    staging_page_ids = torch.tensor([[[[-1, 0]]]], dtype=torch.int64, device=device)
+    resident_page_ids = torch.tensor([[[[0], [-1]]]], dtype=torch.int64, device=device)
+    staging_page_ids = torch.tensor([[[[-1], [0]]]], dtype=torch.int64, device=device)
     resident_keys = torch.zeros(1, 2, 1, dtype=torch.float16, device=device)
     resident_values = resident_keys.clone()
     staging_keys = torch.ones(1, 2, 1, dtype=torch.float16, device=device)
@@ -789,8 +878,8 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         resident_value_pages=resident_values,
         staging_key_pages=staging_keys,
         staging_value_pages=staging_values,
-        hit_cluster_mask=torch.tensor([[[True]]], device=device),
-        miss_cluster_mask=torch.tensor([[[False]]], device=device),
+        hit_cluster_mask=torch.tensor([[[True, False]]], device=device),
+        miss_cluster_mask=torch.tensor([[[False, True]]], device=device),
         resident_ready_event=resident_ready_event,
     )
     if pre_resolved:
@@ -798,13 +887,19 @@ def test_exact_attention_resolves_resident_and_staging_pages(
 
     controller.index.cluster_store.resolve_cluster_pages = Mock(return_value=resolved)
 
+    call_order: list[str] = []
     execution = make_exact_execution(
         torch.zeros(1, 1, 3, 1, dtype=torch.float16, device=device),
         torch.zeros(1, 1, 3, 1, dtype=torch.float16, device=device),
         torch.ones(1, 1, 3, dtype=torch.bool, device=device),
     )
-    pack = Mock(return_value=execution)
+    pack = Mock(
+        side_effect=lambda **_: call_order.append("pack") or execution,
+    )
     controller.exact_execution_buffer = SimpleNamespace(pack=pack)
+    controller.index.cluster_store.admit_staged_clusters = Mock(
+        side_effect=lambda **_: call_order.append("admit"),
+    )
     expected_output = (
         torch.zeros(1, 1, 1, dtype=torch.float16, device=device),
         torch.zeros(1, 1, dtype=torch.float32, device=device),
@@ -833,8 +928,22 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         controller.index.cluster_store.resolve_cluster_pages.assert_not_called()
     else:
         controller.index.cluster_store.resolve_cluster_pages.assert_called_once_with(
-            "layer", page_ids
+            "layer",
+            page_ids,
+            mode="verification",
         )
+    if expect_admission:
+        controller.index.cluster_store.admit_staged_clusters.assert_called_once_with(
+            layer_name="layer",
+            logical_page_ids=page_ids,
+            staging_page_ids=staging_page_ids,
+            staging_key_pages=staging_keys,
+            staging_value_pages=staging_values,
+        )
+        assert call_order == ["pack", "admit"]
+    else:
+        controller.index.cluster_store.admit_staged_clusters.assert_not_called()
+        assert call_order == ["pack"]
     call = pack.call_args.kwargs
     assert call["resident_page_ids"] is resident_page_ids
     assert call["staging_page_ids"] is staging_page_ids

@@ -706,6 +706,22 @@ class RetroSpecSparseAttention:
                         attn_metadata.block_table,
                     )
                 )
+
+                if (
+                    self.mode
+                    in (
+                        RetroSpecAttentionMode.SPARSE_VERIFY,
+                        RetroSpecAttentionMode.EXPANDED_VERIFY,
+                    )
+                    and query.device.type == "cuda"
+                    and self.index.cluster_store.is_cpu_backed
+                    and selection.exact_page_ids.numel()
+                ):
+                    self.index.cluster_store.admit_resident_clusters(
+                        selection.plan.layer_name,
+                        selection.exact_page_ids,
+                    )
+
                 return self._run_grouped_reference_attention(
                     impl,
                     query,
@@ -737,6 +753,7 @@ class RetroSpecSparseAttention:
                 resolved_pages = self.index.cluster_store.resolve_cluster_pages(
                     selection.plan.layer_name,
                     selection.exact_page_ids,
+                    mode="verification",
                 )
 
             if resolved_pages is not None:
@@ -764,6 +781,28 @@ class RetroSpecSparseAttention:
                 staging_value_pages=staging_value_pages,
                 resident_ready_event=resident_ready_event,
             )
+
+            if (
+                self.mode
+                in (
+                    RetroSpecAttentionMode.SPARSE_VERIFY,
+                    RetroSpecAttentionMode.EXPANDED_VERIFY,
+                )
+                and self.index.cluster_store.is_cpu_backed
+                and selection.exact_page_ids.numel()
+            ):
+                if resolved_pages is None:
+                    raise RuntimeError(
+                        "Verification cache update requires resolved cluster pages"
+                    )
+
+                self.index.cluster_store.admit_staged_clusters(
+                    layer_name=selection.plan.layer_name,
+                    logical_page_ids=selection.exact_page_ids,
+                    staging_page_ids=resolved_pages.staging_page_ids,
+                    staging_key_pages=resolved_pages.staging_key_pages,
+                    staging_value_pages=resolved_pages.staging_value_pages,
+                )
 
             return self._run_grouped_flash_exact_attention(
                 impl,

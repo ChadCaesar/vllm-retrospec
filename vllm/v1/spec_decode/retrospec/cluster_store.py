@@ -16,6 +16,10 @@ RetroSpecClusterStorageMode = Literal[
     "gpu_reference",
     "cpu_offload",
 ]
+RetroSpecClusterResolveMode = Literal[
+    "resident_only",
+    "verification",
+]
 
 
 @dataclass(frozen=True)
@@ -890,18 +894,20 @@ class RetroSpecClusterPageStore:
         self,
         layer_name: str,
         logical_page_ids: torch.Tensor,
-        admit_missing: bool = True,
+        mode: RetroSpecClusterResolveMode = "verification",
     ) -> RetroSpecResolvedClusterPages:
-        """Resolve logical cluster pages to physical GPU sources.
+        """Resolve logical cluster pages for draft or verification.
 
-        When admit_missing is true, missing clusters are admitted to the bounded
-        resident cache when capacity permits. Remaining misses are copied to a
-        temporary staging buffer. This is the verification path.
+        resident_only performs a lookup without staging or admission. It is used
+        by draft attention.
 
-        When admit_missing is false, the resident cache is only queried. Missing
-        clusters remain unresolved and no H2D copy is submitted. This is the
-        latency-sensitive draft path.
+        verification snapshots the current resident hits and stages every current
+        miss. Cache admission is deliberately deferred until exact packing has
+        consumed these sources.
         """
+        if mode not in ("resident_only", "verification"):
+            raise ValueError(f"Unsupported RetroSpec cluster resolve mode: {mode}")
+
         pool = self._layer_pools.get(layer_name)
         if pool is None:
             raise RuntimeError(
@@ -929,14 +935,13 @@ class RetroSpecClusterPageStore:
 
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
-        if admit_missing:
-            resident_access = resident_cache.admit(
-                logical_page_ids,
-                pool.allocated_page_ids,
-                pool.key_pages,
-                pool.value_pages,
-            )
+        resident_access = resident_cache.lookup(
+            logical_page_ids,
+            pool.allocated_page_ids,
+            touch=True,
+        )
 
+        if mode == "verification":
             (
                 staging_page_ids,
                 staging_key_pages,
@@ -947,12 +952,6 @@ class RetroSpecClusterPageStore:
                 resident_access.miss_cluster_mask,
             )
         else:
-            resident_access = resident_cache.lookup(
-                logical_page_ids,
-                pool.allocated_page_ids,
-                touch=True,
-            )
-
             staging_page_ids = torch.full_like(
                 logical_page_ids,
                 -1,
@@ -1005,6 +1004,25 @@ class RetroSpecClusterPageStore:
             pool.allocated_page_ids,
             pool.key_pages,
             pool.value_pages,
+        )
+
+    def admit_staged_clusters(
+        self,
+        layer_name: str,
+        logical_page_ids: torch.Tensor,
+        staging_page_ids: torch.Tensor,
+        staging_key_pages: torch.Tensor,
+        staging_value_pages: torch.Tensor,
+    ) -> RetroSpecResidentPageAccess:
+        """Update the resident cache from verification staging pages."""
+        pool, resident_cache = self._get_or_create_resident_cache(layer_name)
+
+        return resident_cache.admit_staged(
+            page_ids=logical_page_ids,
+            allocated_page_ids=pool.allocated_page_ids,
+            staging_page_ids=staging_page_ids,
+            staging_key_pages=staging_key_pages,
+            staging_value_pages=staging_value_pages,
         )
 
     def get_resident_page_storage(

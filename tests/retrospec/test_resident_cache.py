@@ -68,8 +68,8 @@ def test_resident_cache_records_copy_batch_and_retains_sources():
 
     assert len(cache._pending_copy_batches) == 1
     pending = cache._pending_copy_batches[0]
-    assert pending.backing_key_pages is backing_keys
-    assert pending.backing_value_pages is backing_values
+    assert pending.source_key_pages is backing_keys
+    assert pending.source_value_pages is backing_values
 
     cache.synchronize_pending_copies()
     assert cache.num_pending_copy_batches == 0
@@ -201,14 +201,14 @@ def test_resident_cache_admits_cluster_atomic_priority_prefix():
 
 
 @pytest.mark.parametrize(
-    ("touch_first_cluster", "expected_hit_mask"),
+    ("touch_second_cluster", "expected_hit_mask"),
     [
-        (False, [False, True, True]),
-        (True, [True, False, True]),
+        (False, [True, False, True]),
+        (True, [False, True, True]),
     ],
 )
 def test_resident_cache_lookup_controls_lru_order(
-    touch_first_cluster: bool,
+    touch_second_cluster: bool,
     expected_hit_mask: list[bool],
 ):
     cache = make_cache(capacity=4)
@@ -216,7 +216,7 @@ def test_resident_cache_lookup_controls_lru_order(
     first_two = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
     cache.admit(first_two, set(range(6)), backing_keys, backing_values)
 
-    cache.lookup(first_two[:1], set(range(6)), touch=touch_first_cluster)
+    cache.lookup(first_two[1:], set(range(6)), touch=touch_second_cluster)
     cache.admit(
         torch.tensor([[4, 5]], dtype=torch.int64),
         set(range(6)),
@@ -230,6 +230,165 @@ def test_resident_cache_lookup_controls_lru_order(
     assert access.miss_cluster_mask.tolist() == [not hit for hit in expected_hit_mask]
 
 
+def test_resident_cache_interleaves_priority_across_groups():
+    cache = make_cache(capacity=2)
+    backing_keys, backing_values = make_backing_pages()
+
+    # Each row is one request/head group and the middle dimension is retrieval
+    # rank. Rank-major admission gives both groups their rank-zero cluster.
+    page_ids = torch.tensor(
+        [
+            [[0], [2]],
+            [[1], [3]],
+        ],
+        dtype=torch.int64,
+    )
+    access = cache.admit(
+        page_ids,
+        set(range(4)),
+        backing_keys,
+        backing_values,
+    )
+
+    assert access.hit_cluster_mask.tolist() == [
+        [True, False],
+        [True, False],
+    ]
+    assert access.miss_cluster_mask.tolist() == [
+        [False, True],
+        [False, True],
+    ]
+    resident_logical_page_ids = page_ids.masked_fill(
+        access.miss_cluster_mask.unsqueeze(-1),
+        -1,
+    )
+    assert_cached_pages_match_backing(
+        cache,
+        resident_logical_page_ids,
+        access.cache_page_ids,
+        backing_keys,
+        backing_values,
+    )
+
+
+def test_resident_cache_high_priority_misses_displace_lower_priority_hits():
+    cache = make_cache(capacity=2)
+    backing_keys, backing_values = make_backing_pages()
+    cache.admit(
+        torch.tensor([[2], [3]], dtype=torch.int64),
+        set(range(4)),
+        backing_keys,
+        backing_values,
+    )
+
+    page_ids = torch.tensor(
+        [
+            [[0], [2]],
+            [[1], [3]],
+        ],
+        dtype=torch.int64,
+    )
+    access = cache.admit(
+        page_ids,
+        set(range(4)),
+        backing_keys,
+        backing_values,
+    )
+
+    assert access.hit_cluster_mask.tolist() == [
+        [True, False],
+        [True, False],
+    ]
+    assert cache.lookup(
+        torch.tensor([[2], [3]]),
+        set(range(4)),
+        touch=False,
+    ).miss_cluster_mask.all()
+
+
+def test_resident_cache_keeps_rank_zero_cluster_most_recent():
+    cache = make_cache(capacity=2)
+    backing_keys, backing_values = make_backing_pages()
+    cache.admit(
+        torch.tensor([[0], [1]], dtype=torch.int64),
+        set(range(3)),
+        backing_keys,
+        backing_values,
+    )
+
+    cache.admit(
+        torch.tensor([[2]], dtype=torch.int64),
+        set(range(3)),
+        backing_keys,
+        backing_values,
+    )
+    access = cache.lookup(
+        torch.tensor([[0], [1], [2]], dtype=torch.int64),
+        set(range(3)),
+        touch=False,
+    )
+
+    assert access.hit_cluster_mask.tolist() == [True, False, True]
+
+
+def test_resident_cache_admits_from_gpu_staging_pages():
+    cache = make_cache(capacity=2)
+    source_keys_cpu, source_values_cpu = make_backing_pages(num_pages=2)
+    source_keys = source_keys_cpu.cuda()
+    source_values = source_values_cpu.cuda()
+    logical_page_ids = torch.tensor([[0, 1]], dtype=torch.int64, device="cuda")
+    staging_page_ids = torch.tensor([[1, 0]], dtype=torch.int64, device="cuda")
+
+    access = cache.admit_staged(
+        logical_page_ids,
+        {0, 1},
+        staging_page_ids,
+        source_keys,
+        source_values,
+    )
+
+    assert len(cache._pending_copy_batches) == 1
+    pending = cache._pending_copy_batches[0]
+    assert pending.source_key_pages is source_keys
+    assert pending.source_value_pages is source_values
+
+    logical_keys = source_keys_cpu.index_select(0, torch.tensor([1, 0]))
+    logical_values = source_values_cpu.index_select(0, torch.tensor([1, 0]))
+    assert_cached_pages_match_backing(
+        cache,
+        logical_page_ids.cpu(),
+        access.cache_page_ids.cpu(),
+        logical_keys,
+        logical_values,
+    )
+
+
+def test_resident_cache_validates_staging_sources_before_eviction():
+    cache = make_cache(capacity=1)
+    backing_keys, backing_values = make_backing_pages()
+    cache.admit(
+        torch.tensor([[1]], dtype=torch.int64),
+        {0, 1},
+        backing_keys,
+        backing_values,
+    )
+
+    with pytest.raises(RuntimeError, match="complete source pages"):
+        cache.admit_staged(
+            torch.tensor([[0]], dtype=torch.int64, device="cuda"),
+            {0, 1},
+            torch.tensor([[-1]], dtype=torch.int64, device="cuda"),
+            backing_keys.cuda(),
+            backing_values.cuda(),
+        )
+
+    assert cache.lookup(
+        torch.tensor([[1]], dtype=torch.int64),
+        {0, 1},
+        touch=False,
+    ).hit_cluster_mask.item()
+
+
 def test_resident_cache_resize_evicts_whole_clusters_and_preserves_storage():
     cache = make_cache(capacity=3)
     backing_keys, backing_values = make_backing_pages()
@@ -239,16 +398,16 @@ def test_resident_cache_resize_evicts_whole_clusters_and_preserves_storage():
     cache.resize(2)
     access = cache.lookup(page_ids, set(range(3)), touch=False)
 
-    assert access.hit_cluster_mask.tolist() == [False, True]
-    assert access.miss_cluster_mask.tolist() == [True, False]
+    assert access.hit_cluster_mask.tolist() == [True, False]
+    assert access.miss_cluster_mask.tolist() == [False, True]
     assert cache.capacity == 2
     assert cache.physical_capacity == 3
-    assert cache.num_resident_pages == 1
+    assert cache.num_resident_pages == 2
 
     cache.resize(5)
     assert cache.capacity == 5
     assert cache.physical_capacity == 5
-    assert cache.lookup(page_ids[1:], set(range(3))).hit_cluster_mask.item()
+    assert cache.lookup(page_ids[:1], set(range(3))).hit_cluster_mask.item()
 
 
 def test_resident_cache_invalidation_prevents_stale_page_reuse():

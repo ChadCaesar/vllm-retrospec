@@ -13,11 +13,11 @@ _ClusterKey = tuple[int, ...]
 
 @dataclass(frozen=True)
 class _PendingCopyBatch:
-    """Keep asynchronous H2D copy resources alive until completion."""
+    """Keep asynchronous cache-copy sources alive until completion."""
 
     ready_event: torch.cuda.Event
-    backing_key_pages: torch.Tensor
-    backing_value_pages: torch.Tensor
+    source_key_pages: torch.Tensor
+    source_value_pages: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,8 @@ class RetroSpecResidentClusterCache:
             raise ValueError("head_size must be positive")
         if device.type != "cuda":
             raise ValueError("Resident cluster cache requires a CUDA device")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
 
         self.page_size = page_size
         self.head_size = head_size
@@ -112,8 +114,8 @@ class RetroSpecResidentClusterCache:
 
     def _record_copy_batch(
         self,
-        backing_key_pages: torch.Tensor,
-        backing_value_pages: torch.Tensor,
+        source_key_pages: torch.Tensor,
+        source_value_pages: torch.Tensor,
     ) -> None:
         ready_event = torch.cuda.Event()
         ready_event.record(self._copy_stream)
@@ -121,8 +123,8 @@ class RetroSpecResidentClusterCache:
         self._pending_copy_batches.append(
             _PendingCopyBatch(
                 ready_event=ready_event,
-                backing_key_pages=backing_key_pages,
-                backing_value_pages=backing_value_pages,
+                source_key_pages=source_key_pages,
+                source_value_pages=source_value_pages,
             )
         )
 
@@ -335,6 +337,39 @@ class RetroSpecResidentClusterCache:
             valid_positions,
         )
 
+    @staticmethod
+    def _priority_ordered_clusters(
+        cluster_keys: list[_ClusterKey],
+        leading_shape: torch.Size,
+    ) -> list[_ClusterKey]:
+        """Return unique clusters in retrieval-priority order.
+
+        For a page table shaped [..., ranked_clusters, pages], the final leading
+        dimension is the retrieval rank. Earlier leading dimensions identify
+        independent request/KV-head groups.
+
+        Rank-major ordering prevents the first request or KV head from consuming
+        the entire shared resident cache before other groups receive their
+        highest-ranked cluster.
+        """
+        if len(leading_shape) <= 1:
+            ordered_clusters = cluster_keys
+        else:
+            num_ranked_clusters = leading_shape[-1]
+            num_groups = prod(leading_shape[:-1])
+
+            ordered_clusters = [
+                cluster_keys[group_index * num_ranked_clusters + rank]
+                for rank in range(num_ranked_clusters)
+                for group_index in range(num_groups)
+            ]
+
+        return list(
+            dict.fromkeys(
+                cluster_key for cluster_key in ordered_clusters if cluster_key
+            )
+        )
+
     def lookup(
         self,
         page_ids: torch.Tensor,
@@ -369,8 +404,7 @@ class RetroSpecResidentClusterCache:
 
         flat_hit_mask = hit_cluster_mask_cpu.reshape(-1)
         flat_miss_mask = miss_cluster_mask_cpu.reshape(-1)
-
-        touched_clusters: set[_ClusterKey] = set()
+        hit_clusters: set[_ClusterKey] = set()
 
         for cluster_index, (
             cluster_key,
@@ -390,6 +424,7 @@ class RetroSpecResidentClusterCache:
                 continue
 
             flat_hit_mask[cluster_index] = True
+            hit_clusters.add(cluster_key)
 
             for position, slot_id in zip(
                 positions,
@@ -400,12 +435,20 @@ class RetroSpecResidentClusterCache:
                     position,
                 ] = slot_id
 
-            if touch and cluster_key not in touched_clusters:
-                self._lru.move_to_end(
-                    cluster_key,
-                    last=True,
-                )
-                touched_clusters.add(cluster_key)
+        if touch:
+            requested_clusters = self._priority_ordered_clusters(
+                cluster_keys,
+                page_ids_cpu.shape[:-1],
+            )
+
+            # OrderedDict stores oldest entries first and newest entries last.
+            # Touch low-priority entries first so rank-zero clusters end up newest.
+            for cluster_key in reversed(requested_clusters):
+                if cluster_key in hit_clusters:
+                    self._lru.move_to_end(
+                        cluster_key,
+                        last=True,
+                    )
 
         return RetroSpecResidentPageAccess(
             cache_page_ids=cache_page_ids_cpu.to(
@@ -422,82 +465,128 @@ class RetroSpecResidentClusterCache:
             ),
         )
 
-    def _validate_backing_pages(
+    def _validate_source_pages(
         self,
         key_pages: torch.Tensor,
         value_pages: torch.Tensor,
     ) -> None:
         if key_pages.shape != value_pages.shape:
-            raise ValueError("Backing key and value page shapes must match")
+            raise ValueError("Source key and value page shapes must match")
         if key_pages.ndim != 3:
             raise ValueError(
-                "Backing pages must have shape [pages, page_size, head_size]"
+                "Source pages must have shape [pages, page_size, head_size]"
             )
         if key_pages.shape[1:] != (
             self.page_size,
             self.head_size,
         ):
-            raise ValueError("Backing page shape does not match resident cache")
+            raise ValueError("Source page shape does not match resident cache")
         if key_pages.dtype != self.dtype:
-            raise ValueError("Backing key dtype does not match resident cache")
+            raise ValueError("Source key dtype does not match resident cache")
         if value_pages.dtype != self.dtype:
-            raise ValueError("Backing value dtype does not match resident cache")
+            raise ValueError("Source value dtype does not match resident cache")
         if key_pages.device != value_pages.device:
-            raise ValueError("Backing key and value pages must use one device")
+            raise ValueError("Source key and value pages must use one device")
+
+    def _validate_backing_pages(
+        self,
+        key_pages: torch.Tensor,
+        value_pages: torch.Tensor,
+    ) -> None:
+        self._validate_source_pages(key_pages, value_pages)
         if key_pages.device.type != "cpu":
             raise ValueError("Resident cache admission requires CPU backing pages")
 
     def _copy_cluster_to_slots(
         self,
-        cluster_key: _ClusterKey,
+        source_page_ids: tuple[int, ...],
         slots: tuple[int, ...],
-        backing_key_pages: torch.Tensor,
-        backing_value_pages: torch.Tensor,
+        source_key_pages: torch.Tensor,
+        source_value_pages: torch.Tensor,
     ) -> None:
         """Enqueue one complete cluster on the dedicated copy stream."""
         with torch.cuda.stream(self._copy_stream):
-            for logical_page_id, slot_id in zip(cluster_key, slots):
+            for source_page_id, slot_id in zip(source_page_ids, slots):
                 self.key_pages[slot_id].copy_(
-                    backing_key_pages[logical_page_id],
+                    source_key_pages[source_page_id],
                     non_blocking=True,
                 )
                 self.value_pages[slot_id].copy_(
-                    backing_value_pages[logical_page_id],
+                    source_value_pages[source_page_id],
                     non_blocking=True,
                 )
 
-    def admit(
+    def _admit_from_sources(
         self,
         page_ids: torch.Tensor,
         allocated_page_ids: Collection[int],
-        backing_key_pages: torch.Tensor,
-        backing_value_pages: torch.Tensor,
+        source_page_ids: torch.Tensor,
+        source_key_pages: torch.Tensor,
+        source_value_pages: torch.Tensor,
     ) -> RetroSpecResidentPageAccess:
-        """Asynchronously admit a priority-ordered cluster prefix.
-
-        Clusters already resident are protected and moved to MRU. Missing
-        clusters are admitted in input order while complete clusters fit in the
-        active page capacity. Lower-priority clusters are left as misses.
-
-        Newly admitted clusters become logically resident after their complete
-        copy has been submitted. Consumers must wait on pending_copy_event() or
-        call wait_for_pending_copies() before reading resident storage.
-        """
-        self._validate_backing_pages(
-            backing_key_pages,
-            backing_value_pages,
+        """Admit a priority prefix using CPU or GPU source pages."""
+        self._validate_source_pages(
+            source_key_pages,
+            source_value_pages,
         )
-        _, cluster_keys, _ = self._parse_clusters(
+
+        if source_page_ids.shape != page_ids.shape:
+            raise ValueError(
+                "Source page IDs must have the same shape as logical page IDs"
+            )
+        if source_page_ids.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError("Source page IDs must use an integral dtype")
+
+        (
+            page_ids_cpu,
+            cluster_keys,
+            valid_positions,
+        ) = self._parse_clusters(
             page_ids,
             allocated_page_ids,
         )
 
-        requested_clusters = list(
-            dict.fromkeys(cluster_key for cluster_key in cluster_keys if cluster_key)
+        source_page_ids_cpu = source_page_ids.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        )
+        if torch.any(source_page_ids_cpu < -1).item():
+            raise ValueError("Source page IDs must be at least -1")
+
+        flat_source_page_ids = source_page_ids_cpu.reshape(
+            len(cluster_keys),
+            source_page_ids_cpu.shape[-1],
         )
 
-        protected_clusters: set[_ClusterKey] = set()
-        protected_page_count = 0
+        cluster_source_ids: dict[_ClusterKey, tuple[int, ...]] = {}
+
+        for cluster_key, positions, source_row in zip(
+            cluster_keys,
+            valid_positions,
+            flat_source_page_ids,
+        ):
+            if not cluster_key:
+                continue
+
+            current_source_ids = tuple(
+                int(source_row[position]) for position in positions
+            )
+            previous_source_ids = cluster_source_ids.get(cluster_key)
+
+            # A duplicated logical cluster may appear in more than one request
+            # position. Prefer an occurrence with complete source-page mappings.
+            if previous_source_ids is None or any(
+                source_page_id < 0 for source_page_id in previous_source_ids
+            ):
+                cluster_source_ids[cluster_key] = current_source_ids
+
+        requested_clusters = self._priority_ordered_clusters(
+            cluster_keys,
+            page_ids_cpu.shape[:-1],
+        )
 
         for cluster_key in requested_clusters:
             for logical_page_id in cluster_key:
@@ -508,41 +597,57 @@ class RetroSpecResidentClusterCache:
                         "resident cluster"
                     )
 
-            if cluster_key not in self._cluster_to_slots:
+        target_clusters: list[_ClusterKey] = []
+        target_page_count = 0
+
+        for cluster_key in requested_clusters:
+            cluster_page_count = len(cluster_key)
+
+            if cluster_page_count > self._logical_capacity:
                 continue
 
-            self._lru.move_to_end(cluster_key, last=True)
-            protected_clusters.add(cluster_key)
-            protected_page_count += len(cluster_key)
+            if target_page_count + cluster_page_count > self._logical_capacity:
+                break
+
+            target_clusters.append(cluster_key)
+            target_page_count += cluster_page_count
+
+        target_cluster_set = set(target_clusters)
+        missing_targets = [
+            cluster_key
+            for cluster_key in target_clusters
+            if cluster_key not in self._cluster_to_slots
+        ]
+
+        # Validate every source before evicting existing data.
+        for cluster_key in missing_targets:
+            source_ids = cluster_source_ids.get(cluster_key)
+            if source_ids is None or len(source_ids) != len(cluster_key):
+                raise RuntimeError("Missing source-page mapping for resident admission")
+            if any(source_page_id < 0 for source_page_id in source_ids):
+                raise RuntimeError(
+                    "A missing cluster does not have complete source pages"
+                )
+            if any(
+                source_page_id >= source_key_pages.shape[0]
+                for source_page_id in source_ids
+            ):
+                raise RuntimeError("Source page ID exceeds source storage capacity")
+
+        required_page_count = sum(len(cluster_key) for cluster_key in missing_targets)
+
+        while self.num_resident_pages + required_page_count > self._logical_capacity:
+            if not self._evict_oldest_unprotected(target_cluster_set):
+                raise RuntimeError(
+                    "Resident cache cannot free enough slots for priority admission"
+                )
 
         copy_batch_started = False
         copy_scheduled = False
 
         try:
-            for cluster_key in requested_clusters:
-                if cluster_key in self._cluster_to_slots:
-                    continue
-
+            for cluster_key in missing_targets:
                 cluster_page_count = len(cluster_key)
-                if cluster_page_count > self._logical_capacity:
-                    continue
-
-                if protected_page_count + cluster_page_count > self._logical_capacity:
-                    break
-
-                while (
-                    self.num_resident_pages + cluster_page_count
-                    > self._logical_capacity
-                ):
-                    if not self._evict_oldest_unprotected(protected_clusters):
-                        break
-
-                if (
-                    self.num_resident_pages + cluster_page_count
-                    > self._logical_capacity
-                ):
-                    break
-
                 slots = tuple(sorted(self._free_slots)[:cluster_page_count])
                 if len(slots) != cluster_page_count:
                     raise RuntimeError(
@@ -555,45 +660,102 @@ class RetroSpecResidentClusterCache:
                 if not copy_batch_started:
                     self._reap_completed_copy_batches()
 
-                    # Copy-stream writes must not overwrite slots still being read
-                    # by work previously submitted to the compute stream.
+                    # For staged admission this wait is recorded after the exact
+                    # packing kernels. Cache slots cannot be overwritten before
+                    # the current verification has consumed them.
                     current_stream = torch.cuda.current_stream(self.device)
                     self._copy_stream.wait_stream(current_stream)
                     copy_batch_started = True
 
+                source_ids = cluster_source_ids[cluster_key]
                 copy_scheduled = True
+
                 try:
                     self._copy_cluster_to_slots(
-                        cluster_key,
+                        source_ids,
                         slots,
-                        backing_key_pages,
-                        backing_value_pages,
+                        source_key_pages,
+                        source_value_pages,
                     )
                 except Exception:
                     self._free_slots.update(slots)
                     raise
 
-                # Publish the cluster only after every page copy has been
-                # successfully submitted to the copy stream.
                 self._cluster_to_slots[cluster_key] = slots
                 self._lru[cluster_key] = None
 
                 for logical_page_id in cluster_key:
                     self._page_to_cluster[logical_page_id] = cluster_key
-
-                protected_clusters.add(cluster_key)
-                protected_page_count += cluster_page_count
         finally:
             if copy_scheduled:
                 self._record_copy_batch(
-                    backing_key_pages,
-                    backing_value_pages,
+                    source_key_pages,
+                    source_value_pages,
+                )
+
+        # Touch every selected resident cluster, but preserve retrieval priority:
+        # rank-zero clusters become the newest entries.
+        for cluster_key in reversed(requested_clusters):
+            if cluster_key in self._cluster_to_slots:
+                self._lru.move_to_end(
+                    cluster_key,
+                    last=True,
                 )
 
         return self.lookup(
             page_ids,
             allocated_page_ids,
             touch=False,
+        )
+
+    def admit(
+        self,
+        page_ids: torch.Tensor,
+        allocated_page_ids: Collection[int],
+        backing_key_pages: torch.Tensor,
+        backing_value_pages: torch.Tensor,
+    ) -> RetroSpecResidentPageAccess:
+        """Admit a priority prefix from stable CPU backing pages."""
+        self._validate_backing_pages(
+            backing_key_pages,
+            backing_value_pages,
+        )
+
+        return self._admit_from_sources(
+            page_ids=page_ids,
+            allocated_page_ids=allocated_page_ids,
+            source_page_ids=page_ids,
+            source_key_pages=backing_key_pages,
+            source_value_pages=backing_value_pages,
+        )
+
+    def admit_staged(
+        self,
+        page_ids: torch.Tensor,
+        allocated_page_ids: Collection[int],
+        staging_page_ids: torch.Tensor,
+        staging_key_pages: torch.Tensor,
+        staging_value_pages: torch.Tensor,
+    ) -> RetroSpecResidentPageAccess:
+        """Admit a priority prefix from temporary GPU staging pages.
+
+        The caller must invoke this only after all current consumers of resident
+        slots and staging pages have been submitted to the current CUDA stream.
+        The cache copy stream then waits for that stream before updating slots.
+        """
+        self._validate_source_pages(
+            staging_key_pages,
+            staging_value_pages,
+        )
+        if staging_key_pages.device != self.device:
+            raise ValueError("Staging pages must use the resident cache CUDA device")
+
+        return self._admit_from_sources(
+            page_ids=page_ids,
+            allocated_page_ids=allocated_page_ids,
+            source_page_ids=staging_page_ids,
+            source_key_pages=staging_key_pages,
+            source_value_pages=staging_value_pages,
         )
 
     def invalidate(

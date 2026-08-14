@@ -343,8 +343,8 @@ def test_execution_buffer_packs_resolved_cpu_backing_pages():
     )
     torch.cuda.synchronize()
 
-    assert (resolved.resident_page_ids >= 0).sum().item() == 2
-    assert (resolved.staging_page_ids >= 0).sum().item() == 1
+    assert not (resolved.resident_page_ids >= 0).any()
+    assert (resolved.staging_page_ids >= 0).sum().item() == 3
     assert execution.exact_seq_lens.tolist() == [6]
     torch.testing.assert_close(execution.keys[:6], token_keys[0].view(6, 1, head_size))
     torch.testing.assert_close(

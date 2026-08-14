@@ -1529,7 +1529,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         resolved_pages = self.cluster_store.resolve_cluster_pages(
             plan.layer_name,
             plan.sparse_exact_page_ids,
-            admit_missing=False,
+            mode="resident_only",
         )
 
         hit_cluster_mask = (
