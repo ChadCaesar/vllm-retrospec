@@ -37,13 +37,19 @@ class RetroSpecClusterPageTable:
 
 @dataclass(frozen=True)
 class RetroSpecResolvedClusterPages:
-    """Physical page sources for one exact-attention selection.
+    """Physical GPU sources for one logical cluster-page selection.
 
-    Resident page IDs index the persistent GPU resident cache. Staging page
-    IDs index the temporary tensors owned by this result.
+    resident_page_ids and staging_page_ids have the same shape as the logical
+    page table. A non-negative resident page ID indexes resident_key_pages and
+    resident_value_pages. A non-negative staging page ID indexes the temporary
+    staging tensors.
 
-    ``resident_ready_event`` is recorded on the resident-cache copy stream.
-    The execution path may perform work independent of resident pages before
+    hit_cluster_mask and miss_cluster_mask have the logical page table's
+    leading shape, excluding the page dimension. Empty or padded clusters are
+    false in both masks.
+
+    resident_ready_event is recorded on the resident-cache copy stream. The
+    execution path may perform work independent of resident pages before
     waiting on this event.
     """
 
@@ -55,6 +61,9 @@ class RetroSpecResolvedClusterPages:
 
     staging_key_pages: torch.Tensor
     staging_value_pages: torch.Tensor
+
+    hit_cluster_mask: torch.Tensor
+    miss_cluster_mask: torch.Tensor
     resident_ready_event: torch.cuda.Event | None
 
 
@@ -881,12 +890,17 @@ class RetroSpecClusterPageStore:
         self,
         layer_name: str,
         logical_page_ids: torch.Tensor,
+        admit_missing: bool = True,
     ) -> RetroSpecResolvedClusterPages:
-        """Resolve logical pages into GPU resident and staging page sources.
+        """Resolve logical cluster pages to physical GPU sources.
 
-        Resident-cache admission copies are asynchronous. This method returns
-        the latest resident-copy event instead of immediately waiting for it, so
-        callers can execute work that does not consume resident pages first.
+        When admit_missing is true, missing clusters are admitted to the bounded
+        resident cache when capacity permits. Remaining misses are copied to a
+        temporary staging buffer. This is the verification path.
+
+        When admit_missing is false, the resident cache is only queried. Missing
+        clusters remain unresolved and no H2D copy is submitted. This is the
+        latency-sensitive draft path.
         """
         pool = self._layer_pools.get(layer_name)
         if pool is None:
@@ -899,6 +913,8 @@ class RetroSpecClusterPageStore:
                 logical_page_ids,
                 -1,
             )
+            hit_cluster_mask = (logical_page_ids >= 0).any(dim=-1)
+
             return RetroSpecResolvedClusterPages(
                 resident_page_ids=logical_page_ids,
                 staging_page_ids=staging_page_ids,
@@ -906,27 +922,43 @@ class RetroSpecClusterPageStore:
                 resident_value_pages=pool.value_pages,
                 staging_key_pages=pool.key_pages[:0],
                 staging_value_pages=pool.value_pages[:0],
+                hit_cluster_mask=hit_cluster_mask,
+                miss_cluster_mask=torch.zeros_like(hit_cluster_mask),
                 resident_ready_event=None,
             )
 
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
-        resident_access = resident_cache.admit(
-            logical_page_ids,
-            pool.allocated_page_ids,
-            pool.key_pages,
-            pool.value_pages,
-        )
+        if admit_missing:
+            resident_access = resident_cache.admit(
+                logical_page_ids,
+                pool.allocated_page_ids,
+                pool.key_pages,
+                pool.value_pages,
+            )
 
-        (
-            staging_page_ids,
-            staging_key_pages,
-            staging_value_pages,
-        ) = self._stage_missing_pages(
-            pool,
-            logical_page_ids,
-            resident_access.miss_cluster_mask,
-        )
+            (
+                staging_page_ids,
+                staging_key_pages,
+                staging_value_pages,
+            ) = self._stage_missing_pages(
+                pool,
+                logical_page_ids,
+                resident_access.miss_cluster_mask,
+            )
+        else:
+            resident_access = resident_cache.lookup(
+                logical_page_ids,
+                pool.allocated_page_ids,
+                touch=True,
+            )
+
+            staging_page_ids = torch.full_like(
+                logical_page_ids,
+                -1,
+            )
+            staging_key_pages = resident_cache.key_pages[:0]
+            staging_value_pages = resident_cache.value_pages[:0]
 
         return RetroSpecResolvedClusterPages(
             resident_page_ids=resident_access.cache_page_ids,
@@ -935,6 +967,8 @@ class RetroSpecClusterPageStore:
             resident_value_pages=resident_cache.value_pages,
             staging_key_pages=staging_key_pages,
             staging_value_pages=staging_value_pages,
+            hit_cluster_mask=resident_access.hit_cluster_mask,
+            miss_cluster_mask=resident_access.miss_cluster_mask,
             resident_ready_event=resident_cache.pending_copy_event(),
         )
 

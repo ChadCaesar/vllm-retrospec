@@ -12,6 +12,7 @@ from .cluster_store import (
     RetroSpecClusterPageStore,
     RetroSpecClusterPageTable,
     RetroSpecClusterStorageMode,
+    RetroSpecResolvedClusterPages,
 )
 from .clustering import segmented_kmeans_assignments
 from .index import (
@@ -57,9 +58,14 @@ class RetroSpecTokenAttentionSelection:
     attention_mass: torch.Tensor
     plan: RetroSpecTokenSelectionPlan
 
+    # Draft CPU-offload selections are resolved while the resident hit/miss
+    # split is constructed. Verification selections leave this as None and
+    # resolve their pages later in the attention execution path.
+    resolved_pages: RetroSpecResolvedClusterPages | None
+
     @property
     def hit_attn(self) -> torch.Tensor:
-        return self.plan.sparse_attn
+        return self.attention_mass
 
 
 @dataclass(frozen=True)
@@ -1495,6 +1501,128 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         selected.masked_fill_(~token_mask.unsqueeze(-1), 0.0)
         return selected.contiguous()
 
+    def _materialize_draft_selection(
+        self,
+        plan: RetroSpecTokenSelectionPlan,
+        packed: _PackedSegmentedIndex,
+        cluster_zones: _PackedClusterZones,
+        cluster_scores: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> RetroSpecTokenAttentionSelection:
+        """Materialize a cache-aware sparse selection for the draft stage.
+
+        GPU-reference storage computes every sparse retrieval cluster exactly.
+
+        CPU-offload storage computes only resident retrieval clusters exactly.
+        Selected cache misses are represented by their key/value centroids and
+        merged into the normal sparse estimation zone.
+        """
+        if (
+            not self.cluster_store.is_cpu_backed
+            or plan.sparse_exact_page_ids.numel() == 0
+        ):
+            return self._materialize_token_selection(
+                plan,
+                RetroSpecAttentionLevel.SPARSE,
+            )
+
+        resolved_pages = self.cluster_store.resolve_cluster_pages(
+            plan.layer_name,
+            plan.sparse_exact_page_ids,
+            admit_missing=False,
+        )
+
+        hit_cluster_mask = (
+            cluster_zones.sparse_retrieval_mask & resolved_pages.hit_cluster_mask
+        )
+        miss_cluster_mask = (
+            cluster_zones.sparse_retrieval_mask & resolved_pages.miss_cluster_mask
+        )
+
+        draft_exact_page_token_counts = plan.sparse_exact_page_token_counts.clone()
+        draft_exact_page_token_counts.masked_fill_(
+            ~hit_cluster_mask.unsqueeze(-1),
+            0,
+        )
+
+        (
+            miss_estimation_keys,
+            miss_estimation_values,
+            miss_estimation_token_counts,
+        ) = self._build_estimation_selection(
+            packed.cluster_keys,
+            packed.cluster_values,
+            packed.cluster_token_counts,
+            cluster_zones.sparse_retrieval_indices,
+            miss_cluster_mask,
+        )
+
+        estimation_keys = torch.cat(
+            (
+                plan.sparse_estimation_keys,
+                miss_estimation_keys,
+            ),
+            dim=2,
+        ).contiguous()
+        estimation_values = torch.cat(
+            (
+                plan.sparse_estimation_values,
+                miss_estimation_values,
+            ),
+            dim=2,
+        ).contiguous()
+        estimation_token_counts = torch.cat(
+            (
+                plan.sparse_estimation_token_counts,
+                miss_estimation_token_counts,
+            ),
+            dim=2,
+        ).contiguous()
+
+        hit_attn_by_head = self._sum_selected_scores(
+            cluster_scores,
+            cluster_zones.sparse_retrieval_indices,
+            hit_cluster_mask,
+        )
+
+        has_clusters = packed.cluster_mask.any(dim=2)
+        hit_attn_by_head = torch.where(
+            has_clusters,
+            hit_attn_by_head,
+            torch.ones_like(hit_attn_by_head),
+        )
+
+        hit_attn = hit_attn_by_head.mean(dim=1)
+        hit_attn = torch.where(
+            active_mask,
+            hit_attn,
+            torch.ones_like(hit_attn),
+        )
+
+        primary_token_counts = plan.primary_exact_token_mask.sum(
+            dim=2,
+            dtype=torch.int32,
+        )
+        clustered_token_counts = draft_exact_page_token_counts.sum(
+            dim=(2, 3),
+            dtype=torch.int32,
+        )
+        exact_token_counts = (
+            primary_token_counts + clustered_token_counts
+        ).contiguous()
+
+        return RetroSpecTokenAttentionSelection(
+            exact_page_ids=plan.sparse_exact_page_ids,
+            exact_page_token_counts=draft_exact_page_token_counts,
+            exact_token_counts=exact_token_counts,
+            estimation_keys=estimation_keys,
+            estimation_values=estimation_values,
+            estimation_token_counts=estimation_token_counts,
+            attention_mass=hit_attn,
+            plan=plan,
+            resolved_pages=resolved_pages,
+        )
+
     def _materialize_token_selection(
         self,
         plan: RetroSpecTokenSelectionPlan,
@@ -1538,6 +1666,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             estimation_token_counts=estimation_token_counts,
             attention_mass=attention_mass,
             plan=plan,
+            resolved_pages=None,
         )
 
     def materialize_exact_reference(
@@ -1738,9 +1867,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             packed=packed,
         )
 
-        return self._materialize_token_selection(
-            plan,
-            RetroSpecAttentionLevel.SPARSE,
+        return self._materialize_draft_selection(
+            plan=plan,
+            packed=packed,
+            cluster_zones=cluster_zones,
+            cluster_scores=cluster_scores,
+            active_mask=active_mask,
         )
 
     def materialize(

@@ -563,6 +563,85 @@ def test_segmented_index_proposal_lifecycle_tracks_empty_batches():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
+    device = torch.device("cuda")
+    index = make_index(
+        cache_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    keys, values = make_cache()
+    keys = keys.to(device=device, dtype=torch.bfloat16)
+    values = values.to(device=device, dtype=torch.bfloat16)
+    block_table = torch.arange(
+        7,
+        dtype=torch.int32,
+        device=device,
+    ).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+
+    selection_kwargs = {
+        "request_ids": ["request"],
+        "layer_name": "layer",
+        "query": torch.ones(1, 1, 1, device=device, dtype=torch.bfloat16),
+        "key_cache": keys,
+        "value_cache": values,
+        "block_table": block_table,
+        "seq_lens": torch.tensor([10], dtype=torch.int32, device=device),
+        "active_mask": torch.tensor([True], device=device),
+        "scale": 1.0,
+    }
+
+    index.begin_proposal(["request"])
+    try:
+        cold = index.select_segmented(**selection_kwargs)
+    finally:
+        index.end_proposal()
+
+    assert cold.resolved_pages is not None
+    assert index.cluster_store.num_resident_pages("layer") == 0
+    assert cold.exact_token_counts.tolist() == [[6]]
+    assert cold.estimation_token_counts.tolist() == [[[2, 2]]]
+    assert cold.estimation_keys[0, 0, :, 0].tolist() == pytest.approx([1.0, 2.0])
+    assert cold.estimation_values[0, 0, :, 0].tolist() == pytest.approx([10.0, 20.0])
+    assert cold.hit_attn.item() == pytest.approx(0.0)
+    assert not cold.exact_page_token_counts.any()
+    assert cold.plan.sparse_exact_page_token_counts.sum().item() == 2
+
+    index.cluster_store.admit_resident_clusters(
+        "layer",
+        cold.plan.sparse_exact_page_ids,
+    )
+    index.cluster_store.get_resident_page_storage("layer")
+    torch.cuda.current_stream().synchronize()
+
+    index.begin_proposal(["request"])
+    try:
+        warm = index.select_segmented(**selection_kwargs)
+        verification = index.materialize(
+            warm.plan,
+            RetroSpecAttentionLevel.SPARSE,
+            keys,
+            values,
+            block_table,
+        )
+    finally:
+        index.end_proposal()
+
+    assert warm.resolved_pages is not None
+    assert index.cluster_store.num_resident_pages("layer") == 1
+    assert warm.exact_token_counts.tolist() == [[8]]
+    assert warm.estimation_token_counts.tolist() == [[[2, 0]]]
+    assert warm.hit_attn.item() == pytest.approx(warm.plan.sparse_attn.item())
+
+    assert verification.resolved_pages is None
+    assert verification.exact_token_counts.tolist() == [[8]]
+    assert verification.estimation_token_counts.tolist() == [[[2]]]
+    assert verification.attention_mass.item() == pytest.approx(
+        warm.plan.sparse_attn.item()
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_segmented_index_builds_and_selects_on_cuda():
     device = torch.device("cuda")
     index = make_index()

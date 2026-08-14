@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import Mock, patch
@@ -481,6 +482,7 @@ def test_token_exact_attention_uses_reference_fallback_on_cpu():
         estimation_token_counts=torch.empty(1, 2, 0, dtype=torch.int32),
         attention_mass=torch.ones(1),
         plan=plan,
+        resolved_pages=None,
     )
     query = torch.ones(1, 4, 8, dtype=torch.bfloat16)
     expected = (
@@ -666,6 +668,7 @@ def test_token_estimation_attention_uses_per_head_cluster_sizes():
         ),
         attention_mass=torch.ones(1),
         plan=plan,
+        resolved_pages=None,
     )
 
     output, lse = controller._run_estimation_attention(
@@ -712,6 +715,7 @@ def test_get_grouped_estimation_keeps_token_layout():
         estimation_token_counts=torch.ones(1, 2, 3, dtype=torch.int32),
         attention_mass=torch.ones(1),
         plan=plan,
+        resolved_pages=None,
     )
 
     keys, values, counts = RetroSpecSparseAttention._get_grouped_estimation(selection)
@@ -721,8 +725,11 @@ def test_get_grouped_estimation_keeps_token_layout():
     assert counts is selection.estimation_token_counts
 
 
+@pytest.mark.parametrize("pre_resolved", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_exact_attention_resolves_resident_and_staging_pages():
+def test_exact_attention_resolves_resident_and_staging_pages(
+    pre_resolved: bool,
+):
     controller = make_controller(
         index_mode="segmented_cluster",
         cache_mode="cpu_offload",
@@ -765,6 +772,7 @@ def test_exact_attention_resolves_resident_and_staging_pages():
         estimation_token_counts=plan.sparse_estimation_token_counts,
         attention_mass=torch.ones(1, device=device),
         plan=plan,
+        resolved_pages=None,
     )
 
     resident_page_ids = torch.tensor([[[[0, -1]]]], dtype=torch.int64, device=device)
@@ -781,8 +789,13 @@ def test_exact_attention_resolves_resident_and_staging_pages():
         resident_value_pages=resident_values,
         staging_key_pages=staging_keys,
         staging_value_pages=staging_values,
+        hit_cluster_mask=torch.tensor([[[True]]], device=device),
+        miss_cluster_mask=torch.tensor([[[False]]], device=device),
         resident_ready_event=resident_ready_event,
     )
+    if pre_resolved:
+        selection = replace(selection, resolved_pages=resolved)
+
     controller.index.cluster_store.resolve_cluster_pages = Mock(return_value=resolved)
 
     execution = make_exact_execution(
@@ -816,9 +829,12 @@ def test_exact_attention_resolves_resident_and_staging_pages():
     )
 
     assert result is expected_output
-    controller.index.cluster_store.resolve_cluster_pages.assert_called_once_with(
-        "layer", page_ids
-    )
+    if pre_resolved:
+        controller.index.cluster_store.resolve_cluster_pages.assert_not_called()
+    else:
+        controller.index.cluster_store.resolve_cluster_pages.assert_called_once_with(
+            "layer", page_ids
+        )
     call = pack.call_args.kwargs
     assert call["resident_page_ids"] is resident_page_ids
     assert call["staging_page_ids"] is staging_page_ids

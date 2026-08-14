@@ -731,12 +731,15 @@ class RetroSpecSparseAttention:
             staging_value_pages: torch.Tensor | None = None
             resident_ready_event: torch.cuda.Event | None = None
 
-            if selection.exact_page_ids.numel():
+            resolved_pages = selection.resolved_pages
+
+            if resolved_pages is None and selection.exact_page_ids.numel():
                 resolved_pages = self.index.cluster_store.resolve_cluster_pages(
                     selection.plan.layer_name,
                     selection.exact_page_ids,
                 )
 
+            if resolved_pages is not None:
                 resident_page_ids = resolved_pages.resident_page_ids
                 staging_page_ids = resolved_pages.staging_page_ids
 
