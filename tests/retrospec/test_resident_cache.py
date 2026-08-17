@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.v1.spec_decode.retrospec.cluster_identity import RetroSpecClusterGroup
 from vllm.v1.spec_decode.retrospec.resident_cache import (
     RetroSpecResidentClusterCache,
 )
@@ -34,12 +35,23 @@ def _cluster_ids_from_pages(page_ids: torch.Tensor) -> torch.Tensor:
 class _ResidentCacheTestAdapter(RetroSpecResidentClusterCache):
     """Keep legacy test cases concise while supplying stable cluster IDs."""
 
+    _DEFAULT_GROUP = RetroSpecClusterGroup("request", 0)
+
     @staticmethod
     def _allocated_cluster_ids(
         cluster_ids: torch.Tensor, allocated_page_ids: set[int]
     ) -> set[int]:
         valid_ids = cluster_ids[cluster_ids >= 0].detach().cpu().tolist()
         return set(allocated_page_ids).union(valid_ids)
+
+    @classmethod
+    def _cluster_groups(
+        cls, cluster_ids: torch.Tensor
+    ) -> dict[int, RetroSpecClusterGroup]:
+        return {
+            cluster_id: cls._DEFAULT_GROUP
+            for cluster_id in cluster_ids[cluster_ids >= 0].detach().cpu().tolist()
+        }
 
     def lookup(
         self,
@@ -48,10 +60,13 @@ class _ResidentCacheTestAdapter(RetroSpecResidentClusterCache):
         touch=True,
         *,
         cluster_ids=None,
+        cluster_groups=None,
         allocated_cluster_ids=None,
     ):
         if cluster_ids is None:
             cluster_ids = _cluster_ids_from_pages(page_ids)
+        if cluster_groups is None:
+            cluster_groups = self._cluster_groups(cluster_ids)
         if allocated_cluster_ids is None:
             allocated_cluster_ids = self._allocated_cluster_ids(
                 cluster_ids, allocated_page_ids
@@ -59,6 +74,7 @@ class _ResidentCacheTestAdapter(RetroSpecResidentClusterCache):
         return super().lookup(
             cluster_ids=cluster_ids,
             page_ids=page_ids,
+            cluster_groups=cluster_groups,
             allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=allocated_page_ids,
             touch=touch,
@@ -70,14 +86,24 @@ class _ResidentCacheTestAdapter(RetroSpecResidentClusterCache):
         allocated_page_ids,
         backing_key_pages,
         backing_value_pages,
+        *,
+        cluster_ids=None,
+        cluster_groups=None,
+        allocated_cluster_ids=None,
     ):
-        cluster_ids = _cluster_ids_from_pages(page_ids)
+        if cluster_ids is None:
+            cluster_ids = _cluster_ids_from_pages(page_ids)
+        if cluster_groups is None:
+            cluster_groups = self._cluster_groups(cluster_ids)
+        if allocated_cluster_ids is None:
+            allocated_cluster_ids = self._allocated_cluster_ids(
+                cluster_ids, allocated_page_ids
+            )
         return super().admit(
             cluster_ids=cluster_ids,
             page_ids=page_ids,
-            allocated_cluster_ids=self._allocated_cluster_ids(
-                cluster_ids, allocated_page_ids
-            ),
+            cluster_groups=cluster_groups,
+            allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=allocated_page_ids,
             backing_key_pages=backing_key_pages,
             backing_value_pages=backing_value_pages,
@@ -90,14 +116,24 @@ class _ResidentCacheTestAdapter(RetroSpecResidentClusterCache):
         staging_page_ids,
         staging_key_pages,
         staging_value_pages,
+        *,
+        cluster_ids=None,
+        cluster_groups=None,
+        allocated_cluster_ids=None,
     ):
-        cluster_ids = _cluster_ids_from_pages(page_ids)
+        if cluster_ids is None:
+            cluster_ids = _cluster_ids_from_pages(page_ids)
+        if cluster_groups is None:
+            cluster_groups = self._cluster_groups(cluster_ids)
+        if allocated_cluster_ids is None:
+            allocated_cluster_ids = self._allocated_cluster_ids(
+                cluster_ids, allocated_page_ids
+            )
         return super().admit_staged(
             cluster_ids=cluster_ids,
             page_ids=page_ids,
-            allocated_cluster_ids=self._allocated_cluster_ids(
-                cluster_ids, allocated_page_ids
-            ),
+            cluster_groups=cluster_groups,
+            allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=allocated_page_ids,
             staging_page_ids=staging_page_ids,
             staging_key_pages=staging_key_pages,
@@ -360,6 +396,124 @@ def test_resident_cache_interleaves_priority_across_groups():
     )
 
 
+def test_resident_cache_tracks_group_scoped_lru_in_shared_arena():
+    cache = make_cache(capacity=4)
+    backing_keys, backing_values = make_backing_pages()
+    cluster_ids = torch.tensor([10, 11, 12], dtype=torch.int64)
+    page_ids = torch.tensor([[0], [1], [2]], dtype=torch.int64)
+    first_group = RetroSpecClusterGroup("first", 0)
+    second_group = RetroSpecClusterGroup("second", 0)
+    cluster_groups = {
+        10: first_group,
+        11: first_group,
+        12: second_group,
+    }
+
+    cache.admit(
+        page_ids,
+        set(range(4)),
+        backing_keys,
+        backing_values,
+        cluster_ids=cluster_ids,
+        cluster_groups=cluster_groups,
+    )
+
+    assert cache.num_resident_groups == 2
+    assert cache._group_states[first_group].num_pages == 2
+    assert cache._group_states[second_group].num_pages == 1
+    assert list(cache._group_states[first_group].lru) == [11, 10]
+    assert list(cache._group_states[second_group].lru) == [12]
+    assert len(set(cache._cluster_to_slots.values())) == 3
+
+    cache.lookup(
+        page_ids[1:2],
+        set(range(4)),
+        cluster_ids=cluster_ids[1:2],
+        cluster_groups={11: first_group},
+    )
+
+    assert list(cache._group_states[first_group].lru) == [10, 11]
+    assert list(cache._group_states[second_group].lru) == [12]
+
+
+def test_resident_cache_invalidates_clusters_and_removes_empty_groups():
+    cache = make_cache(capacity=4)
+    backing_keys, backing_values = make_backing_pages()
+    cluster_ids = torch.tensor([10, 11, 12], dtype=torch.int64)
+    page_ids = torch.tensor([[0], [1], [2]], dtype=torch.int64)
+    first_group = RetroSpecClusterGroup("first", 0)
+    second_group = RetroSpecClusterGroup("second", 0)
+    cluster_groups = {
+        10: first_group,
+        11: first_group,
+        12: second_group,
+    }
+    cache.admit(
+        page_ids,
+        set(range(4)),
+        backing_keys,
+        backing_values,
+        cluster_ids=cluster_ids,
+        cluster_groups=cluster_groups,
+    )
+
+    cache.invalidate(cluster_ids[:2])
+
+    assert first_group not in cache._group_states
+    assert cache._group_states[second_group].num_pages == 1
+    assert cache.num_resident_groups == 1
+    assert cache.num_resident_clusters == 1
+    assert cache.num_resident_pages == 1
+    assert len(cache._free_slots) == cache.physical_capacity - 1
+    assert set(cache._global_lru) == {12}
+
+    cache.invalidate(cluster_ids[2:])
+
+    assert cache.num_resident_groups == 0
+    assert cache.num_resident_clusters == 0
+    assert cache.num_resident_pages == 0
+    assert not cache._global_lru
+
+
+def test_resident_cache_validates_cluster_group_metadata():
+    cache = make_cache(capacity=1)
+    backing_keys, backing_values = make_backing_pages()
+    cluster_ids = torch.tensor([7], dtype=torch.int64)
+    page_ids = torch.tensor([[0]], dtype=torch.int64)
+    first_group = RetroSpecClusterGroup("first", 0)
+    second_group = RetroSpecClusterGroup("second", 0)
+
+    with pytest.raises(RuntimeError, match="Missing resident group metadata"):
+        cache.admit(
+            page_ids,
+            {0},
+            backing_keys,
+            backing_values,
+            cluster_ids=cluster_ids,
+            cluster_groups={},
+        )
+
+    cache.admit(
+        page_ids,
+        {0},
+        backing_keys,
+        backing_values,
+        cluster_ids=cluster_ids,
+        cluster_groups={7: first_group},
+    )
+
+    with pytest.raises(RuntimeError, match="does not match requested ownership"):
+        cache.lookup(
+            page_ids,
+            {0},
+            cluster_ids=cluster_ids,
+            cluster_groups={7: second_group},
+        )
+
+    assert cache._cluster_to_group == {7: first_group}
+    assert cache.num_resident_groups == 1
+
+
 def test_resident_cache_high_priority_misses_displace_lower_priority_hits():
     cache = make_cache(capacity=2)
     backing_keys, backing_values = make_backing_pages()
@@ -570,11 +724,13 @@ def test_resident_cache_uses_cluster_id_as_identity_after_page_reuse():
     cache = make_cache(capacity=2)
     backing_keys, backing_values = make_backing_pages()
     page_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    group = RetroSpecClusterGroup("request", 0)
 
     first = RetroSpecResidentClusterCache.admit(
         cache,
         cluster_ids=torch.tensor([7]),
         page_ids=page_ids,
+        cluster_groups={7: group},
         allocated_cluster_ids={7},
         allocated_page_ids={0, 1},
         backing_key_pages=backing_keys,
@@ -587,6 +743,7 @@ def test_resident_cache_uses_cluster_id_as_identity_after_page_reuse():
         cache,
         cluster_ids=torch.tensor([8]),
         page_ids=page_ids,
+        cluster_groups={8: group},
         allocated_cluster_ids={8},
         allocated_page_ids={0, 1},
         touch=False,
@@ -597,12 +754,14 @@ def test_resident_cache_uses_cluster_id_as_identity_after_page_reuse():
 def test_resident_cache_rejects_cluster_id_descriptor_conflicts():
     cache = make_cache(capacity=2)
     backing_keys, backing_values = make_backing_pages()
+    group = RetroSpecClusterGroup("request", 0)
 
     with pytest.raises(ValueError, match="different logical pages"):
         RetroSpecResidentClusterCache.admit(
             cache,
             cluster_ids=torch.tensor([3, 3]),
             page_ids=torch.tensor([[0, 1], [2, 3]]),
+            cluster_groups={3: group},
             allocated_cluster_ids={3},
             allocated_page_ids={0, 1, 2, 3},
             backing_key_pages=backing_keys,
@@ -614,6 +773,7 @@ def test_resident_cache_rejects_cluster_id_descriptor_conflicts():
             cache,
             cluster_ids=torch.tensor([4]),
             page_ids=torch.tensor([[0]]),
+            cluster_groups={4: group},
             allocated_cluster_ids={3},
             allocated_page_ids={0},
         )

@@ -535,6 +535,13 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     assert store.resident_capacity("layer") == 3
     assert store.num_resident_pages("layer") == 3
     assert store.num_resident_clusters("layer") == 2
+    assert store.num_resident_groups("layer") == 2
+    assert (
+        resident_cache._group_states[RetroSpecClusterGroup("request", 0)].num_pages == 2
+    )
+    assert (
+        resident_cache._group_states[RetroSpecClusterGroup("request", 1)].num_pages == 1
+    )
     assert access.hit_cluster_mask.tolist() == [[True, False], [True, False]]
     assert access.miss_cluster_mask.tolist() == [[False, True], [False, True]]
     assert len(resident_cache._pending_copy_batches) == 1
@@ -558,6 +565,7 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     assert store.resident_capacity("layer") == 0
     assert store.num_resident_pages("layer") == 0
     assert store.num_resident_clusters("layer") == 0
+    assert store.num_resident_groups("layer") == 0
 
 
 @pytest.mark.skipif(

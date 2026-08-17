@@ -605,12 +605,30 @@ class RetroSpecClusterPageStore:
             for cluster_id in ordered_cluster_ids
         }
 
+    def _get_cluster_groups(
+        self,
+        layer_name: str,
+        cluster_ids_cpu: torch.Tensor,
+    ) -> dict[int, RetroSpecClusterGroup]:
+        """Map stable cluster handles to resident replacement domains."""
+        descriptors = self._cluster_block_descriptors[layer_name]
+        ordered_cluster_ids = dict.fromkeys(
+            cluster_id
+            for cluster_id in cluster_ids_cpu.reshape(-1).tolist()
+            if cluster_id >= 0
+        )
+
+        return {
+            cluster_id: descriptors[cluster_id].identity.group
+            for cluster_id in ordered_cluster_ids
+        }
+
     def _validate_cluster_blocks(
         self,
         layer_name: str,
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         if page_ids.ndim != cluster_ids.ndim + 1:
             raise ValueError("Cluster pages must add one page dimension to cluster IDs")
         if page_ids.shape[:-1] != cluster_ids.shape:
@@ -647,6 +665,8 @@ class RetroSpecClusterPageStore:
                 raise RuntimeError(
                     "Cluster page descriptor does not match its stable cluster ID"
                 )
+
+        return cluster_ids_cpu
 
     def max_pages_per_cluster(
         self,
@@ -1266,7 +1286,11 @@ class RetroSpecClusterPageStore:
         if logical_page_ids.device != cluster_ids.device:
             raise ValueError("Cluster IDs and logical pages must use one device")
 
-        self._validate_cluster_blocks(layer_name, cluster_ids, logical_page_ids)
+        cluster_ids_cpu = self._validate_cluster_blocks(
+            layer_name,
+            cluster_ids,
+            logical_page_ids,
+        )
 
         pool = self._layer_pools.get(layer_name)
         if pool is None:
@@ -1277,10 +1301,7 @@ class RetroSpecClusterPageStore:
         allocated_cluster_ids = self._get_allocated_cluster_ids(layer_name)
 
         if not self.is_cpu_backed:
-            staging_page_ids = torch.full_like(
-                logical_page_ids,
-                -1,
-            )
+            staging_page_ids = torch.full_like(logical_page_ids, -1)
             hit_cluster_mask = cluster_ids >= 0
 
             return RetroSpecResolvedClusterPages(
@@ -1295,11 +1316,16 @@ class RetroSpecClusterPageStore:
                 resident_ready_event=None,
             )
 
+        cluster_groups = self._get_cluster_groups(
+            layer_name,
+            cluster_ids_cpu,
+        )
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
         resident_access = resident_cache.lookup(
             cluster_ids=cluster_ids,
             page_ids=logical_page_ids,
+            cluster_groups=cluster_groups,
             allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=pool.allocated_page_ids,
             touch=True,
@@ -1316,10 +1342,7 @@ class RetroSpecClusterPageStore:
                 resident_access.miss_cluster_mask,
             )
         else:
-            staging_page_ids = torch.full_like(
-                logical_page_ids,
-                -1,
-            )
+            staging_page_ids = torch.full_like(logical_page_ids, -1)
             staging_key_pages = resident_cache.key_pages[:0]
             staging_value_pages = resident_cache.value_pages[:0]
 
@@ -1342,12 +1365,20 @@ class RetroSpecClusterPageStore:
         page_ids: torch.Tensor,
         touch: bool = True,
     ) -> RetroSpecResidentPageAccess:
-        self._validate_cluster_blocks(layer_name, cluster_ids, page_ids)
+        cluster_ids_cpu = self._validate_cluster_blocks(
+            layer_name,
+            cluster_ids,
+            page_ids,
+        )
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
         return resident_cache.lookup(
             cluster_ids=cluster_ids,
             page_ids=page_ids,
+            cluster_groups=self._get_cluster_groups(
+                layer_name,
+                cluster_ids_cpu,
+            ),
             allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
             allocated_page_ids=pool.allocated_page_ids,
             touch=touch,
@@ -1359,12 +1390,20 @@ class RetroSpecClusterPageStore:
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
     ) -> RetroSpecResidentPageAccess:
-        self._validate_cluster_blocks(layer_name, cluster_ids, page_ids)
+        cluster_ids_cpu = self._validate_cluster_blocks(
+            layer_name,
+            cluster_ids,
+            page_ids,
+        )
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
         return resident_cache.admit(
             cluster_ids=cluster_ids,
             page_ids=page_ids,
+            cluster_groups=self._get_cluster_groups(
+                layer_name,
+                cluster_ids_cpu,
+            ),
             allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
             allocated_page_ids=pool.allocated_page_ids,
             backing_key_pages=pool.key_pages,
@@ -1380,12 +1419,20 @@ class RetroSpecClusterPageStore:
         staging_key_pages: torch.Tensor,
         staging_value_pages: torch.Tensor,
     ) -> RetroSpecResidentPageAccess:
-        self._validate_cluster_blocks(layer_name, cluster_ids, logical_page_ids)
+        cluster_ids_cpu = self._validate_cluster_blocks(
+            layer_name,
+            cluster_ids,
+            logical_page_ids,
+        )
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
         return resident_cache.admit_staged(
             cluster_ids=cluster_ids,
             page_ids=logical_page_ids,
+            cluster_groups=self._get_cluster_groups(
+                layer_name,
+                cluster_ids_cpu,
+            ),
             allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
             allocated_page_ids=pool.allocated_page_ids,
             staging_page_ids=staging_page_ids,
@@ -1430,6 +1477,13 @@ class RetroSpecClusterPageStore:
     ) -> int:
         resident_cache = self._resident_caches.get(layer_name)
         return 0 if resident_cache is None else resident_cache.num_resident_clusters
+
+    def num_resident_groups(
+        self,
+        layer_name: str,
+    ) -> int:
+        resident_cache = self._resident_caches.get(layer_name)
+        return 0 if resident_cache is None else resident_cache.num_resident_groups
 
     def num_allocated_pages(
         self,

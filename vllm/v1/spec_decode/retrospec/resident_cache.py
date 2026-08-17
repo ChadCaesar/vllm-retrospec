@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import OrderedDict, deque
-from collections.abc import Collection
-from dataclasses import dataclass
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass, field
 from math import prod
 
 import torch
+
+from .cluster_identity import RetroSpecClusterGroup
 
 _ClusterId = int
 _LogicalPages = tuple[int, ...]
@@ -21,6 +23,14 @@ class _PendingCopyBatch:
     source_value_pages: torch.Tensor
 
 
+@dataclass
+class _ResidentGroupState:
+    """Resident replacement state for one request and KV head."""
+
+    lru: OrderedDict[_ClusterId, None] = field(default_factory=OrderedDict)
+    num_pages: int = 0
+
+
 @dataclass(frozen=True)
 class RetroSpecResidentPageAccess:
     """Result of resolving logical cluster pages against the GPU cache."""
@@ -31,13 +41,15 @@ class RetroSpecResidentPageAccess:
 
 
 class RetroSpecResidentClusterCache:
-    """Bounded GPU page cache with cluster-atomic LRU ownership.
+    """Bounded layer-wide GPU page arena with group-scoped LRU state.
 
     Logical page IDs address the stable CPU backing store. Resident page IDs
-    address slots in key_pages and value_pages.
+    address slots in the shared key_pages and value_pages tensors.
 
-    Every LRU entry owns all pages of one cluster. A cluster is therefore either
-    completely resident or completely missing.
+    Every cluster belongs to one request/KV-head group. Cluster ownership and
+    recency are tracked independently for each group, while physical GPU slots
+    remain shared by the whole layer. A cluster is always admitted and evicted
+    atomically.
     """
 
     def __init__(
@@ -73,13 +85,19 @@ class RetroSpecResidentClusterCache:
         self._logical_capacity = 0
         self._physical_capacity = 0
 
-        # cluster_id is the stable identity used by lookup, LRU and admission.
-        # Logical pages only describe where the cluster payload is stored.
+        # Physical page and slot ownership remains layer-wide.
         self._cluster_to_pages: dict[_ClusterId, _LogicalPages] = {}
         self._cluster_to_slots: dict[_ClusterId, tuple[int, ...]] = {}
         self._page_to_cluster: dict[int, _ClusterId] = {}
-        self._lru: OrderedDict[_ClusterId, None] = OrderedDict()
         self._free_slots: set[int] = set()
+
+        # Semantic ownership and recency are isolated by request/KV-head group.
+        self._cluster_to_group: dict[_ClusterId, RetroSpecClusterGroup] = {}
+        self._group_states: dict[RetroSpecClusterGroup, _ResidentGroupState] = {}
+
+        # Keep the existing layer-wide eviction order until group quotas are added.
+        # Every touch is recorded in both the owning group LRU and this arbiter.
+        self._global_lru: OrderedDict[_ClusterId, None] = OrderedDict()
 
         self._copy_stream = torch.cuda.Stream(device=device)
         self._pending_copy_batches: deque[_PendingCopyBatch] = deque()
@@ -101,6 +119,10 @@ class RetroSpecResidentClusterCache:
     @property
     def num_resident_clusters(self) -> int:
         return len(self._cluster_to_slots)
+
+    @property
+    def num_resident_groups(self) -> int:
+        return len(self._group_states)
 
     @property
     def num_pending_copy_batches(self) -> int:
@@ -209,16 +231,74 @@ class RetroSpecResidentClusterCache:
         self.value_pages = new_value_pages
         self._physical_capacity = required_capacity
 
-    def _evict_cluster(
+    def _register_cluster(
         self,
         cluster_id: _ClusterId,
+        group: RetroSpecClusterGroup,
+        logical_pages: _LogicalPages,
+        slots: tuple[int, ...],
     ) -> None:
+        """Register one newly resident cluster in its group and shared arena."""
+        if cluster_id in self._cluster_to_slots:
+            raise RuntimeError(f"Resident cluster {cluster_id} is already registered")
+        if len(logical_pages) != len(slots):
+            raise RuntimeError(
+                "Resident cluster pages and GPU slots must have equal lengths"
+            )
+
+        group_state = self._group_states.setdefault(group, _ResidentGroupState())
+
+        self._cluster_to_pages[cluster_id] = logical_pages
+        self._cluster_to_slots[cluster_id] = slots
+        self._cluster_to_group[cluster_id] = group
+
+        group_state.lru[cluster_id] = None
+        group_state.num_pages += len(slots)
+        self._global_lru[cluster_id] = None
+
+        for logical_page_id in logical_pages:
+            self._page_to_cluster[logical_page_id] = cluster_id
+
+    def _touch_cluster(self, cluster_id: _ClusterId) -> None:
+        """Mark a resident cluster as recent in both replacement domains."""
+        group = self._cluster_to_group.get(cluster_id)
+        if group is None:
+            raise RuntimeError(
+                f"Resident cluster {cluster_id} does not have an owning group"
+            )
+
+        group_state = self._group_states.get(group)
+        if group_state is None or cluster_id not in group_state.lru:
+            raise RuntimeError(f"Resident group state is missing cluster {cluster_id}")
+        if cluster_id not in self._global_lru:
+            raise RuntimeError(f"Global resident LRU is missing cluster {cluster_id}")
+
+        group_state.lru.move_to_end(cluster_id, last=True)
+        self._global_lru.move_to_end(cluster_id, last=True)
+
+    def _evict_cluster(self, cluster_id: _ClusterId) -> None:
         slots = self._cluster_to_slots.pop(cluster_id, None)
         if slots is None:
             return
 
         logical_pages = self._cluster_to_pages.pop(cluster_id)
-        self._lru.pop(cluster_id, None)
+        group = self._cluster_to_group.pop(cluster_id)
+        self._global_lru.pop(cluster_id, None)
+
+        group_state = self._group_states.get(group)
+        if group_state is None or cluster_id not in group_state.lru:
+            raise RuntimeError(f"Resident group state is missing cluster {cluster_id}")
+
+        group_state.lru.pop(cluster_id)
+        group_state.num_pages -= len(slots)
+
+        if group_state.num_pages < 0:
+            raise RuntimeError("Resident group page count became negative")
+
+        if not group_state.lru:
+            if group_state.num_pages != 0:
+                raise RuntimeError("An empty resident group still owns GPU pages")
+            del self._group_states[group]
 
         for logical_page_id, slot_id in zip(logical_pages, slots):
             self._page_to_cluster.pop(logical_page_id, None)
@@ -230,7 +310,7 @@ class RetroSpecResidentClusterCache:
     ) -> bool:
         victim = None
 
-        for cluster_id in self._lru:
+        for cluster_id in self._global_lru:
             if cluster_id not in protected_clusters:
                 victim = cluster_id
                 break
@@ -242,11 +322,11 @@ class RetroSpecResidentClusterCache:
         return True
 
     def resize(self, capacity: int) -> None:
-        """Change the active resident-page capacity.
+        """Change the active layer-wide resident-page capacity.
 
         Physical storage grows when necessary but is not shrunk. Reducing the
-        active capacity evicts complete LRU clusters until the resident page
-        count satisfies the new limit.
+        active capacity evicts complete clusters according to the existing global
+        eviction order. Group-aware capacity balancing is handled separately.
         """
         if capacity < 0:
             raise ValueError("Resident cache capacity must be non-negative")
@@ -255,7 +335,7 @@ class RetroSpecResidentClusterCache:
         self._logical_capacity = capacity
 
         while self.num_resident_pages > capacity:
-            oldest_cluster = next(iter(self._lru))
+            oldest_cluster = next(iter(self._global_lru))
             self._evict_cluster(oldest_cluster)
 
     @staticmethod
@@ -408,10 +488,28 @@ class RetroSpecResidentClusterCache:
             )
         )
 
+    @staticmethod
+    def _validate_cluster_groups(
+        parsed_cluster_ids: list[_ClusterId | None],
+        cluster_groups: Mapping[_ClusterId, RetroSpecClusterGroup],
+    ) -> None:
+        """Require group metadata for every valid requested cluster."""
+        checked_clusters: set[_ClusterId] = set()
+
+        for cluster_id in parsed_cluster_ids:
+            if cluster_id is None or cluster_id in checked_clusters:
+                continue
+            if cluster_id not in cluster_groups:
+                raise RuntimeError(
+                    f"Missing resident group metadata for cluster {cluster_id}"
+                )
+            checked_clusters.add(cluster_id)
+
     def lookup(
         self,
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
+        cluster_groups: Mapping[_ClusterId, RetroSpecClusterGroup],
         allocated_cluster_ids: Collection[int],
         allocated_page_ids: Collection[int],
         touch: bool = True,
@@ -429,6 +527,7 @@ class RetroSpecResidentClusterCache:
             allocated_cluster_ids,
             allocated_page_ids,
         )
+        self._validate_cluster_groups(parsed_cluster_ids, cluster_groups)
 
         cache_page_ids_cpu = torch.full_like(page_ids_cpu, -1)
         flat_cache_page_ids = cache_page_ids_cpu.reshape(
@@ -465,6 +564,12 @@ class RetroSpecResidentClusterCache:
                 flat_miss_mask[cluster_index] = True
                 continue
 
+            resident_group = self._cluster_to_group.get(cluster_id)
+            if resident_group != cluster_groups[cluster_id]:
+                raise RuntimeError(
+                    "Resident cluster group does not match requested ownership"
+                )
+
             resident_pages = self._cluster_to_pages[cluster_id]
             if resident_pages != logical_pages:
                 raise RuntimeError(
@@ -486,7 +591,7 @@ class RetroSpecResidentClusterCache:
             # Touch low-priority entries first so rank-zero clusters finish as MRU.
             for cluster_id in reversed(requested_clusters):
                 if cluster_id in hit_clusters:
-                    self._lru.move_to_end(cluster_id, last=True)
+                    self._touch_cluster(cluster_id)
 
         return RetroSpecResidentPageAccess(
             cache_page_ids=cache_page_ids_cpu.to(
@@ -558,6 +663,7 @@ class RetroSpecResidentClusterCache:
         self,
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
+        cluster_groups: Mapping[_ClusterId, RetroSpecClusterGroup],
         allocated_cluster_ids: Collection[int],
         allocated_page_ids: Collection[int],
         source_page_ids: torch.Tensor,
@@ -565,10 +671,7 @@ class RetroSpecResidentClusterCache:
         source_value_pages: torch.Tensor,
     ) -> RetroSpecResidentPageAccess:
         """Admit a priority cluster prefix from CPU or GPU source pages."""
-        self._validate_source_pages(
-            source_key_pages,
-            source_value_pages,
-        )
+        self._validate_source_pages(source_key_pages, source_value_pages)
 
         if source_page_ids.shape != page_ids.shape:
             raise ValueError(
@@ -589,6 +692,7 @@ class RetroSpecResidentClusterCache:
             allocated_cluster_ids,
             allocated_page_ids,
         )
+        self._validate_cluster_groups(parsed_cluster_ids, cluster_groups)
 
         source_page_ids_cpu = source_page_ids.detach().to(
             device="cpu",
@@ -637,10 +741,15 @@ class RetroSpecResidentClusterCache:
             logical_pages = cluster_page_map[cluster_id]
             resident_pages = self._cluster_to_pages.get(cluster_id)
 
-            if resident_pages is not None and resident_pages != logical_pages:
-                raise RuntimeError(
-                    "Cluster ID conflicts with an existing resident descriptor"
-                )
+            if resident_pages is not None:
+                if resident_pages != logical_pages:
+                    raise RuntimeError(
+                        "Cluster ID conflicts with an existing resident descriptor"
+                    )
+                if self._cluster_to_group.get(cluster_id) != cluster_groups[cluster_id]:
+                    raise RuntimeError(
+                        "Resident cluster group does not match requested ownership"
+                    )
 
             for logical_page_id in logical_pages:
                 resident_owner = self._page_to_cluster.get(logical_page_id)
@@ -671,7 +780,7 @@ class RetroSpecResidentClusterCache:
             if cluster_id not in self._cluster_to_slots
         ]
 
-        # Validate all mappings before changing cache ownership.
+        # Validate every source before changing resident ownership.
         for cluster_id in missing_targets:
             logical_pages = cluster_page_map[cluster_id]
             source_ids = cluster_source_ids.get(cluster_id)
@@ -737,12 +846,12 @@ class RetroSpecResidentClusterCache:
                     self._free_slots.update(slots)
                     raise
 
-                self._cluster_to_pages[cluster_id] = logical_pages
-                self._cluster_to_slots[cluster_id] = slots
-                self._lru[cluster_id] = None
-
-                for logical_page_id in logical_pages:
-                    self._page_to_cluster[logical_page_id] = cluster_id
+                self._register_cluster(
+                    cluster_id=cluster_id,
+                    group=cluster_groups[cluster_id],
+                    logical_pages=logical_pages,
+                    slots=slots,
+                )
         finally:
             if copy_scheduled:
                 self._record_copy_batch(
@@ -752,11 +861,12 @@ class RetroSpecResidentClusterCache:
 
         for cluster_id in reversed(requested_clusters):
             if cluster_id in self._cluster_to_slots:
-                self._lru.move_to_end(cluster_id, last=True)
+                self._touch_cluster(cluster_id)
 
         return self.lookup(
             cluster_ids=cluster_ids,
             page_ids=page_ids,
+            cluster_groups=cluster_groups,
             allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=allocated_page_ids,
             touch=False,
@@ -766,6 +876,7 @@ class RetroSpecResidentClusterCache:
         self,
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
+        cluster_groups: Mapping[_ClusterId, RetroSpecClusterGroup],
         allocated_cluster_ids: Collection[int],
         allocated_page_ids: Collection[int],
         backing_key_pages: torch.Tensor,
@@ -780,6 +891,7 @@ class RetroSpecResidentClusterCache:
         return self._admit_from_sources(
             cluster_ids=cluster_ids,
             page_ids=page_ids,
+            cluster_groups=cluster_groups,
             allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=allocated_page_ids,
             source_page_ids=page_ids,
@@ -791,6 +903,7 @@ class RetroSpecResidentClusterCache:
         self,
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
+        cluster_groups: Mapping[_ClusterId, RetroSpecClusterGroup],
         allocated_cluster_ids: Collection[int],
         allocated_page_ids: Collection[int],
         staging_page_ids: torch.Tensor,
@@ -808,6 +921,7 @@ class RetroSpecResidentClusterCache:
         return self._admit_from_sources(
             cluster_ids=cluster_ids,
             page_ids=page_ids,
+            cluster_groups=cluster_groups,
             allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=allocated_page_ids,
             source_page_ids=staging_page_ids,
