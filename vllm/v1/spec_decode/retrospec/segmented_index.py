@@ -509,7 +509,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         )
         max_pages_per_cluster = max(
             (
-                segment.cluster_blocks.page_ids.shape[2]
+                self.cluster_store.max_pages_per_cluster(
+                    layer_name, segment.cluster_blocks.cluster_ids
+                )
                 for record in records
                 if record is not None
                 for segment in record.segments
@@ -597,8 +599,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 cluster_start = segment.cluster_start
                 cluster_end = cluster_start + segment.cluster_keys.shape[1]
 
-                cluster_ids[row, :, cluster_start:cluster_end].copy_(
-                    segment.cluster_blocks.cluster_ids
+                packed_cluster_ids = cluster_ids[row, :, cluster_start:cluster_end]
+                packed_cluster_token_counts = cluster_token_counts[
+                    row, :, cluster_start:cluster_end
+                ]
+
+                packed_cluster_ids.copy_(
+                    segment.cluster_blocks.cluster_ids, non_blocking=False
                 )
                 cluster_keys[row, :, cluster_start:cluster_end].copy_(
                     segment.cluster_keys
@@ -606,23 +613,24 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 cluster_values[row, :, cluster_start:cluster_end].copy_(
                     segment.cluster_values
                 )
-                cluster_token_counts[row, :, cluster_start:cluster_end].copy_(
-                    segment.cluster_token_counts
-                )
+                packed_cluster_token_counts.copy_(segment.cluster_token_counts)
                 cluster_mask[row, :, cluster_start:cluster_end].copy_(
-                    (segment.cluster_blocks.cluster_ids >= 0)
-                    & (segment.cluster_token_counts > 0)
+                    (packed_cluster_ids >= 0) & (packed_cluster_token_counts > 0)
                 )
 
-                segment_page_width = segment.cluster_blocks.page_ids.shape[2]
+                block_metadata = self.cluster_store.get_cluster_block_metadata(
+                    layer_name=layer_name,
+                    cluster_ids=segment.cluster_blocks.cluster_ids,
+                    device=torch.device("cpu"),
+                )
+                segment_page_width = block_metadata.page_ids.shape[2]
 
                 cluster_page_ids[
                     row, :, cluster_start:cluster_end, :segment_page_width
-                ].copy_(segment.cluster_blocks.page_ids)
-
+                ].copy_(block_metadata.page_ids, non_blocking=False)
                 cluster_page_token_counts[
                     row, :, cluster_start:cluster_end, :segment_page_width
-                ].copy_(segment.cluster_blocks.page_token_counts)
+                ].copy_(block_metadata.page_token_counts, non_blocking=False)
 
         packed = _PackedSegmentedIndex(
             indexed_token_mask=indexed_token_mask,
@@ -632,7 +640,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             cluster_token_counts=cluster_token_counts,
             cluster_mask=cluster_mask,
             cluster_page_ids=cluster_page_ids,
-            cluster_page_token_counts=cluster_page_token_counts,
+            cluster_page_token_counts=(cluster_page_token_counts),
         )
         self._packed_index_cache[layer_name] = _PackedSegmentedIndexCacheEntry(
             request_ids=request_ids,

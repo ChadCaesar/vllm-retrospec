@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -114,11 +116,16 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     assert len(record.segments) == 1
 
     segment = record.segments[0]
+    metadata = index.cluster_store.get_cluster_block_metadata(
+        "layer", segment.cluster_blocks.cluster_ids
+    )
     assert (segment.indexed_start, segment.indexed_end) == (2, 6)
     assert segment.cluster_token_counts.tolist() == [[2, 2]]
     assert segment.cluster_blocks.cluster_ids.tolist() == [[0, 1]]
-    assert segment.cluster_blocks.page_ids.shape == (1, 2, 1)
-    assert segment.cluster_blocks.page_token_counts.tolist() == [[[2], [2]]]
+    assert segment.cluster_blocks.cluster_ids.device.type == "cpu"
+    assert not hasattr(segment.cluster_blocks, "page_ids")
+    assert metadata.page_ids.shape == (1, 2, 1)
+    assert metadata.page_token_counts.tolist() == [[[2], [2]]]
     assert index.cluster_store.num_allocated_pages("layer") == 2
 
     index.begin_proposal(["request"])
@@ -189,12 +196,15 @@ def test_segmented_index_clusters_each_kv_head_independently():
 
     build_index(index, 10, keys, values, block_table)
     segment = index._indices["layer"]["request"].segments[0]
+    metadata = index.cluster_store.get_cluster_block_metadata(
+        "layer", segment.cluster_blocks.cluster_ids
+    )
 
     assert segment.cluster_token_counts.tolist() == [[2, 2], [2, 2]]
     clustered_keys, clustered_values, clustered_mask = index.cluster_store.gather_pages(
         "layer",
-        segment.cluster_blocks.page_ids.unsqueeze(0),
-        segment.cluster_blocks.page_token_counts.unsqueeze(0),
+        metadata.page_ids.unsqueeze(0),
+        metadata.page_token_counts.unsqueeze(0),
     )
 
     assert clustered_mask.all()
@@ -493,10 +503,13 @@ def test_segmented_index_reuses_packed_index_until_update():
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 10, keys, values, block_table)
+    materialize_metadata = Mock(wraps=index.cluster_store.get_cluster_block_metadata)
+    index.cluster_store.get_cluster_block_metadata = materialize_metadata
 
     first = index._pack_indices("layer", ["request"], keys, block_table)
     second = index._pack_indices("layer", ["request"], keys, block_table)
     assert second is first
+    assert materialize_metadata.call_count == 1
 
     build_index(index, 14, keys, values, block_table)
     after_update = index._pack_indices("layer", ["request"], keys, block_table)

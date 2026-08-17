@@ -24,21 +24,41 @@ RetroSpecClusterResolveMode = Literal[
 
 @dataclass(frozen=True)
 class RetroSpecClusterBlockTable:
-    """Stable cluster blocks backed by fixed-size internal pages.
+    """Ownership handle for CPU-managed cluster blocks.
 
-    cluster_ids:
+    cluster_ids has shape:
+
         [num_kv_heads, num_clusters]
 
-    page_ids and page_token_counts:
-        [num_kv_heads, num_clusters, max_pages_per_cluster]
-
-    cluster_id is the public logical identity. Page IDs are internal storage
-    descriptors and do not identify a cluster.
+    The handle deliberately does not expose backing page IDs. Page placement
+    belongs to RetroSpecClusterPageStore and is materialized only when an active
+    batch is packed for retrieval.
     """
 
     cluster_ids: torch.Tensor
+
+
+@dataclass(frozen=True)
+class RetroSpecClusterBlockMetadata:
+    """Materialized physical descriptors for selected cluster IDs.
+
+    page_ids and page_token_counts have shape:
+
+        [*, max_pages_per_cluster]
+
+    The leading shape is identical to the input cluster-ID tensor.
+    """
+
     page_ids: torch.Tensor
     page_token_counts: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _ClusterBlockDescriptor:
+    """CPU control-plane metadata owned by one stable cluster ID."""
+
+    page_ids: tuple[int, ...]
+    page_token_counts: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -355,7 +375,9 @@ class RetroSpecClusterPageStore:
 
         self._next_cluster_ids: dict[str, int] = {}
         self._allocated_cluster_ids: dict[str, set[int]] = {}
-        self._cluster_page_descriptors: dict[str, dict[int, tuple[int, ...]]] = {}
+        self._cluster_block_descriptors: dict[
+            str, dict[int, _ClusterBlockDescriptor]
+        ] = {}
 
     @property
     def is_cpu_backed(self) -> bool:
@@ -366,26 +388,40 @@ class RetroSpecClusterPageStore:
         layer_name: str,
         cluster_token_counts: torch.Tensor,
         page_ids: torch.Tensor,
-        metadata_device: torch.device,
+        page_token_counts: torch.Tensor,
     ) -> torch.Tensor:
-        valid_clusters_cpu = (
-            cluster_token_counts.detach().to(
-                device="cpu",
-            )
-            > 0
+        cluster_token_counts_cpu = cluster_token_counts.detach().to(
+            device="cpu", dtype=torch.int64
         )
-        num_clusters = int(valid_clusters_cpu.sum().item())
+        page_ids_cpu = page_ids.detach().to(device="cpu", dtype=torch.int64)
+        page_token_counts_cpu = page_token_counts.detach().to(
+            device="cpu", dtype=torch.int32
+        )
+
+        if page_ids_cpu.shape != page_token_counts_cpu.shape:
+            raise ValueError(
+                "Cluster page IDs and page token counts must have equal shapes"
+            )
+        if page_ids_cpu.shape[:-1] != cluster_token_counts_cpu.shape:
+            raise ValueError(
+                "Cluster page metadata does not match cluster token counts"
+            )
+
+        valid_clusters_cpu = cluster_token_counts_cpu > 0
+        num_valid_clusters = int(valid_clusters_cpu.sum().item())
 
         cluster_ids_cpu = torch.full(
-            cluster_token_counts.shape,
+            cluster_token_counts_cpu.shape,
             -1,
             dtype=torch.int64,
+            device="cpu",
+            pin_memory=self.pin_memory,
         )
 
         next_cluster_id = self._next_cluster_ids.get(layer_name, 0)
-        cluster_id_end = next_cluster_id + num_clusters
+        cluster_id_end = next_cluster_id + num_valid_clusters
 
-        if num_clusters:
+        if num_valid_clusters:
             cluster_ids_cpu.masked_scatter_(
                 valid_clusters_cpu,
                 torch.arange(
@@ -395,33 +431,69 @@ class RetroSpecClusterPageStore:
                 ),
             )
 
-        cluster_ids = cluster_ids_cpu.to(
-            device=metadata_device,
-            non_blocking=False,
-        )
-
         flat_cluster_ids = cluster_ids_cpu.reshape(-1).tolist()
-        flat_page_ids = (
-            page_ids.detach()
-            .to(device="cpu", dtype=torch.int64)
-            .reshape(len(flat_cluster_ids), page_ids.shape[-1])
-        )
-        new_descriptors = {
-            cluster_id: tuple(page_id for page_id in row if page_id >= 0)
-            for cluster_id, row in zip(flat_cluster_ids, flat_page_ids.tolist())
-            if cluster_id >= 0
-        }
+        flat_cluster_token_counts = cluster_token_counts_cpu.reshape(-1).tolist()
+        flat_page_ids = page_ids_cpu.reshape(
+            len(flat_cluster_ids), page_ids_cpu.shape[-1]
+        ).tolist()
+        flat_page_token_counts = page_token_counts_cpu.reshape(
+            len(flat_cluster_ids), page_token_counts_cpu.shape[-1]
+        ).tolist()
+
+        new_descriptors: dict[int, _ClusterBlockDescriptor] = {}
+
+        for (
+            cluster_id,
+            cluster_token_count,
+            page_row,
+            page_count_row,
+        ) in zip(
+            flat_cluster_ids,
+            flat_cluster_token_counts,
+            flat_page_ids,
+            flat_page_token_counts,
+        ):
+            valid_pages = tuple(page_id for page_id in page_row if page_id >= 0)
+            valid_page_token_counts = tuple(
+                page_count
+                for page_id, page_count in zip(page_row, page_count_row)
+                if page_id >= 0
+            )
+
+            for page_id, page_count in zip(page_row, page_count_row):
+                if (page_id >= 0) != (page_count > 0):
+                    raise RuntimeError(
+                        "Cluster page ID and token-count validity do not match"
+                    )
+
+            if cluster_id < 0:
+                if cluster_token_count != 0 or valid_pages:
+                    raise RuntimeError("An empty cluster cannot own backing pages")
+                continue
+
+            if not valid_pages:
+                raise RuntimeError("A valid cluster must own at least one backing page")
+            if sum(valid_page_token_counts) != cluster_token_count:
+                raise RuntimeError(
+                    "Cluster page token counts do not match cluster size"
+                )
+
+            new_descriptors[cluster_id] = _ClusterBlockDescriptor(
+                page_ids=valid_pages,
+                page_token_counts=valid_page_token_counts,
+            )
 
         allocated = self._allocated_cluster_ids.setdefault(layer_name, set())
-        descriptors = self._cluster_page_descriptors.setdefault(layer_name, {})
+        descriptors = self._cluster_block_descriptors.setdefault(layer_name, {})
+
         if allocated.intersection(new_descriptors):
             raise RuntimeError("RetroSpec cluster ID allocator produced a duplicate ID")
 
-        allocated.update(range(next_cluster_id, cluster_id_end))
+        allocated.update(new_descriptors)
         descriptors.update(new_descriptors)
         self._next_cluster_ids[layer_name] = cluster_id_end
 
-        return cluster_ids
+        return cluster_ids_cpu
 
     def _free_cluster_ids(
         self,
@@ -429,13 +501,12 @@ class RetroSpecClusterPageStore:
         cluster_ids: torch.Tensor,
     ) -> None:
         allocated = self._allocated_cluster_ids.get(layer_name)
-        if allocated is None:
+        descriptors = self._cluster_block_descriptors.get(layer_name)
+
+        if allocated is None or descriptors is None:
             raise RuntimeError(f"No RetroSpec clusters exist for layer {layer_name!r}")
 
-        cluster_ids_cpu = cluster_ids.detach().to(
-            device="cpu",
-            dtype=torch.int64,
-        )
+        cluster_ids_cpu = cluster_ids.detach().to(device="cpu", dtype=torch.int64)
         released = set(cluster_ids_cpu[cluster_ids_cpu >= 0].tolist())
 
         for cluster_id in released:
@@ -443,7 +514,7 @@ class RetroSpecClusterPageStore:
                 raise RuntimeError(f"RetroSpec cluster {cluster_id} is not allocated")
 
         allocated.difference_update(released)
-        descriptors = self._cluster_page_descriptors[layer_name]
+
         for cluster_id in released:
             del descriptors[cluster_id]
 
@@ -456,16 +527,37 @@ class RetroSpecClusterPageStore:
             raise RuntimeError(f"No RetroSpec clusters exist for layer {layer_name!r}")
         return allocated
 
+    def _validate_cluster_ids(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if cluster_ids.ndim < 1:
+            raise ValueError("Cluster IDs must have at least one dimension")
+        if cluster_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Cluster IDs must use an integral dtype")
+
+        cluster_ids_cpu = cluster_ids.detach().to(device="cpu", dtype=torch.int64)
+
+        if torch.any(cluster_ids_cpu < -1).item():
+            raise ValueError("Cluster IDs must be at least -1")
+
+        descriptors = self._cluster_block_descriptors.get(layer_name)
+        if descriptors is None:
+            raise RuntimeError(f"No RetroSpec clusters exist for layer {layer_name!r}")
+
+        for cluster_id in cluster_ids_cpu.reshape(-1).tolist():
+            if cluster_id >= 0 and cluster_id not in descriptors:
+                raise RuntimeError(f"RetroSpec cluster {cluster_id} is not allocated")
+
+        return cluster_ids_cpu
+
     def _validate_cluster_blocks(
         self,
         layer_name: str,
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
     ) -> None:
-        if cluster_ids.ndim < 1:
-            raise ValueError("Cluster IDs must have at least one dimension")
-        if cluster_ids.dtype not in (torch.int32, torch.int64):
-            raise ValueError("Cluster IDs must use an integral dtype")
         if page_ids.ndim != cluster_ids.ndim + 1:
             raise ValueError("Cluster pages must add one page dimension to cluster IDs")
         if page_ids.shape[:-1] != cluster_ids.shape:
@@ -475,24 +567,21 @@ class RetroSpecClusterPageStore:
         if cluster_ids.device != page_ids.device:
             raise ValueError("Cluster IDs and page IDs must use one device")
 
-        descriptors = self._cluster_page_descriptors.get(layer_name)
-        if descriptors is None:
-            raise RuntimeError(f"No RetroSpec clusters exist for layer {layer_name!r}")
-
-        cluster_ids_cpu = cluster_ids.detach().to(device="cpu", dtype=torch.int64)
+        cluster_ids_cpu = self._validate_cluster_ids(layer_name, cluster_ids)
         page_ids_cpu = page_ids.detach().to(device="cpu", dtype=torch.int64)
-        if torch.any(cluster_ids_cpu < -1).item():
-            raise ValueError("Cluster IDs must be at least -1")
+
         if torch.any(page_ids_cpu < -1).item():
             raise ValueError("Cluster page IDs must be at least -1")
 
+        descriptors = self._cluster_block_descriptors[layer_name]
         flat_cluster_ids = cluster_ids_cpu.reshape(-1).tolist()
         flat_page_ids = page_ids_cpu.reshape(
             len(flat_cluster_ids), page_ids_cpu.shape[-1]
         ).tolist()
 
-        for cluster_id, row in zip(flat_cluster_ids, flat_page_ids):
-            logical_pages = tuple(page_id for page_id in row if page_id >= 0)
+        for cluster_id, page_row in zip(flat_cluster_ids, flat_page_ids):
+            logical_pages = tuple(page_id for page_id in page_row if page_id >= 0)
+
             if cluster_id < 0:
                 if logical_pages:
                     raise ValueError(
@@ -500,13 +589,91 @@ class RetroSpecClusterPageStore:
                     )
                 continue
 
-            expected_pages = descriptors.get(cluster_id)
-            if expected_pages is None:
-                raise RuntimeError(f"RetroSpec cluster {cluster_id} is not allocated")
+            expected_pages = descriptors[cluster_id].page_ids
             if logical_pages != expected_pages:
                 raise RuntimeError(
                     "Cluster page descriptor does not match its stable cluster ID"
                 )
+
+    def max_pages_per_cluster(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+    ) -> int:
+        cluster_ids_cpu = self._validate_cluster_ids(layer_name, cluster_ids)
+        descriptors = self._cluster_block_descriptors[layer_name]
+
+        return max(
+            (
+                len(descriptors[cluster_id].page_ids)
+                for cluster_id in cluster_ids_cpu.reshape(-1).tolist()
+                if cluster_id >= 0
+            ),
+            default=0,
+        )
+
+    def get_cluster_block_metadata(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+        device: torch.device | None = None,
+    ) -> RetroSpecClusterBlockMetadata:
+        """Materialize CPU-owned block descriptors for an active selection."""
+        cluster_ids_cpu = self._validate_cluster_ids(layer_name, cluster_ids)
+        descriptors = self._cluster_block_descriptors[layer_name]
+
+        max_pages = max(
+            (
+                len(descriptors[cluster_id].page_ids)
+                for cluster_id in cluster_ids_cpu.reshape(-1).tolist()
+                if cluster_id >= 0
+            ),
+            default=0,
+        )
+        output_shape = (*cluster_ids_cpu.shape, max_pages)
+
+        page_ids_cpu = torch.full(
+            output_shape,
+            -1,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+        page_token_counts_cpu = torch.zeros(
+            output_shape,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+
+        flat_cluster_ids = cluster_ids_cpu.reshape(-1).tolist()
+        flat_page_ids = page_ids_cpu.reshape(len(flat_cluster_ids), max_pages)
+        flat_page_token_counts = page_token_counts_cpu.reshape(
+            len(flat_cluster_ids), max_pages
+        )
+
+        for row_index, cluster_id in enumerate(flat_cluster_ids):
+            if cluster_id < 0:
+                continue
+
+            descriptor = descriptors[cluster_id]
+            num_pages = len(descriptor.page_ids)
+
+            flat_page_ids[row_index, :num_pages] = torch.tensor(
+                descriptor.page_ids, dtype=torch.int64
+            )
+            flat_page_token_counts[row_index, :num_pages] = torch.tensor(
+                descriptor.page_token_counts, dtype=torch.int32
+            )
+
+        target_device = cluster_ids.device if device is None else device
+
+        return RetroSpecClusterBlockMetadata(
+            page_ids=page_ids_cpu.to(device=target_device, non_blocking=False),
+            page_token_counts=page_token_counts_cpu.to(
+                device=target_device, non_blocking=False
+            ),
+        )
 
     def num_allocated_clusters(
         self,
@@ -699,25 +866,12 @@ class RetroSpecClusterPageStore:
         if torch.any(cluster_token_counts < 0).item():
             raise ValueError("cluster_token_counts must be non-negative")
 
-        pool = self._get_or_create_pool(
-            layer_name,
-            token_keys,
-        )
-        storage_keys = self._move_to_storage(
-            token_keys,
-            pool.storage_device,
-        )
-        storage_values = self._move_to_storage(
-            token_values,
-            pool.storage_device,
-        )
-        storage_assignments = self._move_to_storage(
-            assignments,
-            pool.storage_device,
-        )
+        pool = self._get_or_create_pool(layer_name, token_keys)
+        storage_keys = self._move_to_storage(token_keys, pool.storage_device)
+        storage_values = self._move_to_storage(token_values, pool.storage_device)
+        storage_assignments = self._move_to_storage(assignments, pool.storage_device)
         storage_cluster_counts = self._move_to_storage(
-            cluster_token_counts,
-            pool.storage_device,
+            cluster_token_counts, pool.storage_device
         )
 
         num_kv_heads, _, head_size = token_keys.shape
@@ -734,9 +888,8 @@ class RetroSpecClusterPageStore:
         )
 
         allocated_storage_page_ids = pool.allocate(total_pages)
-        allocated_metadata_page_ids = allocated_storage_page_ids.to(
-            device=token_keys.device,
-            dtype=torch.int64,
+        allocated_metadata_page_ids = allocated_storage_page_ids.detach().to(
+            device="cpu", dtype=torch.int64
         )
 
         page_ids = torch.full(
@@ -747,12 +900,14 @@ class RetroSpecClusterPageStore:
             ),
             -1,
             dtype=torch.int64,
-            device=token_keys.device,
+            device="cpu",
+            pin_memory=self.pin_memory,
         )
         page_token_counts = torch.zeros(
             page_ids.shape,
             dtype=torch.int32,
-            device=token_keys.device,
+            device="cpu",
+            pin_memory=self.pin_memory,
         )
 
         cursor = 0
@@ -788,32 +943,14 @@ class RetroSpecClusterPageStore:
                             "cluster_token_counts"
                         )
 
-                    packed_keys = self._allocate_packed_pages(
-                        pool,
-                        num_pages,
-                    )
-                    packed_values = self._allocate_packed_pages(
-                        pool,
-                        num_pages,
-                    )
+                    packed_keys = self._allocate_packed_pages(pool, num_pages)
+                    packed_values = self._allocate_packed_pages(pool, num_pages)
 
-                    packed_keys.view(
-                        -1,
-                        head_size,
-                    )[:token_count].copy_(
-                        storage_keys[head_index].index_select(
-                            0,
-                            member_indices,
-                        )
+                    packed_keys.view(-1, head_size)[:token_count].copy_(
+                        storage_keys[head_index].index_select(0, member_indices)
                     )
-                    packed_values.view(
-                        -1,
-                        head_size,
-                    )[:token_count].copy_(
-                        storage_values[head_index].index_select(
-                            0,
-                            member_indices,
-                        )
+                    packed_values.view(-1, head_size)[:token_count].copy_(
+                        storage_values[head_index].index_select(0, member_indices)
                     )
 
                     pool.write(
@@ -851,8 +988,6 @@ class RetroSpecClusterPageStore:
         try:
             self._resize_resident_cache(layer_name, pool)
         except Exception:
-            # Keep allocation transactional if growing the GPU resident cache
-            # fails, for example because the device is out of memory.
             pool.free(allocated_storage_page_ids)
             raise
 
@@ -861,18 +996,14 @@ class RetroSpecClusterPageStore:
                 layer_name=layer_name,
                 cluster_token_counts=cluster_token_counts,
                 page_ids=page_ids,
-                metadata_device=token_keys.device,
+                page_token_counts=page_token_counts,
             )
         except Exception:
             pool.free(allocated_storage_page_ids)
             self._resize_resident_cache(layer_name, pool)
             raise
 
-        return RetroSpecClusterBlockTable(
-            cluster_ids=cluster_ids,
-            page_ids=page_ids,
-            page_token_counts=page_token_counts,
-        )
+        return RetroSpecClusterBlockTable(cluster_ids=cluster_ids)
 
     def free(
         self,
@@ -885,21 +1016,18 @@ class RetroSpecClusterPageStore:
                 f"No RetroSpec page pool exists for layer {layer_name!r}"
             )
 
-        self._validate_cluster_blocks(
-            layer_name,
-            block_table.cluster_ids,
-            block_table.page_ids,
+        block_metadata = self.get_cluster_block_metadata(
+            layer_name=layer_name,
+            cluster_ids=block_table.cluster_ids,
+            device=torch.device("cpu"),
         )
 
         resident_cache = self._resident_caches.get(layer_name)
         if resident_cache is not None:
             resident_cache.invalidate(block_table.cluster_ids)
 
-        pool.free(block_table.page_ids)
-        self._free_cluster_ids(
-            layer_name,
-            block_table.cluster_ids,
-        )
+        pool.free(block_metadata.page_ids)
+        self._free_cluster_ids(layer_name, block_table.cluster_ids)
         self._resize_resident_cache(layer_name, pool)
 
     def gather_pages(
