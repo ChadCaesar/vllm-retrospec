@@ -320,8 +320,9 @@ def test_execution_buffer_packs_resolved_cpu_backing_pages():
         cluster_counts,
     )
     logical_page_ids = table.page_ids.unsqueeze(0)
+    cluster_ids = table.cluster_ids.unsqueeze(0)
     page_counts = table.page_token_counts.unsqueeze(0)
-    resolved = store.resolve_cluster_pages("layer", logical_page_ids)
+    resolved = store.resolve_cluster_blocks("layer", cluster_ids, logical_page_ids)
 
     primary_keys, primary_values = _make_primary_cache(
         1, page_size, 1, head_size, device

@@ -23,18 +23,20 @@ RetroSpecClusterResolveMode = Literal[
 
 
 @dataclass(frozen=True)
-class RetroSpecClusterPageTable:
-    """Logical pages occupied by a group of per-head clusters.
+class RetroSpecClusterBlockTable:
+    """Stable cluster blocks backed by fixed-size internal pages.
 
-    page_ids and page_token_counts have shape:
+    cluster_ids:
+        [num_kv_heads, num_clusters]
 
+    page_ids and page_token_counts:
         [num_kv_heads, num_clusters, max_pages_per_cluster]
 
-    Page IDs address stable pages in the cluster backing store. A page ID of
-    -1 represents padding. page_token_counts records how many vectors in each
-    page are valid.
+    cluster_id is the public logical identity. Page IDs are internal storage
+    descriptors and do not identify a cluster.
     """
 
+    cluster_ids: torch.Tensor
     page_ids: torch.Tensor
     page_token_counts: torch.Tensor
 
@@ -348,18 +350,170 @@ class RetroSpecClusterPageStore:
         self.pin_memory = pin_memory if storage_mode == "cpu_offload" else False
         self.cache_ratio = cache_ratio
 
-        self._layer_pools: dict[
-            str,
-            _LayerClusterPagePool,
-        ] = {}
-        self._resident_caches: dict[
-            str,
-            RetroSpecResidentClusterCache,
-        ] = {}
+        self._layer_pools: dict[str, _LayerClusterPagePool] = {}
+        self._resident_caches: dict[str, RetroSpecResidentClusterCache] = {}
+
+        self._next_cluster_ids: dict[str, int] = {}
+        self._allocated_cluster_ids: dict[str, set[int]] = {}
+        self._cluster_page_descriptors: dict[str, dict[int, tuple[int, ...]]] = {}
 
     @property
     def is_cpu_backed(self) -> bool:
         return self.storage_mode == "cpu_offload"
+
+    def _allocate_cluster_ids(
+        self,
+        layer_name: str,
+        cluster_token_counts: torch.Tensor,
+        page_ids: torch.Tensor,
+        metadata_device: torch.device,
+    ) -> torch.Tensor:
+        valid_clusters_cpu = (
+            cluster_token_counts.detach().to(
+                device="cpu",
+            )
+            > 0
+        )
+        num_clusters = int(valid_clusters_cpu.sum().item())
+
+        cluster_ids_cpu = torch.full(
+            cluster_token_counts.shape,
+            -1,
+            dtype=torch.int64,
+        )
+
+        next_cluster_id = self._next_cluster_ids.get(layer_name, 0)
+        cluster_id_end = next_cluster_id + num_clusters
+
+        if num_clusters:
+            cluster_ids_cpu.masked_scatter_(
+                valid_clusters_cpu,
+                torch.arange(
+                    next_cluster_id,
+                    cluster_id_end,
+                    dtype=torch.int64,
+                ),
+            )
+
+        cluster_ids = cluster_ids_cpu.to(
+            device=metadata_device,
+            non_blocking=False,
+        )
+
+        flat_cluster_ids = cluster_ids_cpu.reshape(-1).tolist()
+        flat_page_ids = (
+            page_ids.detach()
+            .to(device="cpu", dtype=torch.int64)
+            .reshape(len(flat_cluster_ids), page_ids.shape[-1])
+        )
+        new_descriptors = {
+            cluster_id: tuple(page_id for page_id in row if page_id >= 0)
+            for cluster_id, row in zip(flat_cluster_ids, flat_page_ids.tolist())
+            if cluster_id >= 0
+        }
+
+        allocated = self._allocated_cluster_ids.setdefault(layer_name, set())
+        descriptors = self._cluster_page_descriptors.setdefault(layer_name, {})
+        if allocated.intersection(new_descriptors):
+            raise RuntimeError("RetroSpec cluster ID allocator produced a duplicate ID")
+
+        allocated.update(range(next_cluster_id, cluster_id_end))
+        descriptors.update(new_descriptors)
+        self._next_cluster_ids[layer_name] = cluster_id_end
+
+        return cluster_ids
+
+    def _free_cluster_ids(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+    ) -> None:
+        allocated = self._allocated_cluster_ids.get(layer_name)
+        if allocated is None:
+            raise RuntimeError(f"No RetroSpec clusters exist for layer {layer_name!r}")
+
+        cluster_ids_cpu = cluster_ids.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        )
+        released = set(cluster_ids_cpu[cluster_ids_cpu >= 0].tolist())
+
+        for cluster_id in released:
+            if cluster_id not in allocated:
+                raise RuntimeError(f"RetroSpec cluster {cluster_id} is not allocated")
+
+        allocated.difference_update(released)
+        descriptors = self._cluster_page_descriptors[layer_name]
+        for cluster_id in released:
+            del descriptors[cluster_id]
+
+    def _get_allocated_cluster_ids(
+        self,
+        layer_name: str,
+    ) -> set[int]:
+        allocated = self._allocated_cluster_ids.get(layer_name)
+        if allocated is None:
+            raise RuntimeError(f"No RetroSpec clusters exist for layer {layer_name!r}")
+        return allocated
+
+    def _validate_cluster_blocks(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+        page_ids: torch.Tensor,
+    ) -> None:
+        if cluster_ids.ndim < 1:
+            raise ValueError("Cluster IDs must have at least one dimension")
+        if cluster_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Cluster IDs must use an integral dtype")
+        if page_ids.ndim != cluster_ids.ndim + 1:
+            raise ValueError("Cluster pages must add one page dimension to cluster IDs")
+        if page_ids.shape[:-1] != cluster_ids.shape:
+            raise ValueError("Cluster ID and page-table shapes do not match")
+        if page_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Cluster page IDs must use an integral dtype")
+        if cluster_ids.device != page_ids.device:
+            raise ValueError("Cluster IDs and page IDs must use one device")
+
+        descriptors = self._cluster_page_descriptors.get(layer_name)
+        if descriptors is None:
+            raise RuntimeError(f"No RetroSpec clusters exist for layer {layer_name!r}")
+
+        cluster_ids_cpu = cluster_ids.detach().to(device="cpu", dtype=torch.int64)
+        page_ids_cpu = page_ids.detach().to(device="cpu", dtype=torch.int64)
+        if torch.any(cluster_ids_cpu < -1).item():
+            raise ValueError("Cluster IDs must be at least -1")
+        if torch.any(page_ids_cpu < -1).item():
+            raise ValueError("Cluster page IDs must be at least -1")
+
+        flat_cluster_ids = cluster_ids_cpu.reshape(-1).tolist()
+        flat_page_ids = page_ids_cpu.reshape(
+            len(flat_cluster_ids), page_ids_cpu.shape[-1]
+        ).tolist()
+
+        for cluster_id, row in zip(flat_cluster_ids, flat_page_ids):
+            logical_pages = tuple(page_id for page_id in row if page_id >= 0)
+            if cluster_id < 0:
+                if logical_pages:
+                    raise ValueError(
+                        "A padded cluster ID cannot reference logical pages"
+                    )
+                continue
+
+            expected_pages = descriptors.get(cluster_id)
+            if expected_pages is None:
+                raise RuntimeError(f"RetroSpec cluster {cluster_id} is not allocated")
+            if logical_pages != expected_pages:
+                raise RuntimeError(
+                    "Cluster page descriptor does not match its stable cluster ID"
+                )
+
+    def num_allocated_clusters(
+        self,
+        layer_name: str,
+    ) -> int:
+        allocated = self._allocated_cluster_ids.get(layer_name)
+        return 0 if allocated is None else len(allocated)
 
     def _get_storage_device(
         self,
@@ -512,7 +666,7 @@ class RetroSpecClusterPageStore:
         token_values: torch.Tensor,
         assignments: torch.Tensor,
         cluster_token_counts: torch.Tensor,
-    ) -> RetroSpecClusterPageTable:
+    ) -> RetroSpecClusterBlockTable:
         """Reorder token KV into stable per-head, per-cluster backing pages."""
         if token_values.shape != token_keys.shape:
             raise ValueError("token_keys and token_values must have equal shapes")
@@ -702,7 +856,20 @@ class RetroSpecClusterPageStore:
             pool.free(allocated_storage_page_ids)
             raise
 
-        return RetroSpecClusterPageTable(
+        try:
+            cluster_ids = self._allocate_cluster_ids(
+                layer_name=layer_name,
+                cluster_token_counts=cluster_token_counts,
+                page_ids=page_ids,
+                metadata_device=token_keys.device,
+            )
+        except Exception:
+            pool.free(allocated_storage_page_ids)
+            self._resize_resident_cache(layer_name, pool)
+            raise
+
+        return RetroSpecClusterBlockTable(
+            cluster_ids=cluster_ids,
             page_ids=page_ids,
             page_token_counts=page_token_counts,
         )
@@ -710,7 +877,7 @@ class RetroSpecClusterPageStore:
     def free(
         self,
         layer_name: str,
-        page_table: RetroSpecClusterPageTable,
+        block_table: RetroSpecClusterBlockTable,
     ) -> None:
         pool = self._layer_pools.get(layer_name)
         if pool is None:
@@ -718,15 +885,22 @@ class RetroSpecClusterPageStore:
                 f"No RetroSpec page pool exists for layer {layer_name!r}"
             )
 
+        self._validate_cluster_blocks(
+            layer_name,
+            block_table.cluster_ids,
+            block_table.page_ids,
+        )
+
         resident_cache = self._resident_caches.get(layer_name)
         if resident_cache is not None:
-            resident_cache.invalidate(page_table.page_ids)
+            resident_cache.invalidate(block_table.cluster_ids)
 
-        pool.free(page_table.page_ids)
-        self._resize_resident_cache(
+        pool.free(block_table.page_ids)
+        self._free_cluster_ids(
             layer_name,
-            pool,
+            block_table.cluster_ids,
         )
+        self._resize_resident_cache(layer_name, pool)
 
     def gather_pages(
         self,
@@ -890,23 +1064,22 @@ class RetroSpecClusterPageStore:
             staging_value_pages,
         )
 
-    def resolve_cluster_pages(
+    def resolve_cluster_blocks(
         self,
         layer_name: str,
+        cluster_ids: torch.Tensor,
         logical_page_ids: torch.Tensor,
         mode: RetroSpecClusterResolveMode = "verification",
     ) -> RetroSpecResolvedClusterPages:
-        """Resolve logical cluster pages for draft or verification.
-
-        resident_only performs a lookup without staging or admission. It is used
-        by draft attention.
-
-        verification snapshots the current resident hits and stages every current
-        miss. Cache admission is deliberately deferred until exact packing has
-        consumed these sources.
-        """
+        """Resolve selected cluster blocks to physical GPU page sources."""
         if mode not in ("resident_only", "verification"):
             raise ValueError(f"Unsupported RetroSpec cluster resolve mode: {mode}")
+        if logical_page_ids.shape[:-1] != cluster_ids.shape:
+            raise ValueError("Logical page-table shape does not match cluster IDs")
+        if logical_page_ids.device != cluster_ids.device:
+            raise ValueError("Cluster IDs and logical pages must use one device")
+
+        self._validate_cluster_blocks(layer_name, cluster_ids, logical_page_ids)
 
         pool = self._layer_pools.get(layer_name)
         if pool is None:
@@ -914,12 +1087,14 @@ class RetroSpecClusterPageStore:
                 f"No RetroSpec page pool exists for layer {layer_name!r}"
             )
 
+        allocated_cluster_ids = self._get_allocated_cluster_ids(layer_name)
+
         if not self.is_cpu_backed:
             staging_page_ids = torch.full_like(
                 logical_page_ids,
                 -1,
             )
-            hit_cluster_mask = (logical_page_ids >= 0).any(dim=-1)
+            hit_cluster_mask = cluster_ids >= 0
 
             return RetroSpecResolvedClusterPages(
                 resident_page_ids=logical_page_ids,
@@ -936,8 +1111,10 @@ class RetroSpecClusterPageStore:
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
         resident_access = resident_cache.lookup(
-            logical_page_ids,
-            pool.allocated_page_ids,
+            cluster_ids=cluster_ids,
+            page_ids=logical_page_ids,
+            allocated_cluster_ids=allocated_cluster_ids,
+            allocated_page_ids=pool.allocated_page_ids,
             touch=True,
         )
 
@@ -971,54 +1148,58 @@ class RetroSpecClusterPageStore:
             resident_ready_event=resident_cache.pending_copy_event(),
         )
 
-    def lookup_resident_pages(
+    def lookup_resident_clusters(
         self,
         layer_name: str,
+        cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
         touch: bool = True,
     ) -> RetroSpecResidentPageAccess:
-        """Resolve logical cluster pages against resident GPU slots."""
+        self._validate_cluster_blocks(layer_name, cluster_ids, page_ids)
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
         return resident_cache.lookup(
-            page_ids,
-            pool.allocated_page_ids,
-            touch,
+            cluster_ids=cluster_ids,
+            page_ids=page_ids,
+            allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
+            allocated_page_ids=pool.allocated_page_ids,
+            touch=touch,
         )
 
     def admit_resident_clusters(
         self,
         layer_name: str,
+        cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
     ) -> RetroSpecResidentPageAccess:
-        """Asynchronously admit selected clusters into the GPU cache.
-
-        The returned mapping may reference copies still in flight. A consumer must
-        obtain resident storage through get_resident_page_storage(), which inserts
-        the required CUDA stream dependency.
-        """
+        self._validate_cluster_blocks(layer_name, cluster_ids, page_ids)
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
         return resident_cache.admit(
-            page_ids,
-            pool.allocated_page_ids,
-            pool.key_pages,
-            pool.value_pages,
+            cluster_ids=cluster_ids,
+            page_ids=page_ids,
+            allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
+            allocated_page_ids=pool.allocated_page_ids,
+            backing_key_pages=pool.key_pages,
+            backing_value_pages=pool.value_pages,
         )
 
     def admit_staged_clusters(
         self,
         layer_name: str,
+        cluster_ids: torch.Tensor,
         logical_page_ids: torch.Tensor,
         staging_page_ids: torch.Tensor,
         staging_key_pages: torch.Tensor,
         staging_value_pages: torch.Tensor,
     ) -> RetroSpecResidentPageAccess:
-        """Update the resident cache from verification staging pages."""
+        self._validate_cluster_blocks(layer_name, cluster_ids, logical_page_ids)
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
         return resident_cache.admit_staged(
+            cluster_ids=cluster_ids,
             page_ids=logical_page_ids,
+            allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
             allocated_page_ids=pool.allocated_page_ids,
             staging_page_ids=staging_page_ids,
             staging_key_pages=staging_key_pages,

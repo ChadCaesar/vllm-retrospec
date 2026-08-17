@@ -9,8 +9,8 @@ import torch
 
 from .cluster_scoring import reduce_grouped_cluster_scores
 from .cluster_store import (
+    RetroSpecClusterBlockTable,
     RetroSpecClusterPageStore,
-    RetroSpecClusterPageTable,
     RetroSpecClusterStorageMode,
     RetroSpecResolvedClusterPages,
 )
@@ -29,12 +29,14 @@ class RetroSpecTokenSelectionPlan:
     primary_exact_token_indices: torch.Tensor
     primary_exact_token_mask: torch.Tensor
 
+    sparse_exact_cluster_ids: torch.Tensor
     sparse_exact_page_ids: torch.Tensor
     sparse_exact_page_token_counts: torch.Tensor
     sparse_estimation_keys: torch.Tensor
     sparse_estimation_values: torch.Tensor
     sparse_estimation_token_counts: torch.Tensor
 
+    expanded_exact_cluster_ids: torch.Tensor
     expanded_exact_page_ids: torch.Tensor
     expanded_exact_page_token_counts: torch.Tensor
     expanded_estimation_keys: torch.Tensor
@@ -47,6 +49,7 @@ class RetroSpecTokenSelectionPlan:
 
 @dataclass(frozen=True)
 class RetroSpecTokenAttentionSelection:
+    exact_cluster_ids: torch.Tensor
     exact_page_ids: torch.Tensor
     exact_page_token_counts: torch.Tensor
     exact_token_counts: torch.Tensor
@@ -57,10 +60,6 @@ class RetroSpecTokenAttentionSelection:
 
     attention_mass: torch.Tensor
     plan: RetroSpecTokenSelectionPlan
-
-    # Draft CPU-offload selections are resolved while the resident hit/miss
-    # split is constructed. Verification selections leave this as None and
-    # resolve their pages later in the attention execution path.
     resolved_pages: RetroSpecResolvedClusterPages | None
 
     @property
@@ -77,7 +76,7 @@ class _RequestLayerSegment:
     cluster_keys: torch.Tensor
     cluster_values: torch.Tensor
     cluster_token_counts: torch.Tensor
-    cluster_pages: RetroSpecClusterPageTable
+    cluster_blocks: RetroSpecClusterBlockTable
 
 
 @dataclass
@@ -91,6 +90,7 @@ class _RequestLayerIndex:
 class _PackedSegmentedIndex:
     indexed_token_mask: torch.Tensor
 
+    cluster_ids: torch.Tensor
     cluster_keys: torch.Tensor
     cluster_values: torch.Tensor
     cluster_token_counts: torch.Tensor
@@ -283,7 +283,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         record: _RequestLayerIndex,
     ) -> None:
         for segment in record.segments:
-            self.cluster_store.free(layer_name, segment.cluster_pages)
+            self.cluster_store.free(layer_name, segment.cluster_blocks)
 
     @staticmethod
     def _cluster_means(
@@ -351,9 +351,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
             record = layer_indices.get(request_id)
             if record is not None and desired_end < record.indexed_end:
-                # The cached packed view owns page IDs from this record. Drop
-                # it before releasing pages so an exception while rebuilding
-                # cannot leave a cache entry that refers to freed storage.
+                # Drop the packed view before releasing stable cluster IDs and their
+                # backing pages.
                 self._packed_index_cache.pop(layer_name, None)
                 self._free_record(layer_name, record)
                 record = self._empty_index()
@@ -441,7 +440,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 cluster_token_counts,
             )
 
-            cluster_pages = self.cluster_store.store_clusters(
+            cluster_blocks = self.cluster_store.store_clusters(
                 layer_name=layer_name,
                 token_keys=token_keys,
                 token_values=token_values,
@@ -463,7 +462,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                     cluster_keys=cluster_keys,
                     cluster_values=cluster_values,
                     cluster_token_counts=cluster_token_counts,
-                    cluster_pages=cluster_pages,
+                    cluster_blocks=cluster_blocks,
                 )
             )
             record.num_clusters += cluster_token_counts.shape[1]
@@ -510,7 +509,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         )
         max_pages_per_cluster = max(
             (
-                segment.cluster_pages.page_ids.shape[2]
+                segment.cluster_blocks.page_ids.shape[2]
                 for record in records
                 if record is not None
                 for segment in record.segments
@@ -525,6 +524,17 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             batch_size,
             max_num_tokens,
             dtype=torch.bool,
+            device=key_cache.device,
+        )
+
+        cluster_ids = torch.full(
+            (
+                batch_size,
+                num_kv_heads,
+                max_num_clusters,
+            ),
+            -1,
+            dtype=torch.int64,
             device=key_cache.device,
         )
 
@@ -587,43 +597,36 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 cluster_start = segment.cluster_start
                 cluster_end = cluster_start + segment.cluster_keys.shape[1]
 
-                cluster_keys[
-                    row,
-                    :,
-                    cluster_start:cluster_end,
-                ].copy_(segment.cluster_keys)
-                cluster_values[
-                    row,
-                    :,
-                    cluster_start:cluster_end,
-                ].copy_(segment.cluster_values)
-                cluster_token_counts[
-                    row,
-                    :,
-                    cluster_start:cluster_end,
-                ].copy_(segment.cluster_token_counts)
-                cluster_mask[
-                    row,
-                    :,
-                    cluster_start:cluster_end,
-                ].copy_(segment.cluster_token_counts > 0)
+                cluster_ids[row, :, cluster_start:cluster_end].copy_(
+                    segment.cluster_blocks.cluster_ids
+                )
+                cluster_keys[row, :, cluster_start:cluster_end].copy_(
+                    segment.cluster_keys
+                )
+                cluster_values[row, :, cluster_start:cluster_end].copy_(
+                    segment.cluster_values
+                )
+                cluster_token_counts[row, :, cluster_start:cluster_end].copy_(
+                    segment.cluster_token_counts
+                )
+                cluster_mask[row, :, cluster_start:cluster_end].copy_(
+                    (segment.cluster_blocks.cluster_ids >= 0)
+                    & (segment.cluster_token_counts > 0)
+                )
 
-                segment_page_width = segment.cluster_pages.page_ids.shape[2]
+                segment_page_width = segment.cluster_blocks.page_ids.shape[2]
+
                 cluster_page_ids[
-                    row,
-                    :,
-                    cluster_start:cluster_end,
-                    :segment_page_width,
-                ].copy_(segment.cluster_pages.page_ids)
+                    row, :, cluster_start:cluster_end, :segment_page_width
+                ].copy_(segment.cluster_blocks.page_ids)
+
                 cluster_page_token_counts[
-                    row,
-                    :,
-                    cluster_start:cluster_end,
-                    :segment_page_width,
-                ].copy_(segment.cluster_pages.page_token_counts)
+                    row, :, cluster_start:cluster_end, :segment_page_width
+                ].copy_(segment.cluster_blocks.page_token_counts)
 
         packed = _PackedSegmentedIndex(
             indexed_token_mask=indexed_token_mask,
+            cluster_ids=cluster_ids,
             cluster_keys=cluster_keys,
             cluster_values=cluster_values,
             cluster_token_counts=cluster_token_counts,
@@ -1280,14 +1283,20 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         return selected_scores.sum(dim=2)
 
     @staticmethod
-    def _build_cluster_page_selection(
+    def _build_exact_cluster_selection(
+        cluster_ids: torch.Tensor,
         cluster_page_ids: torch.Tensor,
         cluster_page_token_counts: torch.Tensor,
         packed_cluster_indices: torch.Tensor,
         packed_cluster_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, num_kv_heads, _, max_pages = cluster_page_ids.shape
         max_selected_clusters = packed_cluster_indices.shape[2]
+
+        selected_cluster_ids = cluster_ids.gather(
+            dim=2,
+            index=packed_cluster_indices,
+        )
 
         page_indices = packed_cluster_indices.unsqueeze(-1).expand(
             batch_size,
@@ -1305,19 +1314,19 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             index=page_indices,
         )
 
+        valid_clusters = packed_cluster_mask & (selected_cluster_ids >= 0)
+        selected_cluster_ids.masked_fill_(~valid_clusters, -1)
+
         valid_pages = (
-            packed_cluster_mask.unsqueeze(-1)
+            valid_clusters.unsqueeze(-1)
             & (selected_page_ids >= 0)
             & (selected_page_token_counts > 0)
         )
-
         selected_page_ids.masked_fill_(~valid_pages, -1)
-        selected_page_token_counts.masked_fill_(
-            ~valid_pages,
-            0,
-        )
+        selected_page_token_counts.masked_fill_(~valid_pages, 0)
 
         return (
+            selected_cluster_ids.contiguous(),
             selected_page_ids.contiguous(),
             selected_page_token_counts.contiguous(),
         )
@@ -1398,18 +1407,23 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         )
 
         (
+            sparse_exact_cluster_ids,
             sparse_exact_page_ids,
             sparse_exact_page_token_counts,
-        ) = self._build_cluster_page_selection(
+        ) = self._build_exact_cluster_selection(
+            packed.cluster_ids,
             packed.cluster_page_ids,
             packed.cluster_page_token_counts,
             cluster_zones.sparse_retrieval_indices,
             cluster_zones.sparse_retrieval_mask,
         )
+
         (
+            expanded_exact_cluster_ids,
             expanded_exact_page_ids,
             expanded_exact_page_token_counts,
-        ) = self._build_cluster_page_selection(
+        ) = self._build_exact_cluster_selection(
+            packed.cluster_ids,
             packed.cluster_page_ids,
             packed.cluster_page_token_counts,
             cluster_zones.expanded_retrieval_indices,
@@ -1443,11 +1457,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             layer_name=layer_name,
             primary_exact_token_indices=primary_exact_token_indices,
             primary_exact_token_mask=primary_exact_token_mask,
+            sparse_exact_cluster_ids=sparse_exact_cluster_ids,
             sparse_exact_page_ids=sparse_exact_page_ids,
             sparse_exact_page_token_counts=sparse_exact_page_token_counts,
             sparse_estimation_keys=sparse_estimation_keys,
             sparse_estimation_values=sparse_estimation_values,
             sparse_estimation_token_counts=sparse_estimation_token_counts,
+            expanded_exact_cluster_ids=expanded_exact_cluster_ids,
             expanded_exact_page_ids=expanded_exact_page_ids,
             expanded_exact_page_token_counts=expanded_exact_page_token_counts,
             expanded_estimation_keys=expanded_estimation_keys,
@@ -1519,16 +1535,17 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         """
         if (
             not self.cluster_store.is_cpu_backed
-            or plan.sparse_exact_page_ids.numel() == 0
+            or plan.sparse_exact_cluster_ids.numel() == 0
         ):
             return self._materialize_token_selection(
                 plan,
                 RetroSpecAttentionLevel.SPARSE,
             )
 
-        resolved_pages = self.cluster_store.resolve_cluster_pages(
-            plan.layer_name,
-            plan.sparse_exact_page_ids,
+        resolved_pages = self.cluster_store.resolve_cluster_blocks(
+            layer_name=plan.layer_name,
+            cluster_ids=plan.sparse_exact_cluster_ids,
+            logical_page_ids=plan.sparse_exact_page_ids,
             mode="resident_only",
         )
 
@@ -1612,6 +1629,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         ).contiguous()
 
         return RetroSpecTokenAttentionSelection(
+            exact_cluster_ids=plan.sparse_exact_cluster_ids,
             exact_page_ids=plan.sparse_exact_page_ids,
             exact_page_token_counts=draft_exact_page_token_counts,
             exact_token_counts=exact_token_counts,
@@ -1629,6 +1647,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         level: RetroSpecAttentionLevel,
     ) -> RetroSpecTokenAttentionSelection:
         if level == RetroSpecAttentionLevel.SPARSE:
+            exact_cluster_ids = plan.sparse_exact_cluster_ids
             exact_page_ids = plan.sparse_exact_page_ids
             exact_page_token_counts = plan.sparse_exact_page_token_counts
             estimation_keys = plan.sparse_estimation_keys
@@ -1636,6 +1655,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             estimation_token_counts = plan.sparse_estimation_token_counts
             attention_mass = plan.sparse_attn
         elif level == RetroSpecAttentionLevel.EXPANDED:
+            exact_cluster_ids = plan.expanded_exact_cluster_ids
             exact_page_ids = plan.expanded_exact_page_ids
             exact_page_token_counts = plan.expanded_exact_page_token_counts
             estimation_keys = plan.expanded_estimation_keys
@@ -1658,6 +1678,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         ).contiguous()
 
         return RetroSpecTokenAttentionSelection(
+            exact_cluster_ids=exact_cluster_ids,
             exact_page_ids=exact_page_ids,
             exact_page_token_counts=exact_page_token_counts,
             exact_token_counts=exact_token_counts,

@@ -170,16 +170,24 @@ def make_token_plan(
         dtype=torch.int64,
     )
     page_token_counts = torch.empty_like(page_ids, dtype=torch.int32)
+    cluster_ids = torch.empty(
+        batch_size,
+        num_kv_heads,
+        0,
+        dtype=torch.int64,
+    )
 
     return RetroSpecTokenSelectionPlan(
         layer_name="layer",
         primary_exact_token_indices=exact_indices,
         primary_exact_token_mask=exact_mask,
+        sparse_exact_cluster_ids=cluster_ids,
         sparse_exact_page_ids=page_ids,
         sparse_exact_page_token_counts=page_token_counts,
         sparse_estimation_keys=estimation_keys,
         sparse_estimation_values=estimation_keys.clone(),
         sparse_estimation_token_counts=estimation_counts,
+        expanded_exact_cluster_ids=cluster_ids,
         expanded_exact_page_ids=page_ids,
         expanded_exact_page_token_counts=page_token_counts,
         expanded_estimation_keys=estimation_keys,
@@ -474,6 +482,7 @@ def test_token_exact_attention_uses_reference_fallback_on_cpu():
         estimation_width=0,
     )
     selection = RetroSpecTokenAttentionSelection(
+        exact_cluster_ids=plan.sparse_exact_cluster_ids,
         exact_page_ids=plan.sparse_exact_page_ids,
         exact_page_token_counts=plan.sparse_exact_page_token_counts,
         exact_token_counts=torch.full((1, 2), 2, dtype=torch.int32),
@@ -541,15 +550,18 @@ def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
     controller.mode = RetroSpecAttentionMode.SPARSE_VERIFY
 
     device = torch.device("cuda")
+    cluster_ids = torch.tensor([[[0]]], dtype=torch.int64, device=device)
     page_ids = torch.tensor([[[[0]]]], dtype=torch.int64, device=device)
     page_counts = torch.ones_like(page_ids, dtype=torch.int32)
     base_plan = make_token_plan(1, 1, exact_width=0, estimation_width=0)
     plan = replace(
         base_plan,
+        sparse_exact_cluster_ids=cluster_ids,
         sparse_exact_page_ids=page_ids,
         sparse_exact_page_token_counts=page_counts,
     )
     selection = RetroSpecTokenAttentionSelection(
+        exact_cluster_ids=cluster_ids,
         exact_page_ids=page_ids,
         exact_page_token_counts=page_counts,
         exact_token_counts=torch.ones(1, 1, dtype=torch.int32, device=device),
@@ -578,11 +590,11 @@ def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
             "materialize_exact_reference",
             side_effect=lambda *_: call_order.append("materialize") or reference_exact,
         ),
-        patch.object(
-            controller.index.cluster_store,
-            "admit_resident_clusters",
-            side_effect=lambda *_: call_order.append("admit"),
-        ) as admit,
+            patch.object(
+                controller.index.cluster_store,
+                "admit_resident_clusters",
+                side_effect=lambda **_: call_order.append("admit"),
+            ) as admit,
         patch.object(
             controller,
             "_run_grouped_reference_attention",
@@ -605,7 +617,9 @@ def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
         )
 
     assert result is expected
-    admit.assert_called_once_with("layer", page_ids)
+    admit.assert_called_once_with(
+        layer_name="layer", cluster_ids=cluster_ids, page_ids=page_ids
+    )
     assert call_order == ["materialize", "admit", "attention"]
 
 
@@ -733,6 +747,7 @@ def test_token_estimation_attention_uses_per_head_cluster_sizes():
         estimation_width=2,
     )
     selection = RetroSpecTokenAttentionSelection(
+        exact_cluster_ids=plan.sparse_exact_cluster_ids,
         exact_page_ids=plan.sparse_exact_page_ids,
         exact_page_token_counts=plan.sparse_exact_page_token_counts,
         exact_token_counts=torch.zeros(1, 2, dtype=torch.int32),
@@ -786,6 +801,7 @@ def test_get_grouped_estimation_converts_block_layout():
 def test_get_grouped_estimation_keeps_token_layout():
     plan = make_token_plan(1, 2, exact_width=0, estimation_width=3)
     selection = RetroSpecTokenAttentionSelection(
+        exact_cluster_ids=plan.sparse_exact_cluster_ids,
         exact_page_ids=plan.sparse_exact_page_ids,
         exact_page_token_counts=plan.sparse_exact_page_token_counts,
         exact_token_counts=torch.zeros(1, 2, dtype=torch.int32),
@@ -827,6 +843,7 @@ def test_exact_attention_resolves_resident_and_staging_pages(
     controller.mode = attention_mode
 
     device = torch.device("cuda")
+    cluster_ids = torch.tensor([[[0, 1]]], dtype=torch.int64, device=device)
     page_ids = torch.tensor([[[[0], [1]]]], dtype=torch.int64, device=device)
     page_counts = torch.tensor([[[[2], [1]]]], dtype=torch.int32, device=device)
     plan = RetroSpecTokenSelectionPlan(
@@ -835,6 +852,7 @@ def test_exact_attention_resolves_resident_and_staging_pages(
             1, 1, 0, dtype=torch.int64, device=device
         ),
         primary_exact_token_mask=torch.empty(1, 1, 0, dtype=torch.bool, device=device),
+        sparse_exact_cluster_ids=cluster_ids,
         sparse_exact_page_ids=page_ids,
         sparse_exact_page_token_counts=page_counts,
         sparse_estimation_keys=torch.empty(1, 1, 0, 1, device=device),
@@ -842,6 +860,7 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         sparse_estimation_token_counts=torch.empty(
             1, 1, 0, dtype=torch.int32, device=device
         ),
+        expanded_exact_cluster_ids=cluster_ids,
         expanded_exact_page_ids=page_ids,
         expanded_exact_page_token_counts=page_counts,
         expanded_estimation_keys=torch.empty(1, 1, 0, 1, device=device),
@@ -853,6 +872,7 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         expanded_attn=torch.ones(1, device=device),
     )
     selection = RetroSpecTokenAttentionSelection(
+        exact_cluster_ids=cluster_ids,
         exact_page_ids=page_ids,
         exact_page_token_counts=page_counts,
         exact_token_counts=torch.tensor([[3]], dtype=torch.int32, device=device),
@@ -885,7 +905,7 @@ def test_exact_attention_resolves_resident_and_staging_pages(
     if pre_resolved:
         selection = replace(selection, resolved_pages=resolved)
 
-    controller.index.cluster_store.resolve_cluster_pages = Mock(return_value=resolved)
+    controller.index.cluster_store.resolve_cluster_blocks = Mock(return_value=resolved)
 
     call_order: list[str] = []
     execution = make_exact_execution(
@@ -925,16 +945,18 @@ def test_exact_attention_resolves_resident_and_staging_pages(
 
     assert result is expected_output
     if pre_resolved:
-        controller.index.cluster_store.resolve_cluster_pages.assert_not_called()
+        controller.index.cluster_store.resolve_cluster_blocks.assert_not_called()
     else:
-        controller.index.cluster_store.resolve_cluster_pages.assert_called_once_with(
-            "layer",
-            page_ids,
+        controller.index.cluster_store.resolve_cluster_blocks.assert_called_once_with(
+            layer_name="layer",
+            cluster_ids=cluster_ids,
+            logical_page_ids=page_ids,
             mode="verification",
         )
     if expect_admission:
         controller.index.cluster_store.admit_staged_clusters.assert_called_once_with(
             layer_name="layer",
+            cluster_ids=cluster_ids,
             logical_page_ids=page_ids,
             staging_page_ids=staging_page_ids,
             staging_key_pages=staging_keys,

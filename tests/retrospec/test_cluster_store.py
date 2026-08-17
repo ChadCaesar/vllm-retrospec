@@ -52,11 +52,14 @@ def test_cluster_store_packs_per_head_clusters_across_pages():
     )
 
     assert table.page_ids.shape == (2, 2, 2)
+    assert table.cluster_ids.shape == (2, 2)
+    assert table.cluster_ids.tolist() == [[0, 1], [2, 3]]
     assert table.page_token_counts.tolist() == [
         [[2, 1], [2, 0]],
         [[2, 0], [2, 1]],
     ]
     assert store.num_allocated_pages("layer") == 6
+    assert store.num_allocated_clusters("layer") == 4
 
     key_pages, value_pages = store.get_page_storage("layer")
     assert key_pages.shape[1:] == (2, 1)
@@ -117,16 +120,20 @@ def test_cluster_store_frees_and_reuses_pages():
         "layer", keys, values, assignments, cluster_token_counts
     )
     first_page_ids = set(first.page_ids[first.page_ids >= 0].tolist())
+    first_cluster_ids = set(first.cluster_ids[first.cluster_ids >= 0].tolist())
     store.free("layer", first)
 
     assert store.num_allocated_pages("layer") == 0
+    assert store.num_allocated_clusters("layer") == 0
 
     second = store.store_clusters(
         "layer", keys, values, assignments, cluster_token_counts
     )
     second_page_ids = set(second.page_ids[second.page_ids >= 0].tolist())
+    second_cluster_ids = set(second.cluster_ids[second.cluster_ids >= 0].tolist())
 
     assert second_page_ids == first_page_ids
+    assert second_cluster_ids.isdisjoint(first_cluster_ids)
     assert store.num_allocated_pages("layer") == 6
 
 
@@ -192,10 +199,12 @@ def test_cluster_store_handles_empty_clusters():
     )
 
     assert table.page_ids.shape == (1, 2, 0)
+    assert table.cluster_ids.tolist() == [[-1, -1]]
     assert gathered_keys.shape == (1, 1, 0, 3)
     assert gathered_values.shape == gathered_keys.shape
     assert token_mask.shape == (1, 1, 0)
     assert store.num_allocated_pages("layer") == 0
+    assert store.num_allocated_clusters("layer") == 0
 
 
 def test_cluster_store_rejects_storage_access_before_allocation():
@@ -225,6 +234,7 @@ def test_cpu_backing_store_preserves_page_layout_and_reuses_pages():
     assert store.is_cpu_backed
     assert store.get_storage_device("layer") == torch.device("cpu")
     assert first.page_ids.device == keys.device
+    assert first.cluster_ids.device == keys.device
     assert first.page_token_counts.device == keys.device
     assert key_pages.device.type == "cpu"
     assert value_pages.device.type == "cpu"
@@ -255,6 +265,7 @@ def test_cpu_backing_store_preserves_page_layout_and_reuses_pages():
     )
 
     torch.testing.assert_close(second.page_ids, first_page_ids)
+    assert not torch.equal(second.cluster_ids, first.cluster_ids)
 
 
 def test_cpu_backing_store_growth_preserves_existing_logical_pages():
@@ -332,6 +343,7 @@ def test_cpu_backing_store_keeps_metadata_on_cuda_and_pages_pinned():
     key_pages, value_pages = store.get_page_storage("layer")
 
     assert table.page_ids.is_cuda
+    assert table.cluster_ids.is_cuda
     assert table.page_token_counts.is_cuda
     assert key_pages.device.type == "cpu"
     assert value_pages.device.type == "cpu"
@@ -374,7 +386,7 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
         cluster_token_counts.cuda(),
     )
 
-    access = store.admit_resident_clusters("layer", table.page_ids)
+    access = store.admit_resident_clusters("layer", table.cluster_ids, table.page_ids)
     resident_cache = store._resident_caches["layer"]
 
     assert store.resident_capacity("layer") == 3
@@ -424,7 +436,7 @@ def test_cpu_backing_store_stages_before_updating_resident_cache():
         cluster_token_counts.cuda(),
     )
 
-    resolved = store.resolve_cluster_pages("layer", table.page_ids)
+    resolved = store.resolve_cluster_blocks("layer", table.cluster_ids, table.page_ids)
     torch.cuda.current_stream().synchronize()
 
     valid_pages = table.page_ids >= 0
@@ -461,6 +473,7 @@ def test_cpu_backing_store_stages_before_updating_resident_cache():
 
     access = store.admit_staged_clusters(
         layer_name="layer",
+        cluster_ids=table.cluster_ids,
         logical_page_ids=table.page_ids,
         staging_page_ids=resolved.staging_page_ids,
         staging_key_pages=resolved.staging_key_pages,
@@ -511,14 +524,15 @@ def test_cpu_backing_store_resident_only_resolution_does_not_admit_misses():
         cluster_token_counts.cuda(),
     )
 
-    access = store.admit_resident_clusters("layer", table.page_ids)
+    access = store.admit_resident_clusters("layer", table.cluster_ids, table.page_ids)
     store.get_resident_page_storage("layer")
     torch.cuda.current_stream().synchronize()
 
     resident_pages_before = store.num_resident_pages("layer")
     resident_clusters_before = store.num_resident_clusters("layer")
-    resolved = store.resolve_cluster_pages(
+    resolved = store.resolve_cluster_blocks(
         "layer",
+        table.cluster_ids,
         table.page_ids,
         mode="resident_only",
     )
@@ -557,7 +571,7 @@ def test_gpu_reference_store_resolves_without_staging():
         cluster_token_counts.cuda(),
     )
 
-    resolved = store.resolve_cluster_pages("layer", table.page_ids)
+    resolved = store.resolve_cluster_blocks("layer", table.cluster_ids, table.page_ids)
     stored_keys, stored_values = store.get_page_storage("layer")
 
     assert torch.equal(resolved.resident_page_ids, table.page_ids)
@@ -579,11 +593,12 @@ def test_gpu_reference_store_rejects_resident_cache_operations():
     )
 
     with pytest.raises(RuntimeError, match="only used by CPU-backed"):
-        store.lookup_resident_pages("layer", table.page_ids)
+        store.lookup_resident_clusters("layer", table.cluster_ids, table.page_ids)
 
     with pytest.raises(ValueError, match="Unsupported RetroSpec cluster resolve mode"):
-        store.resolve_cluster_pages(
+        store.resolve_cluster_blocks(
             "layer",
+            table.cluster_ids,
             table.page_ids,
             mode="invalid",  # type: ignore[arg-type]
         )
@@ -625,6 +640,39 @@ def test_cluster_store_rejects_invalid_storage_metadata():
             assignments,
             negative_counts,
         )
+
+
+def test_cluster_store_rejects_cluster_id_page_descriptor_mismatch():
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store.store_clusters(
+        "layer", keys, values, assignments, cluster_token_counts
+    )
+
+    mismatched_page_ids = table.page_ids.clone()
+    mismatched_page_ids[0, 0] = table.page_ids[0, 1]
+
+    with pytest.raises(RuntimeError, match="stable cluster ID"):
+        store.resolve_cluster_blocks("layer", table.cluster_ids, mismatched_page_ids)
+
+
+def test_cluster_store_rejects_released_cluster_id_after_page_reuse():
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    first = store.store_clusters(
+        "layer", keys, values, assignments, cluster_token_counts
+    )
+    stale_cluster_ids = first.cluster_ids.clone()
+    reused_page_ids = first.page_ids.clone()
+    store.free("layer", first)
+
+    second = store.store_clusters(
+        "layer", keys, values, assignments, cluster_token_counts
+    )
+    torch.testing.assert_close(second.page_ids, reused_page_ids)
+
+    with pytest.raises(RuntimeError, match="not allocated"):
+        store.resolve_cluster_blocks("layer", stale_cluster_ids, second.page_ids)
 
 
 @pytest.mark.parametrize("page_size", [0, -1])

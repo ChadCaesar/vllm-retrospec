@@ -715,11 +715,12 @@ class RetroSpecSparseAttention:
                     )
                     and query.device.type == "cuda"
                     and self.index.cluster_store.is_cpu_backed
-                    and selection.exact_page_ids.numel()
+                    and selection.exact_cluster_ids.numel()
                 ):
                     self.index.cluster_store.admit_resident_clusters(
-                        selection.plan.layer_name,
-                        selection.exact_page_ids,
+                        layer_name=selection.plan.layer_name,
+                        cluster_ids=selection.exact_cluster_ids,
+                        page_ids=selection.exact_page_ids,
                     )
 
                 return self._run_grouped_reference_attention(
@@ -749,10 +750,11 @@ class RetroSpecSparseAttention:
 
             resolved_pages = selection.resolved_pages
 
-            if resolved_pages is None and selection.exact_page_ids.numel():
-                resolved_pages = self.index.cluster_store.resolve_cluster_pages(
-                    selection.plan.layer_name,
-                    selection.exact_page_ids,
+            if resolved_pages is None and selection.exact_cluster_ids.numel():
+                resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
+                    layer_name=selection.plan.layer_name,
+                    cluster_ids=selection.exact_cluster_ids,
+                    logical_page_ids=selection.exact_page_ids,
                     mode="verification",
                 )
 
@@ -789,7 +791,7 @@ class RetroSpecSparseAttention:
                     RetroSpecAttentionMode.EXPANDED_VERIFY,
                 )
                 and self.index.cluster_store.is_cpu_backed
-                and selection.exact_page_ids.numel()
+                and selection.exact_cluster_ids.numel()
             ):
                 if resolved_pages is None:
                     raise RuntimeError(
@@ -798,6 +800,7 @@ class RetroSpecSparseAttention:
 
                 self.index.cluster_store.admit_staged_clusters(
                     layer_name=selection.plan.layer_name,
+                    cluster_ids=selection.exact_cluster_ids,
                     logical_page_ids=selection.exact_page_ids,
                     staging_page_ids=resolved_pages.staging_page_ids,
                     staging_key_pages=resolved_pages.staging_key_pages,

@@ -16,8 +16,97 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _cluster_ids_from_pages(page_ids: torch.Tensor) -> torch.Tensor:
+    cluster_ids = torch.full(
+        page_ids.shape[:-1],
+        -1,
+        dtype=torch.int64,
+        device=page_ids.device,
+    )
+    for page_index in range(page_ids.shape[-1]):
+        candidate = page_ids[..., page_index]
+        cluster_ids = torch.where(
+            (cluster_ids < 0) & (candidate >= 0), candidate, cluster_ids
+        )
+    return cluster_ids
+
+
+class _ResidentCacheTestAdapter(RetroSpecResidentClusterCache):
+    """Keep legacy test cases concise while supplying stable cluster IDs."""
+
+    @staticmethod
+    def _allocated_cluster_ids(
+        cluster_ids: torch.Tensor, allocated_page_ids: set[int]
+    ) -> set[int]:
+        valid_ids = cluster_ids[cluster_ids >= 0].detach().cpu().tolist()
+        return set(allocated_page_ids).union(valid_ids)
+
+    def lookup(
+        self,
+        page_ids,
+        allocated_page_ids,
+        touch=True,
+        *,
+        cluster_ids=None,
+        allocated_cluster_ids=None,
+    ):
+        if cluster_ids is None:
+            cluster_ids = _cluster_ids_from_pages(page_ids)
+        if allocated_cluster_ids is None:
+            allocated_cluster_ids = self._allocated_cluster_ids(
+                cluster_ids, allocated_page_ids
+            )
+        return super().lookup(
+            cluster_ids=cluster_ids,
+            page_ids=page_ids,
+            allocated_cluster_ids=allocated_cluster_ids,
+            allocated_page_ids=allocated_page_ids,
+            touch=touch,
+        )
+
+    def admit(
+        self,
+        page_ids,
+        allocated_page_ids,
+        backing_key_pages,
+        backing_value_pages,
+    ):
+        cluster_ids = _cluster_ids_from_pages(page_ids)
+        return super().admit(
+            cluster_ids=cluster_ids,
+            page_ids=page_ids,
+            allocated_cluster_ids=self._allocated_cluster_ids(
+                cluster_ids, allocated_page_ids
+            ),
+            allocated_page_ids=allocated_page_ids,
+            backing_key_pages=backing_key_pages,
+            backing_value_pages=backing_value_pages,
+        )
+
+    def admit_staged(
+        self,
+        page_ids,
+        allocated_page_ids,
+        staging_page_ids,
+        staging_key_pages,
+        staging_value_pages,
+    ):
+        cluster_ids = _cluster_ids_from_pages(page_ids)
+        return super().admit_staged(
+            cluster_ids=cluster_ids,
+            page_ids=page_ids,
+            allocated_cluster_ids=self._allocated_cluster_ids(
+                cluster_ids, allocated_page_ids
+            ),
+            allocated_page_ids=allocated_page_ids,
+            staging_page_ids=staging_page_ids,
+            staging_key_pages=staging_key_pages,
+            staging_value_pages=staging_value_pages,
+        )
+
+
 def make_cache(capacity: int) -> RetroSpecResidentClusterCache:
-    cache = RetroSpecResidentClusterCache(
+    cache = _ResidentCacheTestAdapter(
         page_size=2,
         head_size=1,
         dtype=torch.float32,
@@ -475,3 +564,56 @@ def test_resident_cache_rejects_invalid_cluster_ownership():
 
     with pytest.raises(RuntimeError, match="unallocated logical page 6"):
         cache.lookup(torch.tensor([[6]]), set(range(6)))
+
+
+def test_resident_cache_uses_cluster_id_as_identity_after_page_reuse():
+    cache = make_cache(capacity=2)
+    backing_keys, backing_values = make_backing_pages()
+    page_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+
+    first = RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=torch.tensor([7]),
+        page_ids=page_ids,
+        allocated_cluster_ids={7},
+        allocated_page_ids={0, 1},
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    assert first.hit_cluster_mask.item()
+
+    cache.invalidate(torch.tensor([7]))
+    stale = RetroSpecResidentClusterCache.lookup(
+        cache,
+        cluster_ids=torch.tensor([8]),
+        page_ids=page_ids,
+        allocated_cluster_ids={8},
+        allocated_page_ids={0, 1},
+        touch=False,
+    )
+    assert stale.miss_cluster_mask.item()
+
+
+def test_resident_cache_rejects_cluster_id_descriptor_conflicts():
+    cache = make_cache(capacity=2)
+    backing_keys, backing_values = make_backing_pages()
+
+    with pytest.raises(ValueError, match="different logical pages"):
+        RetroSpecResidentClusterCache.admit(
+            cache,
+            cluster_ids=torch.tensor([3, 3]),
+            page_ids=torch.tensor([[0, 1], [2, 3]]),
+            allocated_cluster_ids={3},
+            allocated_page_ids={0, 1, 2, 3},
+            backing_key_pages=backing_keys,
+            backing_value_pages=backing_values,
+        )
+
+    with pytest.raises(RuntimeError, match="unallocated cluster 4"):
+        RetroSpecResidentClusterCache.lookup(
+            cache,
+            cluster_ids=torch.tensor([4]),
+            page_ids=torch.tensor([[0]]),
+            allocated_cluster_ids={3},
+            allocated_page_ids={0},
+        )

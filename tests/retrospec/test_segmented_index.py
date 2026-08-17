@@ -116,8 +116,9 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     segment = record.segments[0]
     assert (segment.indexed_start, segment.indexed_end) == (2, 6)
     assert segment.cluster_token_counts.tolist() == [[2, 2]]
-    assert segment.cluster_pages.page_ids.shape == (1, 2, 1)
-    assert segment.cluster_pages.page_token_counts.tolist() == [[[2], [2]]]
+    assert segment.cluster_blocks.cluster_ids.tolist() == [[0, 1]]
+    assert segment.cluster_blocks.page_ids.shape == (1, 2, 1)
+    assert segment.cluster_blocks.page_token_counts.tolist() == [[[2], [2]]]
     assert index.cluster_store.num_allocated_pages("layer") == 2
 
     index.begin_proposal(["request"])
@@ -192,8 +193,8 @@ def test_segmented_index_clusters_each_kv_head_independently():
     assert segment.cluster_token_counts.tolist() == [[2, 2], [2, 2]]
     clustered_keys, clustered_values, clustered_mask = index.cluster_store.gather_pages(
         "layer",
-        segment.cluster_pages.page_ids.unsqueeze(0),
-        segment.cluster_pages.page_token_counts.unsqueeze(0),
+        segment.cluster_blocks.page_ids.unsqueeze(0),
+        segment.cluster_blocks.page_token_counts.unsqueeze(0),
     )
 
     assert clustered_mask.all()
@@ -214,6 +215,8 @@ def test_segmented_index_excludes_empty_clusters_from_selection():
 
     assert packed.cluster_token_counts.tolist() == [[[8, 0]]]
     assert packed.cluster_mask.tolist() == [[[True, False]]]
+    assert packed.cluster_ids[0, 0, 0].item() >= 0
+    assert packed.cluster_ids[0, 0, 1].item() == -1
 
 
 @pytest.mark.parametrize(
@@ -609,6 +612,7 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
 
     index.cluster_store.admit_resident_clusters(
         "layer",
+        cold.plan.sparse_exact_cluster_ids,
         cold.plan.sparse_exact_page_ids,
     )
     index.cluster_store.get_resident_page_storage("layer")
@@ -672,6 +676,7 @@ def test_segmented_index_builds_and_selects_on_cuda():
     finally:
         index.end_proposal()
 
+    assert selection.exact_cluster_ids.device.type == "cuda"
     assert selection.exact_page_ids.device.type == "cuda"
     assert selection.exact_token_counts.tolist() == [[8]]
     assert selection.estimation_token_counts[0, 0, 0].item() == 2
