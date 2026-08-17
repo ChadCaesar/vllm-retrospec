@@ -7,6 +7,10 @@ import pytest
 import torch
 
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.spec_decode.retrospec.cluster_identity import (
+    RetroSpecClusterGroup,
+    RetroSpecClusterIdentity,
+)
 from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecClusterPageStore,
 )
@@ -39,6 +43,27 @@ def make_cluster_data() -> tuple[
     return keys, values, assignments, cluster_token_counts
 
 
+def store_cluster_data(
+    store: RetroSpecClusterPageStore,
+    layer_name: str,
+    token_keys: torch.Tensor,
+    token_values: torch.Tensor,
+    assignments: torch.Tensor,
+    cluster_token_counts: torch.Tensor,
+    request_id: str = "request",
+    cluster_start: int = 0,
+):
+    return store.store_clusters(
+        layer_name=layer_name,
+        request_id=request_id,
+        cluster_start=cluster_start,
+        token_keys=token_keys,
+        token_values=token_values,
+        assignments=assignments,
+        cluster_token_counts=cluster_token_counts,
+    )
+
+
 def get_block_metadata(store, table, device=None):
     return store.get_cluster_block_metadata(
         layer_name="layer",
@@ -61,7 +86,8 @@ def test_cluster_store_packs_per_head_clusters_across_pages():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
 
-    table = store.store_clusters(
+    table = store_cluster_data(
+        store,
         "layer",
         keys,
         values,
@@ -131,12 +157,86 @@ def test_cluster_store_packs_per_head_clusters_across_pages():
     assert not gathered_values[~token_mask.unsqueeze(-1)].any()
 
 
+def test_cluster_store_tracks_request_head_local_cluster_identities():
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+
+    first = store_cluster_data(
+        store,
+        "layer",
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+        request_id="first",
+        cluster_start=4,
+    )
+    second = store_cluster_data(
+        store,
+        "layer",
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+        request_id="second",
+        cluster_start=4,
+    )
+    other_layer = store_cluster_data(
+        store,
+        "other-layer",
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+        request_id="first",
+        cluster_start=4,
+    )
+
+    first_identities = store.get_cluster_identities("layer", first.cluster_ids)
+    second_identities = store.get_cluster_identities("layer", second.cluster_ids)
+    other_identities = store.get_cluster_identities(
+        "other-layer", other_layer.cluster_ids
+    )
+
+    assert first.cluster_ids.tolist() == [[0, 1], [2, 3]]
+    assert second.cluster_ids.tolist() == [[4, 5], [6, 7]]
+    assert other_layer.cluster_ids.tolist() == [[0, 1], [2, 3]]
+    assert first_identities == {
+        0: RetroSpecClusterIdentity(RetroSpecClusterGroup("first", 0), 4),
+        1: RetroSpecClusterIdentity(RetroSpecClusterGroup("first", 0), 5),
+        2: RetroSpecClusterIdentity(RetroSpecClusterGroup("first", 1), 4),
+        3: RetroSpecClusterIdentity(RetroSpecClusterGroup("first", 1), 5),
+    }
+    assert second_identities == {
+        4: RetroSpecClusterIdentity(RetroSpecClusterGroup("second", 0), 4),
+        5: RetroSpecClusterIdentity(RetroSpecClusterGroup("second", 0), 5),
+        6: RetroSpecClusterIdentity(RetroSpecClusterGroup("second", 1), 4),
+        7: RetroSpecClusterIdentity(RetroSpecClusterGroup("second", 1), 5),
+    }
+    assert other_identities == first_identities
+
+    selected = torch.tensor([[3, 0, 3, -1]], dtype=torch.int64)
+    selected_identities = store.get_cluster_identities("layer", selected)
+    assert list(selected_identities) == [3, 0]
+
+
+def test_cluster_identity_rejects_negative_indices():
+    with pytest.raises(ValueError, match="kv_head_index"):
+        RetroSpecClusterGroup(request_id="request", kv_head_index=-1)
+
+    with pytest.raises(ValueError, match="local_cluster_id"):
+        RetroSpecClusterIdentity(
+            group=RetroSpecClusterGroup("request", 0),
+            local_cluster_id=-1,
+        )
+
+
 def test_cluster_store_frees_and_reuses_pages():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
 
-    first = store.store_clusters(
-        "layer", keys, values, assignments, cluster_token_counts
+    first = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
     )
     first_metadata = get_block_metadata(store, first)
     first_page_ids = set(first_metadata.page_ids[first_metadata.page_ids >= 0].tolist())
@@ -146,8 +246,8 @@ def test_cluster_store_frees_and_reuses_pages():
     assert store.num_allocated_pages("layer") == 0
     assert store.num_allocated_clusters("layer") == 0
 
-    second = store.store_clusters(
-        "layer", keys, values, assignments, cluster_token_counts
+    second = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
     )
     second_metadata = get_block_metadata(store, second)
     second_page_ids = set(
@@ -167,7 +267,8 @@ def test_cluster_store_releases_pages_when_packing_fails():
     invalid_counts[0, 0] = 2
 
     with pytest.raises(RuntimeError, match="assignment count"):
-        store.store_clusters(
+        store_cluster_data(
+            store,
             "layer",
             keys,
             values,
@@ -185,8 +286,8 @@ def test_cluster_store_releases_pages_when_resident_resize_fails():
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
-    first = store.store_clusters(
-        "layer", keys, values, assignments, cluster_token_counts
+    first = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
     )
     allocated_before = store.num_allocated_pages("layer")
     store._resident_caches["layer"] = Mock(
@@ -194,7 +295,9 @@ def test_cluster_store_releases_pages_when_resident_resize_fails():
     )
 
     with pytest.raises(RuntimeError, match="resident resize failed"):
-        store.store_clusters("layer", keys, values, assignments, cluster_token_counts)
+        store_cluster_data(
+            store, "layer", keys, values, assignments, cluster_token_counts
+        )
 
     assert store.num_allocated_pages("layer") == allocated_before
     del store._resident_caches["layer"]
@@ -208,7 +311,8 @@ def test_cluster_store_handles_empty_clusters():
     assignments = torch.empty(1, 0, dtype=torch.int64)
     cluster_token_counts = torch.zeros(1, 2, dtype=torch.int32)
 
-    table = store.store_clusters(
+    table = store_cluster_data(
+        store,
         "layer",
         keys,
         values,
@@ -229,6 +333,7 @@ def test_cluster_store_handles_empty_clusters():
     assert token_mask.shape == (1, 1, 0)
     assert store.num_allocated_pages("layer") == 0
     assert store.num_allocated_clusters("layer") == 0
+    assert store.get_cluster_identities("layer", table.cluster_ids) == {}
 
 
 def test_cluster_store_rejects_storage_access_before_allocation():
@@ -245,7 +350,8 @@ def test_cpu_backing_store_preserves_page_layout_and_reuses_pages():
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
 
-    first = store.store_clusters(
+    first = store_cluster_data(
+        store,
         "layer",
         keys,
         values,
@@ -281,7 +387,8 @@ def test_cpu_backing_store_preserves_page_layout_and_reuses_pages():
     ]
 
     store.free("layer", first)
-    second = store.store_clusters(
+    second = store_cluster_data(
+        store,
         "layer",
         keys,
         values,
@@ -303,7 +410,8 @@ def test_cpu_backing_store_growth_preserves_existing_logical_pages():
     first_values = first_keys + 1000.0
     first_assignments = torch.zeros(1, 60, dtype=torch.int64)
     first_counts = torch.tensor([[60]], dtype=torch.int32)
-    first = store.store_clusters(
+    first = store_cluster_data(
+        store,
         "layer",
         first_keys,
         first_values,
@@ -316,7 +424,8 @@ def test_cpu_backing_store_growth_preserves_existing_logical_pages():
     second_values = second_keys + 2000.0
     second_assignments = torch.zeros(1, 100, dtype=torch.int64)
     second_counts = torch.tensor([[100]], dtype=torch.int32)
-    second = store.store_clusters(
+    second = store_cluster_data(
+        store,
         "layer",
         second_keys,
         second_values,
@@ -360,7 +469,8 @@ def test_cpu_backing_store_keeps_block_metadata_on_pinned_cpu():
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
 
-    table = store.store_clusters(
+    table = store_cluster_data(
+        store,
         "layer",
         keys.cuda(),
         values.cuda(),
@@ -409,7 +519,8 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
-    table = store.store_clusters(
+    table = store_cluster_data(
+        store,
         "layer",
         keys.cuda(),
         values.cuda(),
@@ -460,7 +571,8 @@ def test_cpu_backing_store_stages_before_updating_resident_cache():
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
-    table = store.store_clusters(
+    table = store_cluster_data(
+        store,
         "layer",
         keys.cuda(),
         values.cuda(),
@@ -549,7 +661,8 @@ def test_cpu_backing_store_resident_only_resolution_does_not_admit_misses():
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
-    table = store.store_clusters(
+    table = store_cluster_data(
+        store,
         "layer",
         keys.cuda(),
         values.cuda(),
@@ -597,7 +710,8 @@ def test_cpu_backing_store_resident_only_resolution_does_not_admit_misses():
 def test_gpu_reference_store_resolves_without_staging():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
-    table = store.store_clusters(
+    table = store_cluster_data(
+        store,
         "layer",
         keys.cuda(),
         values.cuda(),
@@ -623,8 +737,8 @@ def test_gpu_reference_store_resolves_without_staging():
 def test_gpu_reference_store_rejects_resident_cache_operations():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
-    table = store.store_clusters(
-        "layer", keys, values, assignments, cluster_token_counts
+    table = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
     )
     metadata = get_block_metadata(store, table)
 
@@ -649,7 +763,8 @@ def test_cluster_store_rejects_invalid_storage_metadata():
 
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
-    table = store.store_clusters(
+    table = store_cluster_data(
+        store,
         "layer",
         keys,
         values,
@@ -670,7 +785,8 @@ def test_cluster_store_rejects_invalid_storage_metadata():
     negative_counts = cluster_token_counts.clone()
     negative_counts[0, 0] = -1
     with pytest.raises(ValueError, match="non-negative"):
-        store.store_clusters(
+        store_cluster_data(
+            store,
             "other",
             keys,
             values,
@@ -678,12 +794,23 @@ def test_cluster_store_rejects_invalid_storage_metadata():
             negative_counts,
         )
 
+    with pytest.raises(ValueError, match="cluster_start"):
+        store_cluster_data(
+            store,
+            "other",
+            keys,
+            values,
+            assignments,
+            cluster_token_counts,
+            cluster_start=-1,
+        )
+
 
 def test_cluster_store_rejects_cluster_id_page_descriptor_mismatch():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
-    table = store.store_clusters(
-        "layer", keys, values, assignments, cluster_token_counts
+    table = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
     )
     metadata = get_block_metadata(store, table)
 
@@ -697,16 +824,16 @@ def test_cluster_store_rejects_cluster_id_page_descriptor_mismatch():
 def test_cluster_store_rejects_released_cluster_id_after_page_reuse():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
-    first = store.store_clusters(
-        "layer", keys, values, assignments, cluster_token_counts
+    first = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
     )
     first_metadata = get_block_metadata(store, first)
     stale_cluster_ids = first.cluster_ids.clone()
     reused_page_ids = first_metadata.page_ids.clone()
     store.free("layer", first)
 
-    second = store.store_clusters(
-        "layer", keys, values, assignments, cluster_token_counts
+    second = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
     )
     second_metadata = get_block_metadata(store, second)
     torch.testing.assert_close(second_metadata.page_ids, reused_page_ids)
@@ -720,8 +847,8 @@ def test_cluster_store_rejects_released_cluster_id_after_page_reuse():
 def test_cluster_store_materializes_selected_cpu_block_metadata():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
-    table = store.store_clusters(
-        "layer", keys, values, assignments, cluster_token_counts
+    table = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
     )
     selected_cluster_ids = torch.tensor(
         [[table.cluster_ids[0, 0], -1], [table.cluster_ids[1, 1], -1]],

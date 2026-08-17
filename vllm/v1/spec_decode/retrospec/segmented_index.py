@@ -351,8 +351,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
             record = layer_indices.get(request_id)
             if record is not None and desired_end < record.indexed_end:
-                # Drop the packed view before releasing stable cluster IDs and their
-                # backing pages.
+                # Drop the packed view before releasing stable cluster IDs
+                # and their backing pages.
                 self._packed_index_cache.pop(layer_name, None)
                 self._free_record(layer_name, record)
                 record = self._empty_index()
@@ -440,8 +440,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 cluster_token_counts,
             )
 
+            cluster_start = 0 if record is None else record.num_clusters
+
             cluster_blocks = self.cluster_store.store_clusters(
                 layer_name=layer_name,
+                request_id=request_id,
+                cluster_start=cluster_start,
                 token_keys=token_keys,
                 token_values=token_values,
                 assignments=local_assignments,
@@ -451,8 +455,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             if record is None:
                 record = self._empty_index()
                 layer_indices[request_id] = record
-
-            cluster_start = record.num_clusters
 
             record.segments.append(
                 _RequestLayerSegment(

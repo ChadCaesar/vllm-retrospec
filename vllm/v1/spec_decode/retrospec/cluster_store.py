@@ -7,6 +7,10 @@ from typing import Literal
 
 import torch
 
+from .cluster_identity import (
+    RetroSpecClusterGroup,
+    RetroSpecClusterIdentity,
+)
 from .resident_cache import (
     RetroSpecResidentClusterCache,
     RetroSpecResidentPageAccess,
@@ -55,8 +59,9 @@ class RetroSpecClusterBlockMetadata:
 
 @dataclass(frozen=True)
 class _ClusterBlockDescriptor:
-    """CPU control-plane metadata owned by one stable cluster ID."""
+    """CPU metadata mapped from one layer-global stable cluster handle."""
 
+    identity: RetroSpecClusterIdentity
     page_ids: tuple[int, ...]
     page_token_counts: tuple[int, ...]
 
@@ -386,10 +391,15 @@ class RetroSpecClusterPageStore:
     def _allocate_cluster_ids(
         self,
         layer_name: str,
+        request_id: str,
+        cluster_start: int,
         cluster_token_counts: torch.Tensor,
         page_ids: torch.Tensor,
         page_token_counts: torch.Tensor,
     ) -> torch.Tensor:
+        if cluster_start < 0:
+            raise ValueError("cluster_start must be non-negative")
+
         cluster_token_counts_cpu = cluster_token_counts.detach().to(
             device="cpu", dtype=torch.int64
         )
@@ -398,6 +408,10 @@ class RetroSpecClusterPageStore:
             device="cpu", dtype=torch.int32
         )
 
+        if cluster_token_counts_cpu.ndim != 2:
+            raise ValueError(
+                "cluster_token_counts must have shape [num_kv_heads, num_clusters]"
+            )
         if page_ids_cpu.shape != page_token_counts_cpu.shape:
             raise ValueError(
                 "Cluster page IDs and page token counts must have equal shapes"
@@ -406,6 +420,15 @@ class RetroSpecClusterPageStore:
             raise ValueError(
                 "Cluster page metadata does not match cluster token counts"
             )
+
+        num_kv_heads, num_clusters = cluster_token_counts_cpu.shape
+        groups = tuple(
+            RetroSpecClusterGroup(
+                request_id=request_id,
+                kv_head_index=head_index,
+            )
+            for head_index in range(num_kv_heads)
+        )
 
         valid_clusters_cpu = cluster_token_counts_cpu > 0
         num_valid_clusters = int(valid_clusters_cpu.sum().item())
@@ -418,6 +441,8 @@ class RetroSpecClusterPageStore:
             pin_memory=self.pin_memory,
         )
 
+        # Stable handles remain unique and monotonic within one layer. They are
+        # storage handles rather than local clustering labels.
         next_cluster_id = self._next_cluster_ids.get(layer_name, 0)
         cluster_id_end = next_cluster_id + num_valid_clusters
 
@@ -442,17 +467,21 @@ class RetroSpecClusterPageStore:
 
         new_descriptors: dict[int, _ClusterBlockDescriptor] = {}
 
-        for (
+        for flat_index, (
             cluster_id,
             cluster_token_count,
             page_row,
             page_count_row,
-        ) in zip(
-            flat_cluster_ids,
-            flat_cluster_token_counts,
-            flat_page_ids,
-            flat_page_token_counts,
+        ) in enumerate(
+            zip(
+                flat_cluster_ids,
+                flat_cluster_token_counts,
+                flat_page_ids,
+                flat_page_token_counts,
+            )
         ):
+            head_index, cluster_index = divmod(flat_index, num_clusters)
+
             valid_pages = tuple(page_id for page_id in page_row if page_id >= 0)
             valid_page_token_counts = tuple(
                 page_count
@@ -479,6 +508,10 @@ class RetroSpecClusterPageStore:
                 )
 
             new_descriptors[cluster_id] = _ClusterBlockDescriptor(
+                identity=RetroSpecClusterIdentity(
+                    group=groups[head_index],
+                    local_cluster_id=cluster_start + cluster_index,
+                ),
                 page_ids=valid_pages,
                 page_token_counts=valid_page_token_counts,
             )
@@ -551,6 +584,26 @@ class RetroSpecClusterPageStore:
                 raise RuntimeError(f"RetroSpec cluster {cluster_id} is not allocated")
 
         return cluster_ids_cpu
+
+    def get_cluster_identities(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+    ) -> dict[int, RetroSpecClusterIdentity]:
+        """Return semantic identities for valid stable cluster handles."""
+        cluster_ids_cpu = self._validate_cluster_ids(layer_name, cluster_ids)
+        descriptors = self._cluster_block_descriptors[layer_name]
+
+        ordered_cluster_ids = dict.fromkeys(
+            cluster_id
+            for cluster_id in cluster_ids_cpu.reshape(-1).tolist()
+            if cluster_id >= 0
+        )
+
+        return {
+            cluster_id: descriptors[cluster_id].identity
+            for cluster_id in ordered_cluster_ids
+        }
 
     def _validate_cluster_blocks(
         self,
@@ -829,12 +882,16 @@ class RetroSpecClusterPageStore:
     def store_clusters(
         self,
         layer_name: str,
+        request_id: str,
+        cluster_start: int,
         token_keys: torch.Tensor,
         token_values: torch.Tensor,
         assignments: torch.Tensor,
         cluster_token_counts: torch.Tensor,
     ) -> RetroSpecClusterBlockTable:
         """Reorder token KV into stable per-head, per-cluster backing pages."""
+        if cluster_start < 0:
+            raise ValueError("cluster_start must be non-negative")
         if token_values.shape != token_keys.shape:
             raise ValueError("token_keys and token_values must have equal shapes")
         if assignments.shape != token_keys.shape[:2]:
@@ -994,6 +1051,8 @@ class RetroSpecClusterPageStore:
         try:
             cluster_ids = self._allocate_cluster_ids(
                 layer_name=layer_name,
+                request_id=request_id,
+                cluster_start=cluster_start,
                 cluster_token_counts=cluster_token_counts,
                 page_ids=page_ids,
                 page_token_counts=page_token_counts,

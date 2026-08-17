@@ -408,6 +408,25 @@ def test_segmented_index_appends_complete_segments_and_handles_rollback():
     assert [segment.cluster_start for segment in record.segments] == [0, 2]
     assert index.cluster_store.num_allocated_pages("layer") == 4
 
+    first_identities = index.cluster_store.get_cluster_identities(
+        "layer", record.segments[0].cluster_blocks.cluster_ids
+    )
+    second_identities = index.cluster_store.get_cluster_identities(
+        "layer", record.segments[1].cluster_blocks.cluster_ids
+    )
+    assert [identity.local_cluster_id for identity in first_identities.values()] == [
+        0,
+        1,
+    ]
+    assert [identity.local_cluster_id for identity in second_identities.values()] == [
+        2,
+        3,
+    ]
+    assert all(
+        identity.group.request_id == "request" and identity.group.kv_head_index == 0
+        for identity in (*first_identities.values(), *second_identities.values())
+    )
+
     assert index.needs_update("request", 6, ["layer"])
     build_index(index, 6, keys, values, block_table)
     record = index._indices["layer"]["request"]

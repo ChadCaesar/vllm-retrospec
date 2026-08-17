@@ -313,11 +313,13 @@ def test_execution_buffer_packs_resolved_cpu_backing_pages():
         cache_ratio=0.5,
     )
     table = store.store_clusters(
-        "layer",
-        token_keys,
-        token_values,
-        assignments,
-        cluster_counts,
+        layer_name="layer",
+        request_id="request",
+        cluster_start=0,
+        token_keys=token_keys,
+        token_values=token_values,
+        assignments=assignments,
+        cluster_token_counts=cluster_counts,
     )
     cluster_ids = table.cluster_ids.to(device=device).unsqueeze(0)
     metadata = store.get_cluster_block_metadata("layer", cluster_ids, device=device)
