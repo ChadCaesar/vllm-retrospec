@@ -41,15 +41,15 @@ class RetroSpecResidentPageAccess:
 
 
 class RetroSpecResidentClusterCache:
-    """Bounded layer-wide GPU page arena with group-scoped LRU state.
+    """Shared GPU page arena with group-scoped replacement state.
 
     Logical page IDs address the stable CPU backing store. Resident page IDs
     address slots in the shared key_pages and value_pages tensors.
 
-    Every cluster belongs to one request/KV-head group. Cluster ownership and
-    recency are tracked independently for each group, while physical GPU slots
-    remain shared by the whole layer. A cluster is always admitted and evicted
-    atomically.
+    Every cluster belongs to one request/KV-head group. Each group owns an
+    independent LRU and a soft resident-page target. Physical GPU slots remain
+    shared by the whole layer, so unused group capacity may be borrowed.
+    Admission and eviction always operate on complete clusters.
     """
 
     def __init__(
@@ -95,9 +95,9 @@ class RetroSpecResidentClusterCache:
         self._cluster_to_group: dict[_ClusterId, RetroSpecClusterGroup] = {}
         self._group_states: dict[RetroSpecClusterGroup, _ResidentGroupState] = {}
 
-        # Keep the existing layer-wide eviction order until group quotas are added.
-        # Every touch is recorded in both the owning group LRU and this arbiter.
-        self._global_lru: OrderedDict[_ClusterId, None] = OrderedDict()
+        # Soft resident-page targets. Physical slots remain shared and groups may
+        # temporarily borrow unused capacity from one another.
+        self._group_targets: dict[RetroSpecClusterGroup, int] = {}
 
         self._copy_stream = torch.cuda.Stream(device=device)
         self._pending_copy_batches: deque[_PendingCopyBatch] = deque()
@@ -254,13 +254,12 @@ class RetroSpecResidentClusterCache:
 
         group_state.lru[cluster_id] = None
         group_state.num_pages += len(slots)
-        self._global_lru[cluster_id] = None
 
         for logical_page_id in logical_pages:
             self._page_to_cluster[logical_page_id] = cluster_id
 
     def _touch_cluster(self, cluster_id: _ClusterId) -> None:
-        """Mark a resident cluster as recent in both replacement domains."""
+        """Mark a resident cluster as recent within its owning group."""
         group = self._cluster_to_group.get(cluster_id)
         if group is None:
             raise RuntimeError(
@@ -270,11 +269,8 @@ class RetroSpecResidentClusterCache:
         group_state = self._group_states.get(group)
         if group_state is None or cluster_id not in group_state.lru:
             raise RuntimeError(f"Resident group state is missing cluster {cluster_id}")
-        if cluster_id not in self._global_lru:
-            raise RuntimeError(f"Global resident LRU is missing cluster {cluster_id}")
 
         group_state.lru.move_to_end(cluster_id, last=True)
-        self._global_lru.move_to_end(cluster_id, last=True)
 
     def _evict_cluster(self, cluster_id: _ClusterId) -> None:
         slots = self._cluster_to_slots.pop(cluster_id, None)
@@ -283,7 +279,6 @@ class RetroSpecResidentClusterCache:
 
         logical_pages = self._cluster_to_pages.pop(cluster_id)
         group = self._cluster_to_group.pop(cluster_id)
-        self._global_lru.pop(cluster_id, None)
 
         group_state = self._group_states.get(group)
         if group_state is None or cluster_id not in group_state.lru:
@@ -304,39 +299,112 @@ class RetroSpecResidentClusterCache:
             self._page_to_cluster.pop(logical_page_id, None)
             self._free_slots.add(slot_id)
 
+    @staticmethod
+    def _oldest_unprotected_cluster(
+        group_state: _ResidentGroupState,
+        protected_clusters: set[_ClusterId],
+    ) -> _ClusterId | None:
+        for cluster_id in group_state.lru:
+            if cluster_id not in protected_clusters:
+                return cluster_id
+
+        return None
+
+    def _select_victim_cluster(
+        self,
+        protected_clusters: set[_ClusterId],
+        incoming_group_pages: Mapping[RetroSpecClusterGroup, int],
+    ) -> _ClusterId | None:
+        """Choose one group-local LRU victim without a layer-global LRU."""
+        candidates: list[tuple[int, int, int, str, int, _ClusterId]] = []
+
+        for group, group_state in self._group_states.items():
+            victim = self._oldest_unprotected_cluster(
+                group_state,
+                protected_clusters,
+            )
+            if victim is None:
+                continue
+
+            target_pages = self._group_targets.get(group, 0)
+            projected_pages = group_state.num_pages + incoming_group_pages.get(group, 0)
+            excess_pages = projected_pages - target_pages
+
+            # Sorting is ascending, so negate descending priorities:
+            #   1. groups above their soft target;
+            #   2. larger excess;
+            #   3. larger current resident footprint;
+            #   4. deterministic request/head order.
+            candidates.append(
+                (
+                    -int(excess_pages > 0),
+                    -excess_pages,
+                    -group_state.num_pages,
+                    group.request_id,
+                    group.kv_head_index,
+                    victim,
+                )
+            )
+
+        if not candidates:
+            return None
+
+        candidates.sort()
+        return candidates[0][-1]
+
     def _evict_oldest_unprotected(
         self,
         protected_clusters: set[_ClusterId],
+        incoming_group_pages: Mapping[RetroSpecClusterGroup, int],
     ) -> bool:
-        victim = None
-
-        for cluster_id in self._global_lru:
-            if cluster_id not in protected_clusters:
-                victim = cluster_id
-                break
-
+        victim = self._select_victim_cluster(
+            protected_clusters,
+            incoming_group_pages,
+        )
         if victim is None:
             return False
 
         self._evict_cluster(victim)
         return True
 
-    def resize(self, capacity: int) -> None:
-        """Change the active layer-wide resident-page capacity.
+    def resize(
+        self,
+        capacity: int,
+        group_targets: Mapping[RetroSpecClusterGroup, int] | None = None,
+    ) -> None:
+        """Change layer capacity and update group soft targets.
 
-        Physical storage grows when necessary but is not shrunk. Reducing the
-        active capacity evicts complete clusters according to the existing global
-        eviction order. Group-aware capacity balancing is handled separately.
+        Physical storage grows when necessary but is not shrunk. Capacity
+        reductions evict clusters from groups exceeding their soft targets first,
+        using only each selected group's local LRU.
         """
         if capacity < 0:
             raise ValueError("Resident cache capacity must be non-negative")
 
+        if group_targets is None:
+            new_group_targets = dict(self._group_targets)
+        else:
+            new_group_targets = dict(group_targets)
+
+        for group, target_pages in new_group_targets.items():
+            if target_pages < 0:
+                raise ValueError(
+                    f"Resident target for group {group!r} must be non-negative"
+                )
+
+        if sum(new_group_targets.values()) > capacity:
+            raise ValueError("Resident group targets cannot exceed layer capacity")
+
         self._grow_storage(capacity)
         self._logical_capacity = capacity
+        self._group_targets = new_group_targets
 
         while self.num_resident_pages > capacity:
-            oldest_cluster = next(iter(self._global_lru))
-            self._evict_cluster(oldest_cluster)
+            if not self._evict_oldest_unprotected(
+                protected_clusters=set(),
+                incoming_group_pages={},
+            ):
+                raise RuntimeError("Resident cache cannot satisfy the reduced capacity")
 
     @staticmethod
     def _parse_clusters(
@@ -801,8 +869,18 @@ class RetroSpecResidentClusterCache:
             len(cluster_page_map[cluster_id]) for cluster_id in missing_targets
         )
 
+        incoming_group_pages: dict[RetroSpecClusterGroup, int] = {}
+        for cluster_id in missing_targets:
+            group = cluster_groups[cluster_id]
+            incoming_group_pages[group] = incoming_group_pages.get(group, 0) + len(
+                cluster_page_map[cluster_id]
+            )
+
         while self.num_resident_pages + required_page_count > self._logical_capacity:
-            if not self._evict_oldest_unprotected(target_cluster_set):
+            if not self._evict_oldest_unprotected(
+                protected_clusters=target_cluster_set,
+                incoming_group_pages=incoming_group_pages,
+            ):
                 raise RuntimeError(
                     "Resident cache cannot free enough slots for priority admission"
                 )

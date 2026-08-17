@@ -219,6 +219,130 @@ def test_cluster_store_tracks_request_head_local_cluster_identities():
     selected_identities = store.get_cluster_identities("layer", selected)
     assert list(selected_identities) == [3, 0]
 
+    assert store._group_backing_page_counts["layer"] == {
+        RetroSpecClusterGroup("first", 0): 3,
+        RetroSpecClusterGroup("first", 1): 3,
+        RetroSpecClusterGroup("second", 0): 3,
+        RetroSpecClusterGroup("second", 1): 3,
+    }
+    assert store._group_backing_page_counts["other-layer"] == {
+        RetroSpecClusterGroup("first", 0): 3,
+        RetroSpecClusterGroup("first", 1): 3,
+    }
+
+
+def test_cluster_store_distributes_soft_targets_by_backing_page_ownership():
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    first = store_cluster_data(
+        store,
+        "layer",
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+        request_id="first",
+    )
+    second = store_cluster_data(
+        store,
+        "layer",
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+        request_id="second",
+    )
+
+    capacity = store._resident_target_capacity(store._layer_pools["layer"])
+    assert capacity == 6
+    assert store._resident_group_targets("layer", capacity) == {
+        RetroSpecClusterGroup("first", 0): 2,
+        RetroSpecClusterGroup("first", 1): 2,
+        RetroSpecClusterGroup("second", 0): 1,
+        RetroSpecClusterGroup("second", 1): 1,
+    }
+
+    store.free("layer", first)
+    capacity = store._resident_target_capacity(store._layer_pools["layer"])
+    assert capacity == 3
+    assert store._group_backing_page_counts["layer"] == {
+        RetroSpecClusterGroup("second", 0): 3,
+        RetroSpecClusterGroup("second", 1): 3,
+    }
+    assert store._resident_group_targets("layer", capacity) == {
+        RetroSpecClusterGroup("second", 0): 2,
+        RetroSpecClusterGroup("second", 1): 1,
+    }
+
+    store.free("layer", second)
+    assert store._group_backing_page_counts["layer"] == {}
+    assert store._resident_group_targets("layer", 0) == {}
+
+
+def test_cluster_store_accumulates_group_pages_across_request_segments():
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    first = store_cluster_data(
+        store,
+        "layer",
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+        request_id="request",
+        cluster_start=0,
+    )
+    second = store_cluster_data(
+        store,
+        "layer",
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+        request_id="request",
+        cluster_start=2,
+    )
+
+    assert store._group_backing_page_counts["layer"] == {
+        RetroSpecClusterGroup("request", 0): 6,
+        RetroSpecClusterGroup("request", 1): 6,
+    }
+
+    store.free("layer", first)
+    assert store._group_backing_page_counts["layer"] == {
+        RetroSpecClusterGroup("request", 0): 3,
+        RetroSpecClusterGroup("request", 1): 3,
+    }
+
+    store.free("layer", second)
+    assert store._group_backing_page_counts["layer"] == {}
+
+
+def test_cluster_store_rejects_drift_in_group_page_accounting():
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    store_cluster_data(
+        store,
+        "layer",
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+    )
+    group = RetroSpecClusterGroup("request", 0)
+    store._group_backing_page_counts["layer"][group] += 1
+
+    with pytest.raises(RuntimeError, match="does not match the layer page pool"):
+        store._resident_group_targets("layer", capacity=3)
+
 
 def test_cluster_identity_rejects_negative_indices():
     with pytest.raises(ValueError, match="kv_head_index"):
@@ -290,6 +414,8 @@ def test_cluster_store_releases_pages_when_resident_resize_fails():
         store, "layer", keys, values, assignments, cluster_token_counts
     )
     allocated_before = store.num_allocated_pages("layer")
+    clusters_before = store.num_allocated_clusters("layer")
+    group_page_counts_before = dict(store._group_backing_page_counts["layer"])
     store._resident_caches["layer"] = Mock(
         resize=Mock(side_effect=RuntimeError("resident resize failed"))
     )
@@ -300,6 +426,8 @@ def test_cluster_store_releases_pages_when_resident_resize_fails():
         )
 
     assert store.num_allocated_pages("layer") == allocated_before
+    assert store.num_allocated_clusters("layer") == clusters_before
+    assert store._group_backing_page_counts["layer"] == group_page_counts_before
     del store._resident_caches["layer"]
     store.free("layer", first)
 
@@ -536,6 +664,10 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     assert store.num_resident_pages("layer") == 3
     assert store.num_resident_clusters("layer") == 2
     assert store.num_resident_groups("layer") == 2
+    assert resident_cache._group_targets == {
+        RetroSpecClusterGroup("request", 0): 2,
+        RetroSpecClusterGroup("request", 1): 1,
+    }
     assert (
         resident_cache._group_states[RetroSpecClusterGroup("request", 0)].num_pages == 2
     )
@@ -566,6 +698,7 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     assert store.num_resident_pages("layer") == 0
     assert store.num_resident_clusters("layer") == 0
     assert store.num_resident_groups("layer") == 0
+    assert resident_cache._group_targets == {}
 
 
 @pytest.mark.skipif(

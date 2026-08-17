@@ -141,14 +141,18 @@ class _ResidentCacheTestAdapter(RetroSpecResidentClusterCache):
         )
 
 
-def make_cache(capacity: int) -> RetroSpecResidentClusterCache:
+def make_cache(
+    capacity: int,
+    *,
+    group_targets: dict[RetroSpecClusterGroup, int] | None = None,
+) -> RetroSpecResidentClusterCache:
     cache = _ResidentCacheTestAdapter(
         page_size=2,
         head_size=1,
         dtype=torch.float32,
         device=torch.device("cuda"),
     )
-    cache.resize(capacity)
+    cache.resize(capacity, group_targets=group_targets)
     return cache
 
 
@@ -436,6 +440,157 @@ def test_resident_cache_tracks_group_scoped_lru_in_shared_arena():
     assert list(cache._group_states[second_group].lru) == [12]
 
 
+def test_resident_cache_evicts_from_group_above_its_soft_target():
+    first_group = RetroSpecClusterGroup("first", 0)
+    second_group = RetroSpecClusterGroup("second", 0)
+    cache = make_cache(
+        capacity=4,
+        group_targets={first_group: 1, second_group: 3},
+    )
+    backing_keys, backing_values = make_backing_pages()
+    initial_cluster_ids = torch.tensor([10, 11, 12, 20], dtype=torch.int64)
+    initial_page_ids = torch.tensor([[0], [1], [2], [3]], dtype=torch.int64)
+    cluster_groups = {
+        10: first_group,
+        11: first_group,
+        12: first_group,
+        20: second_group,
+    }
+    cache.admit(
+        initial_page_ids,
+        set(range(5)),
+        backing_keys,
+        backing_values,
+        cluster_ids=initial_cluster_ids,
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+    )
+
+    cache.admit(
+        torch.tensor([[4]], dtype=torch.int64),
+        set(range(5)),
+        backing_keys,
+        backing_values,
+        cluster_ids=torch.tensor([21], dtype=torch.int64),
+        cluster_groups={21: second_group},
+        allocated_cluster_ids={*cluster_groups, 21},
+    )
+
+    all_cluster_ids = torch.tensor([10, 11, 12, 20, 21], dtype=torch.int64)
+    all_page_ids = torch.arange(5, dtype=torch.int64).unsqueeze(-1)
+    all_cluster_groups = {**cluster_groups, 21: second_group}
+    access = cache.lookup(
+        all_page_ids,
+        set(range(5)),
+        touch=False,
+        cluster_ids=all_cluster_ids,
+        cluster_groups=all_cluster_groups,
+        allocated_cluster_ids=set(all_cluster_groups),
+    )
+
+    assert access.hit_cluster_mask.tolist() == [True, True, False, True, True]
+    assert cache._group_states[first_group].num_pages == 2
+    assert cache._group_states[second_group].num_pages == 2
+
+
+def test_resident_cache_falls_back_when_target_group_is_protected():
+    first_group = RetroSpecClusterGroup("first", 0)
+    second_group = RetroSpecClusterGroup("second", 0)
+    cache = make_cache(
+        capacity=2,
+        group_targets={first_group: 1, second_group: 1},
+    )
+    backing_keys, backing_values = make_backing_pages(num_pages=3)
+    cluster_groups = {10: first_group, 11: first_group, 20: second_group}
+    cache.admit(
+        torch.tensor([[0], [1]], dtype=torch.int64),
+        set(range(3)),
+        backing_keys,
+        backing_values,
+        cluster_ids=torch.tensor([10, 20], dtype=torch.int64),
+        cluster_groups={10: first_group, 20: second_group},
+        allocated_cluster_ids=set(cluster_groups),
+    )
+
+    cache.admit(
+        torch.tensor([[0], [2]], dtype=torch.int64),
+        set(range(3)),
+        backing_keys,
+        backing_values,
+        cluster_ids=torch.tensor([10, 11], dtype=torch.int64),
+        cluster_groups={10: first_group, 11: first_group},
+        allocated_cluster_ids=set(cluster_groups),
+    )
+
+    access = cache.lookup(
+        torch.tensor([[0], [2], [1]], dtype=torch.int64),
+        set(range(3)),
+        touch=False,
+        cluster_ids=torch.tensor([10, 11, 20], dtype=torch.int64),
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+    )
+    assert access.hit_cluster_mask.tolist() == [True, True, False]
+    assert cache._group_states[first_group].num_pages == 2
+    assert second_group not in cache._group_states
+
+
+def test_resident_cache_resize_uses_group_targets_and_local_lru():
+    first_group = RetroSpecClusterGroup("first", 0)
+    second_group = RetroSpecClusterGroup("second", 0)
+    cache = make_cache(
+        capacity=4,
+        group_targets={first_group: 1, second_group: 3},
+    )
+    backing_keys, backing_values = make_backing_pages(num_pages=4)
+    cluster_ids = torch.tensor([10, 11, 12, 20], dtype=torch.int64)
+    page_ids = torch.arange(4, dtype=torch.int64).unsqueeze(-1)
+    cluster_groups = {
+        10: first_group,
+        11: first_group,
+        12: first_group,
+        20: second_group,
+    }
+    cache.admit(
+        page_ids,
+        set(range(4)),
+        backing_keys,
+        backing_values,
+        cluster_ids=cluster_ids,
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+    )
+
+    cache.resize(2, group_targets={first_group: 1, second_group: 1})
+
+    access = cache.lookup(
+        page_ids,
+        set(range(4)),
+        touch=False,
+        cluster_ids=cluster_ids,
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+    )
+    assert access.hit_cluster_mask.tolist() == [True, False, False, True]
+    assert cache._group_states[first_group].num_pages == 1
+    assert cache._group_states[second_group].num_pages == 1
+    assert cache.physical_capacity == 4
+
+
+def test_resident_cache_rejects_invalid_group_targets():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=2)
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        cache.resize(2, group_targets={group: -1})
+
+    with pytest.raises(ValueError, match="cannot exceed layer capacity"):
+        cache.resize(2, group_targets={group: 3})
+
+    assert cache.capacity == 2
+    assert cache._group_targets == {}
+
+
 def test_resident_cache_invalidates_clusters_and_removes_empty_groups():
     cache = make_cache(capacity=4)
     backing_keys, backing_values = make_backing_pages()
@@ -465,14 +620,14 @@ def test_resident_cache_invalidates_clusters_and_removes_empty_groups():
     assert cache.num_resident_clusters == 1
     assert cache.num_resident_pages == 1
     assert len(cache._free_slots) == cache.physical_capacity - 1
-    assert set(cache._global_lru) == {12}
+    assert list(cache._group_states[second_group].lru) == [12]
 
     cache.invalidate(cluster_ids[2:])
 
     assert cache.num_resident_groups == 0
     assert cache.num_resident_clusters == 0
     assert cache.num_resident_pages == 0
-    assert not cache._global_lru
+    assert not cache._group_states
 
 
 def test_resident_cache_validates_cluster_group_metadata():

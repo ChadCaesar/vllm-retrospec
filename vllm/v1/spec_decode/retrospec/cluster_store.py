@@ -384,6 +384,11 @@ class RetroSpecClusterPageStore:
             str, dict[int, _ClusterBlockDescriptor]
         ] = {}
 
+        # layer_name -> group -> number of owned CPU backing pages
+        self._group_backing_page_counts: dict[
+            str, dict[RetroSpecClusterGroup, int]
+        ] = {}
+
     @property
     def is_cpu_backed(self) -> bool:
         return self.storage_mode == "cpu_offload"
@@ -518,14 +523,28 @@ class RetroSpecClusterPageStore:
 
         allocated = self._allocated_cluster_ids.setdefault(layer_name, set())
         descriptors = self._cluster_block_descriptors.setdefault(layer_name, {})
+        group_page_counts = self._group_backing_page_counts.setdefault(
+            layer_name,
+            {},
+        )
 
         if allocated.intersection(new_descriptors):
             raise RuntimeError("RetroSpec cluster ID allocator produced a duplicate ID")
 
+        new_group_pages: dict[RetroSpecClusterGroup, int] = {}
+        for descriptor in new_descriptors.values():
+            group = descriptor.identity.group
+            new_group_pages[group] = new_group_pages.get(group, 0) + len(
+                descriptor.page_ids
+            )
+
         allocated.update(new_descriptors)
         descriptors.update(new_descriptors)
-        self._next_cluster_ids[layer_name] = cluster_id_end
 
+        for group, num_pages in new_group_pages.items():
+            group_page_counts[group] = group_page_counts.get(group, 0) + num_pages
+
+        self._next_cluster_ids[layer_name] = cluster_id_end
         return cluster_ids_cpu
 
     def _free_cluster_ids(
@@ -535,21 +554,47 @@ class RetroSpecClusterPageStore:
     ) -> None:
         allocated = self._allocated_cluster_ids.get(layer_name)
         descriptors = self._cluster_block_descriptors.get(layer_name)
+        group_page_counts = self._group_backing_page_counts.get(layer_name)
 
-        if allocated is None or descriptors is None:
+        if allocated is None or descriptors is None or group_page_counts is None:
             raise RuntimeError(f"No RetroSpec clusters exist for layer {layer_name!r}")
 
-        cluster_ids_cpu = cluster_ids.detach().to(device="cpu", dtype=torch.int64)
+        cluster_ids_cpu = cluster_ids.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        )
         released = set(cluster_ids_cpu[cluster_ids_cpu >= 0].tolist())
+
+        released_group_pages: dict[RetroSpecClusterGroup, int] = {}
 
         for cluster_id in released:
             if cluster_id not in allocated:
                 raise RuntimeError(f"RetroSpec cluster {cluster_id} is not allocated")
 
+            descriptor = descriptors[cluster_id]
+            group = descriptor.identity.group
+            released_group_pages[group] = released_group_pages.get(group, 0) + len(
+                descriptor.page_ids
+            )
+
+        for group, num_pages in released_group_pages.items():
+            current_pages = group_page_counts.get(group)
+            if current_pages is None or current_pages < num_pages:
+                raise RuntimeError(
+                    "RetroSpec group backing-page accounting is inconsistent"
+                )
+
         allocated.difference_update(released)
 
         for cluster_id in released:
             del descriptors[cluster_id]
+
+        for group, num_pages in released_group_pages.items():
+            remaining_pages = group_page_counts[group] - num_pages
+            if remaining_pages:
+                group_page_counts[group] = remaining_pages
+            else:
+                del group_page_counts[group]
 
     def _get_allocated_cluster_ids(
         self,
@@ -814,6 +859,69 @@ class RetroSpecClusterPageStore:
             ceil(pool.num_allocated_pages * self.cache_ratio),
         )
 
+    def _resident_group_targets(
+        self,
+        layer_name: str,
+        capacity: int,
+    ) -> dict[RetroSpecClusterGroup, int]:
+        """Distribute layer capacity proportionally across backing-page owners."""
+        group_page_counts = self._group_backing_page_counts.get(
+            layer_name,
+            {},
+        )
+        total_backing_pages = sum(group_page_counts.values())
+
+        pool = self._layer_pools.get(layer_name)
+        if pool is None:
+            raise RuntimeError(
+                f"No RetroSpec page pool exists for layer {layer_name!r}"
+            )
+        if total_backing_pages != pool.num_allocated_pages:
+            raise RuntimeError(
+                "RetroSpec group backing-page accounting does not match "
+                "the layer page pool"
+            )
+
+        if total_backing_pages == 0:
+            if capacity != 0:
+                raise RuntimeError(
+                    "A non-empty resident capacity has no backing-page owners"
+                )
+            return {}
+
+        if capacity > total_backing_pages:
+            raise RuntimeError("Resident capacity exceeds owned backing pages")
+
+        targets: dict[RetroSpecClusterGroup, int] = {}
+        remainders: list[tuple[int, RetroSpecClusterGroup]] = []
+
+        for group, num_backing_pages in group_page_counts.items():
+            weighted_pages = capacity * num_backing_pages
+            target_pages, remainder = divmod(
+                weighted_pages,
+                total_backing_pages,
+            )
+            targets[group] = target_pages
+            remainders.append((remainder, group))
+
+        remaining_pages = capacity - sum(targets.values())
+        ordered_remainders = sorted(
+            remainders,
+            key=lambda item: (
+                -item[0],
+                item[1].request_id,
+                item[1].kv_head_index,
+            ),
+        )
+
+        for _, group in ordered_remainders[:remaining_pages]:
+            targets[group] += 1
+
+        if sum(targets.values()) != capacity:
+            raise RuntimeError("Resident group targets do not cover layer capacity")
+
+        return targets
+
     def _resize_resident_cache(
         self,
         layer_name: str,
@@ -823,7 +931,15 @@ class RetroSpecClusterPageStore:
         if resident_cache is None:
             return
 
-        resident_cache.resize(self._resident_target_capacity(pool))
+        capacity = self._resident_target_capacity(pool)
+        group_targets = self._resident_group_targets(
+            layer_name,
+            capacity,
+        )
+        resident_cache.resize(
+            capacity,
+            group_targets=group_targets,
+        )
 
     def _get_or_create_resident_cache(
         self,
@@ -855,8 +971,14 @@ class RetroSpecClusterPageStore:
             )
             self._resident_caches[layer_name] = resident_cache
 
-        resident_cache.resize(self._resident_target_capacity(pool))
-
+        capacity = self._resident_target_capacity(pool)
+        resident_cache.resize(
+            capacity,
+            group_targets=self._resident_group_targets(
+                layer_name,
+                capacity,
+            ),
+        )
         return pool, resident_cache
 
     @staticmethod
@@ -1063,12 +1185,6 @@ class RetroSpecClusterPageStore:
             )
 
         try:
-            self._resize_resident_cache(layer_name, pool)
-        except Exception:
-            pool.free(allocated_storage_page_ids)
-            raise
-
-        try:
             cluster_ids = self._allocate_cluster_ids(
                 layer_name=layer_name,
                 request_id=request_id,
@@ -1079,7 +1195,13 @@ class RetroSpecClusterPageStore:
             )
         except Exception:
             pool.free(allocated_storage_page_ids)
+            raise
+
+        try:
             self._resize_resident_cache(layer_name, pool)
+        except Exception:
+            self._free_cluster_ids(layer_name, cluster_ids)
+            pool.free(allocated_storage_page_ids)
             raise
 
         return RetroSpecClusterBlockTable(cluster_ids=cluster_ids)
