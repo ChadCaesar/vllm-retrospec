@@ -895,6 +895,122 @@ def test_gpu_reference_store_rejects_resident_cache_operations():
         )
 
 
+def test_cpu_backing_store_stages_and_commits_cpu_inputs():
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+
+    staged = store.stage_clusters(
+        token_keys=keys,
+        token_values=values,
+        assignments=assignments,
+        cluster_token_counts=cluster_token_counts,
+    )
+
+    assert staged.ready_event is None
+    assert staged.metadata_device == torch.device("cpu")
+    assert "layer" not in store._layer_pools
+
+    table = store.store_staged_clusters(
+        layer_name="layer",
+        request_id="request",
+        cluster_start=0,
+        staged=staged,
+    )
+    metadata = get_block_metadata(store, table)
+    gathered_keys, gathered_values, token_mask = store.gather_pages(
+        "layer",
+        metadata.page_ids.unsqueeze(0),
+        metadata.page_token_counts.unsqueeze(0),
+    )
+
+    assert store.num_allocated_pages("layer") == 6
+    assert gathered_keys[0, 0, token_mask[0, 0], 0].tolist() == [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+    ]
+    torch.testing.assert_close(
+        gathered_values[token_mask.unsqueeze(-1)],
+        gathered_keys[token_mask.unsqueeze(-1)] + 100.0,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA and pinned host memory are required",
+)
+def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        pin_memory=True,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    keys = keys.to(device)
+    values = values.to(device)
+    assignments = assignments.to(device)
+    cluster_token_counts = cluster_token_counts.to(device)
+
+    staged = store.stage_clusters(
+        token_keys=keys,
+        token_values=values,
+        assignments=assignments,
+        cluster_token_counts=cluster_token_counts,
+    )
+
+    assert staged.ready_event is not None
+    assert staged.metadata_device == device
+    assert all(
+        tensor.device.type == "cpu" and tensor.is_pinned()
+        for tensor in (
+            staged.token_keys,
+            staged.token_values,
+            staged.assignments,
+            staged.cluster_token_counts,
+        )
+    )
+    assert "layer" not in store._layer_pools
+
+    table = store.store_staged_clusters(
+        layer_name="layer",
+        request_id="request",
+        cluster_start=0,
+        staged=staged,
+    )
+    pool = store._layer_pools["layer"]
+    metadata = store.get_cluster_block_metadata(
+        "layer",
+        table.cluster_ids,
+        device=torch.device("cpu"),
+    )
+    gathered_keys, gathered_values, token_mask = store.gather_pages(
+        "layer",
+        metadata.page_ids.unsqueeze(0),
+        metadata.page_token_counts.unsqueeze(0),
+    )
+
+    assert pool.storage_device == torch.device("cpu")
+    assert pool.metadata_device == device
+    assert pool.key_pages.is_pinned()
+    assert gathered_keys[0, 0, token_mask[0, 0], 0].tolist() == [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+    ]
+    torch.testing.assert_close(
+        gathered_values[token_mask.unsqueeze(-1)],
+        gathered_keys[token_mask.unsqueeze(-1)] + 100.0,
+    )
+
+
 def test_cluster_store_rejects_invalid_storage_metadata():
     with pytest.raises(ValueError, match="Unsupported"):
         RetroSpecClusterPageStore(

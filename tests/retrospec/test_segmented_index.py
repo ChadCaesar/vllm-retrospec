@@ -22,6 +22,7 @@ def make_index(
     estimation_ratio: float = 0.5,
     cache_mode: RetroSpecClusterStorageMode = "gpu_reference",
     cache_ratio: float = 0.0,
+    pin_memory: bool = False,
 ) -> RetroSpecSegmentedTokenIndex:
     return RetroSpecSegmentedTokenIndex(
         block_size=2,
@@ -33,6 +34,7 @@ def make_index(
         num_kmeans_iterations=2,
         cache_mode=cache_mode,
         cache_ratio=cache_ratio,
+        pin_memory=pin_memory,
     )
 
 
@@ -76,6 +78,7 @@ def build_index(
     keys: torch.Tensor,
     values: torch.Tensor,
     block_table: torch.Tensor,
+    defer_cpu_store: bool = False,
 ) -> None:
     index.build_or_update(
         layer_name="layer",
@@ -85,6 +88,7 @@ def build_index(
         key_cache=keys,
         value_cache=values,
         block_table=block_table,
+        defer_cpu_store=defer_cpu_store,
     )
 
 
@@ -595,6 +599,60 @@ def test_segmented_index_proposal_lifecycle_tracks_empty_batches():
 
     with pytest.raises(RuntimeError, match="not active"):
         index.end_proposal()
+
+
+def test_cpu_offload_can_defer_flush_and_discard_index_updates():
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+
+    build_index(
+        index,
+        10,
+        keys,
+        values,
+        block_table,
+        defer_cpu_store=True,
+    )
+
+    assert index.has_staged_updates
+    assert index.cluster_store.num_allocated_pages("layer") == 0
+    assert index.needs_update("request", 10, ["layer"])
+    with pytest.raises(RuntimeError, match="staged index updates"):
+        index.begin_proposal(["request"])
+
+    index.discard_staged_updates()
+
+    assert not index.has_staged_updates
+    assert index.cluster_store.num_allocated_pages("layer") == 0
+    assert index.needs_update("request", 10, ["layer"])
+
+    build_index(
+        index,
+        10,
+        keys,
+        values,
+        block_table,
+        defer_cpu_store=True,
+    )
+    index.flush_staged_updates()
+
+    assert not index.has_staged_updates
+    assert index.cluster_store.num_allocated_pages("layer") == 2
+    assert not index.needs_update("request", 10, ["layer"])
+
+
+def test_cpu_offload_direct_build_preserves_synchronous_api():
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+
+    build_index(index, 10, keys, values, block_table)
+
+    assert not index.has_staged_updates
+    assert index.cluster_store.num_allocated_pages("layer") == 2
+    index.begin_proposal(["request"])
+    index.end_proposal()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

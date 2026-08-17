@@ -13,6 +13,7 @@ from .cluster_store import (
     RetroSpecClusterPageStore,
     RetroSpecClusterStorageMode,
     RetroSpecResolvedClusterPages,
+    RetroSpecStagedClusterInput,
 )
 from .clustering import segmented_kmeans_assignments
 from .index import (
@@ -77,6 +78,21 @@ class _RequestLayerSegment:
     cluster_values: torch.Tensor
     cluster_token_counts: torch.Tensor
     cluster_blocks: RetroSpecClusterBlockTable
+
+
+@dataclass(frozen=True)
+class _StagedRequestLayerSegment:
+    layer_name: str
+    request_id: str
+
+    indexed_start: int
+    indexed_end: int
+    cluster_start: int
+
+    cluster_keys: torch.Tensor
+    cluster_values: torch.Tensor
+    cluster_token_counts: torch.Tensor
+    staged_clusters: RetroSpecStagedClusterInput
 
 
 @dataclass
@@ -201,6 +217,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         # plan before the workspace is reused.
         self._cluster_selection_workspace: _ClusterSelectionWorkspace | None = None
 
+        # CPU-offload construction is staged during layer execution and
+        # committed after the complete prefill attention context.
+        self._staged_segments: list[_StagedRequestLayerSegment] = []
+        self._staged_segment_keys: set[tuple[str, str]] = set()
+
     def _desired_indexed_end(self, seq_len: int) -> int:
         """Return the exclusive logical-token boundary covered by clustering."""
         full_block_count = seq_len // self.block_size
@@ -253,6 +274,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
     def begin_proposal(self, request_ids: Sequence[str]) -> None:
         if self._proposal_active:
             raise RuntimeError("Segmented token index proposal is already active")
+        if self._staged_segments:
+            raise RuntimeError(
+                "Cannot begin a proposal before staged index updates are flushed"
+            )
 
         self._proposal_active = True
         self._proposal_request_ids = tuple(request_ids)
@@ -284,6 +309,101 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
     ) -> None:
         for segment in record.segments:
             self.cluster_store.free(layer_name, segment.cluster_blocks)
+
+    @property
+    def has_staged_updates(self) -> bool:
+        return bool(self._staged_segments)
+
+    def _append_segment(
+        self,
+        layer_name: str,
+        request_id: str,
+        indexed_start: int,
+        indexed_end: int,
+        cluster_start: int,
+        cluster_keys: torch.Tensor,
+        cluster_values: torch.Tensor,
+        cluster_token_counts: torch.Tensor,
+        cluster_blocks: RetroSpecClusterBlockTable,
+    ) -> None:
+        layer_indices = self._indices.setdefault(layer_name, {})
+        record = layer_indices.get(request_id)
+
+        if record is None:
+            record = self._empty_index()
+            layer_indices[request_id] = record
+
+        if record.indexed_end != indexed_start:
+            raise RuntimeError(
+                "Staged RetroSpec segment no longer follows the indexed prefix"
+            )
+        if record.num_clusters != cluster_start:
+            raise RuntimeError(
+                "Staged RetroSpec segment cluster offset is no longer current"
+            )
+
+        record.segments.append(
+            _RequestLayerSegment(
+                indexed_start=indexed_start,
+                indexed_end=indexed_end,
+                cluster_start=cluster_start,
+                cluster_keys=cluster_keys,
+                cluster_values=cluster_values,
+                cluster_token_counts=cluster_token_counts,
+                cluster_blocks=cluster_blocks,
+            )
+        )
+        record.num_clusters += cluster_token_counts.shape[1]
+        record.indexed_end = indexed_end
+        self._packed_index_cache.pop(layer_name, None)
+
+    def flush_staged_updates(self) -> None:
+        """Commit all completed CPU-offload segments in enqueue order."""
+        staged_segments = self._staged_segments
+        self._staged_segments = []
+        self._staged_segment_keys.clear()
+
+        for index, staged_segment in enumerate(staged_segments):
+            cluster_blocks: RetroSpecClusterBlockTable | None = None
+
+            try:
+                cluster_blocks = self.cluster_store.store_staged_clusters(
+                    layer_name=staged_segment.layer_name,
+                    request_id=staged_segment.request_id,
+                    cluster_start=staged_segment.cluster_start,
+                    staged=staged_segment.staged_clusters,
+                )
+                self._append_segment(
+                    layer_name=staged_segment.layer_name,
+                    request_id=staged_segment.request_id,
+                    indexed_start=staged_segment.indexed_start,
+                    indexed_end=staged_segment.indexed_end,
+                    cluster_start=staged_segment.cluster_start,
+                    cluster_keys=staged_segment.cluster_keys,
+                    cluster_values=staged_segment.cluster_values,
+                    cluster_token_counts=staged_segment.cluster_token_counts,
+                    cluster_blocks=cluster_blocks,
+                )
+            except BaseException:
+                if cluster_blocks is not None:
+                    self.cluster_store.free(
+                        staged_segment.layer_name,
+                        cluster_blocks,
+                    )
+
+                for remaining in staged_segments[index + 1 :]:
+                    remaining.staged_clusters.wait()
+
+                raise
+
+    def discard_staged_updates(self) -> None:
+        """Wait for in-flight D2H copies without publishing their segments."""
+        staged_segments = self._staged_segments
+        self._staged_segments = []
+        self._staged_segment_keys.clear()
+
+        for staged_segment in staged_segments:
+            staged_segment.staged_clusters.wait()
 
     @staticmethod
     def _cluster_means(
@@ -327,8 +447,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
+        defer_cpu_store: bool = False,
     ) -> None:
-        """Cluster stable tokens and copy them into private cluster pages."""
+        """Cluster stable tokens and stage or store private cluster pages."""
         if len(request_ids) != len(seq_lens):
             raise ValueError("request_ids and seq_lens must have equal length")
         if block_table.shape[0] != len(request_ids):
@@ -340,19 +461,28 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 f"KV cache block size {key_cache.shape[1]} does not match "
                 f"configured block size {self.block_size}"
             )
+        if len(rows) != len(set(rows)):
+            raise ValueError("RetroSpec index build rows must be unique")
 
         layer_indices = self._indices.setdefault(layer_name, {})
         layer_changed = False
 
         for row in rows:
+            if not 0 <= row < len(request_ids):
+                raise IndexError("RetroSpec index build row is out of range")
+
             request_id = request_ids[row]
             seq_len = seq_lens[row]
             desired_end = self._desired_indexed_end(seq_len)
 
+            staged_key = (layer_name, request_id)
+            if staged_key in self._staged_segment_keys:
+                raise RuntimeError(
+                    "A RetroSpec request/layer segment is already staged"
+                )
+
             record = layer_indices.get(request_id)
             if record is not None and desired_end < record.indexed_end:
-                # Drop the packed view before releasing stable cluster IDs
-                # and their backing pages.
                 self._packed_index_cache.pop(layer_name, None)
                 self._free_record(layer_name, record)
                 record = self._empty_index()
@@ -442,6 +572,31 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
             cluster_start = 0 if record is None else record.num_clusters
 
+            if self.cluster_store.is_cpu_backed:
+                staged_clusters = self.cluster_store.stage_clusters(
+                    token_keys=token_keys,
+                    token_values=token_values,
+                    assignments=local_assignments,
+                    cluster_token_counts=cluster_token_counts,
+                )
+                self._staged_segments.append(
+                    _StagedRequestLayerSegment(
+                        layer_name=layer_name,
+                        request_id=request_id,
+                        indexed_start=indexed_start,
+                        indexed_end=desired_end,
+                        cluster_start=cluster_start,
+                        cluster_keys=cluster_keys,
+                        cluster_values=cluster_values,
+                        cluster_token_counts=cluster_token_counts,
+                        staged_clusters=staged_clusters,
+                    )
+                )
+                self._staged_segment_keys.add(staged_key)
+                if not defer_cpu_store:
+                    self.flush_staged_updates()
+                continue
+
             cluster_blocks = self.cluster_store.store_clusters(
                 layer_name=layer_name,
                 request_id=request_id,
@@ -451,25 +606,17 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 assignments=local_assignments,
                 cluster_token_counts=cluster_token_counts,
             )
-
-            if record is None:
-                record = self._empty_index()
-                layer_indices[request_id] = record
-
-            record.segments.append(
-                _RequestLayerSegment(
-                    indexed_start=indexed_start,
-                    indexed_end=desired_end,
-                    cluster_start=cluster_start,
-                    cluster_keys=cluster_keys,
-                    cluster_values=cluster_values,
-                    cluster_token_counts=cluster_token_counts,
-                    cluster_blocks=cluster_blocks,
-                )
+            self._append_segment(
+                layer_name=layer_name,
+                request_id=request_id,
+                indexed_start=indexed_start,
+                indexed_end=desired_end,
+                cluster_start=cluster_start,
+                cluster_keys=cluster_keys,
+                cluster_values=cluster_values,
+                cluster_token_counts=cluster_token_counts,
+                cluster_blocks=cluster_blocks,
             )
-            record.num_clusters += cluster_token_counts.shape[1]
-            record.indexed_end = desired_end
-            layer_changed = True
 
         if layer_changed:
             self._packed_index_cache.pop(layer_name, None)

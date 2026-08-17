@@ -175,6 +175,12 @@ class RetroSpecSparseAttention:
         if self.prefill_index_active:
             raise RuntimeError("RetroSpec prefill index context cannot be nested")
 
+        segmented_index = (
+            self.index if isinstance(self.index, RetroSpecSegmentedTokenIndex) else None
+        )
+        if segmented_index is not None and segmented_index.has_staged_updates:
+            raise RuntimeError("A previous RetroSpec prefill left staged index updates")
+
         self.prefill_index_active = True
         self.prefill_request_ids = tuple(request_ids)
         self.prefill_seq_lens = tuple(seq_lens)
@@ -182,6 +188,13 @@ class RetroSpecSparseAttention:
 
         try:
             yield
+        except BaseException:
+            if segmented_index is not None:
+                segmented_index.discard_staged_updates()
+            raise
+        else:
+            if segmented_index is not None:
+                segmented_index.flush_staged_updates()
         finally:
             self.prefill_index_active = False
             self.prefill_request_ids = ()
@@ -423,6 +436,7 @@ class RetroSpecSparseAttention:
                     key_cache=key_cache,
                     value_cache=value_cache,
                     block_table=attn_metadata.block_table,
+                    defer_cpu_store=True,
                 )
 
             return result

@@ -354,6 +354,7 @@ def test_passthrough_forward_builds_segmented_index_after_target_attention():
 
     assert result.tolist() == [3.0]
     assert events == ["forward", "index"]
+    assert controller.index.build_or_update.call_args.kwargs["defer_cpu_store"] is True
     assert not controller.needs_index_update("request", 10)
     assert not controller.prefill_index_active
     assert controller.prefill_request_ids == ()
@@ -363,12 +364,35 @@ def test_passthrough_forward_builds_segmented_index_after_target_attention():
 
 def test_prefill_index_context_restores_state_after_exception():
     controller = make_controller("segmented_cluster")
+    discard_staged_updates = Mock(
+        wraps=controller.index.discard_staged_updates,
+    )
+    controller.index.discard_staged_updates = discard_staged_updates
 
     with (
         pytest.raises(RuntimeError, match="prefill failure"),
         controller.prefill_index_context(["request"], [10], [0]),
     ):
         raise RuntimeError("prefill failure")
+
+    discard_staged_updates.assert_called_once_with()
+    assert not controller.prefill_index_active
+    assert controller.prefill_request_ids == ()
+    assert controller.prefill_seq_lens == ()
+    assert controller.prefill_build_rows == ()
+
+
+def test_prefill_index_context_restores_state_after_flush_failure():
+    controller = make_controller("segmented_cluster")
+    controller.index.flush_staged_updates = Mock(
+        side_effect=RuntimeError("flush failure")
+    )
+
+    with (
+        pytest.raises(RuntimeError, match="flush failure"),
+        controller.prefill_index_context(["request"], [10], [0]),
+    ):
+        pass
 
     assert not controller.prefill_index_active
     assert controller.prefill_request_ids == ()
@@ -590,11 +614,11 @@ def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
             "materialize_exact_reference",
             side_effect=lambda *_: call_order.append("materialize") or reference_exact,
         ),
-            patch.object(
-                controller.index.cluster_store,
-                "admit_resident_clusters",
-                side_effect=lambda **_: call_order.append("admit"),
-            ) as admit,
+        patch.object(
+            controller.index.cluster_store,
+            "admit_resident_clusters",
+            side_effect=lambda **_: call_order.append("admit"),
+        ) as admit,
         patch.object(
             controller,
             "_run_grouped_reference_attention",
