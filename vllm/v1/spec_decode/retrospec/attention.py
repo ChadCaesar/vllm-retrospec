@@ -17,9 +17,13 @@ from vllm.v1.attention.backends.flash_attn import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
+from .cluster_store import RetroSpecResolvedClusterPages
 from .execution import (
     RetroSpecExactExecution,
     RetroSpecExactExecutionBuffer,
+    RetroSpecExactKVSource,
+    RetroSpecExactPageKVSource,
+    RetroSpecExactPrimaryKVSource,
 )
 from .index import (
     RetroSpecAttentionLevel,
@@ -691,6 +695,56 @@ class RetroSpecSparseAttention:
 
         return exact_output, exact_lse
 
+    def _resolve_exact_kv_source(
+        self,
+        selection: RetroSpecTokenAttentionSelection,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> tuple[RetroSpecExactKVSource, RetroSpecResolvedClusterPages | None]:
+        if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
+            raise RuntimeError("Token selection requires the segmented index")
+
+        resolved_pages = selection.resolved_pages
+        if resolved_pages is None and selection.exact_cluster_ids.numel():
+            resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
+                layer_name=selection.plan.layer_name,
+                cluster_ids=selection.exact_cluster_ids,
+                logical_page_ids=selection.exact_page_ids,
+                mode="verification",
+            )
+
+        page_sources: tuple[RetroSpecExactPageKVSource, ...] = ()
+
+        if resolved_pages is not None:
+            page_sources = (
+                RetroSpecExactPageKVSource(
+                    key_pages=resolved_pages.resident_key_pages,
+                    value_pages=resolved_pages.resident_value_pages,
+                    page_ids=resolved_pages.resident_page_ids,
+                    ready_event=resolved_pages.resident_ready_event,
+                ),
+                RetroSpecExactPageKVSource(
+                    key_pages=resolved_pages.staging_key_pages,
+                    value_pages=resolved_pages.staging_value_pages,
+                    page_ids=resolved_pages.staging_page_ids,
+                ),
+            )
+
+        source = RetroSpecExactKVSource(
+            primary=RetroSpecExactPrimaryKVSource(
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=block_table,
+                token_indices=selection.plan.primary_exact_token_indices,
+                token_mask=selection.plan.primary_exact_token_mask,
+            ),
+            page_token_counts=selection.exact_page_token_counts,
+            page_sources=page_sources,
+        )
+
+        return source, resolved_pages
+
     def _run_exact_attention(
         self,
         impl: FlashAttentionImpl,
@@ -750,53 +804,13 @@ class RetroSpecSparseAttention:
                     "RetroSpec exact execution buffer is not initialized"
                 )
 
-            resident_page_ids = selection.exact_page_ids
-            staging_page_ids = torch.full_like(
-                selection.exact_page_ids,
-                -1,
-            )
-
-            resident_key_pages: torch.Tensor | None = None
-            resident_value_pages: torch.Tensor | None = None
-            staging_key_pages: torch.Tensor | None = None
-            staging_value_pages: torch.Tensor | None = None
-            resident_ready_event: torch.cuda.Event | None = None
-
-            resolved_pages = selection.resolved_pages
-
-            if resolved_pages is None and selection.exact_cluster_ids.numel():
-                resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
-                    layer_name=selection.plan.layer_name,
-                    cluster_ids=selection.exact_cluster_ids,
-                    logical_page_ids=selection.exact_page_ids,
-                    mode="verification",
-                )
-
-            if resolved_pages is not None:
-                resident_page_ids = resolved_pages.resident_page_ids
-                staging_page_ids = resolved_pages.staging_page_ids
-
-                resident_key_pages = resolved_pages.resident_key_pages
-                resident_value_pages = resolved_pages.resident_value_pages
-                staging_key_pages = resolved_pages.staging_key_pages
-                staging_value_pages = resolved_pages.staging_value_pages
-                resident_ready_event = resolved_pages.resident_ready_event
-
-            execution = self.exact_execution_buffer.pack(
+            source, resolved_pages = self._resolve_exact_kv_source(
+                selection=selection,
                 key_cache=key_cache,
                 value_cache=value_cache,
                 block_table=attn_metadata.block_table,
-                primary_token_indices=(selection.plan.primary_exact_token_indices),
-                primary_token_mask=(selection.plan.primary_exact_token_mask),
-                resident_page_ids=resident_page_ids,
-                staging_page_ids=staging_page_ids,
-                page_token_counts=(selection.exact_page_token_counts),
-                resident_key_pages=resident_key_pages,
-                resident_value_pages=resident_value_pages,
-                staging_key_pages=staging_key_pages,
-                staging_value_pages=staging_value_pages,
-                resident_ready_event=resident_ready_event,
             )
+            execution = self.exact_execution_buffer.pack(source)
 
             if (
                 self.mode

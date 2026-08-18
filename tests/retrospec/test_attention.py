@@ -21,7 +21,10 @@ from vllm.v1.spec_decode.retrospec.attention import (
 from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecResolvedClusterPages,
 )
-from vllm.v1.spec_decode.retrospec.execution import RetroSpecExactExecution
+from vllm.v1.spec_decode.retrospec.execution import (
+    RetroSpecExactExecution,
+    RetroSpecExactKVSource,
+)
 from vllm.v1.spec_decode.retrospec.index import (
     RetroSpecAttentionLevel,
     RetroSpecAttentionSelection,
@@ -938,7 +941,7 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         torch.ones(1, 1, 3, dtype=torch.bool, device=device),
     )
     pack = Mock(
-        side_effect=lambda **_: call_order.append("pack") or execution,
+        side_effect=lambda *_args, **_kwargs: call_order.append("pack") or execution
     )
     controller.exact_execution_buffer = SimpleNamespace(pack=pack)
     controller.index.cluster_store.admit_staged_clusters = Mock(
@@ -990,14 +993,24 @@ def test_exact_attention_resolves_resident_and_staging_pages(
     else:
         controller.index.cluster_store.admit_staged_clusters.assert_not_called()
         assert call_order == ["pack"]
-    call = pack.call_args.kwargs
-    assert call["resident_page_ids"] is resident_page_ids
-    assert call["staging_page_ids"] is staging_page_ids
-    assert call["resident_key_pages"] is resident_keys
-    assert call["resident_value_pages"] is resident_values
-    assert call["staging_key_pages"] is staging_keys
-    assert call["staging_value_pages"] is staging_values
-    assert call["resident_ready_event"] is resident_ready_event
+    source = pack.call_args.args[0]
+    assert isinstance(source, RetroSpecExactKVSource)
+    assert source.primary.key_cache is key_cache
+    assert source.primary.value_cache is value_cache
+    assert source.primary.token_indices is plan.primary_exact_token_indices
+    assert source.primary.token_mask is plan.primary_exact_token_mask
+    assert source.page_token_counts is page_counts
+    assert len(source.page_sources) == 2
+
+    resident_source, staging_source = source.page_sources
+    assert resident_source.page_ids is resident_page_ids
+    assert resident_source.key_pages is resident_keys
+    assert resident_source.value_pages is resident_values
+    assert resident_source.ready_event is resident_ready_event
+    assert staging_source.page_ids is staging_page_ids
+    assert staging_source.key_pages is staging_keys
+    assert staging_source.value_pages is staging_values
+    assert staging_source.ready_event is None
 
 
 def test_verification_reuses_draft_selection_plan_without_reranking():
