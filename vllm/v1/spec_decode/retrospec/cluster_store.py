@@ -7,6 +7,8 @@ from typing import Literal
 
 import torch
 
+from vllm import _custom_ops as ops
+
 from .cluster_identity import (
     RetroSpecClusterGroup,
     RetroSpecClusterIdentity,
@@ -102,9 +104,10 @@ class RetroSpecResolvedClusterPages:
     leading shape, excluding the page dimension. Empty or padded clusters are
     false in both masks.
 
-    resident_ready_event is recorded on the resident-cache copy stream. The
-    execution path may perform work independent of resident pages before
-    waiting on this event.
+    resident_ready_event is recorded on the resident-cache copy stream.
+    staging_ready_event is recorded after a full-verification layer transfer.
+    The execution stream must wait for the corresponding event before reading
+    a page source.
     """
 
     resident_page_ids: torch.Tensor
@@ -119,6 +122,7 @@ class RetroSpecResolvedClusterPages:
     hit_cluster_mask: torch.Tensor
     miss_cluster_mask: torch.Tensor
     resident_ready_event: torch.cuda.Event | None
+    staging_ready_event: torch.cuda.Event | None = None
 
 
 class _LayerClusterPagePool:
@@ -364,6 +368,186 @@ class _LayerClusterPagePool:
         )
 
 
+class _FullVerificationTransferBuffer:
+    """One reusable full-layer H2D page arena for a CUDA device."""
+
+    _MIN_CAPACITY = 64
+
+    def __init__(self, page_size: int, device: torch.device) -> None:
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        if device.type != "cuda":
+            raise ValueError("Full-verification transfer buffer requires CUDA")
+
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+
+        self.page_size = page_size
+        self.device = device
+
+        self._dtype: torch.dtype | None = None
+        self._head_size: int | None = None
+        self._capacity = 0
+
+        self.key_pages: torch.Tensor | None = None
+        self.value_pages: torch.Tensor | None = None
+
+        self._transfer_stream = torch.cuda.Stream(device=device)
+
+    @staticmethod
+    def _next_power_of_two(value: int) -> int:
+        return 1 << (max(value, 1) - 1).bit_length()
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    def _release_old_storage(self) -> None:
+        if self.key_pages is None or self.value_pages is None:
+            return
+
+        # The transfer stream already waits for the execution stream before
+        # this method is called. Recording the old tensors on the transfer
+        # stream prevents the CUDA allocator from recycling them too early.
+        self.key_pages.record_stream(self._transfer_stream)
+        self.value_pages.record_stream(self._transfer_stream)
+
+    def _ensure_capacity(
+        self,
+        required_pages: int,
+        dtype: torch.dtype,
+        head_size: int,
+    ) -> None:
+        if required_pages < 0:
+            raise ValueError("required_pages must be non-negative")
+        if head_size <= 0:
+            raise ValueError("head_size must be positive")
+
+        layout_changed = self._dtype != dtype or self._head_size != head_size
+        if not layout_changed and required_pages <= self._capacity:
+            return
+
+        self._release_old_storage()
+
+        self._dtype = dtype
+        self._head_size = head_size
+        self._capacity = max(
+            self._MIN_CAPACITY,
+            self._next_power_of_two(required_pages),
+        )
+
+        shape = (
+            self._capacity,
+            self.page_size,
+            head_size,
+        )
+        self.key_pages = torch.empty(shape, dtype=dtype, device=self.device)
+        self.value_pages = torch.empty_like(self.key_pages)
+
+    def stage(
+        self,
+        pool: _LayerClusterPagePool,
+        logical_page_ids: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.cuda.Event,
+    ]:
+        """Copy every valid logical page into the shared CUDA arena."""
+        if pool.storage_device.type != "cpu":
+            raise ValueError("Full-verification staging requires CPU backing pages")
+        if pool.metadata_device != self.device:
+            raise ValueError(
+                "Full-verification metadata and transfer buffer devices differ"
+            )
+        if logical_page_ids.device != self.device:
+            raise ValueError("Logical page IDs must be on the transfer device")
+        if logical_page_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Logical page IDs must use an integral dtype")
+
+        logical_page_ids_cpu = logical_page_ids.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        )
+        valid_page_mask_cpu = logical_page_ids_cpu >= 0
+        source_page_ids = logical_page_ids_cpu[valid_page_mask_cpu].contiguous()
+        num_pages = source_page_ids.numel()
+
+        valid_page_mask = logical_page_ids >= 0
+        staging_page_ids = torch.full_like(
+            logical_page_ids,
+            -1,
+            dtype=torch.int64,
+        )
+
+        if num_pages:
+            staging_page_ids.masked_scatter_(
+                valid_page_mask,
+                torch.arange(
+                    num_pages,
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+            )
+
+        current_stream = torch.cuda.current_stream(self.device)
+
+        # The previous layer may still be reading this arena. Waiting on the
+        # execution stream makes it safe to overwrite for the next layer.
+        self._transfer_stream.wait_stream(current_stream)
+        ready_event = torch.cuda.Event()
+
+        with torch.cuda.stream(self._transfer_stream):
+            self._ensure_capacity(
+                required_pages=num_pages,
+                dtype=pool.dtype,
+                head_size=pool.head_size,
+            )
+
+            assert self.key_pages is not None
+            assert self.value_pages is not None
+
+            staging_key_pages = self.key_pages[:num_pages]
+            staging_value_pages = self.value_pages[:num_pages]
+
+            if num_pages:
+                destination_page_ids = torch.arange(
+                    num_pages,
+                    dtype=torch.int64,
+                    device="cpu",
+                )
+                block_mapping = torch.stack(
+                    (source_page_ids, destination_page_ids),
+                    dim=1,
+                ).contiguous()
+
+                block_size_in_bytes = (
+                    pool.key_pages.element_size() * pool.key_pages.stride(0)
+                )
+                ops.swap_blocks(
+                    pool.key_pages,
+                    staging_key_pages,
+                    block_size_in_bytes,
+                    block_mapping,
+                )
+                ops.swap_blocks(
+                    pool.value_pages,
+                    staging_value_pages,
+                    block_size_in_bytes,
+                    block_mapping,
+                )
+
+            ready_event.record(self._transfer_stream)
+
+        return (
+            staging_page_ids,
+            staging_key_pages,
+            staging_value_pages,
+            ready_event,
+        )
+
+
 class RetroSpecClusterPageStore:
     """Per-layer secondary KV store organized by token clusters.
 
@@ -416,6 +600,12 @@ class RetroSpecClusterPageStore:
         # share the stream so their staged CPU buffers are completed in enqueue
         # order without synchronizing the model execution stream.
         self._offload_streams: dict[torch.device, torch.cuda.Stream] = {}
+
+        # Full verification transfers one complete layer at a time. Layers on
+        # the same CUDA device reuse one growable page arena.
+        self._full_verification_buffers: dict[
+            torch.device, _FullVerificationTransferBuffer
+        ] = {}
 
     @property
     def is_cpu_backed(self) -> bool:
@@ -1507,6 +1697,27 @@ class RetroSpecClusterPageStore:
 
         return pool.storage_device
 
+    def _get_full_verification_buffer(
+        self,
+        pool: _LayerClusterPagePool,
+    ) -> _FullVerificationTransferBuffer:
+        device = pool.metadata_device
+
+        if device.type != "cuda":
+            raise RuntimeError("Full-verification transfer requires CUDA metadata")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+
+        buffer = self._full_verification_buffers.get(device)
+        if buffer is None:
+            buffer = _FullVerificationTransferBuffer(
+                page_size=self.page_size,
+                device=device,
+            )
+            self._full_verification_buffers[device] = buffer
+
+        return buffer
+
     @staticmethod
     def _stage_missing_pages(
         pool: _LayerClusterPagePool,
@@ -1667,6 +1878,65 @@ class RetroSpecClusterPageStore:
             hit_cluster_mask=resident_access.hit_cluster_mask,
             miss_cluster_mask=resident_access.miss_cluster_mask,
             resident_ready_event=resident_cache.pending_copy_event(),
+        )
+
+    def resolve_full_verification_blocks(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+        logical_page_ids: torch.Tensor,
+    ) -> RetroSpecResolvedClusterPages:
+        """Stage every clustered KV page required by full verification."""
+        if logical_page_ids.shape[:-1] != cluster_ids.shape:
+            raise ValueError("Logical page-table shape does not match cluster IDs")
+        if logical_page_ids.device != cluster_ids.device:
+            raise ValueError("Cluster IDs and logical pages must use one device")
+
+        if not self.is_cpu_backed:
+            return self.resolve_cluster_blocks(
+                layer_name=layer_name,
+                cluster_ids=cluster_ids,
+                logical_page_ids=logical_page_ids,
+                mode="verification",
+            )
+
+        self._validate_cluster_blocks(
+            layer_name,
+            cluster_ids,
+            logical_page_ids,
+        )
+
+        pool = self._layer_pools.get(layer_name)
+        if pool is None:
+            raise RuntimeError(
+                f"No RetroSpec page pool exists for layer {layer_name!r}"
+            )
+
+        transfer_buffer = self._get_full_verification_buffer(pool)
+        (
+            staging_page_ids,
+            staging_key_pages,
+            staging_value_pages,
+            staging_ready_event,
+        ) = transfer_buffer.stage(
+            pool=pool,
+            logical_page_ids=logical_page_ids,
+        )
+
+        resident_page_ids = torch.full_like(logical_page_ids, -1)
+        valid_cluster_mask = (cluster_ids >= 0) & (logical_page_ids >= 0).any(dim=-1)
+
+        return RetroSpecResolvedClusterPages(
+            resident_page_ids=resident_page_ids,
+            staging_page_ids=staging_page_ids,
+            resident_key_pages=staging_key_pages[:0],
+            resident_value_pages=staging_value_pages[:0],
+            staging_key_pages=staging_key_pages,
+            staging_value_pages=staging_value_pages,
+            hit_cluster_mask=torch.zeros_like(valid_cluster_mask),
+            miss_cluster_mask=valid_cluster_mask,
+            resident_ready_event=None,
+            staging_ready_event=staging_ready_event,
         )
 
     def lookup_resident_clusters(

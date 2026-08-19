@@ -664,7 +664,7 @@ def test_full_verification_source_skips_resolution_without_cluster_pages():
         exact_page_token_counts=torch.empty(1, 1, 1, 0, dtype=torch.int32),
         exact_token_counts=torch.tensor([[3]], dtype=torch.int32),
     )
-    controller.index.cluster_store.resolve_cluster_blocks = Mock()
+    controller.index.cluster_store.resolve_full_verification_blocks = Mock()
     key_cache = torch.zeros(2, 2, 1, 1)
     value_cache = key_cache.clone()
     block_table = torch.tensor([[0, 1]], dtype=torch.int32)
@@ -677,7 +677,8 @@ def test_full_verification_source_skips_resolution_without_cluster_pages():
     )
 
     assert resolved_pages is None
-    controller.index.cluster_store.resolve_cluster_blocks.assert_not_called()
+    resolve_full = controller.index.cluster_store.resolve_full_verification_blocks
+    resolve_full.assert_not_called()
     assert source.primary.key_cache is key_cache
     assert source.primary.value_cache is value_cache
     assert source.primary.token_indices is plan.primary_exact_token_indices
@@ -708,6 +709,7 @@ def test_full_verification_source_resolves_all_cluster_pages():
     resident_values = resident_keys.clone()
     staging_keys = torch.ones(1, 2, 1)
     staging_values = staging_keys.clone()
+    staging_ready_event = Mock()
     resolved = RetroSpecResolvedClusterPages(
         resident_page_ids=resident_page_ids,
         staging_page_ids=staging_page_ids,
@@ -718,8 +720,11 @@ def test_full_verification_source_resolves_all_cluster_pages():
         hit_cluster_mask=torch.tensor([[[True, False]]]),
         miss_cluster_mask=torch.tensor([[[False, True]]]),
         resident_ready_event=None,
+        staging_ready_event=staging_ready_event,
     )
-    controller.index.cluster_store.resolve_cluster_blocks = Mock(return_value=resolved)
+    controller.index.cluster_store.resolve_full_verification_blocks = Mock(
+        return_value=resolved
+    )
     key_cache = torch.zeros(3, 2, 1, 1)
     value_cache = key_cache.clone()
     block_table = torch.tensor([[0, 1, 2]], dtype=torch.int32)
@@ -732,11 +737,11 @@ def test_full_verification_source_resolves_all_cluster_pages():
     )
 
     assert resolved_pages is resolved
-    controller.index.cluster_store.resolve_cluster_blocks.assert_called_once_with(
+    resolve_full = controller.index.cluster_store.resolve_full_verification_blocks
+    resolve_full.assert_called_once_with(
         layer_name="layer",
         cluster_ids=cluster_ids,
         logical_page_ids=page_ids,
-        mode="verification",
     )
     assert source.primary.token_indices is plan.primary_exact_token_indices
     assert source.primary.token_mask is plan.primary_exact_token_mask
@@ -744,6 +749,7 @@ def test_full_verification_source_resolves_all_cluster_pages():
     assert len(source.page_sources) == 2
     assert source.page_sources[0].page_ids is resident_page_ids
     assert source.page_sources[1].page_ids is staging_page_ids
+    assert source.page_sources[1].ready_event is staging_ready_event
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

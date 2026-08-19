@@ -875,6 +875,190 @@ def test_gpu_reference_store_resolves_without_staging():
     assert resolved.resident_ready_event is None
 
 
+def test_gpu_reference_full_verification_reuses_backing_pages():
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
+    )
+    metadata = get_block_metadata(store, table)
+
+    resolved = store.resolve_full_verification_blocks(
+        "layer", table.cluster_ids, metadata.page_ids
+    )
+    stored_keys, stored_values = store.get_page_storage("layer")
+
+    assert torch.equal(resolved.resident_page_ids, metadata.page_ids)
+    assert torch.all(resolved.staging_page_ids == -1)
+    assert resolved.resident_key_pages is stored_keys
+    assert resolved.resident_value_pages is stored_values
+    assert resolved.staging_key_pages.shape[0] == 0
+    assert resolved.staging_value_pages.shape[0] == 0
+    assert resolved.hit_cluster_mask.all()
+    assert not resolved.miss_cluster_mask.any()
+    assert resolved.resident_ready_event is None
+    assert resolved.staging_ready_event is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for full-verification staging",
+)
+def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+
+    first_table = store_cluster_data(
+        store,
+        "first-layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    second_table = store_cluster_data(
+        store,
+        "second-layer",
+        (keys + 1000).to(device),
+        (values + 1000).to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+
+    first_cluster_ids = first_table.cluster_ids.to(device)
+    first_metadata = store.get_cluster_block_metadata(
+        "first-layer", first_cluster_ids, device=device
+    )
+    first_resolved = store.resolve_full_verification_blocks(
+        "first-layer", first_cluster_ids, first_metadata.page_ids
+    )
+    assert first_resolved.staging_ready_event is not None
+    torch.cuda.current_stream(device).wait_event(first_resolved.staging_ready_event)
+
+    first_valid = first_metadata.page_ids >= 0
+    first_slots = first_resolved.staging_page_ids[first_valid].to(torch.int64)
+    first_logical_ids = first_metadata.page_ids[first_valid].cpu().to(torch.int64)
+    first_backing_keys, first_backing_values = store.get_page_storage("first-layer")
+    first_key_snapshot = first_resolved.staging_key_pages.index_select(0, first_slots)
+    first_value_snapshot = first_resolved.staging_value_pages.index_select(
+        0, first_slots
+    )
+
+    first_key_ptr = first_resolved.staging_key_pages.data_ptr()
+    first_value_ptr = first_resolved.staging_value_pages.data_ptr()
+    resident_pages_before = store.num_resident_pages("first-layer")
+
+    second_cluster_ids = second_table.cluster_ids.to(device)
+    second_metadata = store.get_cluster_block_metadata(
+        "second-layer", second_cluster_ids, device=device
+    )
+    second_resolved = store.resolve_full_verification_blocks(
+        "second-layer", second_cluster_ids, second_metadata.page_ids
+    )
+    assert second_resolved.staging_ready_event is not None
+    torch.cuda.current_stream(device).wait_event(second_resolved.staging_ready_event)
+
+    second_valid = second_metadata.page_ids >= 0
+    second_slots = second_resolved.staging_page_ids[second_valid].to(torch.int64)
+    second_logical_ids = second_metadata.page_ids[second_valid].cpu().to(torch.int64)
+    second_backing_keys, second_backing_values = store.get_page_storage("second-layer")
+    torch.testing.assert_close(
+        first_key_snapshot.cpu(),
+        first_backing_keys.index_select(0, first_logical_ids),
+    )
+    torch.testing.assert_close(
+        first_value_snapshot.cpu(),
+        first_backing_values.index_select(0, first_logical_ids),
+    )
+    torch.testing.assert_close(
+        second_resolved.staging_key_pages.index_select(0, second_slots).cpu(),
+        second_backing_keys.index_select(0, second_logical_ids),
+    )
+    torch.testing.assert_close(
+        second_resolved.staging_value_pages.index_select(0, second_slots).cpu(),
+        second_backing_values.index_select(0, second_logical_ids),
+    )
+
+    assert second_resolved.staging_key_pages.data_ptr() == first_key_ptr
+    assert second_resolved.staging_value_pages.data_ptr() == first_value_ptr
+    assert len(store._full_verification_buffers) == 1
+    assert not second_resolved.hit_cluster_mask.any()
+    assert second_resolved.miss_cluster_mask.all()
+    assert store.num_resident_pages("first-layer") == resident_pages_before
+    assert store.num_resident_pages("second-layer") == 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for full-verification staging",
+)
+def test_full_verification_buffer_grows_for_a_larger_layer():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+    )
+
+    small_keys = torch.arange(4, dtype=torch.float16, device=device).view(1, 4, 1)
+    small_table = store_cluster_data(
+        store,
+        "small-layer",
+        small_keys,
+        small_keys + 100,
+        torch.zeros(1, 4, dtype=torch.int64, device=device),
+        torch.tensor([[4]], dtype=torch.int32, device=device),
+    )
+    small_cluster_ids = small_table.cluster_ids.to(device)
+    small_metadata = store.get_cluster_block_metadata(
+        "small-layer", small_cluster_ids, device=device
+    )
+    small_resolved = store.resolve_full_verification_blocks(
+        "small-layer", small_cluster_ids, small_metadata.page_ids
+    )
+    small_key_ptr = small_resolved.staging_key_pages.data_ptr()
+
+    large_keys = torch.arange(130, dtype=torch.float16, device=device).view(1, 130, 1)
+    large_table = store_cluster_data(
+        store,
+        "large-layer",
+        large_keys,
+        large_keys + 100,
+        torch.zeros(1, 130, dtype=torch.int64, device=device),
+        torch.tensor([[130]], dtype=torch.int32, device=device),
+    )
+    large_cluster_ids = large_table.cluster_ids.to(device)
+    large_metadata = store.get_cluster_block_metadata(
+        "large-layer", large_cluster_ids, device=device
+    )
+    large_resolved = store.resolve_full_verification_blocks(
+        "large-layer", large_cluster_ids, large_metadata.page_ids
+    )
+    assert large_resolved.staging_ready_event is not None
+    torch.cuda.current_stream(device).wait_event(large_resolved.staging_ready_event)
+
+    valid_pages = large_metadata.page_ids >= 0
+    staging_slots = large_resolved.staging_page_ids[valid_pages].to(torch.int64)
+    logical_page_ids = large_metadata.page_ids[valid_pages].cpu().to(torch.int64)
+    backing_keys, backing_values = store.get_page_storage("large-layer")
+
+    torch.testing.assert_close(
+        large_resolved.staging_key_pages.index_select(0, staging_slots).cpu(),
+        backing_keys.index_select(0, logical_page_ids),
+    )
+    torch.testing.assert_close(
+        large_resolved.staging_value_pages.index_select(0, staging_slots).cpu(),
+        backing_values.index_select(0, logical_page_ids),
+    )
+    transfer_buffer = store._full_verification_buffers[device]
+    assert transfer_buffer.capacity == 128
+    assert large_resolved.staging_key_pages.data_ptr() != small_key_ptr
+
+
 def test_gpu_reference_store_rejects_resident_cache_operations():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()

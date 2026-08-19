@@ -706,7 +706,9 @@ class RetroSpecSparseAttention:
         if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
             raise RuntimeError("Token selection requires the segmented index")
 
-        if isinstance(selection, RetroSpecFullVerificationPlan):
+        full_verification = isinstance(selection, RetroSpecFullVerificationPlan)
+
+        if full_verification:
             layer_name = selection.layer_name
             primary_token_indices = selection.primary_exact_token_indices
             primary_token_mask = selection.primary_exact_token_mask
@@ -723,16 +725,22 @@ class RetroSpecSparseAttention:
             exact_page_token_counts = selection.exact_page_token_counts
             resolved_pages = selection.resolved_pages
 
-        # A padded cluster dimension may be non-empty even when there are no
-        # physical pages. Checking page_ids avoids trying to resolve a layer
-        # pool for a short request with no clustered segments.
         if resolved_pages is None and exact_page_ids.numel():
-            resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
-                layer_name=layer_name,
-                cluster_ids=exact_cluster_ids,
-                logical_page_ids=exact_page_ids,
-                mode="verification",
-            )
+            if full_verification:
+                resolved_pages = (
+                    self.index.cluster_store.resolve_full_verification_blocks(
+                        layer_name=layer_name,
+                        cluster_ids=exact_cluster_ids,
+                        logical_page_ids=exact_page_ids,
+                    )
+                )
+            else:
+                resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
+                    layer_name=layer_name,
+                    cluster_ids=exact_cluster_ids,
+                    logical_page_ids=exact_page_ids,
+                    mode="verification",
+                )
 
         page_sources: tuple[RetroSpecExactPageKVSource, ...] = ()
 
@@ -748,6 +756,7 @@ class RetroSpecSparseAttention:
                     key_pages=resolved_pages.staging_key_pages,
                     value_pages=resolved_pages.staging_value_pages,
                     page_ids=resolved_pages.staging_page_ids,
+                    ready_event=resolved_pages.staging_ready_event,
                 ),
             )
 
