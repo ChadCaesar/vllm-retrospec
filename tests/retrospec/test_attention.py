@@ -31,6 +31,7 @@ from vllm.v1.spec_decode.retrospec.index import (
     RetroSpecSelectionPlan,
 )
 from vllm.v1.spec_decode.retrospec.segmented_index import (
+    RetroSpecFullVerificationPlan,
     RetroSpecSegmentedTokenIndex,
     RetroSpecTokenAttentionSelection,
     RetroSpecTokenSelectionPlan,
@@ -648,6 +649,157 @@ def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
         layer_name="layer", cluster_ids=cluster_ids, page_ids=page_ids
     )
     assert call_order == ["materialize", "admit", "attention"]
+
+
+def test_full_verification_source_skips_resolution_without_cluster_pages():
+    controller = make_controller("segmented_cluster")
+    assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
+
+    plan = RetroSpecFullVerificationPlan(
+        layer_name="layer",
+        primary_exact_token_indices=torch.tensor([[[0, 1, 2]]]),
+        primary_exact_token_mask=torch.ones(1, 1, 3, dtype=torch.bool),
+        exact_cluster_ids=torch.full((1, 1, 1), -1, dtype=torch.int64),
+        exact_page_ids=torch.empty(1, 1, 1, 0, dtype=torch.int64),
+        exact_page_token_counts=torch.empty(1, 1, 1, 0, dtype=torch.int32),
+        exact_token_counts=torch.tensor([[3]], dtype=torch.int32),
+    )
+    controller.index.cluster_store.resolve_cluster_blocks = Mock()
+    key_cache = torch.zeros(2, 2, 1, 1)
+    value_cache = key_cache.clone()
+    block_table = torch.tensor([[0, 1]], dtype=torch.int32)
+
+    source, resolved_pages = controller._resolve_exact_kv_source(
+        plan,
+        key_cache,
+        value_cache,
+        block_table,
+    )
+
+    assert resolved_pages is None
+    controller.index.cluster_store.resolve_cluster_blocks.assert_not_called()
+    assert source.primary.key_cache is key_cache
+    assert source.primary.value_cache is value_cache
+    assert source.primary.token_indices is plan.primary_exact_token_indices
+    assert source.primary.token_mask is plan.primary_exact_token_mask
+    assert source.page_token_counts is plan.exact_page_token_counts
+    assert source.page_sources == ()
+
+
+def test_full_verification_source_resolves_all_cluster_pages():
+    controller = make_controller("segmented_cluster")
+    assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
+
+    cluster_ids = torch.tensor([[[0, 1]]], dtype=torch.int64)
+    page_ids = torch.tensor([[[[2], [3]]]], dtype=torch.int64)
+    page_counts = torch.tensor([[[[2], [1]]]], dtype=torch.int32)
+    plan = RetroSpecFullVerificationPlan(
+        layer_name="layer",
+        primary_exact_token_indices=torch.tensor([[[0, 4]]]),
+        primary_exact_token_mask=torch.ones(1, 1, 2, dtype=torch.bool),
+        exact_cluster_ids=cluster_ids,
+        exact_page_ids=page_ids,
+        exact_page_token_counts=page_counts,
+        exact_token_counts=torch.tensor([[5]], dtype=torch.int32),
+    )
+    resident_page_ids = torch.tensor([[[[0], [-1]]]], dtype=torch.int64)
+    staging_page_ids = torch.tensor([[[[-1], [0]]]], dtype=torch.int64)
+    resident_keys = torch.zeros(1, 2, 1)
+    resident_values = resident_keys.clone()
+    staging_keys = torch.ones(1, 2, 1)
+    staging_values = staging_keys.clone()
+    resolved = RetroSpecResolvedClusterPages(
+        resident_page_ids=resident_page_ids,
+        staging_page_ids=staging_page_ids,
+        resident_key_pages=resident_keys,
+        resident_value_pages=resident_values,
+        staging_key_pages=staging_keys,
+        staging_value_pages=staging_values,
+        hit_cluster_mask=torch.tensor([[[True, False]]]),
+        miss_cluster_mask=torch.tensor([[[False, True]]]),
+        resident_ready_event=None,
+    )
+    controller.index.cluster_store.resolve_cluster_blocks = Mock(return_value=resolved)
+    key_cache = torch.zeros(3, 2, 1, 1)
+    value_cache = key_cache.clone()
+    block_table = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+
+    source, resolved_pages = controller._resolve_exact_kv_source(
+        plan,
+        key_cache,
+        value_cache,
+        block_table,
+    )
+
+    assert resolved_pages is resolved
+    controller.index.cluster_store.resolve_cluster_blocks.assert_called_once_with(
+        layer_name="layer",
+        cluster_ids=cluster_ids,
+        logical_page_ids=page_ids,
+        mode="verification",
+    )
+    assert source.primary.token_indices is plan.primary_exact_token_indices
+    assert source.primary.token_mask is plan.primary_exact_token_mask
+    assert source.page_token_counts is page_counts
+    assert len(source.page_sources) == 2
+    assert source.page_sources[0].page_ids is resident_page_ids
+    assert source.page_sources[1].page_ids is staging_page_ids
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_full_verification_packs_cpu_backed_cluster_pages_on_cuda():
+    controller = make_controller(
+        index_mode="segmented_cluster",
+        cache_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
+    assert controller.exact_execution_buffer is not None
+
+    device = torch.device("cuda")
+    head_size = 64
+    token_values = torch.arange(16, dtype=torch.float16, device=device)
+    key_cache = token_values.view(8, 2, 1, 1).expand(8, 2, 1, head_size).contiguous()
+    value_cache = key_cache + 100
+    block_table = torch.arange(7, dtype=torch.int32, device=device).view(1, -1)
+
+    controller.index.build_or_update(
+        layer_name="layer",
+        request_ids=["request"],
+        seq_lens=[10],
+        rows=[0],
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+    )
+    plan = controller.index.build_full_verification_plan(
+        request_ids=["request"],
+        layer_name="layer",
+        seq_lens=[10],
+        key_cache=key_cache,
+        block_table=block_table,
+    )
+
+    source, resolved_pages = controller._resolve_exact_kv_source(
+        plan,
+        key_cache,
+        value_cache,
+        block_table,
+    )
+    execution = controller.exact_execution_buffer.pack(source)
+    torch.cuda.synchronize()
+
+    assert resolved_pages is not None
+    assert controller.index.cluster_store.is_cpu_backed
+    assert execution.exact_seq_lens.tolist() == [10]
+    assert plan.primary_exact_token_mask.sum().item() == 6
+    assert plan.exact_page_token_counts.sum().item() == 4
+
+    actual_keys = execution.keys[:10, 0, 0].sort().values
+    actual_values = execution.values[:10, 0, 0].sort().values
+    expected_keys = torch.arange(10, dtype=torch.float16, device=device)
+    torch.testing.assert_close(actual_keys, expected_keys)
+    torch.testing.assert_close(actual_values, expected_keys + 100)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

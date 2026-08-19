@@ -391,6 +391,116 @@ def test_segmented_index_handles_mixed_long_and_short_requests():
     assert selection.attention_mass.tolist()[1] == pytest.approx(1.0)
 
 
+def test_full_verification_plan_covers_clustered_and_primary_tokens():
+    index = make_index()
+    keys, values = make_cache(num_kv_heads=2)
+    block_table = torch.arange(7, dtype=torch.int32).repeat(2, 1)
+    index.build_or_update(
+        layer_name="layer",
+        request_ids=["long", "short"],
+        seq_lens=[10, 3],
+        rows=[0, 1],
+        key_cache=keys,
+        value_cache=values,
+        block_table=block_table,
+    )
+
+    plan = index.build_full_verification_plan(
+        request_ids=["long", "short"],
+        layer_name="layer",
+        seq_lens=[10, 3],
+        key_cache=keys,
+        block_table=block_table,
+    )
+
+    assert plan.layer_name == "layer"
+    assert plan.exact_token_counts.tolist() == [[10, 10], [3, 3]]
+    assert plan.primary_exact_token_mask.sum(dim=2).tolist() == [[6, 6], [3, 3]]
+    assert plan.exact_page_token_counts.sum(dim=(2, 3)).tolist() == [
+        [4, 4],
+        [0, 0],
+    ]
+    assert plan.primary_exact_token_indices[0, 0].tolist() == [0, 1, 6, 7, 8, 9]
+    assert plan.primary_exact_token_mask[1, 0].tolist() == [
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+    short_primary_indices = plan.primary_exact_token_indices[1, 0][
+        plan.primary_exact_token_mask[1, 0]
+    ]
+    assert short_primary_indices.tolist() == [0, 1, 2]
+    assert (plan.exact_cluster_ids[0] >= 0).sum(dim=1).tolist() == [2, 2]
+    assert not (plan.exact_cluster_ids[1] >= 0).any()
+
+
+def test_full_verification_plan_handles_request_without_cluster_pages():
+    index = make_index()
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(index, 3, keys, values, block_table)
+
+    plan = index.build_full_verification_plan(
+        request_ids=["request"],
+        layer_name="layer",
+        seq_lens=[3],
+        key_cache=keys,
+        block_table=block_table,
+    )
+
+    assert plan.exact_token_counts.tolist() == [[3]]
+    assert plan.primary_exact_token_indices.tolist() == [[[0, 1, 2]]]
+    assert plan.primary_exact_token_mask.all()
+    assert plan.exact_page_ids.shape == (1, 1, 1, 0)
+    assert plan.exact_page_ids.numel() == 0
+    assert plan.exact_page_token_counts.numel() == 0
+
+
+def test_full_verification_plan_rejects_staged_index_updates():
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(
+        index,
+        10,
+        keys,
+        values,
+        block_table,
+        defer_cpu_store=True,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="index updates are staged"):
+            index.build_full_verification_plan(
+                request_ids=["request"],
+                layer_name="layer",
+                seq_lens=[10],
+                key_cache=keys,
+                block_table=block_table,
+            )
+    finally:
+        index.discard_staged_updates()
+
+
+def test_full_verification_plan_rejects_unapplied_rollback():
+    index = make_index()
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+
+    with pytest.raises(RuntimeError, match="rolled-back cluster state"):
+        index.build_full_verification_plan(
+            request_ids=["request"],
+            layer_name="layer",
+            seq_lens=[5],
+            key_cache=keys,
+            block_table=block_table,
+        )
+
+
 def test_segmented_index_appends_complete_segments_and_handles_rollback():
     index = make_index()
     keys, values = make_cache()

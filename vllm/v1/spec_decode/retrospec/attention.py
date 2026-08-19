@@ -32,6 +32,7 @@ from .index import (
     RetroSpecSelectionPlan,
 )
 from .segmented_index import (
+    RetroSpecFullVerificationPlan,
     RetroSpecSegmentedTokenIndex,
     RetroSpecTokenAttentionSelection,
     RetroSpecTokenSelectionPlan,
@@ -697,7 +698,7 @@ class RetroSpecSparseAttention:
 
     def _resolve_exact_kv_source(
         self,
-        selection: RetroSpecTokenAttentionSelection,
+        selection: RetroSpecTokenAttentionSelection | RetroSpecFullVerificationPlan,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
@@ -705,12 +706,31 @@ class RetroSpecSparseAttention:
         if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
             raise RuntimeError("Token selection requires the segmented index")
 
-        resolved_pages = selection.resolved_pages
-        if resolved_pages is None and selection.exact_cluster_ids.numel():
+        if isinstance(selection, RetroSpecFullVerificationPlan):
+            layer_name = selection.layer_name
+            primary_token_indices = selection.primary_exact_token_indices
+            primary_token_mask = selection.primary_exact_token_mask
+            exact_cluster_ids = selection.exact_cluster_ids
+            exact_page_ids = selection.exact_page_ids
+            exact_page_token_counts = selection.exact_page_token_counts
+            resolved_pages = None
+        else:
+            layer_name = selection.plan.layer_name
+            primary_token_indices = selection.plan.primary_exact_token_indices
+            primary_token_mask = selection.plan.primary_exact_token_mask
+            exact_cluster_ids = selection.exact_cluster_ids
+            exact_page_ids = selection.exact_page_ids
+            exact_page_token_counts = selection.exact_page_token_counts
+            resolved_pages = selection.resolved_pages
+
+        # A padded cluster dimension may be non-empty even when there are no
+        # physical pages. Checking page_ids avoids trying to resolve a layer
+        # pool for a short request with no clustered segments.
+        if resolved_pages is None and exact_page_ids.numel():
             resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
-                layer_name=selection.plan.layer_name,
-                cluster_ids=selection.exact_cluster_ids,
-                logical_page_ids=selection.exact_page_ids,
+                layer_name=layer_name,
+                cluster_ids=exact_cluster_ids,
+                logical_page_ids=exact_page_ids,
                 mode="verification",
             )
 
@@ -736,10 +756,10 @@ class RetroSpecSparseAttention:
                 key_cache=key_cache,
                 value_cache=value_cache,
                 block_table=block_table,
-                token_indices=selection.plan.primary_exact_token_indices,
-                token_mask=selection.plan.primary_exact_token_mask,
+                token_indices=primary_token_indices,
+                token_mask=primary_token_mask,
             ),
-            page_token_counts=selection.exact_page_token_counts,
+            page_token_counts=exact_page_token_counts,
             page_sources=page_sources,
         )
 

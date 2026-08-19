@@ -69,6 +69,26 @@ class RetroSpecTokenAttentionSelection:
 
 
 @dataclass(frozen=True)
+class RetroSpecFullVerificationPlan:
+    """Exact committed-prefix layout used by target full verification.
+
+    Clustered stable tokens reference the existing cluster page store.
+    Tokens outside complete clustered segments remain primary references into
+    the active vLLM KV cache. No second full-prefix KV cache is created.
+    """
+
+    layer_name: str
+
+    primary_exact_token_indices: torch.Tensor
+    primary_exact_token_mask: torch.Tensor
+
+    exact_cluster_ids: torch.Tensor
+    exact_page_ids: torch.Tensor
+    exact_page_token_counts: torch.Tensor
+    exact_token_counts: torch.Tensor
+
+
+@dataclass(frozen=True)
 class _RequestLayerSegment:
     indexed_start: int
     indexed_end: int
@@ -1934,6 +1954,127 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         ).contiguous()
 
         return exact_keys, exact_values, exact_token_mask
+
+    def build_full_verification_plan(
+        self,
+        request_ids: Sequence[str],
+        layer_name: str,
+        seq_lens: Sequence[int],
+        key_cache: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> RetroSpecFullVerificationPlan:
+        """Build an exact full-verification view over existing KV storage.
+
+        Complete indexed segments are represented by every cluster page owned
+        by the requests. Tokens outside those segments remain primary logical
+        token references into the active vLLM KV cache.
+        """
+        request_ids = tuple(request_ids)
+        seq_lens = tuple(int(seq_len) for seq_len in seq_lens)
+
+        if self.has_staged_updates:
+            raise RuntimeError(
+                "Cannot build full verification while index updates are staged"
+            )
+        if key_cache.ndim != 4:
+            raise ValueError(
+                "KV cache must have shape [num_blocks, block_size, kv_heads, head_size]"
+            )
+        if key_cache.shape[1] != self.block_size:
+            raise ValueError("KV cache block size does not match the index")
+        if block_table.ndim != 2:
+            raise ValueError("block_table must be two-dimensional")
+        if block_table.shape[0] != len(request_ids):
+            raise ValueError("block_table batch size does not match request_ids")
+        if len(seq_lens) != len(request_ids):
+            raise ValueError("request_ids and seq_lens must have equal length")
+        if block_table.device != key_cache.device:
+            raise ValueError("block_table and KV cache must use one device")
+        if block_table.dtype not in (torch.int32, torch.int64):
+            raise ValueError("block_table entries must be integral")
+
+        max_num_tokens = block_table.shape[1] * self.block_size
+        if any(seq_len <= 0 for seq_len in seq_lens):
+            raise ValueError("Full-verification sequence lengths must be positive")
+        if any(seq_len > max_num_tokens for seq_len in seq_lens):
+            raise ValueError(
+                "Full-verification sequence length exceeds the block table"
+            )
+
+        layer_indices = self._indices.get(layer_name, {})
+        primary_token_counts: list[int] = []
+
+        for request_id, seq_len in zip(request_ids, seq_lens):
+            record = layer_indices.get(request_id)
+
+            if record is None or not record.segments:
+                indexed_token_count = 0
+            else:
+                if record.indexed_end > seq_len:
+                    raise RuntimeError(
+                        "Full verification requires rolled-back cluster state "
+                        "to be rebuilt first"
+                    )
+                indexed_token_count = record.indexed_end - self.block_size
+
+            primary_token_counts.append(seq_len - indexed_token_count)
+
+        packed = self._pack_indices(
+            layer_name,
+            request_ids,
+            key_cache,
+            block_table,
+        )
+
+        seq_lens_tensor = torch.tensor(
+            seq_lens,
+            dtype=torch.int64,
+            device=block_table.device,
+        )
+        _, valid_token_mask, _ = self._build_token_layout(
+            block_table,
+            seq_lens_tensor,
+        )
+
+        # Every committed token not owned by a complete clustered segment is
+        # part of the exact primary/steady zone.
+        primary_token_mask = valid_token_mask & ~packed.indexed_token_mask
+        num_kv_heads = key_cache.shape[2]
+        per_head_primary_mask = primary_token_mask.unsqueeze(1).expand(
+            -1,
+            num_kv_heads,
+            -1,
+        )
+
+        (
+            primary_exact_token_indices,
+            primary_exact_token_mask,
+        ) = self._pack_bounded_mask_indices(
+            per_head_primary_mask,
+            max(primary_token_counts, default=0),
+        )
+
+        primary_exact_token_counts = primary_exact_token_mask.sum(
+            dim=2,
+            dtype=torch.int32,
+        )
+        clustered_exact_token_counts = packed.cluster_page_token_counts.sum(
+            dim=(2, 3),
+            dtype=torch.int32,
+        )
+        exact_token_counts = (
+            primary_exact_token_counts + clustered_exact_token_counts
+        ).contiguous()
+
+        return RetroSpecFullVerificationPlan(
+            layer_name=layer_name,
+            primary_exact_token_indices=primary_exact_token_indices,
+            primary_exact_token_mask=primary_exact_token_mask,
+            exact_cluster_ids=packed.cluster_ids,
+            exact_page_ids=packed.cluster_page_ids,
+            exact_page_token_counts=packed.cluster_page_token_counts,
+            exact_token_counts=exact_token_counts,
+        )
 
     def select_segmented(
         self,
