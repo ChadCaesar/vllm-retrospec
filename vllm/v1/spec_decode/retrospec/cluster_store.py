@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil
+from threading import Lock
 from typing import Literal
 
 import torch
@@ -26,6 +27,77 @@ RetroSpecClusterResolveMode = Literal[
     "resident_only",
     "verification",
 ]
+
+
+@dataclass
+class _PinnedStagingSlot:
+    """Reusable pinned CPU buffers for one in-flight cluster build."""
+
+    source_device: torch.device
+
+    token_key_storage: torch.Tensor | None = None
+    token_value_storage: torch.Tensor | None = None
+    assignment_storage: torch.Tensor | None = None
+    cluster_count_storage: torch.Tensor | None = None
+
+    in_use: bool = False
+
+    @staticmethod
+    def _reserve(
+        storage: torch.Tensor | None,
+        source: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        required_numel = source.numel()
+        if (
+            storage is None
+            or storage.dtype != source.dtype
+            or storage.numel() < required_numel
+        ):
+            storage = torch.empty(
+                required_numel,
+                dtype=source.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+
+        view = storage[:required_numel].view(source.shape)
+        return storage, view
+
+    def reserve_token_kv(
+        self,
+        token_keys: torch.Tensor,
+        token_values: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.in_use:
+            raise RuntimeError("Pinned staging slot must be acquired before use")
+
+        self.token_key_storage, staged_token_keys = self._reserve(
+            self.token_key_storage,
+            token_keys,
+        )
+        self.token_value_storage, staged_token_values = self._reserve(
+            self.token_value_storage,
+            token_values,
+        )
+        return staged_token_keys, staged_token_values
+
+    def reserve_cluster_metadata(
+        self,
+        assignments: torch.Tensor,
+        cluster_token_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.in_use:
+            raise RuntimeError("Pinned staging slot must be acquired before use")
+
+        self.assignment_storage, staged_assignments = self._reserve(
+            self.assignment_storage,
+            assignments,
+        )
+        self.cluster_count_storage, staged_cluster_token_counts = self._reserve(
+            self.cluster_count_storage,
+            cluster_token_counts,
+        )
+        return staged_assignments, staged_cluster_token_counts
 
 
 @dataclass(frozen=True)
@@ -72,6 +144,11 @@ class RetroSpecStagedTokenKV:
 
     source_device: torch.device
     ready_event: torch.cuda.Event | None
+    staging_slot: _PinnedStagingSlot | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def wait(self) -> None:
         if self.ready_event is not None:
@@ -94,6 +171,11 @@ class RetroSpecStagedClusterInput:
 
     metadata_device: torch.device
     ready_event: torch.cuda.Event | None
+    staging_slot: _PinnedStagingSlot | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def wait(self) -> None:
         if self.ready_event is not None:
@@ -618,6 +700,14 @@ class RetroSpecClusterPageStore:
         # share the stream so their staged CPU buffers are completed in enqueue
         # order without synchronizing the model execution stream.
         self._offload_streams: dict[torch.device, torch.cuda.Stream] = {}
+
+        # Pinned D2H staging slots are shared by all model layers on one CUDA
+        # device. The segmented index bounds the number simultaneously in use.
+        self._pinned_staging_slots: dict[
+            torch.device,
+            list[_PinnedStagingSlot],
+        ] = {}
+        self._pinned_staging_lock = Lock()
 
         # Full verification transfers one complete layer at a time. Layers on
         # the same CUDA device reuse one growable page arena.
@@ -1299,18 +1389,22 @@ class RetroSpecClusterPageStore:
         if cluster_token_counts.device != staged_token_kv.source_device:
             raise ValueError("Cluster counts must remain on the token KV source device")
 
-    def _get_offload_stream(
-        self,
-        device: torch.device,
-    ) -> torch.cuda.Stream:
+    @staticmethod
+    def _canonical_cuda_device(device: torch.device) -> torch.device:
         if device.type != "cuda":
-            raise ValueError("RetroSpec D2H offload requires a CUDA source device")
+            raise ValueError("RetroSpec staging requires a CUDA source device")
 
         device_index = device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
 
-        canonical_device = torch.device("cuda", device_index)
+        return torch.device("cuda", device_index)
+
+    def _get_offload_stream(
+        self,
+        device: torch.device,
+    ) -> torch.cuda.Stream:
+        canonical_device = self._canonical_cuda_device(device)
         stream = self._offload_streams.get(canonical_device)
 
         if stream is None:
@@ -1319,16 +1413,58 @@ class RetroSpecClusterPageStore:
 
         return stream
 
-    @staticmethod
-    def _allocate_pinned_staging(
-        source: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.empty(
-            source.shape,
-            dtype=source.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+    def _acquire_pinned_staging_slot(
+        self,
+        source_device: torch.device,
+    ) -> _PinnedStagingSlot:
+        canonical_device = self._canonical_cuda_device(source_device)
+
+        with self._pinned_staging_lock:
+            slots = self._pinned_staging_slots.setdefault(canonical_device, [])
+
+            for slot in slots:
+                if not slot.in_use:
+                    slot.in_use = True
+                    return slot
+
+            slot = _PinnedStagingSlot(
+                source_device=canonical_device,
+                in_use=True,
+            )
+            slots.append(slot)
+            return slot
+
+    def _release_pinned_staging_slot(
+        self,
+        slot: _PinnedStagingSlot | None,
+    ) -> None:
+        if slot is None:
+            return
+
+        with self._pinned_staging_lock:
+            if not slot.in_use:
+                raise RuntimeError("Pinned staging slot has already been released")
+            slot.in_use = False
+
+    def discard_staged_token_kv(
+        self,
+        staged: RetroSpecStagedTokenKV,
+    ) -> None:
+        """Wait for an abandoned token-KV transfer and release its slot."""
+        try:
+            staged.wait()
+        finally:
+            self._release_pinned_staging_slot(staged.staging_slot)
+
+    def discard_staged_clusters(
+        self,
+        staged: RetroSpecStagedClusterInput,
+    ) -> None:
+        """Wait for abandoned cluster inputs and release their slot."""
+        try:
+            staged.wait()
+        finally:
+            self._release_pinned_staging_slot(staged.staging_slot)
 
     def stage_token_kv(
         self,
@@ -1361,28 +1497,40 @@ class RetroSpecClusterPageStore:
                 ready_event=None,
             )
 
-        staged_token_keys = self._allocate_pinned_staging(token_keys)
-        staged_token_values = self._allocate_pinned_staging(token_values)
+        staging_slot = self._acquire_pinned_staging_slot(source_device)
+        offload_stream: torch.cuda.Stream | None = None
 
-        offload_stream = self._get_offload_stream(source_device)
-        current_stream = torch.cuda.current_stream(source_device)
-        offload_stream.wait_stream(current_stream)
+        try:
+            staged_token_keys, staged_token_values = staging_slot.reserve_token_kv(
+                token_keys,
+                token_values,
+            )
 
-        ready_event = torch.cuda.Event()
+            offload_stream = self._get_offload_stream(source_device)
+            current_stream = torch.cuda.current_stream(source_device)
+            offload_stream.wait_stream(current_stream)
 
-        with torch.cuda.stream(offload_stream):
-            staged_token_keys.copy_(token_keys, non_blocking=True)
-            staged_token_values.copy_(token_values, non_blocking=True)
-            ready_event.record(offload_stream)
+            ready_event = torch.cuda.Event()
 
-        token_keys.record_stream(offload_stream)
-        token_values.record_stream(offload_stream)
+            with torch.cuda.stream(offload_stream):
+                staged_token_keys.copy_(token_keys, non_blocking=True)
+                staged_token_values.copy_(token_values, non_blocking=True)
+                ready_event.record(offload_stream)
+
+            token_keys.record_stream(offload_stream)
+            token_values.record_stream(offload_stream)
+        except BaseException:
+            if offload_stream is not None:
+                offload_stream.synchronize()
+            self._release_pinned_staging_slot(staging_slot)
+            raise
 
         return RetroSpecStagedTokenKV(
             token_keys=staged_token_keys,
             token_values=staged_token_values,
             source_device=source_device,
             ready_event=ready_event,
+            staging_slot=staging_slot,
         )
 
     def finish_stage_clusters(
@@ -1427,30 +1575,43 @@ class RetroSpecClusterPageStore:
                 ready_event=None,
             )
 
-        staged_assignments = self._allocate_pinned_staging(assignments)
-        staged_cluster_token_counts = self._allocate_pinned_staging(
-            cluster_token_counts
-        )
+        staging_slot = staged_token_kv.staging_slot
+        if staging_slot is None:
+            raise RuntimeError("Pinned token KV does not own a staging slot")
 
         offload_stream = self._get_offload_stream(source_device)
-        current_stream = torch.cuda.current_stream(source_device)
 
-        # The wait is enqueued after the token-KV copies. Token D2H therefore
-        # overlaps clustering, while metadata D2H waits for clustering output.
-        offload_stream.wait_stream(current_stream)
-
-        ready_event = torch.cuda.Event()
-
-        with torch.cuda.stream(offload_stream):
-            staged_assignments.copy_(assignments, non_blocking=True)
-            staged_cluster_token_counts.copy_(
-                cluster_token_counts,
-                non_blocking=True,
+        try:
+            staged_assignments, staged_cluster_token_counts = (
+                staging_slot.reserve_cluster_metadata(
+                    assignments,
+                    cluster_token_counts,
+                )
             )
-            ready_event.record(offload_stream)
 
-        assignments.record_stream(offload_stream)
-        cluster_token_counts.record_stream(offload_stream)
+            current_stream = torch.cuda.current_stream(source_device)
+
+            # Token-KV copies were enqueued earlier on the same offload stream.
+            # This wait delays only metadata D2H until clustering has completed.
+            offload_stream.wait_stream(current_stream)
+
+            ready_event = torch.cuda.Event()
+
+            with torch.cuda.stream(offload_stream):
+                staged_assignments.copy_(assignments, non_blocking=True)
+                staged_cluster_token_counts.copy_(
+                    cluster_token_counts,
+                    non_blocking=True,
+                )
+                ready_event.record(offload_stream)
+
+            assignments.record_stream(offload_stream)
+            cluster_token_counts.record_stream(offload_stream)
+        except BaseException:
+            # Ownership remains with staged_token_kv until this method returns.
+            # Synchronize partially queued metadata copies before it is discarded.
+            offload_stream.synchronize()
+            raise
 
         return RetroSpecStagedClusterInput(
             token_keys=staged_token_kv.token_keys,
@@ -1459,6 +1620,7 @@ class RetroSpecClusterPageStore:
             cluster_token_counts=staged_cluster_token_counts,
             metadata_device=source_device,
             ready_event=ready_event,
+            staging_slot=staging_slot,
         )
 
     def stage_clusters(
@@ -1484,7 +1646,7 @@ class RetroSpecClusterPageStore:
                 cluster_token_counts,
             )
         except BaseException:
-            staged_token_kv.wait()
+            self.discard_staged_token_kv(staged_token_kv)
             raise
 
     def store_staged_clusters(
@@ -1495,18 +1657,21 @@ class RetroSpecClusterPageStore:
         staged: RetroSpecStagedClusterInput,
     ) -> RetroSpecClusterBlockTable:
         """Wait for staged D2H copies and construct CPU cluster pages."""
-        staged.wait()
+        try:
+            staged.wait()
 
-        return self.store_clusters(
-            layer_name=layer_name,
-            request_id=request_id,
-            cluster_start=cluster_start,
-            token_keys=staged.token_keys,
-            token_values=staged.token_values,
-            assignments=staged.assignments,
-            cluster_token_counts=staged.cluster_token_counts,
-            metadata_device=staged.metadata_device,
-        )
+            return self.store_clusters(
+                layer_name=layer_name,
+                request_id=request_id,
+                cluster_start=cluster_start,
+                token_keys=staged.token_keys,
+                token_values=staged.token_values,
+                assignments=staged.assignments,
+                cluster_token_counts=staged.cluster_token_counts,
+                metadata_device=staged.metadata_device,
+            )
+        finally:
+            self._release_pinned_staging_slot(staged.staging_slot)
 
     @staticmethod
     def _move_to_storage(

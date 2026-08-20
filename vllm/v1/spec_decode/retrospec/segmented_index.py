@@ -839,7 +839,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 )
             except BaseException:
                 if staged_token_kv is not None:
-                    staged_token_kv.wait()
+                    self.cluster_store.discard_staged_token_kv(staged_token_kv)
                 raise
 
             cluster_start = 0 if record is None else record.num_clusters
@@ -854,7 +854,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                         cluster_token_counts,
                     )
                 except BaseException:
-                    staged_token_kv.wait()
+                    self.cluster_store.discard_staged_token_kv(staged_token_kv)
                     raise
 
                 try:
@@ -865,9 +865,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                         staged_clusters=staged_clusters,
                     )
                 except BaseException:
-                    # Metadata D2H may already be queued. Wait before releasing
-                    # its pinned CPU staging buffers.
-                    staged_clusters.wait()
+                    # Metadata D2H may already be queued. Wait before returning
+                    # its pinned staging slot to the shared pool.
+                    self.cluster_store.discard_staged_clusters(staged_clusters)
                     raise
 
                 self._staged_segments.append(

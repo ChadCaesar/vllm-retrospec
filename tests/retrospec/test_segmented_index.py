@@ -1109,11 +1109,19 @@ def test_cpu_offload_waits_for_staged_kv_when_clustering_fails(monkeypatch):
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     staged_token_kv = Mock()
+    discard_staged_token_kv = Mock(
+        wraps=index.cluster_store.discard_staged_token_kv,
+    )
 
     monkeypatch.setattr(
         index.cluster_store,
         "stage_token_kv",
         Mock(return_value=staged_token_kv),
+    )
+    monkeypatch.setattr(
+        index.cluster_store,
+        "discard_staged_token_kv",
+        discard_staged_token_kv,
     )
 
     monkeypatch.setattr(
@@ -1126,6 +1134,66 @@ def test_cpu_offload_waits_for_staged_kv_when_clustering_fails(monkeypatch):
         build_index(index, 10, keys, values, block_table)
 
     staged_token_kv.wait.assert_called_once_with()
+    discard_staged_token_kv.assert_called_once_with(staged_token_kv)
+    assert not index.has_staged_updates
+
+
+def test_cpu_offload_discards_staged_kv_when_metadata_staging_fails(monkeypatch):
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    staged_token_kv = Mock()
+    discard_staged_token_kv = Mock(
+        wraps=index.cluster_store.discard_staged_token_kv,
+    )
+
+    monkeypatch.setattr(
+        index.cluster_store,
+        "stage_token_kv",
+        Mock(return_value=staged_token_kv),
+    )
+    monkeypatch.setattr(
+        index.cluster_store,
+        "finish_stage_clusters",
+        Mock(side_effect=RuntimeError("metadata staging failed")),
+    )
+    monkeypatch.setattr(
+        index.cluster_store,
+        "discard_staged_token_kv",
+        discard_staged_token_kv,
+    )
+
+    with pytest.raises(RuntimeError, match="metadata staging failed"):
+        build_index(index, 10, keys, values, block_table)
+
+    staged_token_kv.wait.assert_called_once_with()
+    discard_staged_token_kv.assert_called_once_with(staged_token_kv)
+    assert not index.has_staged_updates
+
+
+def test_cpu_offload_discards_staged_clusters_when_submission_fails(monkeypatch):
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    discard_staged_clusters = Mock(
+        wraps=index.cluster_store.discard_staged_clusters,
+    )
+
+    monkeypatch.setattr(
+        index,
+        "_submit_cluster_build",
+        Mock(side_effect=RuntimeError("submission failed")),
+    )
+    monkeypatch.setattr(
+        index.cluster_store,
+        "discard_staged_clusters",
+        discard_staged_clusters,
+    )
+
+    with pytest.raises(RuntimeError, match="submission failed"):
+        build_index(index, 10, keys, values, block_table)
+
+    discard_staged_clusters.assert_called_once()
     assert not index.has_staged_updates
 
 

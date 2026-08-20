@@ -1245,6 +1245,162 @@ def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA and pinned host memory are required",
+)
+def test_cpu_backing_store_reuses_pinned_staging_slot_after_build():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        pin_memory=True,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    keys = keys.to(device)
+    values = values.to(device)
+    assignments = assignments.to(device)
+    cluster_token_counts = cluster_token_counts.to(device)
+
+    first = store.stage_clusters(
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+    )
+    first_slot = first.staging_slot
+    assert first_slot is not None
+    first_pointers = (
+        first.token_keys.data_ptr(),
+        first.token_values.data_ptr(),
+        first.assignments.data_ptr(),
+        first.cluster_token_counts.data_ptr(),
+    )
+
+    store.store_staged_clusters("first-layer", "request", 0, first)
+
+    assert not first_slot.in_use
+
+    second = store.stage_clusters(
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+    )
+    second_pointers = (
+        second.token_keys.data_ptr(),
+        second.token_values.data_ptr(),
+        second.assignments.data_ptr(),
+        second.cluster_token_counts.data_ptr(),
+    )
+
+    assert second.staging_slot is first_slot
+    assert second_pointers == first_pointers
+    assert len(store._pinned_staging_slots[device]) == 1
+
+    store.store_staged_clusters("second-layer", "request", 0, second)
+    assert not first_slot.in_use
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA and pinned host memory are required",
+)
+def test_cpu_backing_store_does_not_reuse_busy_pinned_staging_slot():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        pin_memory=True,
+    )
+    keys, values, _, _ = make_cluster_data()
+    keys = keys.to(device)
+    values = values.to(device)
+
+    first = store.stage_token_kv(keys, values)
+    second = store.stage_token_kv(keys, values)
+
+    assert first.staging_slot is not None
+    assert second.staging_slot is not None
+    assert second.staging_slot is not first.staging_slot
+    assert len(store._pinned_staging_slots[device]) == 2
+
+    store.discard_staged_token_kv(first)
+    store.discard_staged_token_kv(second)
+
+    assert not first.staging_slot.in_use
+    assert not second.staging_slot.in_use
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA and pinned host memory are required",
+)
+def test_cpu_backing_store_grows_reused_pinned_staging_slot():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        pin_memory=True,
+    )
+    small_keys = torch.arange(4, dtype=torch.float32, device=device).view(1, 4, 1)
+    small_values = small_keys + 10
+    small = store.stage_token_kv(small_keys, small_values)
+    slot = small.staging_slot
+    assert slot is not None
+    assert slot.token_key_storage is not None
+    old_capacity = slot.token_key_storage.numel()
+    store.discard_staged_token_kv(small)
+
+    large_keys = torch.arange(12, dtype=torch.float32, device=device).view(1, 12, 1)
+    large_values = large_keys + 20
+    large = store.stage_token_kv(large_keys, large_values)
+    large.wait()
+
+    assert large.staging_slot is slot
+    assert slot.token_key_storage is not None
+    assert slot.token_key_storage.numel() == large_keys.numel()
+    assert slot.token_key_storage.numel() > old_capacity
+    torch.testing.assert_close(large.token_keys, large_keys.cpu())
+    torch.testing.assert_close(large.token_values, large_values.cpu())
+
+    store.discard_staged_token_kv(large)
+    assert not slot.in_use
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA and pinned host memory are required",
+)
+def test_cpu_backing_store_releases_pinned_slot_when_build_fails(monkeypatch):
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        pin_memory=True,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    staged = store.stage_clusters(
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    slot = staged.staging_slot
+    assert slot is not None
+
+    monkeypatch.setattr(
+        store,
+        "store_clusters",
+        Mock(side_effect=RuntimeError("cluster build failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="cluster build failed"):
+        store.store_staged_clusters("layer", "request", 0, staged)
+
+    assert not slot.in_use
+
+
 def test_cluster_store_rejects_invalid_storage_metadata():
     with pytest.raises(ValueError, match="Unsupported"):
         RetroSpecClusterPageStore(
