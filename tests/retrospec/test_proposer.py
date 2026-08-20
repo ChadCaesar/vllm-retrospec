@@ -17,7 +17,10 @@ from vllm.v1.spec_decode.retrospec import (
     RetroSpecAttentionMode,
     RetroSpecProposer,
 )
-from vllm.v1.spec_decode.retrospec.proposer import RetroSpecVerificationResult
+from vllm.v1.spec_decode.retrospec.proposer import (
+    RetroSpecParallelVerificationOutput,
+    RetroSpecVerificationResult,
+)
 from vllm.v1.spec_decode.retrospec.state import RetroSpecStage
 
 
@@ -620,6 +623,24 @@ def initialize_verification(
     proposer.proposal_start_positions[:batch_size].fill_(1)
 
 
+def make_parallel_verification_output(
+    request_indices: list[int],
+    token_indices: list[int],
+    token_ids: list[int],
+    margin: list[float] | None = None,
+    attention_mass: list[float] | None = None,
+) -> RetroSpecParallelVerificationOutput:
+    if attention_mass is None:
+        attention_mass = [1.0] * len(request_indices)
+    return RetroSpecParallelVerificationOutput(
+        request_indices=torch.tensor(request_indices, dtype=torch.int64),
+        token_indices=torch.tensor(token_indices, dtype=torch.int64),
+        token_ids=torch.tensor(token_ids, dtype=torch.int32),
+        margin=None if margin is None else torch.tensor(margin),
+        attention_mass=torch.tensor(attention_mass),
+    )
+
+
 def test_propose_stops_draft_at_index_update_boundary(monkeypatch):
     proposer = RetroSpecProposer(
         make_vllm_config(retrospec_index_update_interval=2),
@@ -668,28 +689,26 @@ def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch)
         torch.tensor([[10, 20, 30, -1]], dtype=torch.int32),
         torch.tensor([3], dtype=torch.int32),
     )
-    observed_indices: list[int] = []
+    observed_rows: list[tuple[list[int], list[int]]] = []
 
-    def fake_run_verification_step(
+    def fake_run_parallel_verification(
         batch_size,
-        draft_index,
-        input_ids,
-        active_mask,
+        request_indices,
+        token_indices,
         common_attn_metadata,
         sampling_metadata,
         attention_mode,
     ):
-        observed_indices.append(draft_index)
-        return (
-            proposer._draft_token_ids[:batch_size, draft_index].clone(),
-            None,
-            torch.ones(batch_size),
+        assert attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY
+        observed_rows.append((list(request_indices), list(token_indices)))
+        return make_parallel_verification_output(
+            list(request_indices), list(token_indices), [10, 20, 30]
         )
 
     monkeypatch.setattr(
         proposer,
-        "_run_verification_step",
-        fake_run_verification_step,
+        "_run_parallel_verification",
+        fake_run_parallel_verification,
     )
 
     verification = proposer._verify_draft_tokens(
@@ -699,7 +718,7 @@ def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch)
         make_sampling_metadata(all_greedy=True),
     )
 
-    assert observed_indices == [0, 1]
+    assert observed_rows == [([0, 0, 0], [0, 1, 2])]
     assert verification.verified_counts.tolist() == [2]
     assert verification.require_full.tolist() == [True]
 
@@ -725,27 +744,27 @@ def test_verify_unchanged_sparse_tokens_keeps_complete_prefix(monkeypatch):
         torch.tensor([[10, 20, 30, -1]], dtype=torch.int32),
         torch.tensor([3], dtype=torch.int32),
     )
-    observed_inputs: list[list[int]] = []
+    observed_rows: list[tuple[list[int], list[int]]] = []
 
-    def fake_run_verification_step(
+    def fake_run_parallel_verification(
         batch_size,
-        draft_index,
-        input_ids,
-        active_mask,
+        request_indices,
+        token_indices,
         common_attn_metadata,
         sampling_metadata,
         attention_mode,
     ):
         assert attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY
-        assert active_mask.tolist() == [True]
-        observed_inputs.append(input_ids[:batch_size].tolist())
-        return (
-            proposer._draft_token_ids[:batch_size, draft_index].clone(),
-            None,
-            torch.ones(batch_size),
+        observed_rows.append((list(request_indices), list(token_indices)))
+        return make_parallel_verification_output(
+            list(request_indices), list(token_indices), [10, 20, 30]
         )
 
-    monkeypatch.setattr(proposer, "_run_verification_step", fake_run_verification_step)
+    monkeypatch.setattr(
+        proposer,
+        "_run_parallel_verification",
+        fake_run_parallel_verification,
+    )
     verification = proposer._verify_draft_tokens(
         1,
         torch.zeros(1, dtype=torch.int32),
@@ -756,7 +775,7 @@ def test_verify_unchanged_sparse_tokens_keeps_complete_prefix(monkeypatch):
     assert verification.verified_counts.tolist() == [3]
     assert not verification.require_full.any()
     assert proposer._draft_token_ids[0, :3].tolist() == [10, 20, 30]
-    assert observed_inputs == [[7], [10], [20]]
+    assert observed_rows == [([0, 0, 0], [0, 1, 2])]
     assert proposer.state.stage.tolist() == [int(RetroSpecStage.DRAFT)]
 
 
@@ -769,19 +788,28 @@ def test_sparse_token_change_is_corrected_and_truncates_prefix(monkeypatch):
     )
     observed_modes: list[RetroSpecAttentionMode] = []
 
-    def fake_run_verification_step(
+    def fake_run_parallel_verification(
         batch_size,
-        draft_index,
-        input_ids,
-        active_mask,
+        request_indices,
+        token_indices,
         common_attn_metadata,
         sampling_metadata,
         attention_mode,
     ):
         observed_modes.append(attention_mode)
-        return torch.tensor([11], dtype=torch.int32), None, torch.ones(1)
+        if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
+            token_ids = [11, 20, 30]
+        else:
+            token_ids = [11]
+        return make_parallel_verification_output(
+            list(request_indices), list(token_indices), token_ids
+        )
 
-    monkeypatch.setattr(proposer, "_run_verification_step", fake_run_verification_step)
+    monkeypatch.setattr(
+        proposer,
+        "_run_parallel_verification",
+        fake_run_parallel_verification,
+    )
     verification = proposer._verify_draft_tokens(
         1,
         torch.zeros(1, dtype=torch.int32),
@@ -814,27 +842,36 @@ def test_expanded_verification_passes_or_stops_requests_independently(
         torch.tensor([[10, 20, 30, -1], [11, 21, 31, -1]], dtype=torch.int32),
         torch.tensor([3, 3], dtype=torch.int32),
     )
-    expanded_masks: list[list[bool]] = []
+    observed_rows: list[tuple[RetroSpecAttentionMode, list[int], list[int]]] = []
 
-    def fake_run_verification_step(
+    def fake_run_parallel_verification(
         batch_size,
-        draft_index,
-        input_ids,
-        active_mask,
+        request_indices,
+        token_indices,
         common_attn_metadata,
         sampling_metadata,
         attention_mode,
     ):
-        token_ids = proposer._draft_token_ids[:batch_size, draft_index].clone()
+        request_indices = list(request_indices)
+        token_indices = list(token_indices)
+        observed_rows.append((attention_mode, request_indices, token_indices))
         if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
-            margin = torch.tensor([0.1, 0.1])
-            return token_ids, margin, torch.ones(batch_size)
+            return make_parallel_verification_output(
+                request_indices,
+                token_indices,
+                [10, 20, 30, 11, 21, 31],
+                margin=[0.1] * 6,
+            )
 
-        expanded_masks.append(active_mask.tolist())
-        margin = torch.tensor([0.9, 0.1])
-        return token_ids, margin, torch.ones(batch_size)
+        return make_parallel_verification_output(
+            request_indices, token_indices, [10, 11], margin=[0.9, 0.1]
+        )
 
-    monkeypatch.setattr(proposer, "_run_verification_step", fake_run_verification_step)
+    monkeypatch.setattr(
+        proposer,
+        "_run_parallel_verification",
+        fake_run_parallel_verification,
+    )
     verification = proposer._verify_draft_tokens(
         2,
         torch.zeros(2, dtype=torch.int32),
@@ -842,9 +879,12 @@ def test_expanded_verification_passes_or_stops_requests_independently(
         make_sampling_metadata(all_greedy=True),
     )
 
-    assert verification.verified_counts.tolist() == [3, 1]
+    assert verification.verified_counts.tolist() == [1, 1]
     assert verification.require_full.tolist() == [False, True]
-    assert expanded_masks == [[True, True], [True, False], [True, False]]
+    assert observed_rows == [
+        (RetroSpecAttentionMode.SPARSE_VERIFY, [0, 0, 0, 1, 1, 1], [0, 1, 2, 0, 1, 2]),
+        (RetroSpecAttentionMode.EXPANDED_VERIFY, [0, 1], [0, 0]),
+    ]
     assert proposer.state.stage.tolist() == [
         int(RetroSpecStage.DRAFT),
         int(RetroSpecStage.FULL_VERIFY),
@@ -865,20 +905,25 @@ def test_expanded_token_change_replaces_current_token_before_truncation(
         torch.tensor([2], dtype=torch.int32),
     )
 
-    def fake_run_verification_step(
+    def fake_run_parallel_verification(
         batch_size,
-        draft_index,
-        input_ids,
-        active_mask,
+        request_indices,
+        token_indices,
         common_attn_metadata,
         sampling_metadata,
         attention_mode,
     ):
         if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
-            return torch.tensor([10]), torch.tensor([0.1]), torch.ones(1)
-        return torch.tensor([99]), None, torch.ones(1)
+            return make_parallel_verification_output(
+                [0, 0], [0, 1], [10, 20], margin=[0.1, 0.9]
+            )
+        return make_parallel_verification_output([0], [0], [99])
 
-    monkeypatch.setattr(proposer, "_run_verification_step", fake_run_verification_step)
+    monkeypatch.setattr(
+        proposer,
+        "_run_parallel_verification",
+        fake_run_parallel_verification,
+    )
     verification = proposer._verify_draft_tokens(
         1,
         torch.zeros(1, dtype=torch.int32),
@@ -899,28 +944,27 @@ def test_verify_only_processes_current_logical_draft_interval(monkeypatch):
         torch.tensor([2], dtype=torch.int32),
         pending_counts=torch.tensor([2], dtype=torch.int32),
     )
-    observed_indices: list[int] = []
-    observed_inputs: list[list[int]] = []
+    observed_rows: list[tuple[list[int], list[int]]] = []
 
-    def fake_run_verification_step(
+    def fake_run_parallel_verification(
         batch_size,
-        draft_index,
-        input_ids,
-        active_mask,
+        request_indices,
+        token_indices,
         common_attn_metadata,
         sampling_metadata,
         attention_mode,
     ):
         assert attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY
-        observed_indices.append(draft_index)
-        observed_inputs.append(input_ids[:batch_size].tolist())
-        return (
-            proposer._draft_token_ids[:batch_size, draft_index].clone(),
-            None,
-            torch.ones(batch_size),
+        observed_rows.append((list(request_indices), list(token_indices)))
+        return make_parallel_verification_output(
+            list(request_indices), list(token_indices), [30, 40]
         )
 
-    monkeypatch.setattr(proposer, "_run_verification_step", fake_run_verification_step)
+    monkeypatch.setattr(
+        proposer,
+        "_run_parallel_verification",
+        fake_run_parallel_verification,
+    )
     verification = proposer._verify_draft_tokens(
         1,
         torch.tensor([2], dtype=torch.int32),
@@ -928,8 +972,7 @@ def test_verify_only_processes_current_logical_draft_interval(monkeypatch):
         make_sampling_metadata(all_greedy=True),
     )
 
-    assert observed_indices == [2, 3]
-    assert observed_inputs == [[20], [30]]
+    assert observed_rows == [([0, 0], [2, 3])]
     assert verification.verified_counts.tolist() == [2]
     assert verification.require_full.tolist() == [True]
 
@@ -1071,38 +1114,90 @@ def test_propose_handles_different_round_offsets_in_one_buffer(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("attention_mode", "expected_compute_margin"),
+    ("attention_mode", "expect_margin"),
     [
         (RetroSpecAttentionMode.SPARSE_VERIFY, True),
         (RetroSpecAttentionMode.EXPANDED_VERIFY, False),
     ],
 )
-def test_run_verification_step_uses_stage_margin_and_original_positions(
+def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     monkeypatch,
     attention_mode,
-    expected_compute_margin,
+    expect_margin,
 ):
     proposer = RetroSpecProposer(
         make_vllm_config(retrospec_sparse_margin_threshold=0.5),
         torch.device("cpu"),
         make_runner(),
     )
-    proposer.proposal_start_positions[:2].copy_(torch.tensor([3, 5]))
-    run_model_step = Mock(
-        return_value=(torch.zeros(2, dtype=torch.int32), None, torch.ones(2))
+    common_attn_metadata = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([4, 6], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=2,
+        max_query_len=1,
+        max_seq_len=6,
+        block_table_tensor=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        slot_mapping=torch.tensor([3, 13], dtype=torch.int64),
     )
-    monkeypatch.setattr(proposer, "_run_model_step", run_model_step)
+    proposer.proposal_start_positions[:2].copy_(torch.tensor([3, 5]))
+    proposer.proposal_input_ids[:2].copy_(torch.tensor([7, 8]))
+    proposer._draft_token_ids[:2, :2].copy_(torch.tensor([[10, 20], [11, 21]]))
 
-    proposer._run_verification_step(
+    class FakeBuilder:
+        def build_for_drafting(self, metadata, draft_index):
+            assert draft_index == 0
+            assert metadata.num_reqs == 3
+            assert metadata.query_start_loc.tolist() == [0, 1, 2, 3]
+            assert metadata.seq_lens.tolist() == [6, 5, 7]
+            assert metadata.block_table_tensor.tolist() == [[2, 3], [0, 1], [2, 3]]
+            assert metadata.slot_mapping.tolist() == [13, 4, 14]
+            return SimpleNamespace()
+
+    class FakeModel(torch.nn.Module):
+        def forward(self, input_ids, positions, inputs_embeds):
+            assert input_ids.tolist() == [8, 10, 11]
+            assert positions.tolist() == [5, 4, 6]
+            return torch.zeros((3, 4))
+
+        def compute_logits(self, hidden_states):
+            return torch.tensor([[0.0, 2.0, 1.0], [3.0, 1.0, 0.0], [0.0, 1.0, 4.0]])
+
+    sampling_calls: list[torch.Tensor] = []
+
+    def sample(*, logits, sampling_metadata):
+        sampling_calls.append(logits.clone())
+        return SimpleNamespace(sampled_token_ids=logits.argmax(dim=-1, keepdim=True))
+
+    proposer.model = FakeModel()
+    proposer.attn_layer_names = ["model.layers.0.self_attn.attn"]
+    proposer.attn_metadata_builder = cast(Any, FakeBuilder())
+    proposer.runner.sampler = sample
+    proposer.sparse_attention.begin_parallel_step = Mock()
+    proposer.sparse_attention.end_step = Mock(return_value=torch.ones(3))
+    monkeypatch.setattr(
+        "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
+        lambda *args, **kwargs: nullcontext(),
+    )
+
+    result = proposer._run_parallel_verification(
         batch_size=2,
-        draft_index=1,
-        input_ids=torch.tensor([10, 11], dtype=torch.int32),
-        active_mask=torch.tensor([True, False]),
-        common_attn_metadata=make_common_metadata([3, 5]),
+        request_indices=[1, 0, 1],
+        token_indices=[0, 1, 1],
+        common_attn_metadata=common_attn_metadata,
         sampling_metadata=make_sampling_metadata(all_greedy=True),
         attention_mode=attention_mode,
     )
 
-    call_kwargs = run_model_step.call_args.kwargs
-    assert call_kwargs["positions"].tolist() == [4, 6]
-    assert call_kwargs["compute_margin"] is expected_compute_margin
+    assert result.request_indices.tolist() == [1, 0, 1]
+    assert result.token_indices.tolist() == [0, 1, 1]
+    assert result.token_ids.tolist() == [1, 0, 2]
+    assert (result.margin is not None) is expect_margin
+    if result.margin is not None:
+        assert result.margin.tolist() == [1.0, 2.0, 3.0]
+    assert len(sampling_calls) == 2
+    proposer.sparse_attention.begin_parallel_step.assert_called_once_with(
+        attention_mode, [1, 0, 1], [0, 1, 1]
+    )
+    proposer.sparse_attention.end_step.assert_called_once_with()

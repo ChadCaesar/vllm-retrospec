@@ -1510,6 +1510,74 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
         assert materialize_args[4] is metadata.block_table
 
 
+def test_parallel_verification_gathers_block_plan_rows_by_request_and_token():
+    controller = make_controller()
+    mark_installed(controller)
+    step_zero = replace(
+        make_plan(batch_size=2, width=2),
+        sparse_exact_indices=torch.tensor([[0, 1], [2, 3]]),
+        sparse_attn=torch.tensor([0.1, 0.2]),
+    )
+    step_one = replace(
+        make_plan(batch_size=2, width=2),
+        sparse_exact_indices=torch.tensor([[4, 5], [6, 7]]),
+        sparse_attn=torch.tensor([0.3, 0.4]),
+    )
+
+    with controller.proposal_context(["request-0", "request-1"]):
+        controller.selection_plans[0]["layer"] = step_zero
+        controller.selection_plans[1]["layer"] = step_one
+        controller.begin_parallel_step(
+            RetroSpecAttentionMode.SPARSE_VERIFY,
+            request_indices=[1, 0, 1],
+            token_indices=[0, 1, 1],
+        )
+
+        plan = controller._gather_parallel_plan("layer")
+        assert isinstance(plan, RetroSpecSelectionPlan)
+        assert plan.sparse_exact_indices.tolist() == [[2, 3], [4, 5], [6, 7]]
+        assert plan.sparse_attn.tolist() == pytest.approx([0.2, 0.3, 0.4])
+
+        controller.attention_mass_layer_count = 1
+        controller.end_step()
+
+
+def test_parallel_verification_gathers_segmented_token_plan_rows():
+    controller = make_controller(index_mode="segmented_cluster")
+    mark_installed(controller)
+    step_zero = replace(
+        make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),
+        primary_exact_token_indices=torch.tensor([[[0, 1]], [[2, 3]]]),
+        sparse_attn=torch.tensor([0.1, 0.2]),
+    )
+    step_one = replace(
+        make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),
+        primary_exact_token_indices=torch.tensor([[[4, 5]], [[6, 7]]]),
+        sparse_attn=torch.tensor([0.3, 0.4]),
+    )
+
+    with controller.proposal_context(["request-0", "request-1"]):
+        controller.selection_plans[0]["layer"] = step_zero
+        controller.selection_plans[1]["layer"] = step_one
+        controller.begin_parallel_step(
+            RetroSpecAttentionMode.EXPANDED_VERIFY,
+            request_indices=[1, 0, 1],
+            token_indices=[0, 1, 1],
+        )
+
+        plan = controller._gather_parallel_plan("layer")
+        assert isinstance(plan, RetroSpecTokenSelectionPlan)
+        assert plan.primary_exact_token_indices.tolist() == [
+            [[2, 3]],
+            [[4, 5]],
+            [[6, 7]],
+        ]
+        assert plan.sparse_attn.tolist() == pytest.approx([0.2, 0.3, 0.4])
+
+        controller.attention_mass_layer_count = 1
+        controller.end_step()
+
+
 def test_end_step_requires_completed_attention_layer():
     controller = make_controller()
     mark_installed(controller)

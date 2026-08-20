@@ -120,6 +120,7 @@ class RetroSpecSparseAttention:
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.block_size = block_size
         self.num_speculative_tokens = config.num_speculative_tokens
+        self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
 
         if config.retrospec_index_mode == "block_mean":
             self.index = RetroSpecBlockIndex(
@@ -172,10 +173,11 @@ class RetroSpecSparseAttention:
         self.step_index = -1
         self.active_mask: torch.Tensor | None = None
         self.batch_size = 0
+        self.parallel_plan_rows: tuple[tuple[int, int], ...] = ()
 
         self.attention_mass_layer_count = 0
         self.attention_mass_sum = torch.zeros(
-            self.max_batch_size, dtype=torch.float32, device=device
+            self.max_parallel_tokens, dtype=torch.float32, device=device
         )
 
         self.original_forwards: dict[str, tuple[FlashAttentionImpl, LayerForward]] = {}
@@ -479,6 +481,7 @@ class RetroSpecSparseAttention:
             self.step_index = -1
             self.active_mask = None
             self.batch_size = 0
+            self.parallel_plan_rows = ()
             self.attention_mass_layer_count = 0
 
             if isinstance(self.index, RetroSpecSegmentedTokenIndex):
@@ -515,6 +518,52 @@ class RetroSpecSparseAttention:
         self.step_index = step_index
         self.batch_size = active_mask.shape[0]
         self.active_mask = active_mask
+        self.parallel_plan_rows = ()
+
+        self.attention_mass_sum[: self.batch_size].zero_()
+        self.attention_mass_layer_count = 0
+        self.step_active = True
+
+    def begin_parallel_step(
+        self,
+        mode: RetroSpecAttentionMode,
+        request_indices: Sequence[int],
+        token_indices: Sequence[int],
+    ) -> None:
+        if not self.in_proposal:
+            raise RuntimeError(
+                "begin_parallel_step must be called inside proposal_context."
+            )
+        if mode not in (
+            RetroSpecAttentionMode.SPARSE_VERIFY,
+            RetroSpecAttentionMode.EXPANDED_VERIFY,
+        ):
+            raise ValueError("Parallel steps are supported only for verification.")
+        if self.step_active:
+            raise RuntimeError("The previous RetroSpec attention step is still active.")
+        if len(request_indices) != len(token_indices):
+            raise ValueError(
+                "request_indices and token_indices must have equal length."
+            )
+        if not request_indices:
+            raise ValueError("A parallel verification step cannot be empty.")
+        if len(request_indices) > self.max_parallel_tokens:
+            raise ValueError("Parallel verification exceeds the configured capacity.")
+
+        rows = tuple(zip(request_indices, token_indices))
+        for request_index, token_index in rows:
+            if not 0 <= request_index < len(self.proposal_request_ids):
+                raise ValueError("request_index is outside the proposal batch.")
+            if not 0 <= token_index < self.num_speculative_tokens:
+                raise ValueError("token_index is outside the speculative token range.")
+
+        self.mode = mode
+        self.step_index = -1
+        self.batch_size = len(rows)
+        self.active_mask = torch.ones(
+            self.batch_size, dtype=torch.bool, device=self.device
+        )
+        self.parallel_plan_rows = rows
 
         self.attention_mass_sum[: self.batch_size].zero_()
         self.attention_mass_layer_count = 0
@@ -535,9 +584,84 @@ class RetroSpecSparseAttention:
         self.step_index = -1
         self.active_mask = None
         self.batch_size = 0
+        self.parallel_plan_rows = ()
         self.attention_mass_layer_count = 0
 
         return attention_mass
+
+    def _gather_parallel_plan(self, layer_name: str) -> RetroSpecPlan:
+        plans: list[RetroSpecPlan] = []
+        request_indices: list[int] = []
+
+        for request_index, token_index in self.parallel_plan_rows:
+            try:
+                plan = self.selection_plans[token_index][layer_name]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"No draft selection plan for step {token_index}, "
+                    f"layer {layer_name!r}."
+                ) from exc
+            plans.append(plan)
+            request_indices.append(request_index)
+
+        first_plan = plans[0]
+        if any(type(plan) is not type(first_plan) for plan in plans[1:]):
+            raise RuntimeError("Parallel verification plans use different formats.")
+
+        def gather(name: str) -> torch.Tensor:
+            rows = [
+                getattr(plan, name)[request_index : request_index + 1]
+                for plan, request_index in zip(plans, request_indices)
+            ]
+            try:
+                return torch.cat(rows, dim=0)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"Parallel verification plan field {name!r} has "
+                    "incompatible per-step shapes."
+                ) from exc
+
+        if isinstance(first_plan, RetroSpecTokenSelectionPlan):
+            return RetroSpecTokenSelectionPlan(
+                layer_name=layer_name,
+                primary_exact_token_indices=gather("primary_exact_token_indices"),
+                primary_exact_token_mask=gather("primary_exact_token_mask"),
+                sparse_exact_cluster_ids=gather("sparse_exact_cluster_ids"),
+                sparse_exact_page_ids=gather("sparse_exact_page_ids"),
+                sparse_exact_page_token_counts=gather("sparse_exact_page_token_counts"),
+                sparse_estimation_keys=gather("sparse_estimation_keys"),
+                sparse_estimation_values=gather("sparse_estimation_values"),
+                sparse_estimation_token_counts=gather("sparse_estimation_token_counts"),
+                expanded_exact_cluster_ids=gather("expanded_exact_cluster_ids"),
+                expanded_exact_page_ids=gather("expanded_exact_page_ids"),
+                expanded_exact_page_token_counts=gather(
+                    "expanded_exact_page_token_counts"
+                ),
+                expanded_estimation_keys=gather("expanded_estimation_keys"),
+                expanded_estimation_values=gather("expanded_estimation_values"),
+                expanded_estimation_token_counts=gather(
+                    "expanded_estimation_token_counts"
+                ),
+                sparse_attn=gather("sparse_attn"),
+                expanded_attn=gather("expanded_attn"),
+            )
+
+        if isinstance(first_plan, RetroSpecSelectionPlan):
+            return RetroSpecSelectionPlan(
+                sparse_exact_indices=gather("sparse_exact_indices"),
+                sparse_exact_mask=gather("sparse_exact_mask"),
+                sparse_estimation_indices=gather("sparse_estimation_indices"),
+                sparse_estimation_mask=gather("sparse_estimation_mask"),
+                expanded_exact_indices=gather("expanded_exact_indices"),
+                expanded_exact_mask=gather("expanded_exact_mask"),
+                expanded_estimation_indices=gather("expanded_estimation_indices"),
+                expanded_estimation_mask=gather("expanded_estimation_mask"),
+                valid_token_counts=gather("valid_token_counts"),
+                sparse_attn=gather("sparse_attn"),
+                expanded_attn=gather("expanded_attn"),
+            )
+
+        raise TypeError(f"Unsupported RetroSpec plan type: {type(first_plan)!r}")
 
     def _maybe_update_prefill_index(
         self,
@@ -1422,7 +1546,7 @@ class RetroSpecSparseAttention:
         output: torch.Tensor,
     ) -> torch.Tensor:
         assert self.active_mask is not None
-        assert self.step_index >= 0
+        assert self.step_index >= 0 or self.parallel_plan_rows
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         if num_actual_tokens != self.batch_size:
@@ -1463,13 +1587,16 @@ class RetroSpecSparseAttention:
                 )
             self.selection_plans[self.step_index][layer_name] = selection.plan
         else:
-            try:
-                plan = self.selection_plans[self.step_index][layer_name]
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"No draft selection plan for step "
-                    f"{self.step_index}, layer {layer_name!r}."
-                ) from exc
+            if self.parallel_plan_rows:
+                plan = self._gather_parallel_plan(layer_name)
+            else:
+                try:
+                    plan = self.selection_plans[self.step_index][layer_name]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"No draft selection plan for step "
+                        f"{self.step_index}, layer {layer_name!r}."
+                    ) from exc
 
             if self.mode == RetroSpecAttentionMode.SPARSE_VERIFY:
                 level = RetroSpecAttentionLevel.SPARSE
