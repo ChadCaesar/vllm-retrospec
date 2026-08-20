@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.v1.spec_decode.retrospec import segmented_index as segmented_index_module
 from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecClusterStorageMode,
 )
@@ -865,6 +866,85 @@ def test_cpu_offload_direct_build_preserves_synchronous_api():
     assert index.cluster_store.num_allocated_pages("layer") == 2
     index.begin_proposal(["request"])
     index.end_proposal()
+
+
+def test_cpu_offload_stages_token_kv_before_clustering(monkeypatch):
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    call_order: list[str] = []
+
+    original_stage_token_kv = index.cluster_store.stage_token_kv
+    original_finish_stage_clusters = index.cluster_store.finish_stage_clusters
+
+    def stage_token_kv(*args, **kwargs):
+        call_order.append("stage_token_kv")
+        return original_stage_token_kv(*args, **kwargs)
+
+    def finish_stage_clusters(*args, **kwargs):
+        call_order.append("finish_stage_clusters")
+        return original_finish_stage_clusters(*args, **kwargs)
+
+    original_clustering = segmented_index_module.segmented_kmeans_assignments
+
+    def segmented_kmeans_assignments(*args, **kwargs):
+        call_order.append("segmented_kmeans_assignments")
+        return original_clustering(*args, **kwargs)
+
+    monkeypatch.setattr(index.cluster_store, "stage_token_kv", stage_token_kv)
+    monkeypatch.setattr(
+        index.cluster_store,
+        "finish_stage_clusters",
+        finish_stage_clusters,
+    )
+    monkeypatch.setattr(
+        segmented_index_module,
+        "segmented_kmeans_assignments",
+        segmented_kmeans_assignments,
+    )
+
+    build_index(
+        index,
+        10,
+        keys,
+        values,
+        block_table,
+        defer_cpu_store=True,
+    )
+
+    try:
+        assert call_order == [
+            "stage_token_kv",
+            "segmented_kmeans_assignments",
+            "finish_stage_clusters",
+        ]
+    finally:
+        index.discard_staged_updates()
+
+
+def test_cpu_offload_waits_for_staged_kv_when_clustering_fails(monkeypatch):
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    staged_token_kv = Mock()
+
+    monkeypatch.setattr(
+        index.cluster_store,
+        "stage_token_kv",
+        Mock(return_value=staged_token_kv),
+    )
+
+    monkeypatch.setattr(
+        segmented_index_module,
+        "segmented_kmeans_assignments",
+        Mock(side_effect=RuntimeError("clustering failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="clustering failed"):
+        build_index(index, 10, keys, values, block_table)
+
+    staged_token_kv.wait.assert_called_once_with()
+    assert not index.has_staged_updates
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -632,33 +632,53 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 .contiguous()
             )
 
-            local_assignments, cluster_token_counts = segmented_kmeans_assignments(
-                features=token_keys,
-                segment_size=self.segment_size_tokens,
-                items_per_cluster=self.tokens_per_cluster,
-                num_iterations=self.num_kmeans_iterations,
-            )
+            staged_token_kv = None
+            if self.cluster_store.is_cpu_backed:
+                # Start token-KV D2H before clustering. Both streams only read
+                # the token tensors, so transfer and k-means can safely overlap.
+                staged_token_kv = self.cluster_store.stage_token_kv(
+                    token_keys,
+                    token_values,
+                )
 
-            cluster_keys = self._cluster_means(
-                token_keys,
-                local_assignments,
-                cluster_token_counts,
-            )
-            cluster_values = self._cluster_means(
-                token_values,
-                local_assignments,
-                cluster_token_counts,
-            )
+            try:
+                local_assignments, cluster_token_counts = segmented_kmeans_assignments(
+                    features=token_keys,
+                    segment_size=self.segment_size_tokens,
+                    items_per_cluster=self.tokens_per_cluster,
+                    num_iterations=self.num_kmeans_iterations,
+                )
+
+                cluster_keys = self._cluster_means(
+                    token_keys,
+                    local_assignments,
+                    cluster_token_counts,
+                )
+                cluster_values = self._cluster_means(
+                    token_values,
+                    local_assignments,
+                    cluster_token_counts,
+                )
+            except BaseException:
+                if staged_token_kv is not None:
+                    staged_token_kv.wait()
+                raise
 
             cluster_start = 0 if record is None else record.num_clusters
 
             if self.cluster_store.is_cpu_backed:
-                staged_clusters = self.cluster_store.stage_clusters(
-                    token_keys=token_keys,
-                    token_values=token_values,
-                    assignments=local_assignments,
-                    cluster_token_counts=cluster_token_counts,
-                )
+                assert staged_token_kv is not None
+
+                try:
+                    staged_clusters = self.cluster_store.finish_stage_clusters(
+                        staged_token_kv,
+                        local_assignments,
+                        cluster_token_counts,
+                    )
+                except BaseException:
+                    staged_token_kv.wait()
+                    raise
+
                 self._staged_segments.append(
                     _StagedRequestLayerSegment(
                         layer_name=layer_name,

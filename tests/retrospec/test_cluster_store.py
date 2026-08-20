@@ -1124,6 +1124,44 @@ def test_cpu_backing_store_stages_and_commits_cpu_inputs():
     )
 
 
+def test_cpu_backing_store_supports_two_phase_staging():
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+
+    staged_token_kv = store.stage_token_kv(keys, values)
+
+    assert staged_token_kv.source_device == torch.device("cpu")
+    assert staged_token_kv.ready_event is None
+    assert staged_token_kv.token_keys is keys
+    assert staged_token_kv.token_values is values
+
+    staged = store.finish_stage_clusters(
+        staged_token_kv,
+        assignments,
+        cluster_token_counts,
+    )
+
+    assert staged.ready_event is None
+    assert staged.metadata_device == torch.device("cpu")
+    assert staged.token_keys is keys
+    assert staged.token_values is values
+    assert staged.assignments is assignments
+    assert staged.cluster_token_counts is cluster_token_counts
+
+    table = store.store_staged_clusters(
+        layer_name="layer",
+        request_id="request",
+        cluster_start=0,
+        staged=staged,
+    )
+
+    assert store.num_allocated_pages("layer") == 6
+    assert table.cluster_ids.tolist() == [[0, 1], [2, 3]]
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not is_pin_memory_available(),
     reason="CUDA and pinned host memory are required",
@@ -1141,11 +1179,23 @@ def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
     assignments = assignments.to(device)
     cluster_token_counts = cluster_token_counts.to(device)
 
-    staged = store.stage_clusters(
-        token_keys=keys,
-        token_values=values,
-        assignments=assignments,
-        cluster_token_counts=cluster_token_counts,
+    staged_token_kv = store.stage_token_kv(keys, values)
+
+    assert staged_token_kv.ready_event is not None
+    assert staged_token_kv.source_device == device
+    assert staged_token_kv.token_keys.device.type == "cpu"
+    assert staged_token_kv.token_values.device.type == "cpu"
+    assert staged_token_kv.token_keys.is_pinned()
+    assert staged_token_kv.token_values.is_pinned()
+
+    # Enqueue work after token-KV staging. finish_stage_clusters() must make
+    # metadata D2H wait for this work without serializing the earlier KV copy.
+    assignments = assignments.clone()
+    cluster_token_counts = cluster_token_counts.clone()
+    staged = store.finish_stage_clusters(
+        staged_token_kv,
+        assignments,
+        cluster_token_counts,
     )
 
     assert staged.ready_event is not None

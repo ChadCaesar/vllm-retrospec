@@ -60,13 +60,31 @@ class RetroSpecClusterBlockMetadata:
 
 
 @dataclass(frozen=True)
-class RetroSpecStagedClusterInput:
-    """Cluster construction inputs staged on the backing-store device.
+class RetroSpecStagedTokenKV:
+    """Token KV staged before GPU clustering starts.
 
-    For CPU offload, tensors reside in pinned CPU memory. ready_event records
-    completion of the asynchronous D2H copies that populate those tensors.
-    metadata_device preserves the CUDA device on which runtime cluster metadata
-    must later be materialized.
+    For pinned CPU offload, token KV is copied on the per-device offload
+    stream while segmented k-means runs on the model execution stream.
+    """
+
+    token_keys: torch.Tensor
+    token_values: torch.Tensor
+
+    source_device: torch.device
+    ready_event: torch.cuda.Event | None
+
+    def wait(self) -> None:
+        if self.ready_event is not None:
+            self.ready_event.synchronize()
+
+
+@dataclass(frozen=True)
+class RetroSpecStagedClusterInput:
+    """Complete CPU inputs required to construct cluster pages.
+
+    ready_event is recorded after both token KV and clustering metadata have
+    been copied to CPU. Waiting for it therefore makes every tensor in this
+    structure safe for CPU page construction.
     """
 
     token_keys: torch.Tensor
@@ -1204,11 +1222,9 @@ class RetroSpecClusterPageStore:
         return pool, resident_cache
 
     @staticmethod
-    def _validate_cluster_input_metadata(
+    def _validate_token_kv_input(
         token_keys: torch.Tensor,
         token_values: torch.Tensor,
-        assignments: torch.Tensor,
-        cluster_token_counts: torch.Tensor,
     ) -> None:
         if token_keys.ndim != 3:
             raise ValueError(
@@ -1218,6 +1234,19 @@ class RetroSpecClusterPageStore:
             raise ValueError("token_keys and token_values must have equal shapes")
         if token_values.dtype != token_keys.dtype:
             raise ValueError("token_keys and token_values must have equal dtypes")
+        if token_values.device != token_keys.device:
+            raise ValueError("Token keys and values must be on one device")
+
+    @classmethod
+    def _validate_cluster_input_metadata(
+        cls,
+        token_keys: torch.Tensor,
+        token_values: torch.Tensor,
+        assignments: torch.Tensor,
+        cluster_token_counts: torch.Tensor,
+    ) -> None:
+        cls._validate_token_kv_input(token_keys, token_values)
+
         if assignments.shape != token_keys.shape[:2]:
             raise ValueError("assignments must have shape [num_kv_heads, num_tokens]")
         if cluster_token_counts.ndim != 2:
@@ -1238,12 +1267,37 @@ class RetroSpecClusterPageStore:
             torch.int64,
         ):
             raise ValueError("cluster_token_counts must use an integral dtype")
-        if token_values.device != token_keys.device:
-            raise ValueError("Token keys and values must be on one device")
         if assignments.device != token_keys.device:
             raise ValueError("Assignments and token KV must be on one device")
         if cluster_token_counts.device != token_keys.device:
             raise ValueError("Cluster counts and token KV must be on one device")
+
+    @staticmethod
+    def _validate_staged_cluster_metadata(
+        staged_token_kv: RetroSpecStagedTokenKV,
+        assignments: torch.Tensor,
+        cluster_token_counts: torch.Tensor,
+    ) -> None:
+        token_shape = staged_token_kv.token_keys.shape
+
+        if assignments.shape != token_shape[:2]:
+            raise ValueError("assignments must have shape [num_kv_heads, num_tokens]")
+        if cluster_token_counts.ndim != 2:
+            raise ValueError(
+                "cluster_token_counts must have shape [num_kv_heads, num_clusters]"
+            )
+        if cluster_token_counts.shape[0] != token_shape[0]:
+            raise ValueError(
+                "cluster_token_counts KV-head count does not match token KV"
+            )
+        if assignments.dtype not in (torch.int32, torch.int64):
+            raise ValueError("assignments must use an integral dtype")
+        if cluster_token_counts.dtype not in (torch.int32, torch.int64):
+            raise ValueError("cluster_token_counts must use an integral dtype")
+        if assignments.device != staged_token_kv.source_device:
+            raise ValueError("Assignments must remain on the token KV source device")
+        if cluster_token_counts.device != staged_token_kv.source_device:
+            raise ValueError("Cluster counts must remain on the token KV source device")
 
     def _get_offload_stream(
         self,
@@ -1276,63 +1330,42 @@ class RetroSpecClusterPageStore:
             pin_memory=True,
         )
 
-    def stage_clusters(
+    def stage_token_kv(
         self,
         token_keys: torch.Tensor,
         token_values: torch.Tensor,
-        assignments: torch.Tensor,
-        cluster_token_counts: torch.Tensor,
-    ) -> RetroSpecStagedClusterInput:
-        """Stage cluster construction inputs on the CPU backing device."""
+    ) -> RetroSpecStagedTokenKV:
+        """Start staging token KV before segmented clustering."""
         if not self.is_cpu_backed:
-            raise RuntimeError(
-                "Cluster input staging is only used by CPU-backed storage"
-            )
+            raise RuntimeError("Token KV staging is only used by CPU-backed storage")
 
-        self._validate_cluster_input_metadata(
-            token_keys,
-            token_values,
-            assignments,
-            cluster_token_counts,
-        )
+        self._validate_token_kv_input(token_keys, token_values)
+        source_device = token_keys.device
 
-        metadata_device = token_keys.device
-
-        if token_keys.device.type == "cpu":
-            return RetroSpecStagedClusterInput(
+        if source_device.type == "cpu":
+            return RetroSpecStagedTokenKV(
                 token_keys=token_keys,
                 token_values=token_values,
-                assignments=assignments,
-                cluster_token_counts=cluster_token_counts,
-                metadata_device=metadata_device,
+                source_device=source_device,
                 ready_event=None,
             )
 
-        if token_keys.device.type != "cuda":
+        if source_device.type != "cuda":
             raise ValueError("CPU-backed cluster staging requires CPU or CUDA inputs")
 
         if not self.pin_memory:
-            return RetroSpecStagedClusterInput(
+            return RetroSpecStagedTokenKV(
                 token_keys=token_keys.to(device="cpu", non_blocking=False),
                 token_values=token_values.to(device="cpu", non_blocking=False),
-                assignments=assignments.to(device="cpu", non_blocking=False),
-                cluster_token_counts=cluster_token_counts.to(
-                    device="cpu",
-                    non_blocking=False,
-                ),
-                metadata_device=metadata_device,
+                source_device=source_device,
                 ready_event=None,
             )
 
         staged_token_keys = self._allocate_pinned_staging(token_keys)
         staged_token_values = self._allocate_pinned_staging(token_values)
-        staged_assignments = self._allocate_pinned_staging(assignments)
-        staged_cluster_token_counts = self._allocate_pinned_staging(
-            cluster_token_counts
-        )
 
-        offload_stream = self._get_offload_stream(token_keys.device)
-        current_stream = torch.cuda.current_stream(token_keys.device)
+        offload_stream = self._get_offload_stream(source_device)
+        current_stream = torch.cuda.current_stream(source_device)
         offload_stream.wait_stream(current_stream)
 
         ready_event = torch.cuda.Event()
@@ -1340,6 +1373,75 @@ class RetroSpecClusterPageStore:
         with torch.cuda.stream(offload_stream):
             staged_token_keys.copy_(token_keys, non_blocking=True)
             staged_token_values.copy_(token_values, non_blocking=True)
+            ready_event.record(offload_stream)
+
+        token_keys.record_stream(offload_stream)
+        token_values.record_stream(offload_stream)
+
+        return RetroSpecStagedTokenKV(
+            token_keys=staged_token_keys,
+            token_values=staged_token_values,
+            source_device=source_device,
+            ready_event=ready_event,
+        )
+
+    def finish_stage_clusters(
+        self,
+        staged_token_kv: RetroSpecStagedTokenKV,
+        assignments: torch.Tensor,
+        cluster_token_counts: torch.Tensor,
+    ) -> RetroSpecStagedClusterInput:
+        """Stage clustering metadata after GPU clustering finishes."""
+        if not self.is_cpu_backed:
+            raise RuntimeError(
+                "Cluster metadata staging is only used by CPU-backed storage"
+            )
+
+        self._validate_staged_cluster_metadata(
+            staged_token_kv,
+            assignments,
+            cluster_token_counts,
+        )
+        source_device = staged_token_kv.source_device
+
+        if source_device.type == "cpu":
+            return RetroSpecStagedClusterInput(
+                token_keys=staged_token_kv.token_keys,
+                token_values=staged_token_kv.token_values,
+                assignments=assignments,
+                cluster_token_counts=cluster_token_counts,
+                metadata_device=source_device,
+                ready_event=None,
+            )
+
+        if not self.pin_memory:
+            return RetroSpecStagedClusterInput(
+                token_keys=staged_token_kv.token_keys,
+                token_values=staged_token_kv.token_values,
+                assignments=assignments.to(device="cpu", non_blocking=False),
+                cluster_token_counts=cluster_token_counts.to(
+                    device="cpu",
+                    non_blocking=False,
+                ),
+                metadata_device=source_device,
+                ready_event=None,
+            )
+
+        staged_assignments = self._allocate_pinned_staging(assignments)
+        staged_cluster_token_counts = self._allocate_pinned_staging(
+            cluster_token_counts
+        )
+
+        offload_stream = self._get_offload_stream(source_device)
+        current_stream = torch.cuda.current_stream(source_device)
+
+        # The wait is enqueued after the token-KV copies. Token D2H therefore
+        # overlaps clustering, while metadata D2H waits for clustering output.
+        offload_stream.wait_stream(current_stream)
+
+        ready_event = torch.cuda.Event()
+
+        with torch.cuda.stream(offload_stream):
             staged_assignments.copy_(assignments, non_blocking=True)
             staged_cluster_token_counts.copy_(
                 cluster_token_counts,
@@ -1347,19 +1449,43 @@ class RetroSpecClusterPageStore:
             )
             ready_event.record(offload_stream)
 
-        token_keys.record_stream(offload_stream)
-        token_values.record_stream(offload_stream)
         assignments.record_stream(offload_stream)
         cluster_token_counts.record_stream(offload_stream)
 
         return RetroSpecStagedClusterInput(
-            token_keys=staged_token_keys,
-            token_values=staged_token_values,
+            token_keys=staged_token_kv.token_keys,
+            token_values=staged_token_kv.token_values,
             assignments=staged_assignments,
             cluster_token_counts=staged_cluster_token_counts,
-            metadata_device=metadata_device,
+            metadata_device=source_device,
             ready_event=ready_event,
         )
+
+    def stage_clusters(
+        self,
+        token_keys: torch.Tensor,
+        token_values: torch.Tensor,
+        assignments: torch.Tensor,
+        cluster_token_counts: torch.Tensor,
+    ) -> RetroSpecStagedClusterInput:
+        """Stage complete inputs when overlap is not controlled by the caller."""
+        self._validate_cluster_input_metadata(
+            token_keys,
+            token_values,
+            assignments,
+            cluster_token_counts,
+        )
+        staged_token_kv = self.stage_token_kv(token_keys, token_values)
+
+        try:
+            return self.finish_stage_clusters(
+                staged_token_kv,
+                assignments,
+                cluster_token_counts,
+            )
+        except BaseException:
+            staged_token_kv.wait()
+            raise
 
     def store_staged_clusters(
         self,
