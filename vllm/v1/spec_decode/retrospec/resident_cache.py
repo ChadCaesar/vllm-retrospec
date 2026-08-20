@@ -19,6 +19,7 @@ class _PendingCopyBatch:
     """Keep asynchronous cache-copy sources alive until completion."""
 
     ready_event: torch.cuda.Event
+    cluster_ids: tuple[_ClusterId, ...]
     source_key_pages: torch.Tensor
     source_value_pages: torch.Tensor
 
@@ -101,6 +102,7 @@ class RetroSpecResidentClusterCache:
 
         self._copy_stream = torch.cuda.Stream(device=device)
         self._pending_copy_batches: deque[_PendingCopyBatch] = deque()
+        self._pending_cluster_events: dict[_ClusterId, torch.cuda.Event] = {}
 
     @property
     def capacity(self) -> int:
@@ -131,28 +133,37 @@ class RetroSpecResidentClusterCache:
         return len(self._pending_copy_batches)
 
     def _reap_completed_copy_batches(self) -> None:
-        """Release source tensors belonging to completed copy batches."""
+        """Release sources and pending markers for completed H2D batches."""
         while (
             self._pending_copy_batches
             and self._pending_copy_batches[0].ready_event.query()
         ):
-            self._pending_copy_batches.popleft()
+            batch = self._pending_copy_batches.popleft()
+
+            for cluster_id in batch.cluster_ids:
+                pending_event = self._pending_cluster_events.get(cluster_id)
+                if pending_event is batch.ready_event:
+                    del self._pending_cluster_events[cluster_id]
 
     def _record_copy_batch(
         self,
+        cluster_ids: tuple[_ClusterId, ...],
         source_key_pages: torch.Tensor,
         source_value_pages: torch.Tensor,
     ) -> None:
         ready_event = torch.cuda.Event()
         ready_event.record(self._copy_stream)
 
-        self._pending_copy_batches.append(
-            _PendingCopyBatch(
-                ready_event=ready_event,
-                source_key_pages=source_key_pages,
-                source_value_pages=source_value_pages,
-            )
+        batch = _PendingCopyBatch(
+            ready_event=ready_event,
+            cluster_ids=cluster_ids,
+            source_key_pages=source_key_pages,
+            source_value_pages=source_value_pages,
         )
+        self._pending_copy_batches.append(batch)
+
+        for cluster_id in cluster_ids:
+            self._pending_cluster_events[cluster_id] = ready_event
 
     def pending_copy_event(self) -> torch.cuda.Event | None:
         """Return the latest outstanding resident-copy event.
@@ -192,12 +203,14 @@ class RetroSpecResidentClusterCache:
         """Synchronize pending copies before CPU backing pages are reused."""
         self._reap_completed_copy_batches()
         if not self._pending_copy_batches:
+            self._pending_cluster_events.clear()
             return
 
         # Every batch uses one copy stream, so completion of the final event also
         # implies completion of all earlier batches.
         self._pending_copy_batches[-1].ready_event.synchronize()
         self._pending_copy_batches.clear()
+        self._pending_cluster_events.clear()
 
     def _grow_storage(self, required_capacity: int) -> None:
         if required_capacity <= self._physical_capacity:
@@ -581,8 +594,17 @@ class RetroSpecResidentClusterCache:
         allocated_cluster_ids: Collection[int],
         allocated_page_ids: Collection[int],
         touch: bool = True,
+        include_pending: bool = True,
     ) -> RetroSpecResidentPageAccess:
-        """Resolve selected cluster blocks against resident GPU slots."""
+        """Resolve selected cluster blocks against resident GPU slots.
+
+        When include_pending is false, clusters whose H2D copies are incomplete
+        are reported as misses. Draft attention can then continue with centroid
+        estimation instead of waiting for verification prefetches.
+        """
+        if not include_pending:
+            self._reap_completed_copy_batches()
+
         (
             cluster_ids_cpu,
             page_ids_cpu,
@@ -628,7 +650,9 @@ class RetroSpecResidentClusterCache:
                 continue
 
             resident_slots = self._cluster_to_slots.get(cluster_id)
-            if resident_slots is None:
+            pending = cluster_id in self._pending_cluster_events
+
+            if resident_slots is None or (pending and not include_pending):
                 flat_miss_mask[cluster_index] = True
                 continue
 
@@ -887,6 +911,7 @@ class RetroSpecResidentClusterCache:
 
         copy_batch_started = False
         copy_scheduled = False
+        copied_cluster_ids: list[_ClusterId] = []
 
         try:
             for cluster_id in missing_targets:
@@ -930,11 +955,13 @@ class RetroSpecResidentClusterCache:
                     logical_pages=logical_pages,
                     slots=slots,
                 )
+                copied_cluster_ids.append(cluster_id)
         finally:
             if copy_scheduled:
                 self._record_copy_batch(
-                    source_key_pages,
-                    source_value_pages,
+                    cluster_ids=tuple(copied_cluster_ids),
+                    source_key_pages=source_key_pages,
+                    source_value_pages=source_value_pages,
                 )
 
         for cluster_id in reversed(requested_clusters):

@@ -9,6 +9,7 @@ import torch
 from vllm.v1.spec_decode.retrospec.cluster_identity import RetroSpecClusterGroup
 from vllm.v1.spec_decode.retrospec.resident_cache import (
     RetroSpecResidentClusterCache,
+    _PendingCopyBatch,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -58,6 +59,7 @@ class _ResidentCacheTestAdapter(RetroSpecResidentClusterCache):
         page_ids,
         allocated_page_ids,
         touch=True,
+        include_pending=True,
         *,
         cluster_ids=None,
         cluster_groups=None,
@@ -78,6 +80,7 @@ class _ResidentCacheTestAdapter(RetroSpecResidentClusterCache):
             allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=allocated_page_ids,
             touch=touch,
+            include_pending=include_pending,
         )
 
     def admit(
@@ -238,6 +241,78 @@ def test_resident_cache_returns_latest_pending_copy_event():
     assert latest_event is not first_event
     assert cache.pending_copy_event() is latest_event
     latest_event.synchronize()
+
+
+def test_pending_resident_cluster_can_be_hidden_from_draft_lookup():
+    cache = make_cache(capacity=2)
+    backing_keys, backing_values = make_backing_pages()
+    page_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+
+    # Keep the tiny copy pending from the host's point of view so both lookup
+    # modes can be checked deterministically.
+    cache._reap_completed_copy_batches = Mock()
+    admitted = cache.admit(
+        page_ids,
+        {0, 1},
+        backing_keys,
+        backing_values,
+    )
+
+    assert admitted.hit_cluster_mask.item()
+    assert cache._pending_cluster_events.keys() == {0}
+
+    verification = cache.lookup(
+        page_ids,
+        {0, 1},
+        include_pending=True,
+    )
+    draft = cache.lookup(
+        page_ids,
+        {0, 1},
+        include_pending=False,
+    )
+
+    assert verification.hit_cluster_mask.item()
+    assert not verification.miss_cluster_mask.item()
+    assert not draft.hit_cluster_mask.item()
+    assert draft.miss_cluster_mask.item()
+    assert torch.all(draft.cache_page_ids == -1)
+
+    cache.synchronize_pending_copies()
+    assert not cache._pending_cluster_events
+
+
+def test_completed_old_batch_does_not_clear_newer_pending_cluster_event():
+    cache = make_cache(capacity=1)
+    source_keys, source_values = make_backing_pages(num_pages=1)
+    first_event = Mock()
+    second_event = Mock()
+    first_event.query.return_value = True
+    second_event.query.return_value = False
+
+    cache._pending_copy_batches.extend(
+        (
+            _PendingCopyBatch(
+                ready_event=first_event,
+                cluster_ids=(7,),
+                source_key_pages=source_keys,
+                source_value_pages=source_values,
+            ),
+            _PendingCopyBatch(
+                ready_event=second_event,
+                cluster_ids=(7,),
+                source_key_pages=source_keys,
+                source_value_pages=source_values,
+            ),
+        )
+    )
+    cache._pending_cluster_events[7] = second_event
+
+    cache._reap_completed_copy_batches()
+
+    assert len(cache._pending_copy_batches) == 1
+    assert cache._pending_copy_batches[0].ready_event is second_event
+    assert cache._pending_cluster_events[7] is second_event
 
 
 def test_resident_cache_waits_on_explicit_consumer_stream():

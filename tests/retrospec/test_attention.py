@@ -1510,6 +1510,73 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
         assert materialize_args[4] is metadata.block_table
 
 
+def test_segmented_draft_prefetches_sparse_plan_after_attention():
+    controller = make_controller(
+        index_mode="segmented_cluster",
+        cache_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    mark_installed(controller)
+    assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
+
+    plan = make_token_plan(2, num_kv_heads=1, exact_width=0, estimation_width=0)
+    selection = RetroSpecTokenAttentionSelection(
+        exact_cluster_ids=plan.sparse_exact_cluster_ids,
+        exact_page_ids=plan.sparse_exact_page_ids,
+        exact_page_token_counts=plan.sparse_exact_page_token_counts,
+        exact_token_counts=torch.zeros(2, 1, dtype=torch.int32),
+        estimation_keys=plan.sparse_estimation_keys,
+        estimation_values=plan.sparse_estimation_values,
+        estimation_token_counts=plan.sparse_estimation_token_counts,
+        attention_mass=torch.ones(2),
+        plan=plan,
+        resolved_pages=None,
+    )
+    controller.index.select_segmented = Mock(return_value=selection)
+
+    call_order: list[str] = []
+    controller._run_exact_attention = Mock(
+        side_effect=lambda *args: call_order.append("exact")
+        or (torch.zeros(2, 1, 1), torch.zeros(2, 1))
+    )
+    controller._run_estimation_attention = Mock(
+        side_effect=lambda *args: call_order.append("estimation")
+        or (torch.zeros(2, 1, 1), torch.zeros(2, 1))
+    )
+    controller.index.prefetch_sparse_verification = Mock(
+        side_effect=lambda **kwargs: call_order.append("prefetch")
+    )
+
+    impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
+    layer = cast(torch.nn.Module, SimpleNamespace())
+    query = torch.zeros(2, 1, 1)
+    kv_cache = torch.zeros(2, 2, 2, 1, 1)
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        max_query_len=1,
+        block_table=torch.zeros(2, 1, dtype=torch.int32),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+    )
+    output = torch.zeros(2, 1, 1)
+    active_mask = torch.tensor([True, False])
+
+    with (
+        patch("vllm.v1.spec_decode.retrospec.attention.merge_attn_states"),
+        controller.proposal_context(["request-0", "request-1"]),
+    ):
+        controller.begin_step(RetroSpecAttentionMode.DRAFT, 0, active_mask)
+        controller._sparse_forward(
+            "layer", impl, layer, query, kv_cache, metadata, output
+        )
+        controller.end_step()
+
+    assert call_order == ["exact", "estimation", "prefetch"]
+    controller.index.prefetch_sparse_verification.assert_called_once_with(
+        plan=plan,
+        active_mask=active_mask,
+    )
+
+
 def test_parallel_verification_gathers_block_plan_rows_by_request_and_token():
     controller = make_controller()
     mark_installed(controller)

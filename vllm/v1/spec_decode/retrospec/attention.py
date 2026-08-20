@@ -1659,4 +1659,15 @@ class RetroSpecSparseAttention:
         self.attention_mass_sum[: self.batch_size].add_(selection.attention_mass)
         self.attention_mass_layer_count += 1
 
+        if self.mode == RetroSpecAttentionMode.DRAFT and isinstance(
+            self.index, RetroSpecSegmentedTokenIndex
+        ):
+            if not isinstance(selection.plan, RetroSpecTokenSelectionPlan):
+                raise RuntimeError("Segmented draft produced an incompatible plan")
+
+            self.index.prefetch_sparse_verification(
+                plan=selection.plan,
+                active_mask=self.active_mask,
+            )
+
         return output

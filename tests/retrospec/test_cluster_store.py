@@ -999,6 +999,62 @@ def test_cpu_backing_store_resident_only_resolution_does_not_admit_misses():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
+    reason="CUDA is required to resolve pending cluster pages",
+)
+def test_cpu_backing_store_hides_pending_pages_from_draft_but_not_verification():
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        storage_mode="cpu_offload",
+        cache_ratio=0.5,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys.cuda(),
+        values.cuda(),
+        assignments.cuda(),
+        cluster_token_counts.cuda(),
+    )
+    cluster_ids, metadata = get_runtime_blocks(store, table, torch.device("cuda"))
+
+    store.admit_resident_clusters("layer", cluster_ids, metadata.page_ids)
+    resident_cache = store._resident_caches["layer"]
+    resident_cache._reap_completed_copy_batches = Mock()
+
+    draft = store.resolve_cluster_blocks(
+        "layer",
+        cluster_ids,
+        metadata.page_ids,
+        mode="resident_only",
+    )
+    verification = store.resolve_cluster_blocks(
+        "layer",
+        cluster_ids,
+        metadata.page_ids,
+        mode="verification",
+    )
+
+    assert not draft.hit_cluster_mask.any()
+    assert draft.miss_cluster_mask.all()
+    assert torch.all(draft.resident_page_ids == -1)
+    assert draft.resident_ready_event is None
+
+    assert verification.hit_cluster_mask.tolist() == [
+        [True, False],
+        [True, False],
+    ]
+    assert verification.miss_cluster_mask.tolist() == [
+        [False, True],
+        [False, True],
+    ]
+    assert verification.resident_ready_event is not None
+
+    resident_cache.synchronize_pending_copies()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
     reason="CUDA is required to resolve cluster pages",
 )
 def test_gpu_reference_store_resolves_without_staging():

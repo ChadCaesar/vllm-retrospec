@@ -77,6 +77,54 @@ def test_segmented_index_configures_resident_cache_ratio(
     assert index.cluster_store.cache_ratio == pytest.approx(expected_cache_ratio)
 
 
+def test_sparse_verification_prefetch_masks_inactive_draft_rows():
+    index = make_index(cache_mode="cpu_offload", cache_ratio=0.5, pin_memory=True)
+    plan = Mock(
+        layer_name="layer",
+        sparse_exact_cluster_ids=torch.tensor([[[0, 1]], [[2, 3]]], dtype=torch.int64),
+        sparse_exact_page_ids=torch.tensor(
+            [[[[0], [1]]], [[[2], [3]]]], dtype=torch.int64
+        ),
+    )
+    index.cluster_store.admit_resident_clusters = Mock()
+
+    index.prefetch_sparse_verification(
+        plan,
+        active_mask=torch.tensor([True, False]),
+    )
+
+    call_kwargs = index.cluster_store.admit_resident_clusters.call_args.kwargs
+    assert call_kwargs["layer_name"] == "layer"
+    assert call_kwargs["cluster_ids"].tolist() == [[[0, 1]], [[-1, -1]]]
+    assert call_kwargs["page_ids"].tolist() == [
+        [[[0], [1]]],
+        [[[-1], [-1]]],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "pin_memory"),
+    [("gpu_reference", False), ("cpu_offload", False)],
+)
+def test_sparse_verification_prefetch_requires_pinned_cpu_backing(
+    cache_mode: RetroSpecClusterStorageMode,
+    pin_memory: bool,
+):
+    index = make_index(cache_mode=cache_mode, pin_memory=pin_memory)
+    plan = Mock(
+        sparse_exact_cluster_ids=torch.tensor([[[0]]]),
+        sparse_exact_page_ids=torch.tensor([[[[0]]]]),
+    )
+    index.cluster_store.admit_resident_clusters = Mock()
+
+    index.prefetch_sparse_verification(
+        plan,
+        active_mask=torch.tensor([True]),
+    )
+
+    index.cluster_store.admit_resident_clusters.assert_not_called()
+
+
 def build_index(
     index: RetroSpecSegmentedTokenIndex,
     seq_len: int,

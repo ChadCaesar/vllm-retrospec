@@ -2089,6 +2089,39 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             resolved_pages=resolved_pages,
         )
 
+    def prefetch_sparse_verification(
+        self,
+        plan: RetroSpecTokenSelectionPlan,
+        active_mask: torch.Tensor,
+    ) -> None:
+        """Asynchronously admit a draft plan's sparse pages into the GPU cache."""
+        if not self.cluster_store.is_cpu_backed or not self.cluster_store.pin_memory:
+            return
+
+        cluster_ids = plan.sparse_exact_cluster_ids
+        page_ids = plan.sparse_exact_page_ids
+
+        if active_mask.ndim != 1 or active_mask.dtype != torch.bool:
+            raise ValueError("active_mask must be a one-dimensional boolean tensor")
+        if active_mask.shape != (cluster_ids.shape[0],):
+            raise ValueError("active_mask does not match the selection batch size")
+        if active_mask.device != cluster_ids.device:
+            raise ValueError("active_mask and selection plan must use one device")
+        if cluster_ids.numel() == 0:
+            return
+
+        active_cluster_mask = active_mask[:, None, None]
+        active_page_mask = active_mask[:, None, None, None]
+
+        prefetch_cluster_ids = cluster_ids.masked_fill(~active_cluster_mask, -1)
+        prefetch_page_ids = page_ids.masked_fill(~active_page_mask, -1)
+
+        self.cluster_store.admit_resident_clusters(
+            layer_name=plan.layer_name,
+            cluster_ids=prefetch_cluster_ids,
+            page_ids=prefetch_page_ids,
+        )
+
     def _materialize_token_selection(
         self,
         plan: RetroSpecTokenSelectionPlan,

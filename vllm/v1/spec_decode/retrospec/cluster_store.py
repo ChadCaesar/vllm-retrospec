@@ -2248,7 +2248,12 @@ class RetroSpecClusterPageStore:
         logical_page_ids: torch.Tensor,
         mode: RetroSpecClusterResolveMode = "verification",
     ) -> RetroSpecResolvedClusterPages:
-        """Resolve selected cluster blocks to physical GPU page sources."""
+        """Resolve selected cluster blocks to physical GPU page sources.
+
+        resident_only exposes only completed resident pages. Verification also
+        exposes pages whose asynchronous H2D copies are pending and returns the
+        event that the execution stream must wait for.
+        """
         if mode not in ("resident_only", "verification"):
             raise ValueError(f"Unsupported RetroSpec cluster resolve mode: {mode}")
         if logical_page_ids.shape[:-1] != cluster_ids.shape:
@@ -2292,6 +2297,7 @@ class RetroSpecClusterPageStore:
         )
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
+        verification = mode == "verification"
         resident_access = resident_cache.lookup(
             cluster_ids=cluster_ids,
             page_ids=logical_page_ids,
@@ -2299,9 +2305,10 @@ class RetroSpecClusterPageStore:
             allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=pool.allocated_page_ids,
             touch=True,
+            include_pending=verification,
         )
 
-        if mode == "verification":
+        if verification:
             (
                 staging_page_ids,
                 staging_key_pages,
@@ -2311,10 +2318,12 @@ class RetroSpecClusterPageStore:
                 logical_page_ids,
                 resident_access.miss_cluster_mask,
             )
+            resident_ready_event = resident_cache.pending_copy_event()
         else:
             staging_page_ids = torch.full_like(logical_page_ids, -1)
             staging_key_pages = resident_cache.key_pages[:0]
             staging_value_pages = resident_cache.value_pages[:0]
+            resident_ready_event = None
 
         return RetroSpecResolvedClusterPages(
             resident_page_ids=resident_access.cache_page_ids,
@@ -2325,7 +2334,7 @@ class RetroSpecClusterPageStore:
             staging_value_pages=staging_value_pages,
             hit_cluster_mask=resident_access.hit_cluster_mask,
             miss_cluster_mask=resident_access.miss_cluster_mask,
-            resident_ready_event=resident_cache.pending_copy_event(),
+            resident_ready_event=resident_ready_event,
         )
 
     def resolve_full_verification_blocks(
