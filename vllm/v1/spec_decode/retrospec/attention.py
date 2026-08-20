@@ -137,6 +137,7 @@ class RetroSpecSparseAttention:
                 segment_size_tokens=config.retrospec_index_segment_size,
                 blocks_per_cluster=config.retrospec_blocks_per_cluster,
                 num_kmeans_iterations=config.retrospec_kmeans_iterations,
+                max_pending_cluster_builds=config.retrospec_max_pending_cluster_builds,
                 cache_mode=config.retrospec_cache_mode,
                 cache_ratio=config.retrospec_cache_ratio,
                 pin_memory=(

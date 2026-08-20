@@ -30,6 +30,7 @@ def test_retrospec_defaults():
     assert config.retrospec_index_segment_size == 1024
     assert config.retrospec_blocks_per_cluster == 4
     assert config.retrospec_kmeans_iterations == 10
+    assert config.retrospec_max_pending_cluster_builds == 2
     assert config.retrospec_index_update_interval == 1024
     assert config.retrospec_min_draft_tokens == 1
     assert config.retrospec_max_draft_tokens == 16
@@ -111,6 +112,7 @@ def test_retrospec_requires_eager():
         ("retrospec_index_segment_size", 0),
         ("retrospec_blocks_per_cluster", 0),
         ("retrospec_kmeans_iterations", 0),
+        ("retrospec_max_pending_cluster_builds", 0),
         ("retrospec_index_update_interval", 0),
         ("num_speculative_tokens", 0),
         ("retrospec_min_draft_tokens", 0),
@@ -189,9 +191,10 @@ def test_retrospec_hash_tracks_execution_structure(field: str, value: Any):
         ("retrospec_hit_attn_threshold", 0.1),
         ("retrospec_retrieval_attn_threshold", 0.1),
         ("retrospec_expanded_attn_threshold", 0.1),
+        ("retrospec_max_pending_cluster_builds", 4),
     ],
 )
-def test_retrospec_hash_ignores_runtime_thresholds(field: str, value: Any):
+def test_retrospec_hash_ignores_runtime_only_fields(field: str, value: Any):
     base_hash = make_retrospec_config().compute_hash()
     changed_hash = make_retrospec_config(**{field: value}).compute_hash()
 

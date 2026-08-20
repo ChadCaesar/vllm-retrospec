@@ -43,6 +43,7 @@ def make_controller(
     index_mode: str = "block_mean",
     cache_mode: str = "gpu_reference",
     cache_ratio: float = 0.0,
+    max_pending_cluster_builds: int = 2,
 ) -> RetroSpecSparseAttention:
     config = cast(
         VllmConfig,
@@ -56,6 +57,7 @@ def make_controller(
                 retrospec_index_segment_size=4,
                 retrospec_blocks_per_cluster=1,
                 retrospec_kmeans_iterations=2,
+                retrospec_max_pending_cluster_builds=max_pending_cluster_builds,
                 retrospec_cache_mode=cache_mode,
                 retrospec_cache_ratio=cache_ratio,
             ),
@@ -110,6 +112,17 @@ def test_segmented_attention_configures_cluster_backing_store(
     assert controller.index.cluster_store.cache_ratio == pytest.approx(
         expected_cache_ratio
     )
+    assert controller.index.max_pending_cluster_builds == 2
+
+
+def test_segmented_attention_configures_pending_cluster_build_limit():
+    controller = make_controller(
+        index_mode="segmented_cluster",
+        max_pending_cluster_builds=4,
+    )
+
+    assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
+    assert controller.index.max_pending_cluster_builds == 4
 
 
 def make_plan(batch_size: int, width: int = 0) -> RetroSpecSelectionPlan:

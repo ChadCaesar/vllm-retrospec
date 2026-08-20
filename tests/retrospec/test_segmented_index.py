@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+from concurrent.futures import Future
 from unittest.mock import Mock
 
 import pytest
@@ -25,6 +26,7 @@ def make_index(
     cache_mode: RetroSpecClusterStorageMode = "gpu_reference",
     cache_ratio: float = 0.0,
     pin_memory: bool = False,
+    max_pending_cluster_builds: int = 2,
 ) -> RetroSpecSegmentedTokenIndex:
     return RetroSpecSegmentedTokenIndex(
         block_size=2,
@@ -34,6 +36,7 @@ def make_index(
         segment_size_tokens=segment_size_tokens,
         blocks_per_cluster=blocks_per_cluster,
         num_kmeans_iterations=2,
+        max_pending_cluster_builds=max_pending_cluster_builds,
         cache_mode=cache_mode,
         cache_ratio=cache_ratio,
         pin_memory=pin_memory,
@@ -844,6 +847,7 @@ def test_cpu_offload_can_defer_flush_and_discard_index_updates():
 
     assert not index.has_staged_updates
     assert index._cluster_build_executor is None
+    assert not index._pending_cluster_builds
     assert index.cluster_store.num_allocated_pages("layer") == 0
     assert index.needs_update("request", 10, ["layer"])
 
@@ -859,6 +863,7 @@ def test_cpu_offload_can_defer_flush_and_discard_index_updates():
 
     assert not index.has_staged_updates
     assert index._cluster_build_executor is None
+    assert not index._pending_cluster_builds
     assert index.cluster_store.num_allocated_pages("layer") == 2
     assert not index.needs_update("request", 10, ["layer"])
 
@@ -944,6 +949,56 @@ def test_cpu_offload_builds_cluster_pages_on_background_worker(monkeypatch):
     assert index.cluster_store.num_allocated_pages("layer") == 2
 
 
+def test_cpu_offload_backpressure_waits_for_oldest_pending_build():
+    index = make_index(cache_mode="cpu_offload", max_pending_cluster_builds=2)
+    first_build: Future = Future()
+    second_build: Future = Future()
+    index._pending_cluster_builds.extend((first_build, second_build))
+    wait_started = threading.Event()
+    slot_available = threading.Event()
+    errors: list[BaseException] = []
+
+    def wait_for_slot():
+        wait_started.set()
+        try:
+            index._wait_for_cluster_build_slot()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            slot_available.set()
+
+    waiter = threading.Thread(target=wait_for_slot)
+    waiter.start()
+
+    try:
+        assert wait_started.wait(timeout=5)
+        assert not slot_available.wait(timeout=0.1)
+        first_build.set_result(Mock())
+        assert slot_available.wait(timeout=5)
+    finally:
+        if not first_build.done():
+            first_build.set_result(Mock())
+        waiter.join(timeout=5)
+
+    assert not waiter.is_alive()
+    assert not errors
+    assert list(index._pending_cluster_builds) == [second_build]
+
+
+def test_cpu_offload_backpressure_reaps_completed_builds_and_propagates_errors():
+    index = make_index(cache_mode="cpu_offload", max_pending_cluster_builds=2)
+    completed_build: Future = Future()
+    failed_build: Future = Future()
+    completed_build.set_result(Mock())
+    failed_build.set_exception(RuntimeError("background build failed"))
+    index._pending_cluster_builds.extend((completed_build, failed_build))
+
+    with pytest.raises(RuntimeError, match="background build failed"):
+        index._wait_for_cluster_build_slot()
+
+    assert not index._pending_cluster_builds
+
+
 def test_cpu_offload_flush_rolls_back_all_layers_after_build_failure(monkeypatch):
     index = make_index(cache_mode="cpu_offload")
     keys, values = make_cache()
@@ -992,6 +1047,11 @@ def test_cpu_offload_stages_token_kv_before_clustering(monkeypatch):
 
     original_stage_token_kv = index.cluster_store.stage_token_kv
     original_finish_stage_clusters = index.cluster_store.finish_stage_clusters
+    original_wait_for_slot = index._wait_for_cluster_build_slot
+
+    def wait_for_cluster_build_slot():
+        call_order.append("wait_for_cluster_build_slot")
+        return original_wait_for_slot()
 
     def stage_token_kv(*args, **kwargs):
         call_order.append("stage_token_kv")
@@ -1008,6 +1068,11 @@ def test_cpu_offload_stages_token_kv_before_clustering(monkeypatch):
         return original_clustering(*args, **kwargs)
 
     monkeypatch.setattr(index.cluster_store, "stage_token_kv", stage_token_kv)
+    monkeypatch.setattr(
+        index,
+        "_wait_for_cluster_build_slot",
+        wait_for_cluster_build_slot,
+    )
     monkeypatch.setattr(
         index.cluster_store,
         "finish_stage_clusters",
@@ -1030,6 +1095,7 @@ def test_cpu_offload_stages_token_kv_before_clustering(monkeypatch):
 
     try:
         assert call_order == [
+            "wait_for_cluster_build_slot",
             "stage_token_kv",
             "segmented_kmeans_assignments",
             "finish_stage_clusters",
@@ -1187,6 +1253,7 @@ def test_segmented_index_builds_and_selects_on_cuda():
         ({"segment_size_tokens": 4, "blocks_per_cluster": 3}, "divisible"),
         ({"blocks_per_cluster": 0}, "positive"),
         ({"num_kmeans_iterations": 0}, "positive"),
+        ({"max_pending_cluster_builds": 0}, "positive"),
     ],
 )
 def test_segmented_index_rejects_invalid_configuration(kwargs, message):

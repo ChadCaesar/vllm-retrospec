@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import deque
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -181,6 +182,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         segment_size_tokens: int,
         blocks_per_cluster: int,
         num_kmeans_iterations: int,
+        max_pending_cluster_builds: int = 2,
         cache_mode: RetroSpecClusterStorageMode = "gpu_reference",
         cache_ratio: float = 0.0,
         pin_memory: bool = False,
@@ -198,6 +200,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             raise ValueError("blocks_per_cluster must be positive")
         if num_kmeans_iterations <= 0:
             raise ValueError("num_kmeans_iterations must be positive")
+        if max_pending_cluster_builds <= 0:
+            raise ValueError("max_pending_cluster_builds must be positive")
 
         tokens_per_cluster = blocks_per_cluster * block_size
         if segment_size_tokens % tokens_per_cluster != 0:
@@ -209,6 +213,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self.segment_size_tokens = segment_size_tokens
         self.tokens_per_cluster = tokens_per_cluster
         self.num_kmeans_iterations = num_kmeans_iterations
+        self.max_pending_cluster_builds = max_pending_cluster_builds
         effective_cache_ratio = cache_ratio
         if cache_mode == "cpu_offload" and cache_ratio == 0.0:
             # RetroInfer uses three sparse retrieval zones when an explicit
@@ -247,6 +252,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         # worker. The executor lives for one staged index transaction and is
         # closed by flush_staged_updates() or discard_staged_updates().
         self._cluster_build_executor: ThreadPoolExecutor | None = None
+        self._pending_cluster_builds: deque[Future[RetroSpecClusterBlockTable]] = (
+            deque()
+        )
 
     def _desired_indexed_end(self, seq_len: int) -> int:
         """Return the exclusive logical-token boundary covered by clustering."""
@@ -422,14 +430,25 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         staged_clusters: RetroSpecStagedClusterInput,
     ) -> Future[RetroSpecClusterBlockTable]:
         executor = self._get_cluster_build_executor()
-
-        return executor.submit(
+        build_future = executor.submit(
             self.cluster_store.store_staged_clusters,
             layer_name=layer_name,
             request_id=request_id,
             cluster_start=cluster_start,
             staged=staged_clusters,
         )
+        self._pending_cluster_builds.append(build_future)
+        return build_future
+
+    def _wait_for_cluster_build_slot(self) -> None:
+        """Bound queued builds before allocating another pinned staging input."""
+        while self._pending_cluster_builds and self._pending_cluster_builds[0].done():
+            self._pending_cluster_builds.popleft().result()
+
+        if len(self._pending_cluster_builds) < self.max_pending_cluster_builds:
+            return
+
+        self._pending_cluster_builds.popleft().result()
 
     def _release_built_segments(
         self,
@@ -565,6 +584,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self._staged_segments = []
         self._staged_segment_keys.clear()
         self._cluster_build_executor = None
+        self._pending_cluster_builds.clear()
 
         if not staged_segments:
             if executor is not None:
@@ -614,6 +634,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self._staged_segments = []
         self._staged_segment_keys.clear()
         self._cluster_build_executor = None
+        self._pending_cluster_builds.clear()
 
         cleanup_error: BaseException | None = None
 
@@ -790,6 +811,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
             staged_token_kv = None
             if self.cluster_store.is_cpu_backed:
+                self._wait_for_cluster_build_slot()
                 # Start token-KV D2H before clustering. Both streams only read
                 # the token tensors, so transfer and k-means can safely overlap.
                 staged_token_kv = self.cluster_store.stage_token_kv(
