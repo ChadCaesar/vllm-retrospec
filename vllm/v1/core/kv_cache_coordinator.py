@@ -198,6 +198,23 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
+    def retire_blocks(
+        self,
+        request_id: str,
+        kv_cache_group_id: int,
+        start_block: int,
+        end_block: int,
+    ) -> None:
+        """Retire one logical range in a specific KV cache group."""
+        if not 0 <= kv_cache_group_id < len(self.single_type_managers):
+            raise ValueError(f"Invalid KV cache group ID: {kv_cache_group_id}")
+
+        self.single_type_managers[kv_cache_group_id].retire_blocks(
+            request_id,
+            start_block,
+            end_block,
+        )
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
         Get the number of common prefix blocks for all requests with allocated

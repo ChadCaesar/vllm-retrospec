@@ -274,6 +274,25 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
         return False
 
+    def get_fully_stored_indexed_end(
+        self,
+        request_id: str,
+        layer_names: Sequence[str],
+    ) -> int:
+        """Return the token boundary stored successfully by every layer."""
+        layer_names = tuple(layer_names)
+        if not layer_names:
+            return self.block_size
+
+        indexed_ends: list[int] = []
+        for layer_name in layer_names:
+            record = self._indices.get(layer_name, {}).get(request_id)
+            if record is None:
+                return self.block_size
+            indexed_ends.append(record.indexed_end)
+
+        return min(indexed_ends)
+
     def remove_requests(self, request_ids: Sequence[str]) -> None:
         request_ids = tuple(request_ids)
 

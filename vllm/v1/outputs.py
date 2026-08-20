@@ -154,6 +154,16 @@ class ECConnectorOutput:
     finished_recving: set[str] | None = None
 
 
+@dataclass(frozen=True)
+class KVCacheRetirement:
+    """A logical KV block range that no longer owns native GPU blocks."""
+
+    request_id: str
+    kv_cache_group_id: int
+    start_block: int
+    end_block: int
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -194,6 +204,9 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # Native GPU KV blocks replaced by CPU-backed clustered storage.
+    kv_cache_retirements: list[KVCacheRetirement] = field(default_factory=list)
 
 
 # ModelRunnerOutput wrapper for async scheduling.

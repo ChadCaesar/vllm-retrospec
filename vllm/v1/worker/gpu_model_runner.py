@@ -119,6 +119,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.core.kv_cache_utils import KV_CACHE_NULL_BLOCK_ID
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -139,6 +140,7 @@ from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ECConnectorOutput,
+    KVCacheRetirement,
     KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -878,6 +880,43 @@ class GPUModelRunner(
     # Note: used for model runner override.
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
+
+    def _apply_retrospec_kv_retirements(
+        self,
+        retirements: Sequence[KVCacheRetirement],
+    ) -> None:
+        for retirement in retirements:
+            request_id = retirement.request_id
+            request = self.requests.get(request_id)
+            if request is None:
+                raise RuntimeError(
+                    f"Cannot retire KV blocks for unknown request {request_id!r}"
+                )
+
+            group_id = retirement.kv_cache_group_id
+            if not 0 <= group_id < len(request.block_ids):
+                raise ValueError(f"Invalid KV cache group ID: {group_id}")
+
+            block_ids = request.block_ids[group_id]
+            start_block = retirement.start_block
+            end_block = retirement.end_block
+            if end_block > len(block_ids):
+                raise ValueError(
+                    f"Retirement end {end_block} exceeds {len(block_ids)} blocks"
+                )
+
+            block_ids[start_block:end_block] = [KV_CACHE_NULL_BLOCK_ID] * (
+                end_block - start_block
+            )
+
+            req_index = self.input_batch.req_id_to_index.get(request_id)
+            if req_index is not None:
+                self.input_batch.block_table.retire_blocks(
+                    kv_cache_group_id=group_id,
+                    row_idx=req_index,
+                    start_block=start_block,
+                    end_block=end_block,
+                )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -3396,10 +3435,13 @@ class GPUModelRunner(
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             retrospec_drafter = getattr(self, "drafter", None)
+            has_retired_retrospec_kv = isinstance(
+                retrospec_drafter, RetroSpecProposer
+            ) and retrospec_drafter.has_retired_kv_blocks(req_ids)
             use_retrospec_full_verification = (
                 isinstance(retrospec_drafter, RetroSpecProposer)
-                and use_spec_decode
                 and retrospec_drafter.uses_full_verification_offload
+                and (use_spec_decode or has_retired_retrospec_kv)
             )
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
@@ -3549,6 +3591,12 @@ class GPUModelRunner(
             index_seq_lens = [
                 self.requests[request_id].num_computed_tokens
                 + int(num_scheduled_tokens_np[row])
+                - len(
+                    scheduler_output.scheduled_spec_decode_tokens.get(
+                        request_id,
+                        (),
+                    )
+                )
                 for row, request_id in enumerate(req_ids)
             ]
 
@@ -3846,6 +3894,14 @@ class GPUModelRunner(
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        kv_cache_retirements: list[KVCacheRetirement] = []
+        retrospec_drafter = getattr(self, "drafter", None)
+        if isinstance(retrospec_drafter, RetroSpecProposer):
+            kv_cache_retirements = retrospec_drafter.take_kv_cache_retirements(
+                tuple(scheduler_output.num_scheduled_tokens)
+            )
+            self._apply_retrospec_kv_retirements(kv_cache_retirements)
+
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
@@ -3869,6 +3925,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                kv_cache_retirements=kv_cache_retirements,
             )
 
         if not self.use_async_scheduling:

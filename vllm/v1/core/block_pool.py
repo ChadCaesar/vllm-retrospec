@@ -13,6 +13,7 @@ from vllm.distributed.kv_events import (
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
+    KV_CACHE_NULL_BLOCK_ID,
     BlockHash,
     BlockHashList,
     BlockHashListWithBlockSize,
@@ -172,6 +173,7 @@ class BlockPool:
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
+        assert self.null_block.block_id == KV_CACHE_NULL_BLOCK_ID
         self.null_block.is_null = True
 
         self.enable_kv_cache_events = enable_kv_cache_events

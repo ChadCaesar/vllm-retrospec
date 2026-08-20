@@ -275,6 +275,33 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
 
+    def retire_blocks(
+        self,
+        request_id: str,
+        start_block: int,
+        end_block: int,
+    ) -> None:
+        """Replace native blocks in [start_block, end_block) with null blocks."""
+        if start_block < 0 or end_block < start_block:
+            raise ValueError("Invalid KV block retirement range")
+
+        blocks = self.req_to_blocks.get(request_id)
+        if blocks is None:
+            raise KeyError(f"Request {request_id!r} does not own KV blocks")
+        if end_block > len(blocks):
+            raise ValueError(f"Retirement end {end_block} exceeds {len(blocks)} blocks")
+
+        removed_blocks: list[KVCacheBlock] = []
+        for block_index in range(end_block - 1, start_block - 1, -1):
+            block = blocks[block_index]
+            if block.is_null:
+                continue
+
+            removed_blocks.append(block)
+            blocks[block_index] = self._null_block
+
+        self.block_pool.free_blocks(removed_blocks)
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """

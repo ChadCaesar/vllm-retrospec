@@ -118,7 +118,6 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     assert record.indexed_end == 6
     assert record.num_clusters == 2
     assert len(record.segments) == 1
-
     segment = record.segments[0]
     metadata = index.cluster_store.get_cluster_block_metadata(
         "layer", segment.cluster_blocks.cluster_ids
@@ -183,6 +182,32 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     )
     assert torch.count_nonzero(expanded.estimation_token_counts) == 0
     assert expanded.attention_mass.item() >= sparse.attention_mass.item()
+
+
+def test_fully_stored_indexed_end_uses_slowest_layer():
+    index = make_index()
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+
+    assert (
+        index.get_fully_stored_indexed_end("request", ["layer", "missing-layer"])
+        == index.block_size
+    )
+
+    index.build_or_update(
+        layer_name="other-layer",
+        request_ids=["request"],
+        seq_lens=[14],
+        rows=[0],
+        key_cache=keys,
+        value_cache=values,
+        block_table=block_table,
+    )
+
+    assert index._indices["layer"]["request"].indexed_end == 6
+    assert index._indices["other-layer"]["request"].indexed_end == 10
+    assert index.get_fully_stored_indexed_end("request", ["layer", "other-layer"]) == 6
 
 
 def test_segmented_index_clusters_each_kv_head_independently():

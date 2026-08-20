@@ -7,6 +7,7 @@ import torch
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.kv_cache_utils import KV_CACHE_NULL_BLOCK_ID
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
@@ -118,6 +119,45 @@ class BlockTable:
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
+
+    def retire_blocks(
+        self,
+        row_idx: int,
+        start_block: int,
+        end_block: int,
+    ) -> None:
+        """Replace manager-level blocks with the null-block mapping."""
+        if start_block < 0 or end_block < start_block:
+            raise ValueError("Invalid KV block retirement range")
+
+        kernel_start = start_block * self.blocks_per_kv_block
+        kernel_end = end_block * self.blocks_per_kv_block
+        if kernel_end > self.num_blocks_per_row[row_idx]:
+            raise ValueError(
+                f"Retirement end {kernel_end} exceeds row size "
+                f"{self.num_blocks_per_row[row_idx]}"
+            )
+        if kernel_start == kernel_end:
+            return
+
+        if not self.use_hybrid_blocks:
+            self.block_table.np[row_idx, kernel_start:kernel_end] = (
+                KV_CACHE_NULL_BLOCK_ID
+            )
+            return
+
+        assert self._kernel_block_arange is not None
+        retired_ids = np.full(
+            end_block - start_block,
+            KV_CACHE_NULL_BLOCK_ID,
+            dtype=np.int32,
+        )
+        null_kernel_ids = self.map_to_kernel_blocks(
+            retired_ids,
+            self.blocks_per_kv_block,
+            self._kernel_block_arange,
+        )
+        self.block_table.np[row_idx, kernel_start:kernel_end] = null_kernel_ids
 
     def move_row(self, src: int, tgt: int) -> None:
         num_blocks = self.num_blocks_per_row[src]
@@ -310,6 +350,19 @@ class MultiGroupBlockTable:
     def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.add_row(block_ids[i], row_idx)
+
+    def retire_blocks(
+        self,
+        kv_cache_group_id: int,
+        row_idx: int,
+        start_block: int,
+        end_block: int,
+    ) -> None:
+        self.block_tables[kv_cache_group_id].retire_blocks(
+            row_idx,
+            start_block,
+            end_block,
+        )
 
     def move_row(self, src: int, tgt: int) -> None:
         for block_table in self.block_tables:

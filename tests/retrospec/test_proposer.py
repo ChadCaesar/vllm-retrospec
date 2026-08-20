@@ -11,6 +11,7 @@ import torch
 
 from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.retrospec import (
     RetroSpecAttentionMode,
@@ -241,6 +242,39 @@ def test_retrospec_proposer_delegates_full_verification_context():
         [5],
         [2],
     )
+
+
+def test_retrospec_proposer_attaches_kv_cache_group_to_retirement():
+    proposer = RetroSpecProposer(
+        make_vllm_config(
+            retrospec_index_mode="segmented_cluster",
+            retrospec_cache_mode="cpu_offload",
+        ),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer.attn_layer_names = ["layer"]
+    kv_cache_config = cast(
+        KVCacheConfig,
+        SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=["other"]),
+                SimpleNamespace(layer_names=["layer"]),
+            ]
+        ),
+    )
+    proposer.validate_same_kv_cache_group(kv_cache_config)
+    proposer.sparse_attention.take_kv_cache_retirement_ranges = Mock(
+        return_value=[("request", 1, 4)]
+    )
+
+    retirements = proposer.take_kv_cache_retirements(["request"])
+
+    assert len(retirements) == 1
+    assert retirements[0].request_id == "request"
+    assert retirements[0].kv_cache_group_id == 1
+    assert retirements[0].start_block == 1
+    assert retirements[0].end_block == 4
 
 
 def test_propose_rejects_random_sampling():

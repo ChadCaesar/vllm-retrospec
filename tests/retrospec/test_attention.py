@@ -456,6 +456,49 @@ def test_full_verification_context_restores_state_after_exception():
     assert controller.full_verification_batch is None
 
 
+def test_attention_reports_only_new_fully_stored_retirement_ranges():
+    controller = make_controller(
+        index_mode="segmented_cluster",
+        cache_mode="cpu_offload",
+    )
+    mark_installed(controller)
+    assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
+    controller.index.get_fully_stored_indexed_end = Mock(return_value=6)
+
+    assert controller.take_kv_cache_retirement_ranges(["request"]) == [
+        ("request", 1, 3)
+    ]
+    assert controller.has_retired_kv_blocks(["request"])
+    assert controller.take_kv_cache_retirement_ranges(["request"]) == []
+
+    controller.index.get_fully_stored_indexed_end.return_value = 10
+    assert controller.take_kv_cache_retirement_ranges(["request"]) == [
+        ("request", 3, 5)
+    ]
+
+    controller.remove_requests(["request"])
+    assert not controller.has_retired_kv_blocks(["request"])
+
+
+def test_full_verification_rejects_rollback_behind_retired_boundary():
+    controller = make_controller(
+        index_mode="segmented_cluster",
+        cache_mode="cpu_offload",
+    )
+    mark_installed(controller)
+    controller._retired_block_ends["request"] = 3
+
+    with (
+        pytest.raises(RuntimeError, match="behind retired KV boundary 6"),
+        controller.full_verification_context(
+            request_ids=["request"],
+            context_lens=[5],
+            query_lens=[1],
+        ),
+    ):
+        pass
+
+
 def test_forward_dispatches_full_verification_and_updates_prefill_index():
     controller = make_controller(
         index_mode="segmented_cluster",

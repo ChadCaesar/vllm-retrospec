@@ -156,6 +156,10 @@ class RetroSpecSparseAttention:
 
         self.full_verification_batch: _RetroSpecFullVerificationBatch | None = None
 
+        # request_id -> exclusive logical block boundary already retired.
+        # Block 0 remains the permanent exact sink.
+        self._retired_block_ends: dict[str, int] = {}
+
         self.prefill_index_active = False
         self.prefill_request_ids: tuple[str, ...] = ()
         self.prefill_seq_lens: tuple[int, ...] = ()
@@ -239,9 +243,58 @@ class RetroSpecSparseAttention:
             tuple(self.original_forwards),
         )
 
+    def has_retired_kv_blocks(self, request_ids: Sequence[str]) -> bool:
+        if not self.uses_full_verification_offload:
+            return False
+
+        return any(
+            self._retired_block_ends.get(request_id, 1) > 1
+            for request_id in request_ids
+        )
+
+    def take_kv_cache_retirement_ranges(
+        self,
+        request_ids: Sequence[str],
+    ) -> list[tuple[str, int, int]]:
+        """Return newly replaceable native block ranges."""
+        if not self.uses_full_verification_offload:
+            return []
+        if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
+            return []
+        if self.index.has_staged_updates:
+            raise RuntimeError("Cannot retire KV blocks before index commit")
+
+        layer_names = tuple(self.original_forwards)
+        retirements: list[tuple[str, int, int]] = []
+
+        for request_id in request_ids:
+            indexed_end = self.index.get_fully_stored_indexed_end(
+                request_id,
+                layer_names,
+            )
+            new_end_block = indexed_end // self.block_size
+            old_end_block = self._retired_block_ends.get(request_id, 1)
+
+            if new_end_block < old_end_block:
+                raise RuntimeError(
+                    f"Stored index for {request_id!r} moved behind retired KV"
+                )
+            if new_end_block == old_end_block:
+                continue
+
+            retirements.append((request_id, old_end_block, new_end_block))
+            self._retired_block_ends[request_id] = new_end_block
+
+        return retirements
+
     def remove_requests(self, request_ids: Sequence[str]) -> None:
+        request_ids = tuple(request_ids)
+
         if isinstance(self.index, RetroSpecSegmentedTokenIndex):
             self.index.remove_requests(request_ids)
+
+        for request_id in request_ids:
+            self._retired_block_ends.pop(request_id, None)
 
     @staticmethod
     def _validate_layer(
@@ -364,6 +417,18 @@ class RetroSpecSparseAttention:
             raise ValueError("Full-verification context lengths must be non-negative")
         if any(length <= 0 for length in query_lens):
             raise ValueError("Full-verification query lengths must be positive")
+
+        for request_id, context_len in zip(request_ids, context_lens):
+            retired_end_block = self._retired_block_ends.get(request_id, 1)
+            if retired_end_block <= 1:
+                continue
+
+            retired_end = retired_end_block * self.block_size
+            if context_len < retired_end:
+                raise RuntimeError(
+                    f"Request {request_id!r} rolled back to {context_len}, "
+                    f"behind retired KV boundary {retired_end}"
+                )
 
         assert isinstance(self.index, RetroSpecSegmentedTokenIndex)
         self.index.prepare_full_verification(

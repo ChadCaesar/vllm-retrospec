@@ -385,6 +385,21 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def retire_blocks(
+        self,
+        request_id: str,
+        kv_cache_group_id: int,
+        start_block: int,
+        end_block: int,
+    ) -> None:
+        """Release native GPU ownership for a logical KV block range."""
+        self.coordinator.retire_blocks(
+            request_id,
+            kv_cache_group_id,
+            start_block,
+            end_block,
+        )
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:

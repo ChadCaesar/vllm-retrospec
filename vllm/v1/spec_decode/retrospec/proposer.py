@@ -16,6 +16,7 @@ from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionMetadataBuilder, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import KVCacheRetirement
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
@@ -95,6 +96,7 @@ class RetroSpecProposer:
         )
         self.attn_metadata_builder: AttentionMetadataBuilder | None = None
         self.attn_layer_names: list[str] = []
+        self.kv_cache_group_id: int | None = None
 
         self.input_ids = torch.zeros(
             self.max_batch_size, dtype=torch.int32, device=device
@@ -151,6 +153,29 @@ class RetroSpecProposer:
             context_lens,
             query_lens,
         )
+
+    def has_retired_kv_blocks(self, request_ids: Sequence[str]) -> bool:
+        return self.sparse_attention.has_retired_kv_blocks(request_ids)
+
+    def take_kv_cache_retirements(
+        self,
+        request_ids: Sequence[str],
+    ) -> list[KVCacheRetirement]:
+        ranges = self.sparse_attention.take_kv_cache_retirement_ranges(request_ids)
+        if not ranges:
+            return []
+        if self.kv_cache_group_id is None:
+            raise RuntimeError("RetroSpec KV cache group has not been initialized")
+
+        return [
+            KVCacheRetirement(
+                request_id=request_id,
+                kv_cache_group_id=self.kv_cache_group_id,
+                start_block=start_block,
+                end_block=end_block,
+            )
+            for request_id, start_block, end_block in ranges
+        ]
 
     def needs_index_update(
         self,
@@ -216,6 +241,8 @@ class RetroSpecProposer:
                 "RetroSpec currently requires all attention layers to use the "
                 "same KV-cache group."
             )
+
+        self.kv_cache_group_id = next(iter(group_indices))
 
     def prepare_next_token_ids_padded(
         self,

@@ -51,7 +51,12 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    KVCacheRetirement,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -1238,6 +1243,29 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    def _apply_kv_cache_retirements(
+        self,
+        scheduler_output: SchedulerOutput,
+        retirements: list[KVCacheRetirement],
+    ) -> None:
+        for retirement in retirements:
+            request_id = retirement.request_id
+            if request_id not in scheduler_output.num_scheduled_tokens:
+                raise RuntimeError(
+                    f"Worker retired KV blocks for unscheduled request {request_id!r}"
+                )
+
+            request = self.requests.get(request_id)
+            if request is None or request.is_finished():
+                continue
+
+            self.kv_cache_manager.retire_blocks(
+                request_id=request_id,
+                kv_cache_group_id=retirement.kv_cache_group_id,
+                start_block=retirement.start_block,
+                end_block=retirement.end_block,
+            )
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1251,6 +1279,10 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        self._apply_kv_cache_retirements(
+            scheduler_output,
+            model_runner_output.kv_cache_retirements,
+        )
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():

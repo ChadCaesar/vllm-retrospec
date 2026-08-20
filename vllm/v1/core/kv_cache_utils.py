@@ -43,6 +43,10 @@ BlockHashWithGroupId = NewType("BlockHashWithGroupId", bytes)
 # after we default block hashing to use sha256 bytes.
 ExternalBlockHash: TypeAlias = bytes | int
 
+# Block 0 is reserved by BlockPool as a physical placeholder for logical
+# positions whose native GPU KV storage has been released.
+KV_CACHE_NULL_BLOCK_ID = 0
+
 
 def make_block_hash_with_group_id(
     block_hash: BlockHash, group_id: int

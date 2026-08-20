@@ -14,9 +14,14 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    FullAttentionManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import ChunkedLocalAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
+    FullAttentionSpec,
+    SlidingWindowSpec,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -39,6 +44,83 @@ def get_chunked_local_attention_manager(
         enable_caching=enable_caching,
         kv_cache_group_id=0,
     )
+
+
+def test_retire_blocks_preserves_logical_layout_and_releases_ownership():
+    attention_spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=16,
+        enable_caching=False,
+        hash_block_size=2,
+    )
+    manager = FullAttentionManager(
+        attention_spec,
+        block_pool=block_pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+    )
+    blocks = block_pool.get_new_blocks(5)
+    original_block_ids = [block.block_id for block in blocks]
+    manager.req_to_blocks["request"] = list(blocks)
+    free_blocks_before = block_pool.get_num_free_blocks()
+
+    manager.retire_blocks("request", 1, 4)
+
+    request_blocks = manager.req_to_blocks["request"]
+    assert len(request_blocks) == 5
+    assert [block.block_id for block in request_blocks] == [
+        original_block_ids[0],
+        block_pool.null_block.block_id,
+        block_pool.null_block.block_id,
+        block_pool.null_block.block_id,
+        original_block_ids[4],
+    ]
+    assert block_pool.get_num_free_blocks() == free_blocks_before + 3
+
+    # A duplicate scheduler acknowledgement must not decrement references twice.
+    manager.retire_blocks("request", 1, 4)
+    assert block_pool.get_num_free_blocks() == free_blocks_before + 3
+
+
+def test_retire_blocks_decrements_shared_block_reference_only_once():
+    attention_spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=16,
+        enable_caching=True,
+        hash_block_size=2,
+    )
+    manager = FullAttentionManager(
+        attention_spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+    )
+    shared_block = block_pool.get_new_blocks(1)[0]
+    block_pool.touch([shared_block])
+    manager.req_to_blocks["request-a"] = [shared_block]
+    manager.req_to_blocks["request-b"] = [shared_block]
+    free_blocks_before = block_pool.get_num_free_blocks()
+
+    manager.retire_blocks("request-a", 0, 1)
+
+    assert shared_block.ref_cnt == 1
+    assert block_pool.get_num_free_blocks() == free_blocks_before
+    assert manager.req_to_blocks["request-a"] == [block_pool.null_block]
+    assert manager.req_to_blocks["request-b"] == [shared_block]
+
+    manager.retire_blocks("request-b", 0, 1)
+    assert shared_block.ref_cnt == 0
+    assert block_pool.get_num_free_blocks() == free_blocks_before + 1
 
 
 def test_chunked_local_attention_possible_cached_prefix():
