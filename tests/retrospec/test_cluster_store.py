@@ -157,6 +157,159 @@ def test_cluster_store_packs_per_head_clusters_across_pages():
     assert not gathered_values[~token_mask.unsqueeze(-1)].any()
 
 
+@pytest.mark.parametrize(
+    ("page_size", "num_kv_heads", "num_tokens", "num_clusters", "head_size"),
+    [
+        (1, 1, 7, 3, 2),
+        (2, 2, 11, 5, 3),
+        (4, 3, 13, 7, 1),
+    ],
+)
+@pytest.mark.parametrize(
+    "device_type",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(),
+                reason="CUDA is required for GPU-reference packing",
+            ),
+        ),
+    ],
+)
+def test_cluster_store_vectorized_packing_matches_cluster_membership(
+    page_size,
+    num_kv_heads,
+    num_tokens,
+    num_clusters,
+    head_size,
+    device_type,
+):
+    device = torch.device(device_type)
+    generator = torch.Generator().manual_seed(
+        page_size * 1000 + num_kv_heads * 100 + num_clusters
+    )
+    assignments = torch.randint(
+        num_clusters,
+        (num_kv_heads, num_tokens),
+        generator=generator,
+        dtype=torch.int64,
+    )
+    cluster_token_counts = torch.zeros(
+        num_kv_heads,
+        num_clusters,
+        dtype=torch.int32,
+    )
+    cluster_token_counts.scatter_add_(
+        1,
+        assignments,
+        torch.ones_like(assignments, dtype=torch.int32),
+    )
+
+    keys = torch.arange(
+        num_kv_heads * num_tokens * head_size,
+        dtype=torch.float32,
+    ).view(num_kv_heads, num_tokens, head_size)
+    values = keys + 1000
+    store = RetroSpecClusterPageStore(page_size=page_size)
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    metadata = get_block_metadata(store, table)
+    key_pages, value_pages = store.get_page_storage("layer")
+
+    for head_index in range(num_kv_heads):
+        for cluster_index in range(num_clusters):
+            token_count = int(cluster_token_counts[head_index, cluster_index])
+            expected_keys = keys[head_index][
+                assignments[head_index] == cluster_index
+            ].to(device)
+            expected_values = values[head_index][
+                assignments[head_index] == cluster_index
+            ].to(device)
+
+            valid_pages = metadata.page_ids[head_index, cluster_index] >= 0
+            cluster_page_ids = metadata.page_ids[
+                head_index,
+                cluster_index,
+                valid_pages,
+            ].to(device=device, dtype=torch.int64)
+            cluster_page_token_counts = metadata.page_token_counts[
+                head_index,
+                cluster_index,
+                valid_pages,
+            ]
+
+            if token_count == 0:
+                assert table.cluster_ids[head_index, cluster_index] == -1
+                assert cluster_page_ids.numel() == 0
+                continue
+
+            cluster_key_pages = key_pages.index_select(0, cluster_page_ids)
+            cluster_value_pages = value_pages.index_select(0, cluster_page_ids)
+            token_mask = torch.arange(
+                page_size,
+                device=cluster_page_token_counts.device,
+            ).view(1, page_size) < cluster_page_token_counts.view(-1, 1)
+
+            torch.testing.assert_close(cluster_key_pages[token_mask], expected_keys)
+            torch.testing.assert_close(
+                cluster_value_pages[token_mask],
+                expected_values,
+            )
+            assert not cluster_key_pages[~token_mask].any()
+            assert not cluster_value_pages[~token_mask].any()
+
+
+def test_cluster_store_vectorized_packing_writes_pages_once():
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    pool = store._get_or_create_pool("layer", keys)
+    pool.write = Mock(wraps=pool.write)
+
+    store_cluster_data(
+        store,
+        "layer",
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+    )
+
+    pool.write.assert_called_once()
+    written_page_ids, written_keys, written_values = pool.write.call_args.args
+    assert written_page_ids.numel() == 6
+    assert written_keys.shape == (6, 2, 1)
+    assert written_values.shape == written_keys.shape
+
+
+@pytest.mark.parametrize("invalid_assignment", [-1, 2])
+def test_cluster_store_rejects_assignment_outside_cluster_range(
+    invalid_assignment,
+):
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    assignments[0, 0] = invalid_assignment
+
+    with pytest.raises(RuntimeError, match="assignment count"):
+        store_cluster_data(
+            store,
+            "layer",
+            keys,
+            values,
+            assignments,
+            cluster_token_counts,
+        )
+
+    assert store.num_allocated_pages("layer") == 0
+
+
 def test_cluster_store_tracks_request_head_local_cluster_identities():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()

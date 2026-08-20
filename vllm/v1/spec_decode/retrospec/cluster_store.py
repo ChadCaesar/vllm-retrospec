@@ -1711,6 +1711,223 @@ class RetroSpecClusterPageStore:
             device=pool.storage_device,
         )
 
+    @staticmethod
+    def _validate_cluster_assignment_counts(
+        assignments: torch.Tensor,
+        cluster_token_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assignments_int64 = assignments.to(torch.int64)
+        cluster_token_counts_int64 = cluster_token_counts.to(torch.int64)
+        num_clusters = cluster_token_counts.shape[1]
+
+        if assignments_int64.numel():
+            invalid_assignments = (assignments_int64 < 0) | (
+                assignments_int64 >= num_clusters
+            )
+            if torch.any(invalid_assignments).item():
+                raise RuntimeError(
+                    "Cluster assignment count does not match cluster_token_counts"
+                )
+
+        actual_cluster_counts = torch.zeros_like(cluster_token_counts_int64)
+        actual_cluster_counts.scatter_add_(
+            dim=1,
+            index=assignments_int64,
+            src=torch.ones_like(assignments_int64),
+        )
+
+        if not torch.equal(actual_cluster_counts, cluster_token_counts_int64):
+            raise RuntimeError(
+                "Cluster assignment count does not match cluster_token_counts"
+            )
+
+        return assignments_int64, cluster_token_counts_int64
+
+    def _pack_cluster_pages(
+        self,
+        pool: _LayerClusterPagePool,
+        storage_keys: torch.Tensor,
+        storage_values: torch.Tensor,
+        storage_assignments: torch.Tensor,
+        storage_cluster_counts: torch.Tensor,
+        cluster_page_counts: torch.Tensor,
+        total_pages: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_kv_heads, num_tokens, head_size = storage_keys.shape
+
+        packed_keys = self._allocate_packed_pages(pool, total_pages)
+        packed_values = self._allocate_packed_pages(pool, total_pages)
+
+        if num_tokens == 0:
+            return packed_keys, packed_values
+
+        # Clusters are ordered by cluster ID. stable=True preserves the
+        # original logical-token order within each cluster.
+        sorted_token_indices = torch.argsort(
+            storage_assignments,
+            dim=1,
+            stable=True,
+        )
+        sorted_assignments = torch.gather(
+            storage_assignments,
+            dim=1,
+            index=sorted_token_indices,
+        )
+
+        gather_indices = sorted_token_indices.unsqueeze(-1).expand(
+            -1,
+            -1,
+            head_size,
+        )
+        sorted_keys = torch.gather(
+            storage_keys,
+            dim=1,
+            index=gather_indices,
+        )
+        sorted_values = torch.gather(
+            storage_values,
+            dim=1,
+            index=gather_indices,
+        )
+
+        cluster_token_offsets = (
+            torch.cumsum(
+                storage_cluster_counts,
+                dim=1,
+            )
+            - storage_cluster_counts
+        )
+
+        flat_cluster_page_counts = cluster_page_counts.reshape(-1)
+        flat_cluster_page_offsets = (
+            torch.cumsum(
+                flat_cluster_page_counts,
+                dim=0,
+            )
+            - flat_cluster_page_counts
+        )
+        cluster_page_offsets = flat_cluster_page_offsets.view_as(cluster_page_counts)
+
+        sorted_cluster_token_offsets = torch.gather(
+            cluster_token_offsets,
+            dim=1,
+            index=sorted_assignments,
+        )
+        sorted_cluster_page_offsets = torch.gather(
+            cluster_page_offsets,
+            dim=1,
+            index=sorted_assignments,
+        )
+
+        sorted_token_positions = torch.arange(
+            num_tokens,
+            dtype=torch.int64,
+            device=pool.storage_device,
+        ).view(1, num_tokens)
+        token_offsets_in_cluster = sorted_token_positions - sorted_cluster_token_offsets
+        packed_token_positions = (
+            sorted_cluster_page_offsets * self.page_size + token_offsets_in_cluster
+        ).reshape(-1)
+
+        packed_keys.view(-1, head_size).index_copy_(
+            0,
+            packed_token_positions,
+            sorted_keys.reshape(num_kv_heads * num_tokens, head_size),
+        )
+        packed_values.view(-1, head_size).index_copy_(
+            0,
+            packed_token_positions,
+            sorted_values.reshape(num_kv_heads * num_tokens, head_size),
+        )
+
+        return packed_keys, packed_values
+
+    def _build_cluster_page_metadata(
+        self,
+        cluster_token_counts: torch.Tensor,
+        cluster_page_counts: torch.Tensor,
+        allocated_metadata_page_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cluster_token_counts_cpu = cluster_token_counts.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        )
+        cluster_page_counts_cpu = cluster_page_counts.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        )
+
+        num_kv_heads, num_clusters = cluster_token_counts_cpu.shape
+        max_pages_per_cluster = (
+            int(cluster_page_counts_cpu.max().item())
+            if cluster_page_counts_cpu.numel()
+            else 0
+        )
+
+        metadata_shape = (
+            num_kv_heads,
+            num_clusters,
+            max_pages_per_cluster,
+        )
+        page_ids = torch.full(
+            metadata_shape,
+            -1,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+        page_token_counts = torch.zeros(
+            metadata_shape,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+
+        if max_pages_per_cluster == 0:
+            return page_ids, page_token_counts
+
+        page_offsets = torch.arange(
+            max_pages_per_cluster,
+            dtype=torch.int64,
+            device="cpu",
+        ).view(1, 1, max_pages_per_cluster)
+        valid_page_mask = page_offsets < cluster_page_counts_cpu.unsqueeze(-1)
+        expected_page_count = int(valid_page_mask.sum().item())
+
+        if expected_page_count != allocated_metadata_page_ids.numel():
+            raise RuntimeError(
+                "Cluster page metadata does not cover all allocated pages"
+            )
+
+        # Row-major (head, cluster, page) order matches the flattened page
+        # offsets used for packing and the order returned by pool.allocate().
+        page_ids.masked_scatter_(
+            valid_page_mask,
+            allocated_metadata_page_ids,
+        )
+        page_token_counts.masked_fill_(
+            valid_page_mask,
+            self.page_size,
+        )
+
+        valid_cluster_mask = cluster_token_counts_cpu > 0
+        last_page_mask = valid_page_mask & (
+            page_offsets == cluster_page_counts_cpu.unsqueeze(-1) - 1
+        )
+        last_page_token_counts = (
+            torch.remainder(
+                cluster_token_counts_cpu[valid_cluster_mask] - 1,
+                self.page_size,
+            )
+            + 1
+        ).to(torch.int32)
+        page_token_counts.masked_scatter_(
+            last_page_mask,
+            last_page_token_counts,
+        )
+
+        return page_ids, page_token_counts
+
     def store_clusters(
         self,
         layer_name: str,
@@ -1727,132 +1944,72 @@ class RetroSpecClusterPageStore:
             raise ValueError("cluster_start must be non-negative")
 
         self._validate_cluster_input_metadata(
-            token_keys, token_values, assignments, cluster_token_counts
+            token_keys,
+            token_values,
+            assignments,
+            cluster_token_counts,
         )
 
         if torch.any(cluster_token_counts < 0).item():
             raise ValueError("cluster_token_counts must be non-negative")
 
         pool = self._get_or_create_pool(
-            layer_name, token_keys, metadata_device=metadata_device
+            layer_name,
+            token_keys,
+            metadata_device=metadata_device,
         )
         storage_keys = self._move_to_storage(token_keys, pool.storage_device)
         storage_values = self._move_to_storage(token_values, pool.storage_device)
-        storage_assignments = self._move_to_storage(assignments, pool.storage_device)
+        storage_assignments = self._move_to_storage(
+            assignments,
+            pool.storage_device,
+        )
         storage_cluster_counts = self._move_to_storage(
             cluster_token_counts, pool.storage_device
         )
 
-        num_kv_heads, _, head_size = token_keys.shape
-        num_clusters = cluster_token_counts.shape[1]
+        storage_assignments, storage_cluster_counts = (
+            self._validate_cluster_assignment_counts(
+                storage_assignments,
+                storage_cluster_counts,
+            )
+        )
 
         cluster_page_counts = torch.div(
-            storage_cluster_counts.to(torch.int64) + self.page_size - 1,
+            storage_cluster_counts + self.page_size - 1,
             self.page_size,
             rounding_mode="floor",
         )
         total_pages = int(cluster_page_counts.sum().item())
-        max_pages_per_cluster = (
-            int(cluster_page_counts.max().item()) if cluster_page_counts.numel() else 0
-        )
 
         allocated_storage_page_ids = pool.allocate(total_pages)
         allocated_metadata_page_ids = allocated_storage_page_ids.detach().to(
             device="cpu", dtype=torch.int64
         )
 
-        page_ids = torch.full(
-            (
-                num_kv_heads,
-                num_clusters,
-                max_pages_per_cluster,
-            ),
-            -1,
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=self.pin_memory,
-        )
-        page_token_counts = torch.zeros(
-            page_ids.shape,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=self.pin_memory,
-        )
-
-        cursor = 0
         try:
-            for head_index in range(num_kv_heads):
-                for cluster_index in range(num_clusters):
-                    token_count = int(
-                        storage_cluster_counts[
-                            head_index,
-                            cluster_index,
-                        ].item()
-                    )
-                    if token_count == 0:
-                        continue
-
-                    num_pages = (token_count + self.page_size - 1) // self.page_size
-                    storage_page_ids = allocated_storage_page_ids[
-                        cursor : cursor + num_pages
-                    ]
-                    metadata_page_ids = allocated_metadata_page_ids[
-                        cursor : cursor + num_pages
-                    ]
-                    cursor += num_pages
-
-                    member_indices = torch.nonzero(
-                        storage_assignments[head_index] == cluster_index,
-                        as_tuple=False,
-                    ).flatten()
-
-                    if member_indices.numel() != token_count:
-                        raise RuntimeError(
-                            "Cluster assignment count does not match "
-                            "cluster_token_counts"
-                        )
-
-                    packed_keys = self._allocate_packed_pages(pool, num_pages)
-                    packed_values = self._allocate_packed_pages(pool, num_pages)
-
-                    packed_keys.view(-1, head_size)[:token_count].copy_(
-                        storage_keys[head_index].index_select(0, member_indices)
-                    )
-                    packed_values.view(-1, head_size)[:token_count].copy_(
-                        storage_values[head_index].index_select(0, member_indices)
-                    )
-
-                    pool.write(
-                        storage_page_ids,
-                        packed_keys,
-                        packed_values,
-                    )
-
-                    page_ids[
-                        head_index,
-                        cluster_index,
-                        :num_pages,
-                    ] = metadata_page_ids
-
-                    page_token_counts[
-                        head_index,
-                        cluster_index,
-                        :num_pages,
-                    ] = self.page_size
-                    page_token_counts[
-                        head_index,
-                        cluster_index,
-                        num_pages - 1,
-                    ] = token_count - (num_pages - 1) * self.page_size
+            packed_keys, packed_values = self._pack_cluster_pages(
+                pool=pool,
+                storage_keys=storage_keys,
+                storage_values=storage_values,
+                storage_assignments=storage_assignments,
+                storage_cluster_counts=storage_cluster_counts,
+                cluster_page_counts=cluster_page_counts,
+                total_pages=total_pages,
+            )
+            page_ids, page_token_counts = self._build_cluster_page_metadata(
+                cluster_token_counts=storage_cluster_counts,
+                cluster_page_counts=cluster_page_counts,
+                allocated_metadata_page_ids=allocated_metadata_page_ids,
+            )
+            pool.write(
+                allocated_storage_page_ids,
+                packed_keys,
+                packed_values,
+            )
         except Exception:
             pool.free(allocated_storage_page_ids)
             raise
-
-        if cursor != total_pages:
-            pool.free(allocated_storage_page_ids)
-            raise RuntimeError(
-                "Cluster page construction did not consume all allocated pages"
-            )
 
         try:
             cluster_ids = self._allocate_cluster_ids(
