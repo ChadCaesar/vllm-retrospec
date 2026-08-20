@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -829,14 +830,20 @@ def test_cpu_offload_can_defer_flush_and_discard_index_updates():
     )
 
     assert index.has_staged_updates
-    assert index.cluster_store.num_allocated_pages("layer") == 0
     assert index.needs_update("request", 10, ["layer"])
     with pytest.raises(RuntimeError, match="staged index updates"):
         index.begin_proposal(["request"])
 
+    # The background worker may finish page construction before the index is
+    # published. Its pages remain private to the staged transaction.
+    index._staged_segments[0].build_future.result()
+    assert index.cluster_store.num_allocated_pages("layer") == 2
+    assert index.needs_update("request", 10, ["layer"])
+
     index.discard_staged_updates()
 
     assert not index.has_staged_updates
+    assert index._cluster_build_executor is None
     assert index.cluster_store.num_allocated_pages("layer") == 0
     assert index.needs_update("request", 10, ["layer"])
 
@@ -851,6 +858,7 @@ def test_cpu_offload_can_defer_flush_and_discard_index_updates():
     index.flush_staged_updates()
 
     assert not index.has_staged_updates
+    assert index._cluster_build_executor is None
     assert index.cluster_store.num_allocated_pages("layer") == 2
     assert not index.needs_update("request", 10, ["layer"])
 
@@ -866,6 +874,114 @@ def test_cpu_offload_direct_build_preserves_synchronous_api():
     assert index.cluster_store.num_allocated_pages("layer") == 2
     index.begin_proposal(["request"])
     index.end_proposal()
+
+
+def test_cpu_offload_recreates_builder_for_later_index_transaction():
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+
+    build_index(index, 10, keys, values, block_table)
+    first_segment = index._indices["layer"]["request"].segments[0]
+
+    assert index._cluster_build_executor is None
+
+    build_index(index, 14, keys, values, block_table)
+
+    record = index._indices["layer"]["request"]
+    assert index._cluster_build_executor is None
+    assert len(record.segments) == 2
+    assert record.segments[0] is first_segment
+    assert record.indexed_end == 10
+    assert index.cluster_store.num_allocated_pages("layer") == 4
+
+
+def test_cpu_offload_builds_cluster_pages_on_background_worker(monkeypatch):
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_started = threading.Event()
+    allow_build = threading.Event()
+    worker_names: list[str] = []
+    original_store = index.cluster_store.store_staged_clusters
+
+    def store_staged_clusters(*args, **kwargs):
+        worker_names.append(threading.current_thread().name)
+        build_started.set()
+        if not allow_build.wait(timeout=5):
+            raise RuntimeError("background build was not released")
+        return original_store(*args, **kwargs)
+
+    monkeypatch.setattr(
+        index.cluster_store,
+        "store_staged_clusters",
+        store_staged_clusters,
+    )
+
+    build_index(
+        index,
+        10,
+        keys,
+        values,
+        block_table,
+        defer_cpu_store=True,
+    )
+
+    try:
+        assert build_started.wait(timeout=5)
+        assert index.has_staged_updates
+        assert index.needs_update("request", 10, ["layer"])
+        assert worker_names[0].startswith("retrospec-cluster-page")
+
+        allow_build.set()
+        index.flush_staged_updates()
+    finally:
+        allow_build.set()
+        if index.has_staged_updates:
+            index.discard_staged_updates()
+
+    assert not index.needs_update("request", 10, ["layer"])
+    assert index.cluster_store.num_allocated_pages("layer") == 2
+
+
+def test_cpu_offload_flush_rolls_back_all_layers_after_build_failure(monkeypatch):
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    original_store = index.cluster_store.store_staged_clusters
+
+    def store_staged_clusters(*args, **kwargs):
+        if kwargs["layer_name"] == "failed-layer":
+            raise RuntimeError("background build failed")
+        return original_store(*args, **kwargs)
+
+    monkeypatch.setattr(
+        index.cluster_store,
+        "store_staged_clusters",
+        store_staged_clusters,
+    )
+
+    for layer_name in ("completed-layer", "failed-layer"):
+        index.build_or_update(
+            layer_name=layer_name,
+            request_ids=["request"],
+            seq_lens=[10],
+            rows=[0],
+            key_cache=keys,
+            value_cache=values,
+            block_table=block_table,
+            defer_cpu_store=True,
+        )
+
+    with pytest.raises(RuntimeError, match="background build failed"):
+        index.flush_staged_updates()
+
+    assert not index.has_staged_updates
+    assert index._cluster_build_executor is None
+    assert index.needs_update("request", 10, ["completed-layer"])
+    assert index.needs_update("request", 10, ["failed-layer"])
+    assert index.cluster_store.num_allocated_pages("completed-layer") == 0
+    assert index.cluster_store.num_allocated_pages("failed-layer") == 0
 
 
 def test_cpu_offload_stages_token_kv_before_clustering(monkeypatch):

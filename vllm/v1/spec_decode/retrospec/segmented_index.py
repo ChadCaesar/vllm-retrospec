@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from math import ceil
 
@@ -112,7 +113,7 @@ class _StagedRequestLayerSegment:
     cluster_keys: torch.Tensor
     cluster_values: torch.Tensor
     cluster_token_counts: torch.Tensor
-    staged_clusters: RetroSpecStagedClusterInput
+    build_future: Future[RetroSpecClusterBlockTable]
 
 
 @dataclass
@@ -241,6 +242,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         # committed after the complete prefill attention context.
         self._staged_segments: list[_StagedRequestLayerSegment] = []
         self._staged_segment_keys: set[tuple[str, str]] = set()
+
+        # CPU-backed cluster pages are built by one serialized background
+        # worker. The executor lives for one staged index transaction and is
+        # closed by flush_staged_updates() or discard_staged_updates().
+        self._cluster_build_executor: ThreadPoolExecutor | None = None
 
     def _desired_indexed_end(self, seq_len: int) -> int:
         """Return the exclusive logical-token boundary covered by clustering."""
@@ -394,6 +400,120 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
     def has_staged_updates(self) -> bool:
         return bool(self._staged_segments)
 
+    def _get_cluster_build_executor(self) -> ThreadPoolExecutor:
+        if not self.cluster_store.is_cpu_backed:
+            raise RuntimeError(
+                "Background cluster construction requires CPU-backed storage"
+            )
+
+        if self._cluster_build_executor is None:
+            self._cluster_build_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="retrospec-cluster-page",
+            )
+
+        return self._cluster_build_executor
+
+    def _submit_cluster_build(
+        self,
+        layer_name: str,
+        request_id: str,
+        cluster_start: int,
+        staged_clusters: RetroSpecStagedClusterInput,
+    ) -> Future[RetroSpecClusterBlockTable]:
+        executor = self._get_cluster_build_executor()
+
+        return executor.submit(
+            self.cluster_store.store_staged_clusters,
+            layer_name=layer_name,
+            request_id=request_id,
+            cluster_start=cluster_start,
+            staged=staged_clusters,
+        )
+
+    def _release_built_segments(
+        self,
+        built_segments: Sequence[
+            tuple[_StagedRequestLayerSegment, RetroSpecClusterBlockTable]
+        ],
+    ) -> None:
+        for staged_segment, cluster_blocks in built_segments:
+            self.cluster_store.free(staged_segment.layer_name, cluster_blocks)
+
+    def _publish_built_segments(
+        self,
+        built_segments: Sequence[
+            tuple[_StagedRequestLayerSegment, RetroSpecClusterBlockTable]
+        ],
+    ) -> None:
+        """Atomically publish one complete staged index transaction."""
+        pending_records: dict[tuple[str, str], _RequestLayerIndex] = {}
+
+        for staged_segment, cluster_blocks in built_segments:
+            key = (staged_segment.layer_name, staged_segment.request_id)
+            record = pending_records.get(key)
+
+            if record is None:
+                current_record = self._indices.get(
+                    staged_segment.layer_name,
+                    {},
+                ).get(staged_segment.request_id)
+
+                if current_record is None:
+                    record = self._empty_index()
+                else:
+                    record = _RequestLayerIndex(
+                        segments=list(current_record.segments),
+                        num_clusters=current_record.num_clusters,
+                        indexed_end=current_record.indexed_end,
+                    )
+
+                pending_records[key] = record
+
+            if record.indexed_end != staged_segment.indexed_start:
+                raise RuntimeError(
+                    "Built RetroSpec segment no longer follows the indexed prefix"
+                )
+            if record.num_clusters != staged_segment.cluster_start:
+                raise RuntimeError(
+                    "Built RetroSpec segment cluster offset is no longer current"
+                )
+
+            record.segments.append(
+                _RequestLayerSegment(
+                    indexed_start=staged_segment.indexed_start,
+                    indexed_end=staged_segment.indexed_end,
+                    cluster_start=staged_segment.cluster_start,
+                    cluster_keys=staged_segment.cluster_keys,
+                    cluster_values=staged_segment.cluster_values,
+                    cluster_token_counts=staged_segment.cluster_token_counts,
+                    cluster_blocks=cluster_blocks,
+                )
+            )
+            record.num_clusters += staged_segment.cluster_token_counts.shape[1]
+            record.indexed_end = staged_segment.indexed_end
+
+        # Construct replacement mappings before publishing self._indices so a
+        # validation failure cannot expose only a subset of the transaction.
+        new_indices = dict(self._indices)
+        changed_layers: dict[str, dict[str, _RequestLayerIndex]] = {}
+
+        for (layer_name, request_id), record in pending_records.items():
+            layer_indices = changed_layers.get(layer_name)
+            if layer_indices is None:
+                layer_indices = dict(self._indices.get(layer_name, {}))
+                changed_layers[layer_name] = layer_indices
+
+            layer_indices[request_id] = record
+
+        for layer_name, layer_indices in changed_layers.items():
+            new_indices[layer_name] = layer_indices
+
+        self._indices = new_indices
+
+        for layer_name in changed_layers:
+            self._packed_index_cache.pop(layer_name, None)
+
     def _append_segment(
         self,
         layer_name: str,
@@ -438,52 +558,88 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self._packed_index_cache.pop(layer_name, None)
 
     def flush_staged_updates(self) -> None:
-        """Commit all completed CPU-offload segments in enqueue order."""
+        """Wait for background page builds and publish them atomically."""
         staged_segments = self._staged_segments
+        executor = self._cluster_build_executor
+
         self._staged_segments = []
         self._staged_segment_keys.clear()
+        self._cluster_build_executor = None
 
-        for index, staged_segment in enumerate(staged_segments):
-            cluster_blocks: RetroSpecClusterBlockTable | None = None
+        if not staged_segments:
+            if executor is not None:
+                executor.shutdown(wait=True)
+            return
+
+        if executor is None:
+            raise RuntimeError(
+                "Staged RetroSpec segments have no cluster build executor"
+            )
+
+        built_segments: list[
+            tuple[_StagedRequestLayerSegment, RetroSpecClusterBlockTable]
+        ] = []
+        first_error: BaseException | None = None
+
+        try:
+            # Resolve every future even after one fails. A later task may have
+            # completed successfully and own unpublished CPU pages.
+            for staged_segment in staged_segments:
+                try:
+                    cluster_blocks = staged_segment.build_future.result()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    continue
+
+                built_segments.append((staged_segment, cluster_blocks))
+
+            if first_error is not None:
+                self._release_built_segments(built_segments)
+                raise first_error
 
             try:
-                cluster_blocks = self.cluster_store.store_staged_clusters(
-                    layer_name=staged_segment.layer_name,
-                    request_id=staged_segment.request_id,
-                    cluster_start=staged_segment.cluster_start,
-                    staged=staged_segment.staged_clusters,
-                )
-                self._append_segment(
-                    layer_name=staged_segment.layer_name,
-                    request_id=staged_segment.request_id,
-                    indexed_start=staged_segment.indexed_start,
-                    indexed_end=staged_segment.indexed_end,
-                    cluster_start=staged_segment.cluster_start,
-                    cluster_keys=staged_segment.cluster_keys,
-                    cluster_values=staged_segment.cluster_values,
-                    cluster_token_counts=staged_segment.cluster_token_counts,
-                    cluster_blocks=cluster_blocks,
-                )
+                self._publish_built_segments(built_segments)
             except BaseException:
-                if cluster_blocks is not None:
+                self._release_built_segments(built_segments)
+                raise
+        finally:
+            executor.shutdown(wait=True)
+
+    def discard_staged_updates(self) -> None:
+        """Drain background builds and release unpublished cluster pages."""
+        staged_segments = self._staged_segments
+        executor = self._cluster_build_executor
+
+        self._staged_segments = []
+        self._staged_segment_keys.clear()
+        self._cluster_build_executor = None
+
+        cleanup_error: BaseException | None = None
+
+        try:
+            for staged_segment in staged_segments:
+                try:
+                    cluster_blocks = staged_segment.build_future.result()
+                except BaseException:
+                    # A failed store_clusters() call releases allocations made
+                    # before it raises. The original prefill error takes priority.
+                    continue
+
+                try:
                     self.cluster_store.free(
                         staged_segment.layer_name,
                         cluster_blocks,
                     )
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
-                for remaining in staged_segments[index + 1 :]:
-                    remaining.staged_clusters.wait()
-
-                raise
-
-    def discard_staged_updates(self) -> None:
-        """Wait for in-flight D2H copies without publishing their segments."""
-        staged_segments = self._staged_segments
-        self._staged_segments = []
-        self._staged_segment_keys.clear()
-
-        for staged_segment in staged_segments:
-            staged_segment.staged_clusters.wait()
+        if cleanup_error is not None:
+            raise cleanup_error
 
     @staticmethod
     def _cluster_means(
@@ -679,6 +835,19 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                     staged_token_kv.wait()
                     raise
 
+                try:
+                    build_future = self._submit_cluster_build(
+                        layer_name=layer_name,
+                        request_id=request_id,
+                        cluster_start=cluster_start,
+                        staged_clusters=staged_clusters,
+                    )
+                except BaseException:
+                    # Metadata D2H may already be queued. Wait before releasing
+                    # its pinned CPU staging buffers.
+                    staged_clusters.wait()
+                    raise
+
                 self._staged_segments.append(
                     _StagedRequestLayerSegment(
                         layer_name=layer_name,
@@ -689,7 +858,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                         cluster_keys=cluster_keys,
                         cluster_values=cluster_values,
                         cluster_token_counts=cluster_token_counts,
-                        staged_clusters=staged_clusters,
+                        build_future=build_future,
                     )
                 )
                 self._staged_segment_keys.add(staged_key)
