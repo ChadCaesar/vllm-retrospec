@@ -485,6 +485,83 @@ def test_full_verification_plan_rejects_staged_index_updates():
         index.discard_staged_updates()
 
 
+def test_full_verification_plan_allows_another_layer_to_be_staged():
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+    index.build_or_update(
+        layer_name="other-layer",
+        request_ids=["request"],
+        seq_lens=[10],
+        rows=[0],
+        key_cache=keys,
+        value_cache=values,
+        block_table=block_table,
+        defer_cpu_store=True,
+    )
+
+    try:
+        plan = index.build_full_verification_plan(
+            request_ids=["request"],
+            layer_name="layer",
+            seq_lens=[10],
+            key_cache=keys,
+            block_table=block_table,
+        )
+    finally:
+        index.discard_staged_updates()
+
+    assert plan.exact_token_counts.tolist() == [[10]]
+
+
+def test_prepare_full_verification_rolls_back_uncommitted_clusters():
+    index = make_index()
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+
+    assert index.cluster_store.num_allocated_pages("layer") == 2
+
+    index.prepare_full_verification(
+        request_ids=["request"],
+        context_lens=[5],
+        layer_names=["layer"],
+    )
+    plan = index.build_full_verification_plan(
+        request_ids=["request"],
+        layer_name="layer",
+        seq_lens=[5],
+        key_cache=keys,
+        block_table=block_table,
+    )
+
+    record = index._indices["layer"]["request"]
+    assert record.segments == []
+    assert index.cluster_store.num_allocated_pages("layer") == 0
+    assert plan.exact_token_counts.tolist() == [[5]]
+    assert plan.primary_exact_token_mask.sum().item() == 5
+
+
+def test_full_verification_plan_accepts_an_empty_context():
+    index = make_index()
+    keys, _ = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+
+    plan = index.build_full_verification_plan(
+        request_ids=["request"],
+        layer_name="layer",
+        seq_lens=[0],
+        key_cache=keys,
+        block_table=block_table,
+    )
+
+    assert plan.exact_token_counts.tolist() == [[0]]
+    assert plan.primary_exact_token_indices.shape == (1, 1, 0)
+    assert plan.primary_exact_token_mask.shape == (1, 1, 0)
+    assert plan.exact_page_ids.numel() == 0
+
+
 def test_full_verification_plan_rejects_unapplied_rollback():
     index = make_index()
     keys, values = make_cache()

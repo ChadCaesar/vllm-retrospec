@@ -14,6 +14,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionImpl,
     FlashAttentionMetadata,
 )
+from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.spec_decode.retrospec.attention import (
     RetroSpecAttentionMode,
     RetroSpecSparseAttention,
@@ -404,6 +405,113 @@ def test_prefill_index_context_restores_state_after_flush_failure():
     assert controller.prefill_build_rows == ()
 
 
+def test_full_verification_context_prepares_and_restores_attention_state():
+    controller = make_controller(
+        index_mode="segmented_cluster",
+        cache_mode="cpu_offload",
+    )
+    mark_installed(controller)
+    controller.index.prepare_full_verification = Mock(
+        wraps=controller.index.prepare_full_verification
+    )
+
+    with controller.full_verification_context(
+        request_ids=["request"],
+        context_lens=[5],
+        query_lens=[3],
+    ):
+        assert controller.mode == RetroSpecAttentionMode.FULL_VERIFY
+        assert controller.full_verification_batch is not None
+        assert controller.full_verification_batch.request_ids == ("request",)
+        assert controller.full_verification_batch.context_lens == (5,)
+        assert controller.full_verification_batch.query_lens == (3,)
+
+    controller.index.prepare_full_verification.assert_called_once_with(
+        ("request",),
+        (5,),
+        ("layer",),
+    )
+    assert controller.mode == RetroSpecAttentionMode.PASSTHROUGH
+    assert controller.full_verification_batch is None
+
+
+def test_full_verification_context_restores_state_after_exception():
+    controller = make_controller(
+        index_mode="segmented_cluster",
+        cache_mode="cpu_offload",
+    )
+    mark_installed(controller)
+
+    with (
+        pytest.raises(RuntimeError, match="verification failure"),
+        controller.full_verification_context(
+            request_ids=["request"],
+            context_lens=[0],
+            query_lens=[1],
+        ),
+    ):
+        raise RuntimeError("verification failure")
+
+    assert controller.mode == RetroSpecAttentionMode.PASSTHROUGH
+    assert controller.full_verification_batch is None
+
+
+def test_forward_dispatches_full_verification_and_updates_prefill_index():
+    controller = make_controller(
+        index_mode="segmented_cluster",
+        cache_mode="cpu_offload",
+    )
+    mark_installed(controller)
+    impl = object.__new__(FlashAttentionImpl)
+    layer = SimpleNamespace(impl=impl)
+    query = torch.ones(1, 1, 1)
+    key = torch.ones_like(query)
+    value = torch.ones_like(query)
+    kv_cache = torch.ones(2, 1, 1, 1, 1)
+    metadata = cast(
+        FlashAttentionMetadata,
+        SimpleNamespace(block_table=torch.zeros(1, 1, dtype=torch.int32)),
+    )
+    output = torch.empty_like(query)
+    expected = torch.full_like(output, 3)
+    original_forward = Mock()
+    controller._full_verification_forward = Mock(return_value=expected)
+    controller._maybe_update_prefill_index = Mock()
+
+    with controller.full_verification_context(
+        request_ids=["request"],
+        context_lens=[0],
+        query_lens=[1],
+    ):
+        result = controller.forward(
+            "layer",
+            original_forward,
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            metadata,
+            output,
+        )
+
+    assert result is expected
+    original_forward.assert_not_called()
+    controller._full_verification_forward.assert_called_once_with(
+        "layer",
+        impl,
+        query,
+        key,
+        value,
+        kv_cache,
+        metadata,
+        output,
+    )
+    controller._maybe_update_prefill_index.assert_called_once_with(
+        "layer", kv_cache, metadata
+    )
+
+
 def test_estimation_attention_weights_centroids_by_token_count():
     controller = make_controller()
     impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
@@ -495,6 +603,126 @@ def test_grouped_flash_exact_attention_handles_no_selected_tokens():
 
     assert not output.any()
     assert torch.isneginf(lse).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_full_verification_attention_matches_dense_causal_reference_on_cuda():
+    device = torch.device("cuda")
+    torch.manual_seed(11)
+
+    query_lens = (2, 3)
+    num_query_heads = 4
+    num_kv_heads = 2
+    queries_per_kv = num_query_heads // num_kv_heads
+    head_size = 64
+    num_tokens = sum(query_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(
+        num_tokens,
+        num_query_heads,
+        head_size,
+        dtype=torch.float16,
+        device=device,
+    )
+    local_keys = torch.randn(
+        num_tokens,
+        num_kv_heads,
+        head_size,
+        dtype=torch.float16,
+        device=device,
+    )
+    local_values = torch.randn_like(local_keys)
+    first_prefix_keys = torch.randn(
+        3,
+        num_kv_heads,
+        head_size,
+        dtype=torch.float16,
+        device=device,
+    )
+    first_prefix_values = torch.randn_like(first_prefix_keys)
+
+    packed_keys = torch.cat(
+        [first_prefix_keys[:, head].unsqueeze(1) for head in range(num_kv_heads)]
+    )
+    packed_values = torch.cat(
+        [first_prefix_values[:, head].unsqueeze(1) for head in range(num_kv_heads)]
+    )
+    execution = RetroSpecExactExecution(
+        keys=packed_keys,
+        values=packed_values,
+        exact_seq_lens=torch.tensor([3, 3, 0, 0], dtype=torch.int32, device=device),
+        cu_seqlens_q=torch.arange(5, dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.tensor([0, 3, 6, 6, 6], dtype=torch.int32, device=device),
+        batch_size=2,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        max_exact_seq_len=3,
+    )
+    query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32, device=device)
+    metadata = cast(
+        FlashAttentionMetadata,
+        SimpleNamespace(
+            query_start_loc=query_start_loc,
+            max_query_len=3,
+        ),
+    )
+    impl = cast(
+        FlashAttentionImpl,
+        SimpleNamespace(scale=scale, vllm_flash_attn_version=2),
+    )
+
+    prefix_output, prefix_lse = RetroSpecSparseAttention._run_full_prefix_attention(
+        impl,
+        query,
+        query_lens,
+        execution,
+    )
+    local_output, local_lse = RetroSpecSparseAttention._run_full_local_attention(
+        impl,
+        query,
+        local_keys,
+        local_values,
+        metadata,
+    )
+    actual = torch.empty_like(query)
+    merge_attn_states(
+        actual,
+        prefix_output,
+        prefix_lse,
+        local_output,
+        local_lse,
+    )
+
+    expected = torch.empty_like(query)
+    token_offset = 0
+    for request_index, query_len in enumerate(query_lens):
+        for local_index in range(query_len):
+            token_index = token_offset + local_index
+            for query_head in range(num_query_heads):
+                kv_head = query_head // queries_per_kv
+                request_keys = local_keys[token_offset : token_index + 1, kv_head]
+                request_values = local_values[token_offset : token_index + 1, kv_head]
+
+                if request_index == 0:
+                    request_keys = torch.cat(
+                        (first_prefix_keys[:, kv_head], request_keys)
+                    )
+                    request_values = torch.cat(
+                        (first_prefix_values[:, kv_head], request_values)
+                    )
+
+                logits = torch.mv(
+                    request_keys.float(), query[token_index, query_head].float()
+                )
+                weights = torch.softmax(logits * scale, dim=0)
+                expected[token_index, query_head] = torch.mv(
+                    request_values.float().transpose(0, 1), weights
+                ).to(expected.dtype)
+
+        token_offset += query_len
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 def test_token_exact_attention_uses_reference_fallback_on_cpu():

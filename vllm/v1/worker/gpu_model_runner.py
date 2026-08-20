@@ -889,11 +889,12 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        if isinstance(self.drafter, RetroSpecProposer):
+        drafter = getattr(self, "drafter", None)
+        if isinstance(drafter, RetroSpecProposer):
             removed_req_ids = scheduler_output.finished_req_ids | (
                 scheduler_output.preempted_req_ids or set()
             )
-            self.drafter.remove_requests(removed_req_ids)
+            drafter.remove_requests(removed_req_ids)
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
@@ -3393,6 +3394,13 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+            retrospec_drafter = getattr(self, "drafter", None)
+            use_retrospec_full_verification = (
+                isinstance(retrospec_drafter, RetroSpecProposer)
+                and use_spec_decode
+                and retrospec_drafter.uses_full_verification_offload
+            )
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
@@ -3421,6 +3429,8 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                allow_microbatching=not use_retrospec_full_verification,
+                force_eager=use_retrospec_full_verification,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
@@ -3476,7 +3486,6 @@ class GPUModelRunner(
                     self.model.get_mamba_state_copy_func(),
                 )
 
-            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
@@ -3533,9 +3542,10 @@ class GPUModelRunner(
         )
 
         retrospec_index_context = nullcontext()
+        retrospec_full_verification_context = nullcontext()
         retrospec_index_rows: list[int] = []
 
-        if isinstance(self.drafter, RetroSpecProposer):
+        if isinstance(retrospec_drafter, RetroSpecProposer):
             index_seq_lens = [
                 self.requests[request_id].num_computed_tokens
                 + int(num_scheduled_tokens_np[row])
@@ -3545,14 +3555,14 @@ class GPUModelRunner(
             retrospec_index_rows = [
                 row
                 for row, request_id in enumerate(req_ids)
-                if self.drafter.needs_index_update(
+                if retrospec_drafter.needs_index_update(
                     request_id,
                     index_seq_lens[row],
                 )
             ]
 
             if retrospec_index_rows:
-                retrospec_index_context = self.drafter.prefill_index_context(
+                retrospec_index_context = retrospec_drafter.prefill_index_context(
                     request_ids=req_ids,
                     seq_lens=index_seq_lens,
                     build_rows=retrospec_index_rows,
@@ -3562,10 +3572,25 @@ class GPUModelRunner(
                 # must not be captured as part of a CUDA graph.
                 cudagraph_mode = CUDAGraphMode.NONE
 
+            if use_retrospec_full_verification:
+                context_lens = self.input_batch.num_computed_tokens_cpu[
+                    :num_reqs
+                ].tolist()
+                query_lens = num_scheduled_tokens_np.tolist()
+
+                retrospec_full_verification_context = (
+                    retrospec_drafter.full_verification_context(
+                        request_ids=req_ids,
+                        context_lens=context_lens,
+                        query_lens=query_lens,
+                    )
+                )
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
             retrospec_index_context,
+            retrospec_full_verification_context,
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -3575,7 +3600,11 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input or bool(retrospec_index_rows),
+                skip_compiled=(
+                    has_encoder_input
+                    or bool(retrospec_index_rows)
+                    or use_retrospec_full_verification
+                ),
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,

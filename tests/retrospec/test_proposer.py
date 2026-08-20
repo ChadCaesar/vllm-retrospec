@@ -214,6 +214,33 @@ def test_retrospec_proposer_accepts_cpu_offloaded_cluster_pages():
     )
 
     assert proposer.sparse_attention.index.cluster_store.is_cpu_backed
+    assert proposer.uses_full_verification_offload
+
+
+def test_retrospec_proposer_delegates_full_verification_context():
+    proposer = RetroSpecProposer(
+        make_vllm_config(
+            retrospec_index_mode="segmented_cluster",
+            retrospec_cache_mode="cpu_offload",
+        ),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    expected = nullcontext()
+    proposer.sparse_attention.full_verification_context = Mock(return_value=expected)
+
+    result = proposer.full_verification_context(
+        request_ids=["request"],
+        context_lens=[5],
+        query_lens=[2],
+    )
+
+    assert result is expected
+    proposer.sparse_attention.full_verification_context.assert_called_once_with(
+        ["request"],
+        [5],
+        [2],
+    )
 
 
 def test_propose_rejects_random_sampling():

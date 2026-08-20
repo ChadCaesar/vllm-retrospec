@@ -136,6 +136,22 @@ class RetroSpecProposer:
         self.index_update_state.remove_requests(request_ids)
         self.sparse_attention.remove_requests(request_ids)
 
+    @property
+    def uses_full_verification_offload(self) -> bool:
+        return self.sparse_attention.uses_full_verification_offload
+
+    def full_verification_context(
+        self,
+        request_ids: Sequence[str],
+        context_lens: Sequence[int],
+        query_lens: Sequence[int],
+    ):
+        return self.sparse_attention.full_verification_context(
+            request_ids,
+            context_lens,
+            query_lens,
+        )
+
     def needs_index_update(
         self,
         request_id: str,

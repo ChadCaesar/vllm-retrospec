@@ -3,6 +3,7 @@
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 
 import torch
@@ -42,6 +43,14 @@ from .weighted_attention import merge_weighted_estimation
 RetroSpecSelection = RetroSpecAttentionSelection | RetroSpecTokenAttentionSelection
 RetroSpecPlan = RetroSpecSelectionPlan | RetroSpecTokenSelectionPlan
 
+
+@dataclass(frozen=True)
+class _RetroSpecFullVerificationBatch:
+    request_ids: tuple[str, ...]
+    context_lens: tuple[int, ...]
+    query_lens: tuple[int, ...]
+
+
 LayerForward = Callable[..., torch.Tensor]
 
 
@@ -50,6 +59,7 @@ class RetroSpecAttentionMode(IntEnum):
     DRAFT = 1
     SPARSE_VERIFY = 2
     EXPANDED_VERIFY = 3
+    FULL_VERIFY = 4
 
 
 class _RetroSpecLayerForward:
@@ -144,6 +154,8 @@ class RetroSpecSparseAttention:
 
         self.proposal_request_ids: tuple[str, ...] = ()
 
+        self.full_verification_batch: _RetroSpecFullVerificationBatch | None = None
+
         self.prefill_index_active = False
         self.prefill_request_ids: tuple[str, ...] = ()
         self.prefill_seq_lens: tuple[int, ...] = ()
@@ -167,6 +179,13 @@ class RetroSpecSparseAttention:
         self.selection_plans: list[dict[str, RetroSpecPlan]] = [
             {} for _ in range(self.num_speculative_tokens)
         ]
+
+    @property
+    def uses_full_verification_offload(self) -> bool:
+        return (
+            isinstance(self.index, RetroSpecSegmentedTokenIndex)
+            and self.index.cluster_store.is_cpu_backed
+        )
 
     @contextmanager
     def prefill_index_context(
@@ -310,6 +329,63 @@ class RetroSpecSparseAttention:
         self.forward_wrappers.clear()
 
     @contextmanager
+    def full_verification_context(
+        self,
+        request_ids: Sequence[str],
+        context_lens: Sequence[int],
+        query_lens: Sequence[int],
+    ) -> Iterator[None]:
+        if self.in_proposal:
+            raise RuntimeError("Full verification cannot run during a proposal")
+        if self.step_active:
+            raise RuntimeError("A RetroSpec proposal step is still active")
+        if self.mode != RetroSpecAttentionMode.PASSTHROUGH:
+            raise RuntimeError("A RetroSpec attention context is already active")
+        if not self.original_forwards:
+            raise RuntimeError(
+                "RetroSpec attention must be installed before full verification"
+            )
+        if not self.uses_full_verification_offload:
+            raise RuntimeError(
+                "Full-verification offload requires a CPU-backed segmented index"
+            )
+
+        request_ids = tuple(request_ids)
+        context_lens = tuple(int(length) for length in context_lens)
+        query_lens = tuple(int(length) for length in query_lens)
+
+        if not request_ids:
+            raise ValueError("Full verification requires at least one request")
+        if len(context_lens) != len(request_ids):
+            raise ValueError("context_lens must match request_ids")
+        if len(query_lens) != len(request_ids):
+            raise ValueError("query_lens must match request_ids")
+        if any(length < 0 for length in context_lens):
+            raise ValueError("Full-verification context lengths must be non-negative")
+        if any(length <= 0 for length in query_lens):
+            raise ValueError("Full-verification query lengths must be positive")
+
+        assert isinstance(self.index, RetroSpecSegmentedTokenIndex)
+        self.index.prepare_full_verification(
+            request_ids,
+            context_lens,
+            tuple(self.original_forwards),
+        )
+
+        self.full_verification_batch = _RetroSpecFullVerificationBatch(
+            request_ids=request_ids,
+            context_lens=context_lens,
+            query_lens=query_lens,
+        )
+        self.mode = RetroSpecAttentionMode.FULL_VERIFY
+
+        try:
+            yield
+        finally:
+            self.mode = RetroSpecAttentionMode.PASSTHROUGH
+            self.full_verification_batch = None
+
+    @contextmanager
     def proposal_context(
         self,
         request_ids: Sequence[str],
@@ -397,6 +473,31 @@ class RetroSpecSparseAttention:
 
         return attention_mass
 
+    def _maybe_update_prefill_index(
+        self,
+        layer_name: str,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+    ) -> None:
+        if (
+            not self.prefill_index_active
+            or not self.prefill_build_rows
+            or not isinstance(self.index, RetroSpecSegmentedTokenIndex)
+        ):
+            return
+
+        key_cache, value_cache = kv_cache.unbind(0)
+        self.index.build_or_update(
+            layer_name=layer_name,
+            request_ids=self.prefill_request_ids,
+            seq_lens=self.prefill_seq_lens,
+            rows=self.prefill_build_rows,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=attn_metadata.block_table,
+            defer_cpu_store=True,
+        )
+
     def forward(
         self,
         layer_name: str,
@@ -423,45 +524,40 @@ class RetroSpecSparseAttention:
                 output_scale,
                 output_block_scale,
             )
-
-            if (
-                self.prefill_index_active
-                and self.prefill_build_rows
-                and isinstance(
-                    self.index,
-                    RetroSpecSegmentedTokenIndex,
-                )
-            ):
-                key_cache, value_cache = kv_cache.unbind(0)
-                self.index.build_or_update(
-                    layer_name=layer_name,
-                    request_ids=self.prefill_request_ids,
-                    seq_lens=self.prefill_seq_lens,
-                    rows=self.prefill_build_rows,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    block_table=attn_metadata.block_table,
-                    defer_cpu_store=True,
-                )
-
+            self._maybe_update_prefill_index(layer_name, kv_cache, attn_metadata)
             return result
 
-        if not self.step_active or self.active_mask is None:
-            raise RuntimeError("RetroSpec attention ran without an active step.")
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
-                "RetroSpec sparse attention does not support fused output quantization."
+                "RetroSpec attention does not support fused output quantization"
             )
         if output is None:
-            raise RuntimeError("RetroSpec FlashAttention requires an output buffer.")
+            raise RuntimeError("RetroSpec FlashAttention requires an output buffer")
         if attn_metadata is None:
-            raise RuntimeError("RetroSpec attention requires attention metadata.")
+            raise RuntimeError("RetroSpec attention requires attention metadata")
 
         impl = getattr(layer, "impl", None)
         if not isinstance(impl, FlashAttentionImpl):
             raise RuntimeError(
-                "RetroSpec attention wrapper received an incompatible layer."
+                "RetroSpec attention wrapper received an incompatible layer"
             )
+
+        if self.mode == RetroSpecAttentionMode.FULL_VERIFY:
+            result = self._full_verification_forward(
+                layer_name,
+                impl,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+            )
+            self._maybe_update_prefill_index(layer_name, kv_cache, attn_metadata)
+            return result
+
+        if not self.step_active or self.active_mask is None:
+            raise RuntimeError("RetroSpec attention ran without an active step")
 
         return self._sparse_forward(
             layer_name, impl, layer, query, kv_cache, attn_metadata, output
@@ -695,6 +791,279 @@ class RetroSpecSparseAttention:
         )
 
         return exact_output, exact_lse
+
+    @staticmethod
+    def _run_full_prefix_attention(
+        impl: FlashAttentionImpl,
+        query: torch.Tensor,
+        query_lens: tuple[int, ...],
+        execution: RetroSpecExactExecution,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens, num_query_heads, head_size = query.shape
+
+        if execution.batch_size != len(query_lens):
+            raise ValueError("Execution batch size does not match query_lens")
+        if execution.head_size != head_size:
+            raise ValueError("Execution head size does not match the query")
+        if sum(query_lens) != num_tokens:
+            raise ValueError("query_lens do not cover the full query tensor")
+
+        num_kv_heads = execution.num_kv_heads
+        if num_query_heads % num_kv_heads != 0:
+            raise ValueError(
+                "The number of query heads must be divisible by the number of KV heads"
+            )
+
+        if execution.max_exact_seq_len == 0:
+            prefix_lse = torch.full(
+                (num_query_heads, num_tokens),
+                float("-inf"),
+                dtype=torch.float32,
+                device=query.device,
+            )
+            return torch.zeros_like(query), prefix_lse
+
+        num_queries_per_kv = num_query_heads // num_kv_heads
+        grouped_query_chunks: list[torch.Tensor] = []
+        query_offset = 0
+
+        for query_len in query_lens:
+            request_query = query[query_offset : query_offset + query_len]
+            request_query = request_query.reshape(
+                query_len,
+                num_kv_heads,
+                num_queries_per_kv,
+                head_size,
+            )
+            grouped_query_chunks.append(
+                request_query.permute(1, 0, 2, 3).reshape(
+                    num_kv_heads * query_len,
+                    num_queries_per_kv,
+                    head_size,
+                )
+            )
+            query_offset += query_len
+
+        grouped_query = torch.cat(grouped_query_chunks).contiguous()
+        grouped_query_lens = torch.tensor(
+            query_lens,
+            dtype=torch.int32,
+            device=query.device,
+        ).repeat_interleave(num_kv_heads)
+
+        grouped_cu_seqlens_q = torch.zeros(
+            grouped_query_lens.numel() + 1,
+            dtype=torch.int32,
+            device=query.device,
+        )
+        torch.cumsum(
+            grouped_query_lens,
+            dim=0,
+            out=grouped_cu_seqlens_q[1:],
+        )
+
+        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+        grouped_output, grouped_lse = flash_attn_varlen_func(
+            q=grouped_query,
+            k=execution.keys,
+            v=execution.values,
+            out=None,
+            cu_seqlens_q=grouped_cu_seqlens_q,
+            cu_seqlens_k=execution.cu_seqlens_k,
+            max_seqlen_q=max(query_lens),
+            max_seqlen_k=execution.max_exact_seq_len,
+            softmax_scale=impl.scale,
+            causal=False,
+            alibi_slopes=None,
+            window_size=[-1, -1],
+            block_table=None,
+            softcap=0.0,
+            return_softmax_lse=True,
+            scheduler_metadata=None,
+            fa_version=impl.vllm_flash_attn_version,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            num_splits=0,
+            s_aux=None,
+        )
+
+        grouped_lse = grouped_lse.as_strided(
+            (num_queries_per_kv, grouped_query.shape[0]),
+            (grouped_query.shape[0], 1),
+        )
+
+        has_prefix = torch.repeat_interleave(
+            execution.exact_seq_lens > 0,
+            grouped_query_lens.to(torch.int64),
+        )
+        grouped_output.masked_fill_(~has_prefix[:, None, None], 0)
+        grouped_lse.masked_fill_(~has_prefix.unsqueeze(0), float("-inf"))
+
+        prefix_output_chunks: list[torch.Tensor] = []
+        prefix_lse_chunks: list[torch.Tensor] = []
+        grouped_offset = 0
+
+        for query_len in query_lens:
+            grouped_count = num_kv_heads * query_len
+            request_output = grouped_output[
+                grouped_offset : grouped_offset + grouped_count
+            ]
+            request_output = (
+                request_output.reshape(
+                    num_kv_heads,
+                    query_len,
+                    num_queries_per_kv,
+                    head_size,
+                )
+                .permute(1, 0, 2, 3)
+                .reshape(query_len, num_query_heads, head_size)
+            )
+            prefix_output_chunks.append(request_output)
+
+            request_lse = grouped_lse[
+                :,
+                grouped_offset : grouped_offset + grouped_count,
+            ]
+            request_lse = (
+                request_lse.reshape(
+                    num_queries_per_kv,
+                    num_kv_heads,
+                    query_len,
+                )
+                .permute(2, 1, 0)
+                .reshape(query_len, num_query_heads)
+                .transpose(0, 1)
+            )
+            prefix_lse_chunks.append(request_lse)
+            grouped_offset += grouped_count
+
+        prefix_output = torch.cat(prefix_output_chunks).contiguous()
+        prefix_lse = torch.cat(prefix_lse_chunks, dim=1).contiguous()
+        return prefix_output, prefix_lse
+
+    @staticmethod
+    def _run_full_local_attention(
+        impl: FlashAttentionImpl,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+        num_tokens = query.shape[0]
+        num_query_heads = query.shape[1]
+
+        local_output, local_lse = flash_attn_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            out=None,
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            cu_seqlens_k=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            max_seqlen_k=attn_metadata.max_query_len,
+            softmax_scale=impl.scale,
+            causal=True,
+            alibi_slopes=None,
+            window_size=[-1, -1],
+            block_table=None,
+            softcap=0.0,
+            return_softmax_lse=True,
+            scheduler_metadata=None,
+            fa_version=impl.vllm_flash_attn_version,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            num_splits=0,
+            s_aux=None,
+        )
+
+        local_lse = local_lse.as_strided(
+            (num_query_heads, num_tokens),
+            (num_tokens, 1),
+        )
+        return local_output, local_lse
+
+    def _full_verification_forward(
+        self,
+        layer_name: str,
+        impl: FlashAttentionImpl,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        batch = self.full_verification_batch
+        if batch is None:
+            raise RuntimeError("No full-verification batch is active")
+        if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
+            raise RuntimeError("Full verification requires the segmented index")
+        if self.exact_execution_buffer is None:
+            raise RuntimeError("RetroSpec exact execution buffer is not initialized")
+        if not attn_metadata.causal:
+            raise RuntimeError("Full verification requires causal decoder attention")
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        if len(batch.request_ids) != attn_metadata.seq_lens.shape[0]:
+            raise RuntimeError(
+                "Full-verification request count does not match attention metadata"
+            )
+        if sum(batch.query_lens) != num_actual_tokens:
+            raise RuntimeError(
+                "Full-verification query lengths do not match num_actual_tokens"
+            )
+        if max(batch.query_lens) != attn_metadata.max_query_len:
+            raise RuntimeError(
+                "Full-verification query lengths do not match max_query_len"
+            )
+
+        query = query[:num_actual_tokens]
+        key = key[:num_actual_tokens]
+        value = value[:num_actual_tokens]
+        key_cache, value_cache = kv_cache.unbind(0)
+
+        plan = self.index.build_full_verification_plan(
+            request_ids=batch.request_ids,
+            layer_name=layer_name,
+            seq_lens=batch.context_lens,
+            key_cache=key_cache,
+            block_table=attn_metadata.block_table,
+        )
+        source, _ = self._resolve_exact_kv_source(
+            selection=plan,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=attn_metadata.block_table,
+        )
+        execution = self.exact_execution_buffer.pack(source)
+
+        prefix_output, prefix_lse = self._run_full_prefix_attention(
+            impl,
+            query,
+            batch.query_lens,
+            execution,
+        )
+        local_output, local_lse = self._run_full_local_attention(
+            impl,
+            query,
+            key,
+            value,
+            attn_metadata,
+        )
+
+        merge_attn_states(
+            output[:num_actual_tokens],
+            prefix_output,
+            prefix_lse,
+            local_output,
+            local_lse,
+        )
+        return output
 
     def _resolve_exact_kv_source(
         self,

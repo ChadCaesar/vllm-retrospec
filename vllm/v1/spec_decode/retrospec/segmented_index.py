@@ -291,6 +291,47 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             if layer_changed:
                 self._packed_index_cache.pop(layer_name, None)
 
+    def prepare_full_verification(
+        self,
+        request_ids: Sequence[str],
+        context_lens: Sequence[int],
+        layer_names: Sequence[str],
+    ) -> None:
+        """Roll back clustered state that extends past committed context."""
+        request_ids = tuple(request_ids)
+        context_lens = tuple(int(context_len) for context_len in context_lens)
+
+        if len(context_lens) != len(request_ids):
+            raise ValueError("context_lens must match request_ids")
+        if any(context_len < 0 for context_len in context_lens):
+            raise ValueError("Full-verification context lengths must be non-negative")
+        if self.has_staged_updates:
+            raise RuntimeError(
+                "Cannot prepare full verification while index updates are staged"
+            )
+
+        for layer_name in layer_names:
+            layer_indices = self._indices.get(layer_name)
+            if layer_indices is None:
+                continue
+
+            layer_changed = False
+            for request_id, context_len in zip(request_ids, context_lens):
+                record = layer_indices.get(request_id)
+                if (
+                    record is None
+                    or not record.segments
+                    or record.indexed_end <= context_len
+                ):
+                    continue
+
+                self._free_record(layer_name, record)
+                layer_indices[request_id] = self._empty_index()
+                layer_changed = True
+
+            if layer_changed:
+                self._packed_index_cache.pop(layer_name, None)
+
     def begin_proposal(self, request_ids: Sequence[str]) -> None:
         if self._proposal_active:
             raise RuntimeError("Segmented token index proposal is already active")
@@ -1972,9 +2013,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         request_ids = tuple(request_ids)
         seq_lens = tuple(int(seq_len) for seq_len in seq_lens)
 
-        if self.has_staged_updates:
+        if any(staged.layer_name == layer_name for staged in self._staged_segments):
             raise RuntimeError(
-                "Cannot build full verification while index updates are staged"
+                "Cannot build full verification because index updates are staged "
+                "for this layer"
             )
         if key_cache.ndim != 4:
             raise ValueError(
@@ -1994,8 +2036,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             raise ValueError("block_table entries must be integral")
 
         max_num_tokens = block_table.shape[1] * self.block_size
-        if any(seq_len <= 0 for seq_len in seq_lens):
-            raise ValueError("Full-verification sequence lengths must be positive")
+        if any(seq_len < 0 for seq_len in seq_lens):
+            raise ValueError("Full-verification context lengths must be non-negative")
         if any(seq_len > max_num_tokens for seq_len in seq_lens):
             raise ValueError(
                 "Full-verification sequence length exceeds the block table"
