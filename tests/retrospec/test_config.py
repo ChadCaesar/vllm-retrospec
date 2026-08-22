@@ -27,8 +27,8 @@ def test_retrospec_defaults():
     assert config.retrospec_estimation_ratio == pytest.approx(0.232)
     assert config.retrospec_cache_ratio == pytest.approx(0.0)
     assert config.retrospec_index_mode == "block_mean"
-    assert config.retrospec_index_segment_size == 1024
-    assert config.retrospec_blocks_per_cluster == 4
+    assert config.retrospec_index_segment_size == 8192
+    assert config.retrospec_blocks_per_cluster == 1
     assert config.retrospec_kmeans_iterations == 10
     assert config.retrospec_max_pending_cluster_builds == 2
     assert config.retrospec_index_update_interval == 1024

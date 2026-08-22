@@ -1371,7 +1371,7 @@ class RetroSpecSparseAttention:
                     )
                     and query.device.type == "cuda"
                     and self.index.cluster_store.is_cpu_backed
-                    and selection.exact_cluster_ids.numel()
+                    and selection.exact_page_ids.numel()
                 ):
                     self.index.cluster_store.admit_resident_clusters(
                         layer_name=selection.plan.layer_name,
@@ -1407,7 +1407,7 @@ class RetroSpecSparseAttention:
                     RetroSpecAttentionMode.EXPANDED_VERIFY,
                 )
                 and self.index.cluster_store.is_cpu_backed
-                and selection.exact_cluster_ids.numel()
+                and selection.exact_page_ids.numel()
             ):
                 if resolved_pages is None:
                     raise RuntimeError(

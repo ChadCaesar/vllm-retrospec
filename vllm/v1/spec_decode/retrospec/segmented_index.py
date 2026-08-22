@@ -1983,7 +1983,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         """
         if (
             not self.cluster_store.is_cpu_backed
-            or plan.sparse_exact_cluster_ids.numel() == 0
+            or plan.sparse_exact_page_ids.numel() == 0
         ):
             return self._materialize_token_selection(
                 plan,
@@ -2107,7 +2107,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             raise ValueError("active_mask does not match the selection batch size")
         if active_mask.device != cluster_ids.device:
             raise ValueError("active_mask and selection plan must use one device")
-        if cluster_ids.numel() == 0:
+        if page_ids.numel() == 0:
             return
 
         active_cluster_mask = active_mask[:, None, None]

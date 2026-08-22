@@ -175,10 +175,13 @@ class SpeculativeConfig:
 
     retrospec_index_mode: Literal["block_mean", "segmented_cluster"] = "block_mean"
     """Block-selection index used by RetroSpec sparse attention."""
-    retrospec_index_segment_size: int = Field(default=1024, gt=0)
-    """Number of tokens represented by one independently clustered segment."""
-    retrospec_blocks_per_cluster: int = Field(default=4, gt=0)
-    """Average number of vLLM KV blocks represented by one cluster."""
+    retrospec_index_segment_size: int = Field(default=8192, gt=0)
+    """Target number of tokens in one independently clustered prefill segment.
+    The number of complete segments grows approximately as context_len / 8192."""
+    retrospec_blocks_per_cluster: int = Field(default=1, gt=0)
+    """Average number of vLLM KV blocks represented by one cluster. With the
+    default CUDA block size of 16, this targets approximately 16 tokens per
+    cluster, matching the RetroInfer configuration."""
     retrospec_kmeans_iterations: int = Field(default=10, gt=0)
     """Number of k-means iterations used when constructing each segment."""
     retrospec_max_pending_cluster_builds: int = Field(default=2, gt=0)

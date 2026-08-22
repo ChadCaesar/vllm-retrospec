@@ -799,6 +799,22 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    from vllm.v1.spec_decode.retrospec.capacity import (
+        get_retrospec_native_working_set_tokens,
+        uses_retrospec_cpu_offload,
+    )
+
+    if uses_retrospec_cpu_offload(vllm_config):
+        block_size = min(
+            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
+        )
+        working_set_tokens = get_retrospec_native_working_set_tokens(
+            vllm_config,
+            block_size,
+        )
+        blocks_per_request = cdiv(working_set_tokens, block_size) + 1
+        return kv_cache_config.num_blocks / blocks_per_request
+
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -1309,16 +1325,35 @@ def _report_kv_cache_config(
         )
     num_tokens_str = f"{num_tokens:,}"
     logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
-    max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
     max_concurrency = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
     )
-    logger.info_once(
-        "Maximum concurrency for %s tokens per request: %.2fx",
-        max_model_len_str,
-        max_concurrency,
-        scope="local",
+
+    from vllm.v1.spec_decode.retrospec.capacity import (
+        get_retrospec_native_working_set_tokens,
+        uses_retrospec_cpu_offload,
     )
+
+    if uses_retrospec_cpu_offload(vllm_config):
+        working_set_tokens = get_retrospec_native_working_set_tokens(
+            vllm_config,
+            min_block_size,
+        )
+        logger.info_once(
+            "Maximum RetroSpec native working-set concurrency for "
+            "%d active tokens per request: %.2fx",
+            working_set_tokens,
+            max_concurrency,
+            scope="local",
+        )
+    else:
+        max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
+        logger.info_once(
+            "Maximum concurrency for %s tokens per request: %.2fx",
+            max_model_len_str,
+            max_concurrency,
+            scope="local",
+        )
 
 
 def _max_memory_usage_bytes_from_groups(
@@ -1508,29 +1543,92 @@ def get_kv_cache_configs(
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
 
-    # If original_max_model_len was -1, automatically
-    # determine the maximum model length that fits in available GPU memory.
-    # We use the global groups here to correctly account for padding.
+    # Auto-fit retains vLLM's normal full-KV capacity model. RetroSpec
+    # long-context mode therefore requires an explicit max_model_len.
     if vllm_config.model_config.original_max_model_len == -1:
         _auto_fit_max_model_len(vllm_config, global_kv_cache_groups, available_memory)
 
-    # Check if the available memory is enough (using min across all workers).
-    # We use the global groups to correctly account for padding.
+    kv_cache_memory = list(available_memory)
     if global_kv_cache_groups:
-        _check_enough_kv_cache_memory(
-            min(available_memory),
-            lambda: _max_memory_usage_bytes_from_groups(
-                vllm_config, global_kv_cache_groups
-            ),
-            vllm_config.model_config.max_model_len,
-            lambda am: _estimate_max_model_len_from_groups(
-                vllm_config, global_kv_cache_groups, am
-            ),
+        full_kv_memory = _max_memory_usage_bytes_from_groups(
+            vllm_config,
+            global_kv_cache_groups,
         )
+
+        from vllm.v1.spec_decode.retrospec.capacity import (
+            build_retrospec_long_context_capacity,
+            uses_retrospec_cpu_offload,
+        )
+
+        use_retrospec_long_context = uses_retrospec_cpu_offload(
+            vllm_config
+        ) and full_kv_memory > min(available_memory)
+
+        if use_retrospec_long_context:
+            scheduler_config = vllm_config.scheduler_config
+            if not scheduler_config.enable_chunked_prefill:
+                raise ValueError(
+                    "RetroSpec long-context CPU offload requires "
+                    "enable_chunked_prefill=True"
+                )
+            if scheduler_config.max_num_seqs != 1:
+                raise ValueError(
+                    "RetroSpec long-context capacity currently requires "
+                    "max_num_seqs=1. GPU index and resident-cache admission "
+                    "for multiple offloaded long requests is not implemented."
+                )
+
+            retrospec_capacities = [
+                build_retrospec_long_context_capacity(
+                    vllm_config,
+                    kv_cache_spec_one_worker,
+                )
+                for kv_cache_spec_one_worker in kv_cache_specs
+            ]
+
+            for worker_index, (capacity, worker_available_memory) in enumerate(
+                zip(retrospec_capacities, available_memory, strict=True)
+            ):
+                if capacity.total_memory_bytes > worker_available_memory:
+                    raise ValueError(
+                        "RetroSpec long-context working set does not fit on "
+                        f"worker {worker_index}: native KV requires "
+                        f"{format_gib(capacity.native_memory_bytes)} GiB and "
+                        "auxiliary RetroSpec buffers require "
+                        f"{format_gib(capacity.auxiliary_memory_bytes)} GiB, "
+                        "but only "
+                        f"{format_gib(worker_available_memory)} GiB is available."
+                    )
+
+            # Allocate only the native streaming working set. The remaining
+            # profiled memory stays available to lazy RetroSpec GPU buffers.
+            kv_cache_memory = [
+                capacity.native_memory_bytes for capacity in retrospec_capacities
+            ]
+
+            logger.info_once(
+                "RetroSpec long-context capacity: native KV working set "
+                "%d tokens, native KV %s GiB, auxiliary reserve %s GiB",
+                retrospec_capacities[0].native_working_set_tokens,
+                format_gib(retrospec_capacities[0].native_memory_bytes),
+                format_gib(retrospec_capacities[0].auxiliary_memory_bytes),
+                scope="local",
+            )
+        else:
+            _check_enough_kv_cache_memory(
+                min(available_memory),
+                lambda: _max_memory_usage_bytes_from_groups(
+                    vllm_config, global_kv_cache_groups
+                ),
+                vllm_config.model_config.max_model_len,
+                lambda am: _estimate_max_model_len_from_groups(
+                    vllm_config, global_kv_cache_groups, am
+                ),
+            )
 
     kv_cache_configs: list[KVCacheConfig] = []
     for kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        kv_cache_specs, available_memory
+        kv_cache_specs, kv_cache_memory, strict=True
     ):
         kv_cache_groups_one_worker: list[KVCacheGroupSpec] = []
         for group in global_kv_cache_groups:

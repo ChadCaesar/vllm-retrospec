@@ -102,6 +102,19 @@ def test_sparse_verification_prefetch_masks_inactive_draft_rows():
     ]
 
 
+def test_sparse_verification_prefetch_skips_empty_page_table():
+    index = make_index(cache_mode="cpu_offload", cache_ratio=0.5, pin_memory=True)
+    plan = Mock(
+        sparse_exact_cluster_ids=torch.full((1, 1, 1), -1, dtype=torch.int64),
+        sparse_exact_page_ids=torch.empty((1, 1, 1, 0), dtype=torch.int64),
+    )
+    index.cluster_store.admit_resident_clusters = Mock()
+
+    index.prefetch_sparse_verification(plan, active_mask=torch.tensor([True]))
+
+    index.cluster_store.admit_resident_clusters.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("cache_mode", "pin_memory"),
     [("gpu_reference", False), ("cpu_offload", False)],
@@ -535,6 +548,37 @@ def test_full_verification_plan_handles_request_without_cluster_pages():
     assert plan.exact_page_ids.shape == (1, 1, 1, 0)
     assert plan.exact_page_ids.numel() == 0
     assert plan.exact_page_token_counts.numel() == 0
+
+
+def test_cpu_offload_sparse_selection_handles_request_without_cluster_pages():
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(index, 3, keys, values, block_table)
+
+    index.begin_proposal(["request"])
+    try:
+        selection = index.select_segmented(
+            request_ids=["request"],
+            layer_name="layer",
+            query=torch.ones(1, 1, 1),
+            key_cache=keys,
+            value_cache=values,
+            block_table=block_table,
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            active_mask=torch.tensor([True]),
+            scale=1.0,
+        )
+    finally:
+        index.end_proposal()
+
+    assert selection.exact_token_counts.tolist() == [[3]]
+    primary_indices = selection.plan.primary_exact_token_indices[
+        selection.plan.primary_exact_token_mask
+    ]
+    assert primary_indices.tolist() == [0, 1, 2]
+    assert selection.exact_page_ids.shape == (1, 1, 1, 0)
+    assert selection.resolved_pages is None
 
 
 def test_full_verification_plan_rejects_staged_index_updates():
