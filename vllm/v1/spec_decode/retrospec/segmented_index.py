@@ -162,7 +162,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         num_speculative_tokens: int,
         retrieval_ratio: float,
         estimation_ratio: float,
-        segment_size_tokens: int,
+        prefill_segment_size_tokens: int,
+        generation_update_interval: int,
         blocks_per_cluster: int,
         num_kmeans_iterations: int,
         max_pending_cluster_builds: int = 2,
@@ -178,8 +179,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             estimation_ratio=estimation_ratio,
         )
 
-        if segment_size_tokens % block_size != 0:
-            raise ValueError("segment_size_tokens must be divisible by block_size")
+        if prefill_segment_size_tokens % block_size != 0:
+            raise ValueError(
+                "prefill_segment_size_tokens must be divisible by block_size"
+            )
+        if generation_update_interval % block_size != 0:
+            raise ValueError(
+                "generation_update_interval must be divisible by block_size"
+            )
         if blocks_per_cluster <= 0:
             raise ValueError("blocks_per_cluster must be positive")
         if num_kmeans_iterations <= 0:
@@ -188,13 +195,19 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             raise ValueError("max_pending_cluster_builds must be positive")
 
         tokens_per_cluster = blocks_per_cluster * block_size
-        if segment_size_tokens % tokens_per_cluster != 0:
+        if prefill_segment_size_tokens % tokens_per_cluster != 0:
             raise ValueError(
-                "segment_size_tokens must be divisible by "
+                "prefill_segment_size_tokens must be divisible by "
+                "blocks_per_cluster * block_size"
+            )
+        if generation_update_interval % tokens_per_cluster != 0:
+            raise ValueError(
+                "generation_update_interval must be divisible by "
                 "blocks_per_cluster * block_size"
             )
 
-        self.segment_size_tokens = segment_size_tokens
+        self.prefill_segment_size_tokens = prefill_segment_size_tokens
+        self.generation_update_interval = generation_update_interval
         self.tokens_per_cluster = tokens_per_cluster
         self.num_kmeans_iterations = num_kmeans_iterations
         self.max_pending_cluster_builds = max_pending_cluster_builds
@@ -242,34 +255,55 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             deque()
         )
 
-    def _desired_indexed_end(self, seq_len: int) -> int:
-        """Return the exclusive logical-token boundary covered by clustering."""
+    def _stable_indexed_end(self, seq_len: int) -> int:
+        """Return the exclusive end of tokens that may leave native GPU KV."""
         full_block_count = seq_len // self.block_size
 
-        # The first block remains an exact attention sink. Recent complete
-        # blocks and the current partial block remain in the exact steady zone.
+        # Block zero remains the exact sink. Recent complete blocks and the
+        # current partial block remain in the native exact-attention zone.
         stable_end_block = max(
             full_block_count - self.num_recent_blocks,
             1,
         )
-        indexable_tokens = (stable_end_block - 1) * self.block_size
+        return stable_end_block * self.block_size
 
-        complete_segments = indexable_tokens // self.segment_size_tokens
-        return self.block_size + complete_segments * self.segment_size_tokens
+    def _segment_size_for_phase(self, is_prefill: bool) -> int:
+        if is_prefill:
+            return self.prefill_segment_size_tokens
+        return self.generation_update_interval
+
+    def _desired_indexed_end(
+        self,
+        seq_len: int,
+        record: _RequestLayerIndex | None,
+        is_prefill: bool,
+    ) -> int:
+        """Return the next complete prefill or generation index boundary."""
+        stable_end = self._stable_indexed_end(seq_len)
+        segment_size = self._segment_size_for_phase(is_prefill)
+
+        if record is None or stable_end < record.indexed_end:
+            indexed_start = self.block_size
+        else:
+            indexed_start = record.indexed_end
+
+        available_tokens = max(stable_end - indexed_start, 0)
+        complete_segments = available_tokens // segment_size
+        return indexed_start + complete_segments * segment_size
 
     def needs_update(
         self,
         request_id: str,
         seq_len: int,
         layer_names: Sequence[str],
+        is_prefill: bool,
     ) -> bool:
-        desired_end = self._desired_indexed_end(seq_len)
-
         for layer_name in layer_names:
             layer_indices = self._indices.get(layer_name)
-            if layer_indices is None or request_id not in layer_indices:
-                return True
-            if layer_indices[request_id].indexed_end != desired_end:
+            record = None if layer_indices is None else layer_indices.get(request_id)
+            desired_end = self._desired_indexed_end(seq_len, record, is_prefill)
+
+            if record is None or record.indexed_end != desired_end:
                 return True
 
         return False
@@ -746,6 +780,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         layer_name: str,
         request_ids: Sequence[str],
         seq_lens: Sequence[int],
+        is_prefill: Sequence[bool],
         rows: Sequence[int],
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
@@ -755,6 +790,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         """Cluster stable tokens and stage or store private cluster pages."""
         if len(request_ids) != len(seq_lens):
             raise ValueError("request_ids and seq_lens must have equal length")
+        if len(request_ids) != len(is_prefill):
+            raise ValueError("request_ids and is_prefill must have equal length")
         if block_table.shape[0] != len(request_ids):
             raise ValueError("block_table batch size does not match request_ids")
         if key_cache.shape != value_cache.shape:
@@ -776,7 +813,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
             request_id = request_ids[row]
             seq_len = seq_lens[row]
-            desired_end = self._desired_indexed_end(seq_len)
+            request_is_prefill = bool(is_prefill[row])
+            segment_size = self._segment_size_for_phase(request_is_prefill)
+
+            record = layer_indices.get(request_id)
+            desired_end = self._desired_indexed_end(
+                seq_len,
+                record,
+                request_is_prefill,
+            )
 
             staged_key = (layer_name, request_id)
             if staged_key in self._staged_segment_keys:
@@ -784,7 +829,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                     "A RetroSpec request/layer segment is already staged"
                 )
 
-            record = layer_indices.get(request_id)
             if record is not None and desired_end < record.indexed_end:
                 self._gpu_index_residency.invalidate_layer(layer_name)
                 self._free_record(layer_name, record)
@@ -801,9 +845,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 continue
 
             num_new_tokens = desired_end - indexed_start
-            if num_new_tokens % self.segment_size_tokens != 0:
+            if num_new_tokens % segment_size != 0:
                 raise RuntimeError(
-                    "New indexed region must contain complete token segments"
+                    "New indexed region must contain complete phase-specific segments"
                 )
 
             first_logical_block = indexed_start // self.block_size
@@ -868,7 +912,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             try:
                 local_assignments, cluster_token_counts = segmented_kmeans_assignments(
                     features=token_keys,
-                    segment_size=self.segment_size_tokens,
+                    segment_size=segment_size,
                     items_per_cluster=self.tokens_per_cluster,
                     num_iterations=self.num_kmeans_iterations,
                 )
@@ -1913,9 +1957,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         # of the sink block, an incomplete segment, recent blocks and the
         # current partial block. This expression is a synchronization-free
         # upper bound for that union.
+        max_unindexed_segment_tokens = max(
+            self.prefill_segment_size_tokens,
+            self.generation_update_interval,
+        )
         max_primary_exact_tokens = min(
             forced_exact_mask.shape[1],
-            self.segment_size_tokens + (self.num_recent_blocks + 1) * self.block_size,
+            max_unindexed_segment_tokens
+            + (self.num_recent_blocks + 1) * self.block_size,
         )
 
         (

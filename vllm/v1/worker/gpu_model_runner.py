@@ -3599,6 +3599,11 @@ class GPUModelRunner(
                 )
                 for row, request_id in enumerate(req_ids)
             ]
+            index_is_prefill = [
+                self.requests[request_id].num_computed_tokens
+                < self.requests[request_id].num_prompt_tokens
+                for request_id in req_ids
+            ]
 
             retrospec_index_rows = [
                 row
@@ -3606,13 +3611,15 @@ class GPUModelRunner(
                 if retrospec_drafter.needs_index_update(
                     request_id,
                     index_seq_lens[row],
+                    index_is_prefill[row],
                 )
             ]
 
             if retrospec_index_rows:
-                retrospec_index_context = retrospec_drafter.prefill_index_context(
+                retrospec_index_context = retrospec_drafter.index_update_context(
                     request_ids=req_ids,
                     seq_lens=index_seq_lens,
+                    is_prefill=index_is_prefill,
                     build_rows=retrospec_index_rows,
                 )
 

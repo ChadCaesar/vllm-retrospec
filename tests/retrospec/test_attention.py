@@ -55,6 +55,7 @@ def make_controller(
                 retrospec_estimation_ratio=0.5,
                 retrospec_index_mode=index_mode,
                 retrospec_index_segment_size=4,
+                retrospec_index_update_interval=2,
                 retrospec_blocks_per_cluster=1,
                 retrospec_kmeans_iterations=2,
                 retrospec_max_pending_cluster_builds=max_pending_cluster_builds,
@@ -358,7 +359,7 @@ def test_passthrough_forward_builds_segmented_index_after_target_attention():
         block_table=torch.arange(5, dtype=torch.int32).view(1, -1)
     )
 
-    with controller.prefill_index_context(["request"], [10], [0]):
+    with controller.index_update_context(["request"], [10], [True], [0]):
         result = controller.forward(
             "layer",
             original_forward,
@@ -373,14 +374,16 @@ def test_passthrough_forward_builds_segmented_index_after_target_attention():
     assert result.tolist() == [3.0]
     assert events == ["forward", "index"]
     assert controller.index.build_or_update.call_args.kwargs["defer_cpu_store"] is True
-    assert not controller.needs_index_update("request", 10)
-    assert not controller.prefill_index_active
-    assert controller.prefill_request_ids == ()
-    assert controller.prefill_seq_lens == ()
-    assert controller.prefill_build_rows == ()
+    assert controller.index.build_or_update.call_args.kwargs["is_prefill"] == (True,)
+    assert not controller.needs_index_update("request", 10, True)
+    assert not controller.index_update_active
+    assert controller.index_update_request_ids == ()
+    assert controller.index_update_seq_lens == ()
+    assert controller.index_update_is_prefill == ()
+    assert controller.index_update_build_rows == ()
 
 
-def test_prefill_index_context_restores_state_after_exception():
+def test_index_update_context_restores_state_after_exception():
     controller = make_controller("segmented_cluster")
     discard_staged_updates = Mock(
         wraps=controller.index.discard_staged_updates,
@@ -389,18 +392,19 @@ def test_prefill_index_context_restores_state_after_exception():
 
     with (
         pytest.raises(RuntimeError, match="prefill failure"),
-        controller.prefill_index_context(["request"], [10], [0]),
+        controller.index_update_context(["request"], [10], [True], [0]),
     ):
         raise RuntimeError("prefill failure")
 
     discard_staged_updates.assert_called_once_with()
-    assert not controller.prefill_index_active
-    assert controller.prefill_request_ids == ()
-    assert controller.prefill_seq_lens == ()
-    assert controller.prefill_build_rows == ()
+    assert not controller.index_update_active
+    assert controller.index_update_request_ids == ()
+    assert controller.index_update_seq_lens == ()
+    assert controller.index_update_is_prefill == ()
+    assert controller.index_update_build_rows == ()
 
 
-def test_prefill_index_context_restores_state_after_flush_failure():
+def test_index_update_context_restores_state_after_flush_failure():
     controller = make_controller("segmented_cluster")
     controller.index.flush_staged_updates = Mock(
         side_effect=RuntimeError("flush failure")
@@ -408,14 +412,42 @@ def test_prefill_index_context_restores_state_after_flush_failure():
 
     with (
         pytest.raises(RuntimeError, match="flush failure"),
-        controller.prefill_index_context(["request"], [10], [0]),
+        controller.index_update_context(["request"], [10], [True], [0]),
     ):
         pass
 
-    assert not controller.prefill_index_active
-    assert controller.prefill_request_ids == ()
-    assert controller.prefill_seq_lens == ()
-    assert controller.prefill_build_rows == ()
+    assert not controller.index_update_active
+    assert controller.index_update_request_ids == ()
+    assert controller.index_update_seq_lens == ()
+    assert controller.index_update_is_prefill == ()
+    assert controller.index_update_build_rows == ()
+
+
+def test_generation_index_context_forwards_generation_phase():
+    controller = make_controller("segmented_cluster")
+    mark_installed(controller)
+    controller.index.build_or_update = Mock()
+    kv_cache = torch.ones(2, 8, 2, 1, 1)
+    metadata = SimpleNamespace(
+        block_table=torch.arange(8, dtype=torch.int32).view(1, -1)
+    )
+
+    with controller.index_update_context(["request"], [12], [False], [0]):
+        controller.forward(
+            "layer",
+            Mock(return_value=torch.tensor([3.0])),
+            Mock(),
+            torch.ones(1, 1, 1),
+            torch.ones(1, 1, 1),
+            torch.ones(1, 1, 1),
+            kv_cache,
+            metadata,
+        )
+
+    call_kwargs = controller.index.build_or_update.call_args.kwargs
+    assert call_kwargs["seq_lens"] == (12,)
+    assert call_kwargs["is_prefill"] == (False,)
+    assert call_kwargs["rows"] == (0,)
 
 
 def test_full_verification_context_prepares_and_restores_attention_state():
@@ -531,7 +563,7 @@ def test_full_verification_rejects_rollback_behind_retired_boundary():
         pass
 
 
-def test_forward_dispatches_full_verification_and_updates_prefill_index():
+def test_forward_dispatches_full_verification_and_updates_index():
     controller = make_controller(
         index_mode="segmented_cluster",
         cache_mode="cpu_offload",
@@ -551,7 +583,7 @@ def test_forward_dispatches_full_verification_and_updates_prefill_index():
     expected = torch.full_like(output, 3)
     original_forward = Mock()
     controller._full_verification_forward = Mock(return_value=expected)
-    controller._maybe_update_prefill_index = Mock()
+    controller._maybe_update_index = Mock()
 
     with controller.full_verification_context(
         request_ids=["request"],
@@ -582,9 +614,7 @@ def test_forward_dispatches_full_verification_and_updates_prefill_index():
         metadata,
         output,
     )
-    controller._maybe_update_prefill_index.assert_called_once_with(
-        "layer", kv_cache, metadata
-    )
+    controller._maybe_update_index.assert_called_once_with("layer", kv_cache, metadata)
 
 
 def test_estimation_attention_weights_centroids_by_token_count():
@@ -1076,6 +1106,7 @@ def test_full_verification_packs_cpu_backed_cluster_pages_on_cuda():
         layer_name="layer",
         request_ids=["request"],
         seq_lens=[10],
+        is_prefill=[True],
         rows=[0],
         key_cache=key_cache,
         value_cache=value_cache,

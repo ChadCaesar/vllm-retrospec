@@ -203,21 +203,25 @@ class RetroSpecProposer:
         self,
         request_id: str,
         seq_len: int,
+        is_prefill: bool,
     ) -> bool:
         return self.sparse_attention.needs_index_update(
             request_id,
             seq_len,
+            is_prefill,
         )
 
-    def prefill_index_context(
+    def index_update_context(
         self,
         request_ids: Sequence[str],
         seq_lens: Sequence[int],
+        is_prefill: Sequence[bool],
         build_rows: Sequence[int],
     ):
-        return self.sparse_attention.prefill_index_context(
+        return self.sparse_attention.index_update_context(
             request_ids,
             seq_lens,
+            is_prefill,
             build_rows,
         )
 

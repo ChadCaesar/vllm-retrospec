@@ -19,7 +19,8 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 
 
 def make_index(
-    segment_size_tokens: int = 4,
+    prefill_segment_size_tokens: int = 4,
+    generation_update_interval: int = 2,
     blocks_per_cluster: int = 1,
     retrieval_ratio: float = 0.5,
     estimation_ratio: float = 0.5,
@@ -34,7 +35,8 @@ def make_index(
         num_speculative_tokens=1,
         retrieval_ratio=retrieval_ratio,
         estimation_ratio=estimation_ratio,
-        segment_size_tokens=segment_size_tokens,
+        prefill_segment_size_tokens=prefill_segment_size_tokens,
+        generation_update_interval=generation_update_interval,
         blocks_per_cluster=blocks_per_cluster,
         num_kmeans_iterations=2,
         max_pending_cluster_builds=max_pending_cluster_builds,
@@ -147,11 +149,13 @@ def build_index(
     values: torch.Tensor,
     block_table: torch.Tensor,
     defer_cpu_store: bool = False,
+    is_prefill: bool = True,
 ) -> None:
     index.build_or_update(
         layer_name="layer",
         request_ids=["request"],
         seq_lens=[seq_len],
+        is_prefill=[is_prefill],
         rows=[0],
         key_cache=keys,
         value_cache=values,
@@ -181,7 +185,7 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 10, keys, values, block_table)
 
-    assert not index.needs_update("request", 10, ["layer"])
+    assert not index.needs_update("request", 10, ["layer"], True)
     record = index._indices["layer"]["request"]
     assert record.indexed_end == 6
     assert record.num_clusters == 2
@@ -252,6 +256,100 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     assert expanded.attention_mass.item() >= sparse.attention_mass.item()
 
 
+def test_generation_appends_smaller_segments_after_prefill():
+    index = make_index(
+        prefill_segment_size_tokens=8,
+        generation_update_interval=4,
+    )
+    keys, values = make_cache(num_blocks=12)
+    block_table = torch.arange(12, dtype=torch.int32).view(1, -1)
+
+    build_index(index, 14, keys, values, block_table, is_prefill=True)
+    record = index._indices["layer"]["request"]
+    assert record.indexed_end == 10
+    assert record.num_clusters == 4
+    assert [
+        (segment.indexed_start, segment.indexed_end) for segment in record.segments
+    ] == [(2, 10)]
+
+    assert not index.needs_update("request", 16, ["layer"], False)
+    assert index.needs_update("request", 18, ["layer"], False)
+
+    build_index(index, 18, keys, values, block_table, is_prefill=False)
+    record = index._indices["layer"]["request"]
+    assert record.indexed_end == 14
+    assert record.num_clusters == 6
+    assert [
+        (segment.indexed_start, segment.indexed_end, segment.cluster_start)
+        for segment in record.segments
+    ] == [(2, 10, 0), (10, 14, 4)]
+    assert not index.needs_update("request", 18, ["layer"], False)
+
+
+def test_prefill_and_generation_sizes_do_not_need_to_divide_each_other():
+    index = make_index(
+        prefill_segment_size_tokens=12,
+        generation_update_interval=8,
+    )
+    keys, values = make_cache(num_blocks=16)
+    block_table = torch.arange(16, dtype=torch.int32).view(1, -1)
+
+    build_index(index, 18, keys, values, block_table, is_prefill=True)
+    assert index._indices["layer"]["request"].indexed_end == 14
+    assert not index.needs_update("request", 24, ["layer"], False)
+    assert index.needs_update("request", 26, ["layer"], False)
+
+    build_index(index, 26, keys, values, block_table, is_prefill=False)
+    record = index._indices["layer"]["request"]
+    assert [
+        (segment.indexed_start, segment.indexed_end) for segment in record.segments
+    ] == [
+        (2, 14),
+        (14, 22),
+    ]
+
+
+def test_generation_rollback_rebuilds_on_generation_boundaries():
+    index = make_index(
+        prefill_segment_size_tokens=8,
+        generation_update_interval=4,
+    )
+    keys, values = make_cache(num_blocks=12)
+    block_table = torch.arange(12, dtype=torch.int32).view(1, -1)
+
+    build_index(index, 14, keys, values, block_table, is_prefill=True)
+    build_index(index, 18, keys, values, block_table, is_prefill=False)
+    assert index._indices["layer"]["request"].indexed_end == 14
+
+    build_index(index, 13, keys, values, block_table, is_prefill=False)
+    record = index._indices["layer"]["request"]
+    assert record.indexed_end == 6
+    assert record.num_clusters == 2
+    assert [
+        (segment.indexed_start, segment.indexed_end) for segment in record.segments
+    ] == [(2, 6)]
+
+
+def test_cpu_offload_keeps_incremental_generation_segments_on_cpu():
+    index = make_index(
+        prefill_segment_size_tokens=8,
+        generation_update_interval=4,
+        cache_mode="cpu_offload",
+    )
+    keys, values = make_cache(num_blocks=12)
+    block_table = torch.arange(12, dtype=torch.int32).view(1, -1)
+
+    build_index(index, 14, keys, values, block_table, is_prefill=True)
+    build_index(index, 18, keys, values, block_table, is_prefill=False)
+
+    record = index._indices["layer"]["request"]
+    assert len(record.segments) == 2
+    for segment in record.segments:
+        assert segment.cluster_keys.device.type == "cpu"
+        assert segment.cluster_values.device.type == "cpu"
+        assert segment.cluster_token_counts.device.type == "cpu"
+
+
 def test_fully_stored_indexed_end_uses_slowest_layer():
     index = make_index()
     keys, values = make_cache()
@@ -267,6 +365,7 @@ def test_fully_stored_indexed_end_uses_slowest_layer():
         layer_name="other-layer",
         request_ids=["request"],
         seq_lens=[14],
+        is_prefill=[True],
         rows=[0],
         key_cache=keys,
         value_cache=values,
@@ -312,7 +411,11 @@ def test_segmented_index_clusters_each_kv_head_independently():
 
 
 def test_segmented_index_excludes_empty_clusters_from_selection():
-    index = make_index(segment_size_tokens=8, blocks_per_cluster=2)
+    index = make_index(
+        prefill_segment_size_tokens=8,
+        generation_update_interval=4,
+        blocks_per_cluster=2,
+    )
     keys = torch.ones(8, 2, 1, 1)
     values = torch.ones_like(keys)
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
@@ -424,11 +527,15 @@ def test_bounded_mask_packing_uses_fixed_width_and_preserves_valid_indices():
 
 
 def test_primary_exact_capacity_covers_every_up_to_date_layout():
-    index = make_index(segment_size_tokens=8)
+    index = make_index(prefill_segment_size_tokens=8)
     max_num_tokens = 128
     capacity = min(
         max_num_tokens,
-        index.segment_size_tokens + (index.num_recent_blocks + 1) * index.block_size,
+        max(
+            index.prefill_segment_size_tokens,
+            index.generation_update_interval,
+        )
+        + (index.num_recent_blocks + 1) * index.block_size,
     )
 
     for seq_len in range(1, max_num_tokens + 1):
@@ -438,7 +545,8 @@ def test_primary_exact_capacity_covers_every_up_to_date_layout():
             torch.tensor([seq_len], dtype=torch.int32),
         )
         indexed_mask = torch.zeros_like(valid_mask)
-        indexed_mask[:, index.block_size : index._desired_indexed_end(seq_len)] = True
+        desired_end = index._desired_indexed_end(seq_len, None, True)
+        indexed_mask[:, index.block_size : desired_end] = True
         forced_exact_mask |= valid_mask & ~indexed_mask
 
         assert forced_exact_mask.sum().item() <= capacity
@@ -452,6 +560,7 @@ def test_segmented_index_handles_mixed_long_and_short_requests():
         layer_name="layer",
         request_ids=["long", "short"],
         seq_lens=[10, 3],
+        is_prefill=[True, True],
         rows=[0, 1],
         key_cache=keys,
         value_cache=values,
@@ -492,6 +601,7 @@ def test_full_verification_plan_covers_clustered_and_primary_tokens():
         layer_name="layer",
         request_ids=["long", "short"],
         seq_lens=[10, 3],
+        is_prefill=[True, True],
         rows=[0, 1],
         key_cache=keys,
         value_cache=values,
@@ -618,6 +728,7 @@ def test_full_verification_plan_allows_another_layer_to_be_staged():
         layer_name="other-layer",
         request_ids=["request"],
         seq_lens=[10],
+        is_prefill=[True],
         rows=[0],
         key_cache=keys,
         value_cache=values,
@@ -713,7 +824,7 @@ def test_segmented_index_appends_complete_segments_and_handles_rollback():
 
     build_index(index, 10, keys, values, block_table)
     first_segment = index._indices["layer"]["request"].segments[0]
-    assert index.needs_update("request", 14, ["layer"])
+    assert index.needs_update("request", 14, ["layer"], True)
 
     build_index(index, 14, keys, values, block_table)
     record = index._indices["layer"]["request"]
@@ -746,7 +857,7 @@ def test_segmented_index_appends_complete_segments_and_handles_rollback():
         for identity in (*first_identities.values(), *second_identities.values())
     )
 
-    assert index.needs_update("request", 6, ["layer"])
+    assert index.needs_update("request", 6, ["layer"], True)
     build_index(index, 6, keys, values, block_table)
     record = index._indices["layer"]["request"]
     assert record.indexed_end == 2
@@ -832,7 +943,7 @@ def test_segmented_index_removes_finished_request_state():
     index.remove_requests(["request"])
 
     assert "request" not in index._indices["layer"]
-    assert index.needs_update("request", 10, ["layer"])
+    assert index.needs_update("request", 10, ["layer"], True)
     assert index.cluster_store.num_allocated_pages("layer") == 0
 
 
@@ -882,6 +993,7 @@ def test_packed_index_cache_tracks_request_order_and_block_table_width():
         layer_name="layer",
         request_ids=["long", "short"],
         seq_lens=[10, 3],
+        is_prefill=[True, True],
         rows=[0, 1],
         key_cache=keys,
         value_cache=values,
@@ -924,6 +1036,7 @@ def test_cpu_offload_packs_multiple_requests_only_while_resident():
         layer_name="layer",
         request_ids=["first", "second"],
         seq_lens=[10, 10],
+        is_prefill=[True, True],
         rows=[0, 1],
         key_cache=keys,
         value_cache=values,
@@ -969,7 +1082,7 @@ def test_cpu_offload_can_defer_flush_and_discard_index_updates():
     )
 
     assert index.has_staged_updates
-    assert index.needs_update("request", 10, ["layer"])
+    assert index.needs_update("request", 10, ["layer"], True)
     with pytest.raises(RuntimeError, match="staged index updates"):
         index.begin_proposal(["request"])
 
@@ -977,7 +1090,7 @@ def test_cpu_offload_can_defer_flush_and_discard_index_updates():
     # published. Its pages remain private to the staged transaction.
     index._staged_segments[0].build_future.result()
     assert index.cluster_store.num_allocated_pages("layer") == 2
-    assert index.needs_update("request", 10, ["layer"])
+    assert index.needs_update("request", 10, ["layer"], True)
 
     index.discard_staged_updates()
 
@@ -985,7 +1098,7 @@ def test_cpu_offload_can_defer_flush_and_discard_index_updates():
     assert index._cluster_build_executor is None
     assert not index._pending_cluster_builds
     assert index.cluster_store.num_allocated_pages("layer") == 0
-    assert index.needs_update("request", 10, ["layer"])
+    assert index.needs_update("request", 10, ["layer"], True)
 
     build_index(
         index,
@@ -1001,7 +1114,7 @@ def test_cpu_offload_can_defer_flush_and_discard_index_updates():
     assert index._cluster_build_executor is None
     assert not index._pending_cluster_builds
     assert index.cluster_store.num_allocated_pages("layer") == 2
-    assert not index.needs_update("request", 10, ["layer"])
+    assert not index.needs_update("request", 10, ["layer"], True)
 
 
 def test_cpu_offload_direct_build_preserves_synchronous_api():
@@ -1071,7 +1184,7 @@ def test_cpu_offload_builds_cluster_pages_on_background_worker(monkeypatch):
     try:
         assert build_started.wait(timeout=5)
         assert index.has_staged_updates
-        assert index.needs_update("request", 10, ["layer"])
+        assert index.needs_update("request", 10, ["layer"], True)
         assert worker_names[0].startswith("retrospec-cluster-page")
 
         allow_build.set()
@@ -1081,7 +1194,7 @@ def test_cpu_offload_builds_cluster_pages_on_background_worker(monkeypatch):
         if index.has_staged_updates:
             index.discard_staged_updates()
 
-    assert not index.needs_update("request", 10, ["layer"])
+    assert not index.needs_update("request", 10, ["layer"], True)
     assert index.cluster_store.num_allocated_pages("layer") == 2
 
 
@@ -1157,6 +1270,7 @@ def test_cpu_offload_flush_rolls_back_all_layers_after_build_failure(monkeypatch
             layer_name=layer_name,
             request_ids=["request"],
             seq_lens=[10],
+            is_prefill=[True],
             rows=[0],
             key_cache=keys,
             value_cache=values,
@@ -1169,8 +1283,8 @@ def test_cpu_offload_flush_rolls_back_all_layers_after_build_failure(monkeypatch
 
     assert not index.has_staged_updates
     assert index._cluster_build_executor is None
-    assert index.needs_update("request", 10, ["completed-layer"])
-    assert index.needs_update("request", 10, ["failed-layer"])
+    assert index.needs_update("request", 10, ["completed-layer"], True)
+    assert index.needs_update("request", 10, ["failed-layer"], True)
     assert index.cluster_store.num_allocated_pages("completed-layer") == 0
     assert index.cluster_store.num_allocated_pages("failed-layer") == 0
 
@@ -1453,8 +1567,10 @@ def test_segmented_index_builds_and_selects_on_cuda():
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"segment_size_tokens": 3}, "divisible by block_size"),
-        ({"segment_size_tokens": 4, "blocks_per_cluster": 3}, "divisible"),
+        ({"prefill_segment_size_tokens": 3}, "divisible by block_size"),
+        ({"generation_update_interval": 3}, "divisible by block_size"),
+        ({"prefill_segment_size_tokens": 4, "blocks_per_cluster": 3}, "divisible"),
+        ({"generation_update_interval": 2, "blocks_per_cluster": 2}, "divisible"),
         ({"blocks_per_cluster": 0}, "positive"),
         ({"num_kmeans_iterations": 0}, "positive"),
         ({"max_pending_cluster_builds": 0}, "positive"),
@@ -1466,7 +1582,8 @@ def test_segmented_index_rejects_invalid_configuration(kwargs, message):
         "num_speculative_tokens": 1,
         "retrieval_ratio": 0.5,
         "estimation_ratio": 0.5,
-        "segment_size_tokens": 4,
+        "prefill_segment_size_tokens": 4,
+        "generation_update_interval": 2,
         "blocks_per_cluster": 1,
         "num_kmeans_iterations": 2,
     }

@@ -135,7 +135,8 @@ class RetroSpecSparseAttention:
                 num_speculative_tokens=config.num_speculative_tokens,
                 retrieval_ratio=config.retrospec_retrieval_ratio,
                 estimation_ratio=config.retrospec_estimation_ratio,
-                segment_size_tokens=config.retrospec_index_segment_size,
+                prefill_segment_size_tokens=config.retrospec_index_segment_size,
+                generation_update_interval=config.retrospec_index_update_interval,
                 blocks_per_cluster=config.retrospec_blocks_per_cluster,
                 num_kmeans_iterations=config.retrospec_kmeans_iterations,
                 max_pending_cluster_builds=config.retrospec_max_pending_cluster_builds,
@@ -163,10 +164,11 @@ class RetroSpecSparseAttention:
         # Block 0 remains the permanent exact sink.
         self._retired_block_ends: dict[str, int] = {}
 
-        self.prefill_index_active = False
-        self.prefill_request_ids: tuple[str, ...] = ()
-        self.prefill_seq_lens: tuple[int, ...] = ()
-        self.prefill_build_rows: tuple[int, ...] = ()
+        self.index_update_active = False
+        self.index_update_request_ids: tuple[str, ...] = ()
+        self.index_update_seq_lens: tuple[int, ...] = ()
+        self.index_update_is_prefill: tuple[bool, ...] = ()
+        self.index_update_build_rows: tuple[int, ...] = ()
 
         self.mode = RetroSpecAttentionMode.PASSTHROUGH
         self.in_proposal = False
@@ -196,27 +198,43 @@ class RetroSpecSparseAttention:
         )
 
     @contextmanager
-    def prefill_index_context(
+    def index_update_context(
         self,
         request_ids: Sequence[str],
         seq_lens: Sequence[int],
+        is_prefill: Sequence[bool],
         build_rows: Sequence[int],
     ) -> Iterator[None]:
         if self.in_proposal:
-            raise RuntimeError("Cannot build a prefill index during a proposal")
-        if self.prefill_index_active:
-            raise RuntimeError("RetroSpec prefill index context cannot be nested")
+            raise RuntimeError("Cannot update the index during a proposal")
+        if self.index_update_active:
+            raise RuntimeError("RetroSpec index update context cannot be nested")
+
+        request_ids = tuple(request_ids)
+        seq_lens = tuple(int(seq_len) for seq_len in seq_lens)
+        is_prefill = tuple(bool(value) for value in is_prefill)
+        build_rows = tuple(int(row) for row in build_rows)
+
+        if len(seq_lens) != len(request_ids):
+            raise ValueError("seq_lens must match request_ids")
+        if len(is_prefill) != len(request_ids):
+            raise ValueError("is_prefill must match request_ids")
+        if len(build_rows) != len(set(build_rows)):
+            raise ValueError("build_rows must be unique")
+        if any(row < 0 or row >= len(request_ids) for row in build_rows):
+            raise IndexError("RetroSpec index build row is out of range")
 
         segmented_index = (
             self.index if isinstance(self.index, RetroSpecSegmentedTokenIndex) else None
         )
         if segmented_index is not None and segmented_index.has_staged_updates:
-            raise RuntimeError("A previous RetroSpec prefill left staged index updates")
+            raise RuntimeError("A previous RetroSpec update left staged index changes")
 
-        self.prefill_index_active = True
-        self.prefill_request_ids = tuple(request_ids)
-        self.prefill_seq_lens = tuple(seq_lens)
-        self.prefill_build_rows = tuple(build_rows)
+        self.index_update_active = True
+        self.index_update_request_ids = request_ids
+        self.index_update_seq_lens = seq_lens
+        self.index_update_is_prefill = is_prefill
+        self.index_update_build_rows = build_rows
 
         try:
             yield
@@ -228,15 +246,17 @@ class RetroSpecSparseAttention:
             if segmented_index is not None:
                 segmented_index.flush_staged_updates()
         finally:
-            self.prefill_index_active = False
-            self.prefill_request_ids = ()
-            self.prefill_seq_lens = ()
-            self.prefill_build_rows = ()
+            self.index_update_active = False
+            self.index_update_request_ids = ()
+            self.index_update_seq_lens = ()
+            self.index_update_is_prefill = ()
+            self.index_update_build_rows = ()
 
     def needs_index_update(
         self,
         request_id: str,
         seq_len: int,
+        is_prefill: bool,
     ) -> bool:
         if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
             return False
@@ -245,6 +265,7 @@ class RetroSpecSparseAttention:
             request_id,
             seq_len,
             tuple(self.original_forwards),
+            is_prefill,
         )
 
     def has_retired_kv_blocks(self, request_ids: Sequence[str]) -> bool:
@@ -665,15 +686,15 @@ class RetroSpecSparseAttention:
 
         raise TypeError(f"Unsupported RetroSpec plan type: {type(first_plan)!r}")
 
-    def _maybe_update_prefill_index(
+    def _maybe_update_index(
         self,
         layer_name: str,
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
     ) -> None:
         if (
-            not self.prefill_index_active
-            or not self.prefill_build_rows
+            not self.index_update_active
+            or not self.index_update_build_rows
             or not isinstance(self.index, RetroSpecSegmentedTokenIndex)
         ):
             return
@@ -681,9 +702,10 @@ class RetroSpecSparseAttention:
         key_cache, value_cache = kv_cache.unbind(0)
         self.index.build_or_update(
             layer_name=layer_name,
-            request_ids=self.prefill_request_ids,
-            seq_lens=self.prefill_seq_lens,
-            rows=self.prefill_build_rows,
+            request_ids=self.index_update_request_ids,
+            seq_lens=self.index_update_seq_lens,
+            is_prefill=self.index_update_is_prefill,
+            rows=self.index_update_build_rows,
             key_cache=key_cache,
             value_cache=value_cache,
             block_table=attn_metadata.block_table,
@@ -716,7 +738,7 @@ class RetroSpecSparseAttention:
                 output_scale,
                 output_block_scale,
             )
-            self._maybe_update_prefill_index(layer_name, kv_cache, attn_metadata)
+            self._maybe_update_index(layer_name, kv_cache, attn_metadata)
             return result
 
         if output_scale is not None or output_block_scale is not None:
@@ -745,7 +767,7 @@ class RetroSpecSparseAttention:
                 attn_metadata,
                 output,
             )
-            self._maybe_update_prefill_index(layer_name, kv_cache, attn_metadata)
+            self._maybe_update_index(layer_name, kv_cache, attn_metadata)
             return result
 
         if not self.step_active or self.active_mask is None:

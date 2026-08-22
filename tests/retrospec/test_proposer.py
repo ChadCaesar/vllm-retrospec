@@ -247,6 +247,33 @@ def test_retrospec_proposer_delegates_full_verification_context():
     )
 
 
+def test_retrospec_proposer_delegates_phase_aware_index_updates():
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_index_mode="segmented_cluster"),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    expected = nullcontext()
+    proposer.sparse_attention.needs_index_update = Mock(return_value=True)
+    proposer.sparse_attention.index_update_context = Mock(return_value=expected)
+
+    assert proposer.needs_index_update("request", 12, False)
+    context = proposer.index_update_context(
+        request_ids=["request"],
+        seq_lens=[12],
+        is_prefill=[False],
+        build_rows=[0],
+    )
+
+    assert context is expected
+    proposer.sparse_attention.needs_index_update.assert_called_once_with(
+        "request", 12, False
+    )
+    proposer.sparse_attention.index_update_context.assert_called_once_with(
+        ["request"], [12], [False], [0]
+    )
+
+
 def test_retrospec_proposer_attaches_kv_cache_group_to_retirement():
     proposer = RetroSpecProposer(
         make_vllm_config(

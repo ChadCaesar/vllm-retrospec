@@ -53,12 +53,17 @@ def get_retrospec_native_working_set_tokens(
 
     num_recent_blocks = cdiv(config.num_speculative_tokens, block_size) + 1
 
+    max_unindexed_segment_tokens = max(
+        config.retrospec_index_segment_size,
+        config.retrospec_index_update_interval,
+    )
+
     # Each active request independently retains its sink, incomplete segment,
     # recent blocks and speculative lookahead. Newly scheduled prefill tokens
     # are shared across the complete scheduler batch.
     per_request_steady_tokens = (
         block_size
-        + config.retrospec_index_segment_size
+        + max_unindexed_segment_tokens
         + num_recent_blocks * block_size
         + config.num_speculative_tokens
     )
@@ -113,10 +118,7 @@ def _get_indexed_token_capacity(
 
     full_block_count = max_model_len // block_size
     stable_end_block = max(full_block_count - num_recent_blocks, 1)
-    indexable_tokens = (stable_end_block - 1) * block_size
-
-    complete_segments = indexable_tokens // config.retrospec_index_segment_size
-    return complete_segments * config.retrospec_index_segment_size
+    return (stable_end_block - 1) * block_size
 
 
 def build_retrospec_long_context_capacity(
@@ -136,16 +138,22 @@ def build_retrospec_long_context_capacity(
     block_size = attention_specs[0].block_size
     max_resident_requests = vllm_config.scheduler_config.max_num_seqs
 
-    segment_size = config.retrospec_index_segment_size
+    prefill_segment_size = config.retrospec_index_segment_size
+    generation_update_interval = config.retrospec_index_update_interval
     tokens_per_cluster = config.retrospec_blocks_per_cluster * block_size
 
-    if segment_size % block_size != 0:
-        raise ValueError("retrospec_index_segment_size must be divisible by block_size")
-    if segment_size % tokens_per_cluster != 0:
-        raise ValueError(
-            "retrospec_index_segment_size must be divisible by "
-            "retrospec_blocks_per_cluster * block_size"
-        )
+    segment_sizes = (
+        ("retrospec_index_segment_size", prefill_segment_size),
+        ("retrospec_index_update_interval", generation_update_interval),
+    )
+    for field_name, segment_size in segment_sizes:
+        if segment_size % block_size != 0:
+            raise ValueError(f"{field_name} must be divisible by block_size")
+        if segment_size % tokens_per_cluster != 0:
+            raise ValueError(
+                f"{field_name} must be divisible by "
+                "retrospec_blocks_per_cluster * block_size"
+            )
 
     native_tokens = get_retrospec_native_working_set_tokens(
         vllm_config,
@@ -159,7 +167,7 @@ def build_retrospec_long_context_capacity(
     )
 
     indexed_tokens = _get_indexed_token_capacity(vllm_config, block_size)
-    num_clusters_per_request = indexed_tokens // tokens_per_cluster
+    num_clusters_per_request = cdiv(indexed_tokens, tokens_per_cluster)
     total_resident_clusters = max_resident_requests * num_clusters_per_request
 
     all_layer_token_bytes = sum(
@@ -209,7 +217,11 @@ def build_retrospec_long_context_capacity(
             scheduler_config.long_prefill_token_threshold,
         )
 
-    cluster_build_tokens = min(indexed_tokens, segment_size + max_prefill_chunk)
+    max_segment_size = max(prefill_segment_size, generation_update_interval)
+    cluster_build_tokens = min(
+        indexed_tokens,
+        max_segment_size + max_prefill_chunk,
+    )
 
     for spec in attention_specs:
         num_kv_heads = spec.num_kv_heads

@@ -395,7 +395,8 @@ def test_cluster_selection_workspace_is_reused_and_resized():
         num_speculative_tokens=4,
         retrieval_ratio=0.25,
         estimation_ratio=0.25,
-        segment_size_tokens=256,
+        prefill_segment_size_tokens=256,
+        generation_update_interval=64,
         blocks_per_cluster=2,
         num_kmeans_iterations=2,
     )
@@ -445,7 +446,8 @@ def test_workspace_cluster_selection_matches_allocating_path():
         num_speculative_tokens=4,
         retrieval_ratio=0.3,
         estimation_ratio=0.4,
-        segment_size_tokens=256,
+        prefill_segment_size_tokens=256,
+        generation_update_interval=64,
         blocks_per_cluster=2,
         num_kmeans_iterations=2,
     )

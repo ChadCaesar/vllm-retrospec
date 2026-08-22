@@ -41,6 +41,7 @@ def make_capacity_config(
         "retrospec_index_mode": "segmented_cluster",
         "retrospec_cache_mode": "cpu_offload",
         "retrospec_index_segment_size": 8192,
+        "retrospec_index_update_interval": 1024,
         "retrospec_blocks_per_cluster": 1,
         "retrospec_retrieval_ratio": 0.018,
         "retrospec_cache_ratio": 0.0,
@@ -103,6 +104,7 @@ def make_engine_config(
                 retrospec_index_mode="segmented_cluster",
                 retrospec_cache_mode="cpu_offload",
                 retrospec_index_segment_size=8192,
+                retrospec_index_update_interval=1024,
                 retrospec_blocks_per_cluster=1,
                 retrospec_retrieval_ratio=0.018,
                 retrospec_cache_ratio=0.0,
@@ -138,6 +140,12 @@ def test_native_working_set_includes_unretired_prefill_chunk():
 def test_native_working_set_honors_long_prefill_threshold():
     config = make_capacity_config(long_prefill_token_threshold=1024)
     assert get_retrospec_native_working_set_tokens(config, 16) == 9376
+
+
+def test_native_working_set_uses_larger_generation_update_interval():
+    config = make_capacity_config(retrospec_index_update_interval=16384)
+
+    assert get_retrospec_native_working_set_tokens(config, 16) == 20640
 
 
 def test_native_working_set_scales_request_state_but_shares_prefill_chunk():
@@ -184,6 +192,13 @@ def test_capacity_rejects_unaligned_segment_size():
     config = make_capacity_config(retrospec_index_segment_size=1000)
 
     with pytest.raises(ValueError, match="divisible by block_size"):
+        build_retrospec_long_context_capacity(config, make_kv_cache_specs())
+
+
+def test_capacity_rejects_unaligned_generation_update_interval():
+    config = make_capacity_config(retrospec_index_update_interval=1000)
+
+    with pytest.raises(ValueError, match="retrospec_index_update_interval"):
         build_retrospec_long_context_capacity(config, make_kv_cache_specs())
 
 
