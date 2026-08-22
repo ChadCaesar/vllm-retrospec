@@ -27,6 +27,7 @@ def make_index(
     cache_ratio: float = 0.0,
     pin_memory: bool = False,
     max_pending_cluster_builds: int = 2,
+    max_resident_requests: int = 1,
 ) -> RetroSpecSegmentedTokenIndex:
     return RetroSpecSegmentedTokenIndex(
         block_size=2,
@@ -40,6 +41,7 @@ def make_index(
         cache_mode=cache_mode,
         cache_ratio=cache_ratio,
         pin_memory=pin_memory,
+        max_resident_requests=max_resident_requests,
     )
 
 
@@ -623,6 +625,9 @@ def test_full_verification_plan_allows_another_layer_to_be_staged():
         defer_cpu_store=True,
     )
 
+    # This unit exercises the layer-local plan guard directly. Production
+    # full verification rejects any unflushed transaction at context entry.
+    index._gpu_index_residency.activate(["request"])
     try:
         plan = index.build_full_verification_plan(
             request_ids=["request"],
@@ -632,6 +637,7 @@ def test_full_verification_plan_allows_another_layer_to_be_staged():
             block_table=block_table,
         )
     finally:
+        index._gpu_index_residency.deactivate()
         index.discard_staged_updates()
 
     assert plan.exact_token_counts.tolist() == [[10]]
@@ -767,7 +773,7 @@ def test_rollback_invalidates_packed_page_ids_before_rebuild(monkeypatch):
     with pytest.raises(RuntimeError, match="clustering failed"):
         build_index(index, 10, keys, values, block_table)
 
-    assert "layer" not in index._packed_index_cache
+    assert index._gpu_index_residency.num_resident_layers == 0
     assert index.cluster_store.num_allocated_pages("layer") == 0
 
 
@@ -856,12 +862,12 @@ def test_removing_request_invalidates_packed_index():
     build_index(index, 10, keys, values, block_table)
 
     packed = index._pack_indices("layer", ["request"], keys, block_table)
-    assert "layer" in index._packed_index_cache
+    assert index._gpu_index_residency.num_resident_layers == 1
 
     index.remove_requests(["request"])
 
     assert "request" not in index._indices["layer"]
-    assert "layer" not in index._packed_index_cache
+    assert index._gpu_index_residency.num_resident_layers == 0
 
     rebuilt = index._pack_indices("layer", ["request"], keys, block_table)
     assert rebuilt is not packed
@@ -908,6 +914,44 @@ def test_segmented_index_proposal_lifecycle_tracks_empty_batches():
 
     with pytest.raises(RuntimeError, match="not active"):
         index.end_proposal()
+
+
+def test_cpu_offload_packs_multiple_requests_only_while_resident():
+    index = make_index(cache_mode="cpu_offload", max_resident_requests=2)
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).repeat(2, 1)
+    index.build_or_update(
+        layer_name="layer",
+        request_ids=["first", "second"],
+        seq_lens=[10, 10],
+        rows=[0, 1],
+        key_cache=keys,
+        value_cache=values,
+        block_table=block_table,
+    )
+
+    for request_id in ("first", "second"):
+        segment = index._indices["layer"][request_id].segments[0]
+        assert segment.cluster_keys.device.type == "cpu"
+        assert segment.cluster_values.device.type == "cpu"
+        assert segment.cluster_token_counts.device.type == "cpu"
+
+    index.begin_proposal(["first", "second"])
+    try:
+        packed = index._pack_indices("layer", ["first", "second"], keys, block_table)
+        assert packed.cluster_mask.all()
+        assert index._gpu_index_residency.num_resident_layers == 1
+    finally:
+        index.end_proposal()
+
+    assert index._gpu_index_residency.num_resident_layers == 0
+
+
+def test_cpu_offload_rejects_more_requests_than_reserved_capacity():
+    index = make_index(cache_mode="cpu_offload", max_resident_requests=2)
+
+    with pytest.raises(RuntimeError, match="exceeds max_num_seqs"):
+        index.begin_proposal(["first", "second", "third"])
 
 
 def test_cpu_offload_can_defer_flush_and_discard_index_updates():

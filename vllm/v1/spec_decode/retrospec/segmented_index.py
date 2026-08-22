@@ -23,6 +23,12 @@ from .index import (
     RetroSpecBlockIndex,
     RetroSpecSelectionPlan,
 )
+from .index_residency import (
+    RetroSpecClusterSummary,
+    RetroSpecGPUIndexResidencyManager,
+    RetroSpecResidentIndex,
+    RetroSpecStagedClusterSummary,
+)
 
 
 @dataclass(frozen=True)
@@ -111,9 +117,7 @@ class _StagedRequestLayerSegment:
     indexed_end: int
     cluster_start: int
 
-    cluster_keys: torch.Tensor
-    cluster_values: torch.Tensor
-    cluster_token_counts: torch.Tensor
+    cluster_summary: RetroSpecStagedClusterSummary
     build_future: Future[RetroSpecClusterBlockTable]
 
 
@@ -122,27 +126,6 @@ class _RequestLayerIndex:
     segments: list[_RequestLayerSegment]
     num_clusters: int
     indexed_end: int
-
-
-@dataclass(frozen=True)
-class _PackedSegmentedIndex:
-    indexed_token_mask: torch.Tensor
-
-    cluster_ids: torch.Tensor
-    cluster_keys: torch.Tensor
-    cluster_values: torch.Tensor
-    cluster_token_counts: torch.Tensor
-    cluster_mask: torch.Tensor
-
-    cluster_page_ids: torch.Tensor
-    cluster_page_token_counts: torch.Tensor
-
-
-@dataclass(frozen=True)
-class _PackedSegmentedIndexCacheEntry:
-    request_ids: tuple[str, ...]
-    max_num_tokens: int
-    packed: _PackedSegmentedIndex
 
 
 @dataclass(frozen=True)
@@ -186,6 +169,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         cache_mode: RetroSpecClusterStorageMode = "gpu_reference",
         cache_ratio: float = 0.0,
         pin_memory: bool = False,
+        max_resident_requests: int = 1,
     ) -> None:
         super().__init__(
             block_size=block_size,
@@ -229,15 +213,17 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             pin_memory=pin_memory,
             cache_ratio=effective_cache_ratio,
         )
+        self._gpu_index_residency = RetroSpecGPUIndexResidencyManager(
+            cpu_offload=cache_mode == "cpu_offload",
+            pin_memory=pin_memory,
+            max_resident_requests=max_resident_requests,
+        )
 
         # layer_name -> request_id -> token-level index
         self._indices: dict[str, dict[str, _RequestLayerIndex]] = {}
 
         self._proposal_active = False
         self._proposal_request_ids: tuple[str, ...] = ()
-
-        # Each layer retains only the most recently packed request batch.
-        self._packed_index_cache: dict[str, _PackedSegmentedIndexCacheEntry] = {}
 
         # Shared across model layers. Selection results are copied into each
         # plan before the workspace is reused.
@@ -309,6 +295,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
     def remove_requests(self, request_ids: Sequence[str]) -> None:
         request_ids = tuple(request_ids)
+        self._gpu_index_residency.invalidate_requests(request_ids)
 
         for layer_name, layer_indices in self._indices.items():
             layer_changed = False
@@ -322,7 +309,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 layer_changed = True
 
             if layer_changed:
-                self._packed_index_cache.pop(layer_name, None)
+                self._gpu_index_residency.invalidate_layer(layer_name)
 
     def prepare_full_verification(
         self,
@@ -363,7 +350,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 layer_changed = True
 
             if layer_changed:
-                self._packed_index_cache.pop(layer_name, None)
+                self._gpu_index_residency.invalidate_layer(layer_name)
 
     def begin_proposal(self, request_ids: Sequence[str]) -> None:
         if self._proposal_active:
@@ -373,15 +360,36 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 "Cannot begin a proposal before staged index updates are flushed"
             )
 
+        request_ids = tuple(request_ids)
+        self._gpu_index_residency.activate(request_ids)
         self._proposal_active = True
-        self._proposal_request_ids = tuple(request_ids)
+        self._proposal_request_ids = request_ids
 
     def end_proposal(self) -> None:
         if not self._proposal_active:
             raise RuntimeError("Segmented token index proposal is not active")
 
-        self._proposal_active = False
-        self._proposal_request_ids = ()
+        try:
+            self._gpu_index_residency.deactivate()
+        finally:
+            self._proposal_active = False
+            self._proposal_request_ids = ()
+
+    def begin_full_verification_residency(
+        self,
+        request_ids: Sequence[str],
+    ) -> None:
+        if self._proposal_active:
+            raise RuntimeError("Full-verification residency cannot overlap a proposal")
+        if self.has_staged_updates:
+            raise RuntimeError(
+                "Full-verification residency cannot begin with staged index updates"
+            )
+
+        self._gpu_index_residency.activate(request_ids)
+
+    def end_full_verification_residency(self) -> None:
+        self._gpu_index_residency.deactivate()
 
     def _empty_index(
         self,
@@ -453,22 +461,30 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
     def _release_built_segments(
         self,
         built_segments: Sequence[
-            tuple[_StagedRequestLayerSegment, RetroSpecClusterBlockTable]
+            tuple[
+                _StagedRequestLayerSegment,
+                RetroSpecClusterSummary,
+                RetroSpecClusterBlockTable,
+            ]
         ],
     ) -> None:
-        for staged_segment, cluster_blocks in built_segments:
+        for staged_segment, _, cluster_blocks in built_segments:
             self.cluster_store.free(staged_segment.layer_name, cluster_blocks)
 
     def _publish_built_segments(
         self,
         built_segments: Sequence[
-            tuple[_StagedRequestLayerSegment, RetroSpecClusterBlockTable]
+            tuple[
+                _StagedRequestLayerSegment,
+                RetroSpecClusterSummary,
+                RetroSpecClusterBlockTable,
+            ]
         ],
     ) -> None:
         """Atomically publish one complete staged index transaction."""
         pending_records: dict[tuple[str, str], _RequestLayerIndex] = {}
 
-        for staged_segment, cluster_blocks in built_segments:
+        for staged_segment, summary, cluster_blocks in built_segments:
             key = (staged_segment.layer_name, staged_segment.request_id)
             record = pending_records.get(key)
 
@@ -503,13 +519,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                     indexed_start=staged_segment.indexed_start,
                     indexed_end=staged_segment.indexed_end,
                     cluster_start=staged_segment.cluster_start,
-                    cluster_keys=staged_segment.cluster_keys,
-                    cluster_values=staged_segment.cluster_values,
-                    cluster_token_counts=staged_segment.cluster_token_counts,
+                    cluster_keys=summary.cluster_keys,
+                    cluster_values=summary.cluster_values,
+                    cluster_token_counts=summary.cluster_token_counts,
                     cluster_blocks=cluster_blocks,
                 )
             )
-            record.num_clusters += staged_segment.cluster_token_counts.shape[1]
+            record.num_clusters += summary.cluster_token_counts.shape[1]
             record.indexed_end = staged_segment.indexed_end
 
         # Construct replacement mappings before publishing self._indices so a
@@ -531,7 +547,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         self._indices = new_indices
 
         for layer_name in changed_layers:
-            self._packed_index_cache.pop(layer_name, None)
+            self._gpu_index_residency.invalidate_layer(layer_name)
 
     def _append_segment(
         self,
@@ -574,7 +590,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         )
         record.num_clusters += cluster_token_counts.shape[1]
         record.indexed_end = indexed_end
-        self._packed_index_cache.pop(layer_name, None)
+        self._gpu_index_residency.invalidate_layer(layer_name)
 
     def flush_staged_updates(self) -> None:
         """Wait for background page builds and publish them atomically."""
@@ -597,22 +613,44 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             )
 
         built_segments: list[
-            tuple[_StagedRequestLayerSegment, RetroSpecClusterBlockTable]
+            tuple[
+                _StagedRequestLayerSegment,
+                RetroSpecClusterSummary,
+                RetroSpecClusterBlockTable,
+            ]
         ] = []
         first_error: BaseException | None = None
 
         try:
-            # Resolve every future even after one fails. A later task may have
-            # completed successfully and own unpublished CPU pages.
             for staged_segment in staged_segments:
+                summary: RetroSpecClusterSummary | None = None
+                cluster_blocks: RetroSpecClusterBlockTable | None = None
+
+                try:
+                    summary = self._gpu_index_residency.finish_cluster_summary(
+                        staged_segment.cluster_summary
+                    )
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+
                 try:
                     cluster_blocks = staged_segment.build_future.result()
                 except BaseException as exc:
                     if first_error is None:
                         first_error = exc
-                    continue
 
-                built_segments.append((staged_segment, cluster_blocks))
+                if summary is not None and cluster_blocks is not None:
+                    built_segments.append((staged_segment, summary, cluster_blocks))
+                elif cluster_blocks is not None:
+                    try:
+                        self.cluster_store.free(
+                            staged_segment.layer_name,
+                            cluster_blocks,
+                        )
+                    except BaseException as exc:
+                        if first_error is None:
+                            first_error = exc
 
             if first_error is not None:
                 self._release_built_segments(built_segments)
@@ -640,6 +678,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
         try:
             for staged_segment in staged_segments:
+                try:
+                    self._gpu_index_residency.discard_cluster_summary(
+                        staged_segment.cluster_summary
+                    )
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+
                 try:
                     cluster_blocks = staged_segment.build_future.result()
                 except BaseException:
@@ -740,7 +786,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
             record = layer_indices.get(request_id)
             if record is not None and desired_end < record.indexed_end:
-                self._packed_index_cache.pop(layer_name, None)
+                self._gpu_index_residency.invalidate_layer(layer_name)
                 self._free_record(layer_name, record)
                 record = self._empty_index()
                 layer_indices[request_id] = record
@@ -848,6 +894,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 assert staged_token_kv is not None
 
                 try:
+                    staged_summary = self._gpu_index_residency.stage_cluster_summary(
+                        cluster_keys,
+                        cluster_values,
+                        cluster_token_counts,
+                    )
+                except BaseException:
+                    self.cluster_store.discard_staged_token_kv(staged_token_kv)
+                    raise
+
+                try:
                     staged_clusters = self.cluster_store.finish_stage_clusters(
                         staged_token_kv,
                         local_assignments,
@@ -855,6 +911,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                     )
                 except BaseException:
                     self.cluster_store.discard_staged_token_kv(staged_token_kv)
+                    self._gpu_index_residency.discard_cluster_summary(staged_summary)
                     raise
 
                 try:
@@ -868,6 +925,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                     # Metadata D2H may already be queued. Wait before returning
                     # its pinned staging slot to the shared pool.
                     self.cluster_store.discard_staged_clusters(staged_clusters)
+                    self._gpu_index_residency.discard_cluster_summary(staged_summary)
                     raise
 
                 self._staged_segments.append(
@@ -877,9 +935,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                         indexed_start=indexed_start,
                         indexed_end=desired_end,
                         cluster_start=cluster_start,
-                        cluster_keys=cluster_keys,
-                        cluster_values=cluster_values,
-                        cluster_token_counts=cluster_token_counts,
+                        cluster_summary=staged_summary,
                         build_future=build_future,
                     )
                 )
@@ -910,7 +966,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             )
 
         if layer_changed:
-            self._packed_index_cache.pop(layer_name, None)
+            self._gpu_index_residency.invalidate_layer(layer_name)
 
     def _pack_indices(
         self,
@@ -918,7 +974,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         request_ids: Sequence[str],
         key_cache: torch.Tensor,
         block_table: torch.Tensor,
-    ) -> _PackedSegmentedIndex:
+    ) -> RetroSpecResidentIndex:
         batch_size, max_num_blocks = block_table.shape
         max_num_tokens = max_num_blocks * self.block_size
         request_ids = tuple(request_ids)
@@ -926,13 +982,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         if len(request_ids) != batch_size:
             raise ValueError("request_ids batch size does not match block_table")
 
-        cached = self._packed_index_cache.get(layer_name)
-        if (
-            cached is not None
-            and cached.request_ids == request_ids
-            and cached.max_num_tokens == max_num_tokens
-        ):
-            return cached.packed
+        cached = self._gpu_index_residency.get(
+            layer_name,
+            request_ids,
+            max_num_tokens,
+        )
+        if cached is not None:
+            return cached
 
         layer_indices = self._indices.get(layer_name, {})
         records = [layer_indices.get(request_id) for request_id in request_ids]
@@ -1021,6 +1077,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             device=key_cache.device,
         )
 
+        non_blocking = (
+            self.cluster_store.is_cpu_backed
+            and self.cluster_store.pin_memory
+            and key_cache.device.type == "cuda"
+        )
+
         for row, record in enumerate(records):
             if record is None:
                 continue
@@ -1045,15 +1107,21 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 ]
 
                 packed_cluster_ids.copy_(
-                    segment.cluster_blocks.cluster_ids, non_blocking=False
+                    segment.cluster_blocks.cluster_ids,
+                    non_blocking=non_blocking,
                 )
                 cluster_keys[row, :, cluster_start:cluster_end].copy_(
-                    segment.cluster_keys
+                    segment.cluster_keys,
+                    non_blocking=non_blocking,
                 )
                 cluster_values[row, :, cluster_start:cluster_end].copy_(
-                    segment.cluster_values
+                    segment.cluster_values,
+                    non_blocking=non_blocking,
                 )
-                packed_cluster_token_counts.copy_(segment.cluster_token_counts)
+                packed_cluster_token_counts.copy_(
+                    segment.cluster_token_counts,
+                    non_blocking=non_blocking,
+                )
                 cluster_mask[row, :, cluster_start:cluster_end].copy_(
                     (packed_cluster_ids >= 0) & (packed_cluster_token_counts > 0)
                 )
@@ -1067,12 +1135,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
 
                 cluster_page_ids[
                     row, :, cluster_start:cluster_end, :segment_page_width
-                ].copy_(block_metadata.page_ids, non_blocking=False)
+                ].copy_(block_metadata.page_ids, non_blocking=non_blocking)
                 cluster_page_token_counts[
                     row, :, cluster_start:cluster_end, :segment_page_width
-                ].copy_(block_metadata.page_token_counts, non_blocking=False)
+                ].copy_(
+                    block_metadata.page_token_counts,
+                    non_blocking=non_blocking,
+                )
 
-        packed = _PackedSegmentedIndex(
+        packed = RetroSpecResidentIndex(
             indexed_token_mask=indexed_token_mask,
             cluster_ids=cluster_ids,
             cluster_keys=cluster_keys,
@@ -1080,12 +1151,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             cluster_token_counts=cluster_token_counts,
             cluster_mask=cluster_mask,
             cluster_page_ids=cluster_page_ids,
-            cluster_page_token_counts=(cluster_page_token_counts),
+            cluster_page_token_counts=cluster_page_token_counts,
         )
-        self._packed_index_cache[layer_name] = _PackedSegmentedIndexCacheEntry(
-            request_ids=request_ids,
-            max_num_tokens=max_num_tokens,
-            packed=packed,
+        self._gpu_index_residency.put(
+            layer_name,
+            request_ids,
+            max_num_tokens,
+            packed,
         )
         return packed
 
@@ -1828,7 +1900,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         cluster_zones: _PackedClusterZones,
         sparse_attn: torch.Tensor,
         expanded_attn: torch.Tensor,
-        packed: _PackedSegmentedIndex,
+        packed: RetroSpecResidentIndex,
     ) -> RetroSpecTokenSelectionPlan:
         num_kv_heads = packed.cluster_keys.shape[1]
         per_head_forced_exact = forced_exact_mask.unsqueeze(1).expand(
@@ -1968,7 +2040,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
     def _materialize_draft_selection(
         self,
         plan: RetroSpecTokenSelectionPlan,
-        packed: _PackedSegmentedIndex,
+        packed: RetroSpecResidentIndex,
         cluster_zones: _PackedClusterZones,
         cluster_scores: torch.Tensor,
         active_mask: torch.Tensor,

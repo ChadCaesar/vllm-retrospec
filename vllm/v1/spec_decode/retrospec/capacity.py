@@ -43,6 +43,9 @@ def get_retrospec_native_working_set_tokens(
         raise ValueError("RetroSpec requires num_speculative_tokens")
 
     scheduler_config = vllm_config.scheduler_config
+    max_num_seqs = scheduler_config.max_num_seqs
+    max_model_len = vllm_config.model_config.max_model_len
+
     max_prefill_chunk = scheduler_config.max_num_batched_tokens
     long_prefill_threshold = scheduler_config.long_prefill_token_threshold
     if long_prefill_threshold > 0:
@@ -50,18 +53,26 @@ def get_retrospec_native_working_set_tokens(
 
     num_recent_blocks = cdiv(config.num_speculative_tokens, block_size) + 1
 
-    # Newly scheduled prefill tokens cannot be retired until the current model
-    # execution has built and committed every complete segment they contain.
-    working_set_tokens = (
+    # Each active request independently retains its sink, incomplete segment,
+    # recent blocks and speculative lookahead. Newly scheduled prefill tokens
+    # are shared across the complete scheduler batch.
+    per_request_steady_tokens = (
         block_size
         + config.retrospec_index_segment_size
         + num_recent_blocks * block_size
-        + max_prefill_chunk
         + config.num_speculative_tokens
+    )
+    per_request_steady_tokens = min(per_request_steady_tokens, max_model_len)
+
+    maximum_total_tokens = max_num_seqs * max_model_len
+    working_set_tokens = min(
+        max_num_seqs * per_request_steady_tokens + max_prefill_chunk,
+        maximum_total_tokens,
     )
     working_set_tokens = cdiv(working_set_tokens, block_size) * block_size
 
-    return min(working_set_tokens, vllm_config.model_config.max_model_len)
+    maximum_rounded_tokens = max_num_seqs * cdiv(max_model_len, block_size) * block_size
+    return min(working_set_tokens, maximum_rounded_tokens)
 
 
 def _next_power_of_two(value: int) -> int:
@@ -123,6 +134,7 @@ def build_retrospec_long_context_capacity(
 
     attention_specs = _get_attention_specs(kv_cache_specs)
     block_size = attention_specs[0].block_size
+    max_resident_requests = vllm_config.scheduler_config.max_num_seqs
 
     segment_size = config.retrospec_index_segment_size
     tokens_per_cluster = config.retrospec_blocks_per_cluster * block_size
@@ -147,19 +159,23 @@ def build_retrospec_long_context_capacity(
     )
 
     indexed_tokens = _get_indexed_token_capacity(vllm_config, block_size)
-    num_clusters = indexed_tokens // tokens_per_cluster
+    num_clusters_per_request = indexed_tokens // tokens_per_cluster
+    total_resident_clusters = max_resident_requests * num_clusters_per_request
 
     all_layer_token_bytes = sum(
         spec.real_page_size_bytes // block_size for spec in attention_specs
     )
 
-    # Segment records retain centroid K/V, while the active packed index owns
-    # one additional GPU copy of the same summaries.
-    cluster_summary_bytes = 2 * num_clusters * all_layer_token_bytes
+    # CPU records are authoritative. Only one packed active-request copy of
+    # every centroid remains on GPU.
+    cluster_summary_bytes = total_resident_clusters * all_layer_token_bytes
 
     # Sum(ceil(cluster_size / block_size)) is bounded by the raw page count
     # plus one partially filled page for every cluster.
-    cluster_pages_per_head = cdiv(indexed_tokens, block_size) + num_clusters
+    cluster_pages_per_head_per_request = (
+        cdiv(indexed_tokens, block_size) + num_clusters_per_request
+    )
+    cluster_pages_per_head = max_resident_requests * cluster_pages_per_head_per_request
 
     effective_cache_ratio = config.retrospec_cache_ratio
     if effective_cache_ratio == 0.0:
@@ -170,13 +186,18 @@ def build_retrospec_long_context_capacity(
         resident_pages_per_head * spec.real_page_size_bytes for spec in attention_specs
     )
 
-    # Cluster IDs, page IDs, page counts, token counts and packed masks remain
-    # on GPU together with the centroid vectors.
+    max_model_len = vllm_config.model_config.max_model_len
+
+    # Cluster IDs, counts and masks use approximately 13 bytes per cluster;
+    # page IDs and counts use 12 bytes per page. The indexed-token masks use
+    # one byte per logical token.
     cluster_metadata_bytes = sum(
-        num_clusters * spec.num_kv_heads * 32 for spec in attention_specs
+        total_resident_clusters * spec.num_kv_heads * 13
+        + cluster_pages_per_head * spec.num_kv_heads * 12
+        + max_resident_requests * max_model_len
+        for spec in attention_specs
     )
 
-    max_model_len = vllm_config.model_config.max_model_len
     max_full_verify_workspace = 0
     max_cluster_build_workspace = 0
 
@@ -202,7 +223,12 @@ def build_retrospec_long_context_capacity(
         )
         transfer_buffer_bytes = transfer_pages * per_head_page_bytes
 
-        execution_tokens = _next_power_of_two(max(1024, num_kv_heads * max_model_len))
+        execution_tokens = _next_power_of_two(
+            max(
+                1024,
+                max_resident_requests * num_kv_heads * max_model_len,
+            )
+        )
         execution_buffer_bytes = execution_tokens * per_head_token_bytes
 
         max_full_verify_workspace = max(
@@ -224,7 +250,9 @@ def build_retrospec_long_context_capacity(
     max_kv_heads = max(spec.num_kv_heads for spec in attention_specs)
 
     # Float logits/scores plus top-k values and indices, shared across layers.
-    selection_workspace_bytes = num_clusters * (4 * num_query_heads + 24 * max_kv_heads)
+    selection_workspace_bytes = total_resident_clusters * (
+        4 * num_query_heads + 24 * max_kv_heads
+    )
 
     phase_workspace_bytes = max(
         max_full_verify_workspace + selection_workspace_bytes,

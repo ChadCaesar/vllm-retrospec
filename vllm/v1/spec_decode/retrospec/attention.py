@@ -145,6 +145,7 @@ class RetroSpecSparseAttention:
                     config.retrospec_cache_mode == "cpu_offload"
                     and is_pin_memory_available()
                 ),
+                max_resident_requests=vllm_config.scheduler_config.max_num_seqs,
             )
 
         self.exact_execution_buffer: RetroSpecExactExecutionBuffer | None = None
@@ -439,19 +440,19 @@ class RetroSpecSparseAttention:
             context_lens,
             tuple(self.original_forwards),
         )
-
-        self.full_verification_batch = _RetroSpecFullVerificationBatch(
-            request_ids=request_ids,
-            context_lens=context_lens,
-            query_lens=query_lens,
-        )
-        self.mode = RetroSpecAttentionMode.FULL_VERIFY
-
+        self.index.begin_full_verification_residency(request_ids)
         try:
+            self.full_verification_batch = _RetroSpecFullVerificationBatch(
+                request_ids=request_ids,
+                context_lens=context_lens,
+                query_lens=query_lens,
+            )
+            self.mode = RetroSpecAttentionMode.FULL_VERIFY
             yield
         finally:
             self.mode = RetroSpecAttentionMode.PASSTHROUGH
             self.full_verification_batch = None
+            self.index.end_full_verification_residency()
 
     @contextmanager
     def proposal_context(
@@ -464,15 +465,16 @@ class RetroSpecSparseAttention:
             raise RuntimeError(
                 "RetroSpec attention must be installed before proposing."
             )
-        self.proposal_request_ids = tuple(request_ids)
+        request_ids = tuple(request_ids)
         if isinstance(self.index, RetroSpecSegmentedTokenIndex):
             self.index.begin_proposal(request_ids)
 
-        for plans in self.selection_plans:
-            plans.clear()
-
-        self.in_proposal = True
         try:
+            self.proposal_request_ids = request_ids
+            for plans in self.selection_plans:
+                plans.clear()
+
+            self.in_proposal = True
             yield
         finally:
             self.in_proposal = False

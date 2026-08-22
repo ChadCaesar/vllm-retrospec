@@ -30,6 +30,7 @@ pytestmark = pytest.mark.cpu_test
 def make_capacity_config(
     *,
     max_model_len: int = 65536,
+    max_num_seqs: int = 1,
     max_num_batched_tokens: int = 4096,
     long_prefill_token_threshold: int = 0,
     **overrides: Any,
@@ -50,6 +51,7 @@ def make_capacity_config(
         SimpleNamespace(
             speculative_config=SimpleNamespace(**spec_values),
             scheduler_config=SimpleNamespace(
+                max_num_seqs=max_num_seqs,
                 max_num_batched_tokens=max_num_batched_tokens,
                 long_prefill_token_threshold=long_prefill_token_threshold,
             ),
@@ -138,6 +140,14 @@ def test_native_working_set_honors_long_prefill_threshold():
     assert get_retrospec_native_working_set_tokens(config, 16) == 9376
 
 
+def test_native_working_set_scales_request_state_but_shares_prefill_chunk():
+    config = make_capacity_config(max_num_seqs=2)
+
+    # 2 * (sink 16 + segment 8192 + recent 80 + lookahead 64)
+    # + one batch-wide prefill chunk 4096.
+    assert get_retrospec_native_working_set_tokens(config, 16) == 20800
+
+
 def test_native_working_set_is_capped_by_max_model_len():
     config = make_capacity_config(max_model_len=4096)
     assert get_retrospec_native_working_set_tokens(config, 16) == 4096
@@ -155,6 +165,19 @@ def test_capacity_reserves_null_block_and_auxiliary_buffers():
     )
     assert capacity.auxiliary_memory_bytes > 0
     assert capacity.total_memory_bytes > capacity.native_memory_bytes
+
+
+def test_capacity_reserves_indices_and_pages_for_all_resident_requests():
+    single = build_retrospec_long_context_capacity(
+        make_capacity_config(max_num_seqs=1), make_kv_cache_specs()
+    )
+    multiple = build_retrospec_long_context_capacity(
+        make_capacity_config(max_num_seqs=2), make_kv_cache_specs()
+    )
+
+    assert multiple.native_working_set_tokens == 20800
+    assert multiple.native_num_blocks > single.native_num_blocks
+    assert multiple.auxiliary_memory_bytes > single.auxiliary_memory_bytes
 
 
 def test_capacity_rejects_unaligned_segment_size():
@@ -235,26 +258,28 @@ def test_long_context_concurrency_uses_native_working_set():
     assert get_max_concurrency_for_kv_cache_config(config, kv_cache_config) == 2.0
 
 
-@pytest.mark.parametrize(
-    ("max_num_seqs", "enable_chunked_prefill", "message"),
-    [
-        (2, True, "max_num_seqs=1"),
-        (1, False, "enable_chunked_prefill=True"),
-    ],
-)
-def test_long_context_capacity_rejects_unsupported_scheduler_modes(
-    max_num_seqs: int,
-    enable_chunked_prefill: bool,
-    message: str,
-):
+def test_long_context_capacity_rejects_disabled_chunked_prefill():
     config = make_engine_config(
-        max_num_seqs=max_num_seqs,
-        enable_chunked_prefill=enable_chunked_prefill,
+        max_num_seqs=2,
+        enable_chunked_prefill=False,
     )
     spec = next(iter(make_kv_cache_specs().values()))
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="enable_chunked_prefill=True"):
         get_kv_cache_configs(config, [{"layer.0": spec}], [spec.page_size_bytes])
+
+
+def test_long_context_capacity_accepts_multiple_resident_requests():
+    config = make_engine_config(max_num_seqs=2)
+    specs = make_kv_cache_specs(num_layers=32)
+    capacity = build_retrospec_long_context_capacity(config, specs)
+    available_memory = (
+        capacity.total_memory_bytes + next(iter(specs.values())).page_size_bytes
+    )
+
+    kv_cache_configs = get_kv_cache_configs(config, [specs], [available_memory])
+
+    assert kv_cache_configs[0].num_blocks == capacity.native_num_blocks
 
 
 def test_long_context_capacity_checks_auxiliary_reserve(monkeypatch):

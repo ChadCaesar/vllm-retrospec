@@ -1340,8 +1340,9 @@ def _report_kv_cache_config(
             min_block_size,
         )
         logger.info_once(
-            "Maximum RetroSpec native working-set concurrency for "
-            "%d active tokens per request: %.2fx",
+            "Maximum RetroSpec native working-set batches for up to %d "
+            "resident requests (%d total active tokens): %.2fx",
+            vllm_config.scheduler_config.max_num_seqs,
             working_set_tokens,
             max_concurrency,
             scope="local",
@@ -1571,13 +1572,6 @@ def get_kv_cache_configs(
                     "RetroSpec long-context CPU offload requires "
                     "enable_chunked_prefill=True"
                 )
-            if scheduler_config.max_num_seqs != 1:
-                raise ValueError(
-                    "RetroSpec long-context capacity currently requires "
-                    "max_num_seqs=1. GPU index and resident-cache admission "
-                    "for multiple offloaded long requests is not implemented."
-                )
-
             retrospec_capacities = [
                 build_retrospec_long_context_capacity(
                     vllm_config,
@@ -1607,8 +1601,10 @@ def get_kv_cache_configs(
             ]
 
             logger.info_once(
-                "RetroSpec long-context capacity: native KV working set "
-                "%d tokens, native KV %s GiB, auxiliary reserve %s GiB",
+                "RetroSpec long-context capacity for up to %d requests: "
+                "native KV working set %d tokens, native KV %s GiB, "
+                "auxiliary reserve %s GiB",
+                scheduler_config.max_num_seqs,
                 retrospec_capacities[0].native_working_set_tokens,
                 format_gib(retrospec_capacities[0].native_memory_bytes),
                 format_gib(retrospec_capacities[0].auxiliary_memory_bytes),

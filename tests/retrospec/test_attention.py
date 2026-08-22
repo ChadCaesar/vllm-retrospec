@@ -469,6 +469,25 @@ def test_full_verification_context_restores_state_after_exception():
     assert controller.full_verification_batch is None
 
 
+def test_proposal_context_rejects_excess_residency_without_state_leak():
+    controller = make_controller(
+        index_mode="segmented_cluster",
+        cache_mode="cpu_offload",
+    )
+    mark_installed(controller)
+    request_ids = [f"request-{index}" for index in range(5)]
+
+    with (
+        pytest.raises(RuntimeError, match="exceeds max_num_seqs"),
+        controller.proposal_context(request_ids),
+    ):
+        pass
+
+    assert not controller.in_proposal
+    assert controller.proposal_request_ids == ()
+    assert controller.index._gpu_index_residency.active_request_ids == ()
+
+
 def test_attention_reports_only_new_fully_stored_retirement_ranges():
     controller = make_controller(
         index_mode="segmented_cluster",
@@ -1062,22 +1081,26 @@ def test_full_verification_packs_cpu_backed_cluster_pages_on_cuda():
         value_cache=value_cache,
         block_table=block_table,
     )
-    plan = controller.index.build_full_verification_plan(
-        request_ids=["request"],
-        layer_name="layer",
-        seq_lens=[10],
-        key_cache=key_cache,
-        block_table=block_table,
-    )
+    controller.index.begin_full_verification_residency(["request"])
+    try:
+        plan = controller.index.build_full_verification_plan(
+            request_ids=["request"],
+            layer_name="layer",
+            seq_lens=[10],
+            key_cache=key_cache,
+            block_table=block_table,
+        )
 
-    source, resolved_pages = controller._resolve_exact_kv_source(
-        plan,
-        key_cache,
-        value_cache,
-        block_table,
-    )
-    execution = controller.exact_execution_buffer.pack(source)
-    torch.cuda.synchronize()
+        source, resolved_pages = controller._resolve_exact_kv_source(
+            plan,
+            key_cache,
+            value_cache,
+            block_table,
+        )
+        execution = controller.exact_execution_buffer.pack(source)
+        torch.cuda.synchronize()
+    finally:
+        controller.index.end_full_verification_residency()
 
     assert resolved_pages is not None
     assert controller.index.cluster_store.is_cpu_backed
