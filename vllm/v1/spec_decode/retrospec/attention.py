@@ -168,6 +168,7 @@ class RetroSpecSparseAttention:
         self.index_update_request_ids: tuple[str, ...] = ()
         self.index_update_seq_lens: tuple[int, ...] = ()
         self.index_update_is_prefill: tuple[bool, ...] = ()
+        self.index_update_prefill_complete: tuple[bool, ...] = ()
         self.index_update_build_rows: tuple[int, ...] = ()
 
         self.mode = RetroSpecAttentionMode.PASSTHROUGH
@@ -203,6 +204,7 @@ class RetroSpecSparseAttention:
         request_ids: Sequence[str],
         seq_lens: Sequence[int],
         is_prefill: Sequence[bool],
+        prefill_complete: Sequence[bool],
         build_rows: Sequence[int],
     ) -> Iterator[None]:
         if self.in_proposal:
@@ -213,12 +215,20 @@ class RetroSpecSparseAttention:
         request_ids = tuple(request_ids)
         seq_lens = tuple(int(seq_len) for seq_len in seq_lens)
         is_prefill = tuple(bool(value) for value in is_prefill)
+        prefill_complete = tuple(bool(value) for value in prefill_complete)
         build_rows = tuple(int(row) for row in build_rows)
 
         if len(seq_lens) != len(request_ids):
             raise ValueError("seq_lens must match request_ids")
         if len(is_prefill) != len(request_ids):
             raise ValueError("is_prefill must match request_ids")
+        if len(prefill_complete) != len(request_ids):
+            raise ValueError("prefill_complete must match request_ids")
+        if any(
+            complete and not prefill
+            for complete, prefill in zip(prefill_complete, is_prefill)
+        ):
+            raise ValueError("prefill_complete requires is_prefill")
         if len(build_rows) != len(set(build_rows)):
             raise ValueError("build_rows must be unique")
         if any(row < 0 or row >= len(request_ids) for row in build_rows):
@@ -234,6 +244,7 @@ class RetroSpecSparseAttention:
         self.index_update_request_ids = request_ids
         self.index_update_seq_lens = seq_lens
         self.index_update_is_prefill = is_prefill
+        self.index_update_prefill_complete = prefill_complete
         self.index_update_build_rows = build_rows
 
         try:
@@ -250,6 +261,7 @@ class RetroSpecSparseAttention:
             self.index_update_request_ids = ()
             self.index_update_seq_lens = ()
             self.index_update_is_prefill = ()
+            self.index_update_prefill_complete = ()
             self.index_update_build_rows = ()
 
     def needs_index_update(
@@ -257,6 +269,7 @@ class RetroSpecSparseAttention:
         request_id: str,
         seq_len: int,
         is_prefill: bool,
+        prefill_complete: bool,
     ) -> bool:
         if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
             return False
@@ -266,6 +279,7 @@ class RetroSpecSparseAttention:
             seq_len,
             tuple(self.original_forwards),
             is_prefill,
+            prefill_complete,
         )
 
     def has_retired_kv_blocks(self, request_ids: Sequence[str]) -> bool:
@@ -710,6 +724,7 @@ class RetroSpecSparseAttention:
             value_cache=value_cache,
             block_table=attn_metadata.block_table,
             defer_cpu_store=True,
+            prefill_complete=self.index_update_prefill_complete,
         )
 
     def forward(

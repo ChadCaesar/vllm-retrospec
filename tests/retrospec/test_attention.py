@@ -359,7 +359,7 @@ def test_passthrough_forward_builds_segmented_index_after_target_attention():
         block_table=torch.arange(5, dtype=torch.int32).view(1, -1)
     )
 
-    with controller.index_update_context(["request"], [10], [True], [0]):
+    with controller.index_update_context(["request"], [10], [True], [True], [0]):
         result = controller.forward(
             "layer",
             original_forward,
@@ -375,11 +375,12 @@ def test_passthrough_forward_builds_segmented_index_after_target_attention():
     assert events == ["forward", "index"]
     assert controller.index.build_or_update.call_args.kwargs["defer_cpu_store"] is True
     assert controller.index.build_or_update.call_args.kwargs["is_prefill"] == (True,)
-    assert not controller.needs_index_update("request", 10, True)
+    assert not controller.needs_index_update("request", 10, True, True)
     assert not controller.index_update_active
     assert controller.index_update_request_ids == ()
     assert controller.index_update_seq_lens == ()
     assert controller.index_update_is_prefill == ()
+    assert controller.index_update_prefill_complete == ()
     assert controller.index_update_build_rows == ()
 
 
@@ -392,7 +393,7 @@ def test_index_update_context_restores_state_after_exception():
 
     with (
         pytest.raises(RuntimeError, match="prefill failure"),
-        controller.index_update_context(["request"], [10], [True], [0]),
+        controller.index_update_context(["request"], [10], [True], [True], [0]),
     ):
         raise RuntimeError("prefill failure")
 
@@ -401,6 +402,7 @@ def test_index_update_context_restores_state_after_exception():
     assert controller.index_update_request_ids == ()
     assert controller.index_update_seq_lens == ()
     assert controller.index_update_is_prefill == ()
+    assert controller.index_update_prefill_complete == ()
     assert controller.index_update_build_rows == ()
 
 
@@ -412,7 +414,7 @@ def test_index_update_context_restores_state_after_flush_failure():
 
     with (
         pytest.raises(RuntimeError, match="flush failure"),
-        controller.index_update_context(["request"], [10], [True], [0]),
+        controller.index_update_context(["request"], [10], [True], [True], [0]),
     ):
         pass
 
@@ -420,6 +422,7 @@ def test_index_update_context_restores_state_after_flush_failure():
     assert controller.index_update_request_ids == ()
     assert controller.index_update_seq_lens == ()
     assert controller.index_update_is_prefill == ()
+    assert controller.index_update_prefill_complete == ()
     assert controller.index_update_build_rows == ()
 
 
@@ -432,7 +435,7 @@ def test_generation_index_context_forwards_generation_phase():
         block_table=torch.arange(8, dtype=torch.int32).view(1, -1)
     )
 
-    with controller.index_update_context(["request"], [12], [False], [0]):
+    with controller.index_update_context(["request"], [12], [False], [False], [0]):
         controller.forward(
             "layer",
             Mock(return_value=torch.tensor([3.0])),
@@ -447,6 +450,7 @@ def test_generation_index_context_forwards_generation_phase():
     call_kwargs = controller.index.build_or_update.call_args.kwargs
     assert call_kwargs["seq_lens"] == (12,)
     assert call_kwargs["is_prefill"] == (False,)
+    assert call_kwargs["prefill_complete"] == (False,)
     assert call_kwargs["rows"] == (0,)
 
 
@@ -1052,6 +1056,7 @@ def test_full_verification_source_resolves_all_cluster_pages():
         staging_value_pages=staging_values,
         hit_cluster_mask=torch.tensor([[[True, False]]]),
         miss_cluster_mask=torch.tensor([[[False, True]]]),
+        hit_gate_ready_mask=torch.zeros(1, 1, 2, dtype=torch.bool),
         resident_ready_event=None,
         staging_ready_event=staging_ready_event,
     )
@@ -1423,6 +1428,7 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         staging_value_pages=staging_values,
         hit_cluster_mask=torch.tensor([[[True, False]]], device=device),
         miss_cluster_mask=torch.tensor([[[False, True]]], device=device),
+        hit_gate_ready_mask=torch.ones(1, 1, 2, dtype=torch.bool, device=device),
         resident_ready_event=resident_ready_event,
     )
     if pre_resolved:

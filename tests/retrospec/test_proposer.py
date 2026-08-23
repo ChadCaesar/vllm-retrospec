@@ -257,20 +257,21 @@ def test_retrospec_proposer_delegates_phase_aware_index_updates():
     proposer.sparse_attention.needs_index_update = Mock(return_value=True)
     proposer.sparse_attention.index_update_context = Mock(return_value=expected)
 
-    assert proposer.needs_index_update("request", 12, False)
+    assert proposer.needs_index_update("request", 12, False, False)
     context = proposer.index_update_context(
         request_ids=["request"],
         seq_lens=[12],
         is_prefill=[False],
+        prefill_complete=[False],
         build_rows=[0],
     )
 
     assert context is expected
     proposer.sparse_attention.needs_index_update.assert_called_once_with(
-        "request", 12, False
+        "request", 12, False, False
     )
     proposer.sparse_attention.index_update_context.assert_called_once_with(
-        ["request"], [12], [False], [0]
+        ["request"], [12], [False], [False], [0]
     )
 
 

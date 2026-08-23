@@ -515,6 +515,74 @@ def test_resident_cache_tracks_group_scoped_lru_in_shared_arena():
     assert list(cache._group_states[second_group].lru) == [12]
 
 
+def test_hit_gate_becomes_ready_at_each_group_soft_target():
+    first_group = RetroSpecClusterGroup("first", 0)
+    second_group = RetroSpecClusterGroup("second", 0)
+    cache = make_cache(
+        capacity=4,
+        group_targets={first_group: 2, second_group: 2},
+    )
+    backing_keys, backing_values = make_backing_pages(num_pages=4)
+    cluster_ids = torch.tensor([10, 11, 20, 21], dtype=torch.int64)
+    page_ids = torch.arange(4, dtype=torch.int64).unsqueeze(-1)
+    cluster_groups = {
+        10: first_group,
+        11: first_group,
+        20: second_group,
+        21: second_group,
+    }
+
+    cache.admit(
+        page_ids[[0, 2, 3]],
+        set(range(4)),
+        backing_keys,
+        backing_values,
+        cluster_ids=cluster_ids[[0, 2, 3]],
+        cluster_groups={10: first_group, 20: second_group, 21: second_group},
+        allocated_cluster_ids=set(cluster_groups),
+    )
+
+    access = cache.lookup(
+        page_ids,
+        set(range(4)),
+        touch=False,
+        cluster_ids=cluster_ids,
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+    )
+    assert access.hit_gate_ready_mask.tolist() == [False, False, True, True]
+
+    cache.admit(
+        page_ids[1:2],
+        set(range(4)),
+        backing_keys,
+        backing_values,
+        cluster_ids=cluster_ids[1:2],
+        cluster_groups={11: first_group},
+        allocated_cluster_ids=set(cluster_groups),
+    )
+    access = cache.lookup(
+        page_ids,
+        set(range(4)),
+        touch=False,
+        cluster_ids=cluster_ids,
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+    )
+    assert access.hit_gate_ready_mask.all()
+
+    cache.resize(5, group_targets={first_group: 3, second_group: 2})
+    access = cache.lookup(
+        page_ids,
+        set(range(4)),
+        touch=False,
+        cluster_ids=cluster_ids,
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+    )
+    assert access.hit_gate_ready_mask.tolist() == [False, False, True, True]
+
+
 def test_resident_cache_evicts_from_group_above_its_soft_target():
     first_group = RetroSpecClusterGroup("first", 0)
     second_group = RetroSpecClusterGroup("second", 0)

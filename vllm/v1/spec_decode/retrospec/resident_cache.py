@@ -39,6 +39,7 @@ class RetroSpecResidentPageAccess:
     cache_page_ids: torch.Tensor
     hit_cluster_mask: torch.Tensor
     miss_cluster_mask: torch.Tensor
+    hit_gate_ready_mask: torch.Tensor
 
 
 class RetroSpecResidentClusterCache:
@@ -284,6 +285,15 @@ class RetroSpecResidentClusterCache:
             raise RuntimeError(f"Resident group state is missing cluster {cluster_id}")
 
         group_state.lru.move_to_end(cluster_id, last=True)
+
+    def _is_group_hit_gate_ready(self, group: RetroSpecClusterGroup) -> bool:
+        """Return whether one request/head LRU reached its soft target."""
+        target_pages = self._group_targets.get(group, 0)
+        if target_pages <= 0:
+            return False
+
+        group_state = self._group_states.get(group)
+        return group_state is not None and group_state.num_pages >= target_pages
 
     def _evict_cluster(self, cluster_id: _ClusterId) -> None:
         slots = self._cluster_to_slots.pop(cluster_id, None)
@@ -630,9 +640,11 @@ class RetroSpecResidentClusterCache:
             dtype=torch.bool,
         )
         miss_cluster_mask_cpu = torch.zeros_like(hit_cluster_mask_cpu)
+        hit_gate_ready_mask_cpu = torch.zeros_like(hit_cluster_mask_cpu)
 
         flat_hit_mask = hit_cluster_mask_cpu.reshape(-1)
         flat_miss_mask = miss_cluster_mask_cpu.reshape(-1)
+        flat_hit_gate_ready_mask = hit_gate_ready_mask_cpu.reshape(-1)
         hit_clusters: set[_ClusterId] = set()
 
         for cluster_index, (
@@ -648,6 +660,11 @@ class RetroSpecResidentClusterCache:
         ):
             if cluster_id is None:
                 continue
+
+            group = cluster_groups[cluster_id]
+            flat_hit_gate_ready_mask[cluster_index] = self._is_group_hit_gate_ready(
+                group
+            )
 
             resident_slots = self._cluster_to_slots.get(cluster_id)
             pending = cluster_id in self._pending_cluster_events
@@ -695,6 +712,10 @@ class RetroSpecResidentClusterCache:
                 non_blocking=False,
             ),
             miss_cluster_mask=miss_cluster_mask_cpu.to(
+                device=cluster_ids.device,
+                non_blocking=False,
+            ),
+            hit_gate_ready_mask=hit_gate_ready_mask_cpu.to(
                 device=cluster_ids.device,
                 non_blocking=False,
             ),

@@ -150,6 +150,7 @@ def build_index(
     block_table: torch.Tensor,
     defer_cpu_store: bool = False,
     is_prefill: bool = True,
+    prefill_complete: bool = False,
 ) -> None:
     index.build_or_update(
         layer_name="layer",
@@ -161,6 +162,7 @@ def build_index(
         value_cache=values,
         block_table=block_table,
         defer_cpu_store=defer_cpu_store,
+        prefill_complete=[prefill_complete],
     )
 
 
@@ -284,6 +286,73 @@ def test_generation_appends_smaller_segments_after_prefill():
         for segment in record.segments
     ] == [(2, 10, 0), (10, 14, 4)]
     assert not index.needs_update("request", 18, ["layer"], False)
+
+
+def test_completed_prefill_clusters_aligned_tail():
+    index = make_index(
+        prefill_segment_size_tokens=8,
+        generation_update_interval=4,
+    )
+    keys, values = make_cache(num_blocks=12)
+    block_table = torch.arange(12, dtype=torch.int32).view(1, -1)
+
+    assert index._desired_indexed_end(16, None, True) == 10
+    assert index._desired_indexed_end(16, None, True, prefill_complete=True) == 12
+
+    build_index(
+        index,
+        16,
+        keys,
+        values,
+        block_table,
+        is_prefill=True,
+        prefill_complete=True,
+    )
+
+    record = index._indices["layer"]["request"]
+    assert record.indexed_end == 12
+    assert record.num_clusters == 5
+    cluster_token_counts = record.segments[0].cluster_token_counts
+    assert cluster_token_counts.shape == (1, 5)
+    assert cluster_token_counts[0, :4].sum().item() == 8
+    assert cluster_token_counts[0, 4].item() == 2
+    assert [
+        (segment.indexed_start, segment.indexed_end) for segment in record.segments
+    ] == [(2, 12)]
+
+
+def test_completed_chunked_prefill_appends_only_adaptive_tail():
+    index = make_index(
+        prefill_segment_size_tokens=8,
+        generation_update_interval=4,
+    )
+    keys, values = make_cache(num_blocks=12)
+    block_table = torch.arange(12, dtype=torch.int32).view(1, -1)
+
+    build_index(index, 14, keys, values, block_table, is_prefill=True)
+    build_index(
+        index,
+        16,
+        keys,
+        values,
+        block_table,
+        is_prefill=True,
+        prefill_complete=True,
+    )
+
+    record = index._indices["layer"]["request"]
+    assert record.indexed_end == 12
+    assert [
+        (segment.indexed_start, segment.indexed_end, segment.cluster_start)
+        for segment in record.segments
+    ] == [(2, 10, 0), (10, 12, 4)]
+
+
+def test_prefill_complete_rejects_generation_phase():
+    index = make_index()
+
+    with pytest.raises(ValueError, match="prefill_complete requires is_prefill"):
+        index.needs_update("request", 10, ["layer"], False, prefill_complete=True)
 
 
 def test_prefill_and_generation_sizes_do_not_need_to_divide_each_other():
@@ -1488,7 +1557,8 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     assert cold.estimation_token_counts.tolist() == [[[2, 2]]]
     assert cold.estimation_keys[0, 0, :, 0].tolist() == pytest.approx([1.0, 2.0])
     assert cold.estimation_values[0, 0, :, 0].tolist() == pytest.approx([10.0, 20.0])
-    assert cold.hit_attn.item() == pytest.approx(0.0)
+    assert cold.hit_attn.item() == pytest.approx(1.0)
+    assert not cold.resolved_pages.hit_gate_ready_mask.any()
     assert not cold.exact_page_token_counts.any()
     assert cold.plan.sparse_exact_page_token_counts.sum().item() == 2
 
@@ -1517,6 +1587,7 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     assert index.cluster_store.num_resident_pages("layer") == 1
     assert warm.exact_token_counts.tolist() == [[8]]
     assert warm.estimation_token_counts.tolist() == [[[2, 0]]]
+    assert warm.resolved_pages.hit_gate_ready_mask.all()
     assert warm.hit_attn.item() == pytest.approx(warm.plan.sparse_attn.item())
 
     assert verification.resolved_pages is None

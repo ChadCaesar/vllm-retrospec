@@ -277,6 +277,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         seq_len: int,
         record: _RequestLayerIndex | None,
         is_prefill: bool,
+        prefill_complete: bool = False,
     ) -> int:
         """Return the next complete prefill or generation index boundary."""
         stable_end = self._stable_indexed_end(seq_len)
@@ -288,8 +289,51 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             indexed_start = record.indexed_end
 
         available_tokens = max(stable_end - indexed_start, 0)
+        if is_prefill and prefill_complete:
+            complete_clusters = available_tokens // self.tokens_per_cluster
+            return indexed_start + complete_clusters * self.tokens_per_cluster
+
         complete_segments = available_tokens // segment_size
         return indexed_start + complete_segments * segment_size
+
+    def _clustering_phases(
+        self,
+        num_tokens: int,
+        is_prefill: bool,
+        prefill_complete: bool,
+    ) -> tuple[tuple[int, int], ...]:
+        """Split one update into regular segments and an adaptive prefill tail.
+
+        Each tuple contains ``(num_phase_tokens, segment_size)``. Standard
+        prefill segments retain the configured target size. Once prefill is
+        complete, the remaining cluster-aligned tail becomes one shorter
+        segment instead of waiting for generation updates.
+        """
+        if num_tokens <= 0:
+            return ()
+
+        segment_size = self._segment_size_for_phase(is_prefill)
+        if not is_prefill or not prefill_complete:
+            if num_tokens % segment_size != 0:
+                raise RuntimeError(
+                    "New indexed region must contain complete phase-specific segments"
+                )
+            return ((num_tokens, segment_size),)
+
+        regular_tokens = num_tokens // segment_size * segment_size
+        tail_tokens = num_tokens - regular_tokens
+        phases: list[tuple[int, int]] = []
+
+        if regular_tokens:
+            phases.append((regular_tokens, segment_size))
+        if tail_tokens:
+            if tail_tokens % self.tokens_per_cluster != 0:
+                raise RuntimeError(
+                    "Adaptive prefill tail must contain complete clusters"
+                )
+            phases.append((tail_tokens, tail_tokens))
+
+        return tuple(phases)
 
     def needs_update(
         self,
@@ -297,11 +341,17 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         seq_len: int,
         layer_names: Sequence[str],
         is_prefill: bool,
+        prefill_complete: bool = False,
     ) -> bool:
+        if prefill_complete and not is_prefill:
+            raise ValueError("prefill_complete requires is_prefill")
+
         for layer_name in layer_names:
             layer_indices = self._indices.get(layer_name)
             record = None if layer_indices is None else layer_indices.get(request_id)
-            desired_end = self._desired_indexed_end(seq_len, record, is_prefill)
+            desired_end = self._desired_indexed_end(
+                seq_len, record, is_prefill, prefill_complete
+            )
 
             if record is None or record.indexed_end != desired_end:
                 return True
@@ -786,12 +836,17 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
         defer_cpu_store: bool = False,
+        prefill_complete: Sequence[bool] | None = None,
     ) -> None:
         """Cluster stable tokens and stage or store private cluster pages."""
         if len(request_ids) != len(seq_lens):
             raise ValueError("request_ids and seq_lens must have equal length")
         if len(request_ids) != len(is_prefill):
             raise ValueError("request_ids and is_prefill must have equal length")
+        if prefill_complete is None:
+            prefill_complete = (False,) * len(request_ids)
+        if len(request_ids) != len(prefill_complete):
+            raise ValueError("request_ids and prefill_complete must have equal length")
         if block_table.shape[0] != len(request_ids):
             raise ValueError("block_table batch size does not match request_ids")
         if key_cache.shape != value_cache.shape:
@@ -814,13 +869,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
             request_id = request_ids[row]
             seq_len = seq_lens[row]
             request_is_prefill = bool(is_prefill[row])
-            segment_size = self._segment_size_for_phase(request_is_prefill)
+            request_prefill_complete = bool(prefill_complete[row])
+            if request_prefill_complete and not request_is_prefill:
+                raise ValueError("prefill_complete requires is_prefill")
 
             record = layer_indices.get(request_id)
             desired_end = self._desired_indexed_end(
                 seq_len,
                 record,
                 request_is_prefill,
+                request_prefill_complete,
             )
 
             staged_key = (layer_name, request_id)
@@ -845,10 +903,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 continue
 
             num_new_tokens = desired_end - indexed_start
-            if num_new_tokens % segment_size != 0:
-                raise RuntimeError(
-                    "New indexed region must contain complete phase-specific segments"
-                )
+            clustering_phases = self._clustering_phases(
+                num_new_tokens,
+                request_is_prefill,
+                request_prefill_complete,
+            )
 
             first_logical_block = indexed_start // self.block_size
             logical_block_end = desired_end // self.block_size
@@ -910,12 +969,29 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
                 )
 
             try:
-                local_assignments, cluster_token_counts = segmented_kmeans_assignments(
-                    features=token_keys,
-                    segment_size=segment_size,
-                    items_per_cluster=self.tokens_per_cluster,
-                    num_iterations=self.num_kmeans_iterations,
-                )
+                assignment_parts: list[torch.Tensor] = []
+                count_parts: list[torch.Tensor] = []
+                token_start = 0
+                cluster_offset = 0
+
+                for phase_tokens, phase_segment_size in clustering_phases:
+                    token_end = token_start + phase_tokens
+                    phase_assignments, phase_counts = segmented_kmeans_assignments(
+                        features=token_keys[:, token_start:token_end],
+                        segment_size=phase_segment_size,
+                        items_per_cluster=self.tokens_per_cluster,
+                        num_iterations=self.num_kmeans_iterations,
+                    )
+                    assignment_parts.append(phase_assignments + cluster_offset)
+                    count_parts.append(phase_counts)
+                    token_start = token_end
+                    cluster_offset += phase_counts.shape[1]
+
+                if token_start != num_new_tokens:
+                    raise RuntimeError("Clustering phases do not cover the update")
+
+                local_assignments = torch.cat(assignment_parts, dim=1)
+                cluster_token_counts = torch.cat(count_parts, dim=1)
 
                 cluster_keys = self._cluster_means(
                     token_keys,
@@ -2172,8 +2248,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecBlockIndex):
         )
 
         has_clusters = packed.cluster_mask.any(dim=2)
+        hit_gate_ready_by_head = (
+            cluster_zones.sparse_retrieval_mask & resolved_pages.hit_gate_ready_mask
+        ).any(dim=2)
+        use_hit_attn = has_clusters & hit_gate_ready_by_head
         hit_attn_by_head = torch.where(
-            has_clusters,
+            use_hit_attn,
             hit_attn_by_head,
             torch.ones_like(hit_attn_by_head),
         )

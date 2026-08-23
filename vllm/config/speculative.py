@@ -178,7 +178,8 @@ class SpeculativeConfig:
     retrospec_index_segment_size: int = Field(default=8192, gt=0)
     """Number of tokens clustered independently in one prefill segment.
     This controls only initial prompt-index construction and does not control
-    generation-time incremental updates."""
+    generation-time incremental updates. The final prefill tail uses a shorter
+    cluster-aligned segment when it cannot fill this target size."""
     retrospec_blocks_per_cluster: int = Field(default=1, gt=0)
     """Average number of vLLM KV blocks represented by one cluster. With the
     default CUDA block size of 16, this targets approximately 16 tokens per

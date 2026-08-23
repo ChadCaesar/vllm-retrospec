@@ -3604,6 +3604,13 @@ class GPUModelRunner(
                 < self.requests[request_id].num_prompt_tokens
                 for request_id in req_ids
             ]
+            index_prefill_complete = [
+                is_prefill
+                and index_seq_lens[row] >= self.requests[request_id].num_prompt_tokens
+                for row, (request_id, is_prefill) in enumerate(
+                    zip(req_ids, index_is_prefill)
+                )
+            ]
 
             retrospec_index_rows = [
                 row
@@ -3612,6 +3619,7 @@ class GPUModelRunner(
                     request_id,
                     index_seq_lens[row],
                     index_is_prefill[row],
+                    index_prefill_complete[row],
                 )
             ]
 
@@ -3620,6 +3628,7 @@ class GPUModelRunner(
                     request_ids=req_ids,
                     seq_lens=index_seq_lens,
                     is_prefill=index_is_prefill,
+                    prefill_complete=index_prefill_complete,
                     build_rows=retrospec_index_rows,
                 )
 

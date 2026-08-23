@@ -204,6 +204,10 @@ class RetroSpecResolvedClusterPages:
     leading shape, excluding the page dimension. Empty or padded clusters are
     false in both masks.
 
+    hit_gate_ready_mask marks clusters whose request/head resident LRU has
+    reached its soft page target. Cold groups remain protected from hit-based
+    draft transitions until this mask becomes true.
+
     resident_ready_event is recorded on the resident-cache copy stream.
     staging_ready_event is recorded after a full-verification layer transfer.
     The execution stream must wait for the corresponding event before reading
@@ -221,6 +225,7 @@ class RetroSpecResolvedClusterPages:
 
     hit_cluster_mask: torch.Tensor
     miss_cluster_mask: torch.Tensor
+    hit_gate_ready_mask: torch.Tensor
     resident_ready_event: torch.cuda.Event | None
     staging_ready_event: torch.cuda.Event | None = None
 
@@ -2288,6 +2293,7 @@ class RetroSpecClusterPageStore:
                 staging_value_pages=pool.value_pages[:0],
                 hit_cluster_mask=hit_cluster_mask,
                 miss_cluster_mask=torch.zeros_like(hit_cluster_mask),
+                hit_gate_ready_mask=hit_cluster_mask,
                 resident_ready_event=None,
             )
 
@@ -2334,6 +2340,7 @@ class RetroSpecClusterPageStore:
             staging_value_pages=staging_value_pages,
             hit_cluster_mask=resident_access.hit_cluster_mask,
             miss_cluster_mask=resident_access.miss_cluster_mask,
+            hit_gate_ready_mask=resident_access.hit_gate_ready_mask,
             resident_ready_event=resident_ready_event,
         )
 
@@ -2392,6 +2399,7 @@ class RetroSpecClusterPageStore:
             staging_value_pages=staging_value_pages,
             hit_cluster_mask=torch.zeros_like(valid_cluster_mask),
             miss_cluster_mask=valid_cluster_mask,
+            hit_gate_ready_mask=torch.zeros_like(valid_cluster_mask),
             resident_ready_event=None,
             staging_ready_event=staging_ready_event,
         )
