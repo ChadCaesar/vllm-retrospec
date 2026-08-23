@@ -174,8 +174,8 @@ def build_retrospec_long_context_capacity(
         spec.real_page_size_bytes // block_size for spec in attention_specs
     )
 
-    # CPU records are authoritative. Only one packed active-request copy of
-    # every centroid remains on GPU.
+    # CPU records are authoritative. One request-level copy of every centroid
+    # remains on GPU from publication until request removal or rollback.
     cluster_summary_bytes = total_resident_clusters * all_layer_token_bytes
 
     # Sum(ceil(cluster_size / block_size)) is bounded by the raw page count
@@ -196,15 +196,20 @@ def build_retrospec_long_context_capacity(
 
     max_model_len = vllm_config.model_config.max_model_len
 
-    # Cluster IDs, counts and masks use approximately 13 bytes per cluster;
-    # page IDs and counts use 12 bytes per page. The indexed-token masks use
-    # one byte per logical token.
-    cluster_metadata_bytes = sum(
+    # Persistent cluster IDs, counts and masks use approximately 13 bytes per
+    # cluster; page IDs and counts use 12 bytes per page.
+    persistent_cluster_metadata_bytes = sum(
         total_resident_clusters * spec.num_kv_heads * 13
         + cluster_pages_per_head * spec.num_kv_heads * 12
-        + max_resident_requests * max_model_len
         for spec in attention_specs
     )
+    # A proposal/full-verification packed view additionally owns one logical
+    # indexed-token mask per request and layer.
+    packed_cluster_metadata_bytes = persistent_cluster_metadata_bytes + sum(
+        max_resident_requests * max_model_len for _ in attention_specs
+    )
+    persistent_index_bytes = cluster_summary_bytes + persistent_cluster_metadata_bytes
+    packed_index_bytes = cluster_summary_bytes + packed_cluster_metadata_bytes
 
     max_full_verify_workspace = 0
     max_cluster_build_workspace = 0
@@ -267,15 +272,12 @@ def build_retrospec_long_context_capacity(
     )
 
     phase_workspace_bytes = max(
-        max_full_verify_workspace + selection_workspace_bytes,
+        max_full_verify_workspace + selection_workspace_bytes + packed_index_bytes,
         max_cluster_build_workspace,
     )
 
     auxiliary_memory_bytes = (
-        cluster_summary_bytes
-        + resident_cache_bytes
-        + cluster_metadata_bytes
-        + phase_workspace_bytes
+        persistent_index_bytes + resident_cache_bytes + phase_workspace_bytes
     )
 
     # Cover allocator rounding, CUDA events and small metadata tensors.

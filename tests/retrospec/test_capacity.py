@@ -285,7 +285,10 @@ def test_long_context_capacity_rejects_disabled_chunked_prefill():
 
 
 def test_long_context_capacity_accepts_multiple_resident_requests():
-    config = make_engine_config(max_num_seqs=2)
+    # The auxiliary request-level and packed indices make 64K full KV cheaper
+    # than long-context mode for this synthetic 32-layer model. Use a context
+    # where full KV still exceeds the complete RetroSpec working set.
+    config = make_engine_config(max_model_len=131072, max_num_seqs=2)
     specs = make_kv_cache_specs(num_layers=32)
     capacity = build_retrospec_long_context_capacity(config, specs)
     available_memory = (

@@ -953,7 +953,7 @@ def test_rollback_invalidates_packed_page_ids_before_rebuild(monkeypatch):
     with pytest.raises(RuntimeError, match="clustering failed"):
         build_index(index, 10, keys, values, block_table)
 
-    assert index._gpu_index_residency.num_resident_layers == 0
+    assert index._gpu_index_residency.num_packed_layers == 0
     assert index.cluster_store.num_allocated_pages("layer") == 0
 
 
@@ -1042,12 +1042,12 @@ def test_removing_request_invalidates_packed_index():
     build_index(index, 10, keys, values, block_table)
 
     packed = index._pack_indices("layer", ["request"], keys, block_table)
-    assert index._gpu_index_residency.num_resident_layers == 1
+    assert index._gpu_index_residency.num_packed_layers == 1
 
     index.remove_requests(["request"])
 
     assert "request" not in index._indices["layer"]
-    assert index._gpu_index_residency.num_resident_layers == 0
+    assert index._gpu_index_residency.num_packed_layers == 0
 
     rebuilt = index._pack_indices("layer", ["request"], keys, block_table)
     assert rebuilt is not packed
@@ -1097,7 +1097,7 @@ def test_segmented_index_proposal_lifecycle_tracks_empty_batches():
         index.end_proposal()
 
 
-def test_cpu_offload_packs_multiple_requests_only_while_resident():
+def test_cpu_offload_keeps_request_indices_after_batch_deactivation():
     index = make_index(cache_mode="cpu_offload", max_resident_requests=2)
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).repeat(2, 1)
@@ -1118,15 +1118,78 @@ def test_cpu_offload_packs_multiple_requests_only_while_resident():
         assert segment.cluster_values.device.type == "cpu"
         assert segment.cluster_token_counts.device.type == "cpu"
 
+        resident_segments = index._gpu_index_residency.get_resident_segments(
+            "layer", request_id
+        )
+        assert len(resident_segments) == 1
+        resident = resident_segments[0]
+        assert resident.indexed_start == segment.indexed_start
+        assert resident.indexed_end == segment.indexed_end
+        assert resident.cluster_start == segment.cluster_start
+        assert torch.equal(resident.cluster_keys, segment.cluster_keys)
+        assert torch.equal(resident.cluster_values, segment.cluster_values)
+        assert torch.equal(resident.cluster_token_counts, segment.cluster_token_counts)
+
+    assert index._gpu_index_residency.resident_request_ids == (
+        "first",
+        "second",
+    )
+    assert index._gpu_index_residency.num_resident_layers == 1
+    assert index._gpu_index_residency.num_packed_layers == 0
+
     index.begin_proposal(["first", "second"])
     try:
         packed = index._pack_indices("layer", ["first", "second"], keys, block_table)
         assert packed.cluster_mask.all()
-        assert index._gpu_index_residency.num_resident_layers == 1
+        assert index._gpu_index_residency.num_packed_layers == 1
     finally:
         index.end_proposal()
 
-    assert index._gpu_index_residency.num_resident_layers == 0
+    assert index._gpu_index_residency.num_packed_layers == 0
+    assert index._gpu_index_residency.num_resident_layers == 1
+
+    index.remove_requests(["first"])
+    assert index._gpu_index_residency.resident_request_ids == ("second",)
+    assert index._gpu_index_residency.get_resident_segments("layer", "first") == ()
+
+
+def test_cpu_offload_appends_resident_segments_across_index_updates():
+    index = make_index(cache_mode="cpu_offload")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+
+    first_segment = index._gpu_index_residency.get_resident_segments(
+        "layer", "request"
+    )[0]
+
+    index.begin_proposal(["request"])
+    try:
+        first_packed = index._pack_indices("layer", ["request"], keys, block_table)
+        assert first_packed.cluster_mask.sum().item() == 2
+    finally:
+        index.end_proposal()
+
+    build_index(index, 14, keys, values, block_table)
+
+    resident_segments = index._gpu_index_residency.get_resident_segments(
+        "layer", "request"
+    )
+    assert len(resident_segments) == 2
+    assert resident_segments[0] is first_segment
+    assert resident_segments[0].indexed_end == resident_segments[1].indexed_start
+    assert (
+        resident_segments[0].cluster_start + resident_segments[0].cluster_keys.shape[1]
+        == resident_segments[1].cluster_start
+    )
+    assert index._gpu_index_residency.num_packed_layers == 0
+
+    index.begin_proposal(["request"])
+    try:
+        updated_packed = index._pack_indices("layer", ["request"], keys, block_table)
+        assert updated_packed.cluster_mask.sum().item() == 4
+    finally:
+        index.end_proposal()
 
 
 def test_cpu_offload_rejects_more_requests_than_reserved_capacity():
@@ -1533,6 +1596,17 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     ).view(1, -1)
     build_index(index, 10, keys, values, block_table)
 
+    resident = index._gpu_index_residency.get_resident_segments("layer", "request")[0]
+    resident_key_ptr = resident.cluster_keys.data_ptr()
+    assert resident.cluster_keys.device.type == "cuda"
+    assert resident.cluster_values.device.type == "cuda"
+    assert resident.cluster_token_counts.device.type == "cuda"
+    assert resident.cluster_ids.device.type == "cuda"
+    assert resident.cluster_page_ids.device.type == "cuda"
+    assert index._indices["layer"]["request"].segments[0].cluster_keys.device.type == (
+        "cpu"
+    )
+
     selection_kwargs = {
         "request_ids": ["request"],
         "layer_name": "layer",
@@ -1550,6 +1624,10 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
         cold = index.select_segmented(**selection_kwargs)
     finally:
         index.end_proposal()
+
+    persistent = index._gpu_index_residency.get_resident_segments("layer", "request")[0]
+    assert persistent.cluster_keys.data_ptr() == resident_key_ptr
+    assert index._gpu_index_residency.num_packed_layers == 0
 
     assert cold.resolved_pages is not None
     assert index.cluster_store.num_resident_pages("layer") == 0
