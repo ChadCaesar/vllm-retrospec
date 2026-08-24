@@ -1137,7 +1137,10 @@ def test_verify_only_processes_current_logical_draft_interval(monkeypatch):
 
 def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
     proposer = RetroSpecProposer(
-        make_vllm_config(retrospec_max_draft_tokens=2),
+        make_vllm_config(
+            retrospec_max_draft_tokens=2,
+            retrospec_stats_interval_seconds=3600.0,
+        ),
         torch.device("cpu"),
         make_runner(),
     )
@@ -1188,6 +1191,21 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
     assert result == [[1, 2, 3, 4]]
     assert proposer.state.pending_counts.tolist() == [4]
     assert proposer.state.stage.tolist() == [int(RetroSpecStage.FULL_VERIFY)]
+
+    stats = proposer.performance_stats
+    gpu_counters = {
+        name: int(stats._gpu_counters[index].item())
+        for name, index in stats._gpu_counter_indices.items()
+    }
+    assert stats._cpu_counters["proposal_calls"] == 1
+    assert stats._cpu_counters["proposal_requests"] == 1
+    assert gpu_counters == {
+        "draft_round_requests": 2,
+        "draft_tokens": 4,
+        "verified_tokens": 4,
+        "proposed_tokens": 4,
+    }
+    assert stats._cpu_times["proposal_wall"][1] == 1
 
 
 def test_propose_handles_different_round_offsets_in_one_buffer(monkeypatch):

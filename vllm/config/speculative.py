@@ -214,6 +214,10 @@ class SpeculativeConfig:
     """Trigger full verification when expanded-zone attention mass is
     below this value."""
 
+    retrospec_stats_interval_seconds: float = Field(default=0.0, ge=0)
+    """Interval for worker-side RetroSpec performance logs. Zero disables all
+    RetroSpec performance counters and CUDA event timing."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

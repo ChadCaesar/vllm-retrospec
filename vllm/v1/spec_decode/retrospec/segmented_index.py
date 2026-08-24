@@ -25,6 +25,7 @@ from .index_residency import (
     RetroSpecResidentSegment,
     RetroSpecStagedClusterSummary,
 )
+from .performance import RetroSpecPerformanceStats
 
 
 @dataclass(frozen=True)
@@ -168,6 +169,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         cache_ratio: float = 0.0,
         pin_memory: bool = False,
         max_resident_requests: int = 1,
+        performance_stats: RetroSpecPerformanceStats | None = None,
     ) -> None:
         super().__init__(
             block_size=block_size,
@@ -210,6 +212,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self.tokens_per_cluster = tokens_per_cluster
         self.num_kmeans_iterations = num_kmeans_iterations
         self.max_pending_cluster_builds = max_pending_cluster_builds
+        self.performance_stats = performance_stats
         effective_cache_ratio = cache_ratio
         if cache_ratio == 0.0:
             # RetroInfer uses three sparse retrieval zones when an explicit
@@ -223,6 +226,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             page_size=block_size,
             pin_memory=pin_memory,
             cache_ratio=effective_cache_ratio,
+            performance_stats=performance_stats,
         )
 
         full_block_count = max_model_len // block_size
@@ -534,6 +538,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             staged=staged_clusters,
         )
         self._pending_cluster_builds.append(build_future)
+        if self.performance_stats is not None:
+            self.performance_stats.observe_peak(
+                "cluster_build_queue_depth",
+                len(self._pending_cluster_builds),
+            )
         return build_future
 
     def _wait_for_cluster_build_slot(self) -> None:
@@ -923,6 +932,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
                 for phase_tokens, phase_segment_size in clustering_phases:
                     token_end = token_start + phase_tokens
+                    kmeans_timer = (
+                        None
+                        if self.performance_stats is None
+                        else self.performance_stats.start_cuda_timer("segmented_kmeans")
+                    )
                     phase_result = segmented_kmeans(
                         token_keys=token_keys[:, token_start:token_end],
                         token_values=token_values[:, token_start:token_end],
@@ -930,6 +944,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                         items_per_cluster=self.tokens_per_cluster,
                         num_iterations=self.num_kmeans_iterations,
                     )
+                    if self.performance_stats is not None:
+                        self.performance_stats.stop_cuda_timer(kmeans_timer)
+                        self.performance_stats.add_counter(
+                            "indexed_token_layers",
+                            phase_tokens,
+                        )
+                        self.performance_stats.add_counter(
+                            "cluster_slots_built",
+                            phase_result.cluster_sizes.numel(),
+                        )
                     assignment_parts.append(phase_result.assignments + cluster_offset)
                     count_parts.append(phase_result.cluster_sizes)
                     key_parts.append(phase_result.cluster_keys)
@@ -1451,11 +1475,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         arena = view.arena
         if arena is None:
             shape = (query.shape[0], num_kv_heads, view.max_num_clusters)
-            scores = torch.zeros(shape, dtype=torch.float32, device=query.device)
-            ranking_scores = torch.full_like(scores, float("-inf"))
-            candidate_counts = torch.zeros(
-                shape[:2], dtype=torch.int32, device=query.device
-            )
+            if workspace is None:
+                scores = torch.zeros(shape, dtype=torch.float32, device=query.device)
+                ranking_scores = torch.full_like(scores, float("-inf"))
+                candidate_counts = torch.zeros(
+                    shape[:2], dtype=torch.int32, device=query.device
+                )
+            else:
+                scores = workspace.scores.zero_()
+                ranking_scores = workspace.ranking_scores.fill_(float("-inf"))
+                candidate_counts = workspace.candidate_counts.zero_()
             return scores, ranking_scores, candidate_counts, workspace
 
         cluster_keys = arena.cluster_keys[:, :, : view.max_num_clusters]

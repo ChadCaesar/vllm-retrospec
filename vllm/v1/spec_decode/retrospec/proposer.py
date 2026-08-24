@@ -3,6 +3,7 @@
 
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -98,6 +99,7 @@ class RetroSpecProposer:
         self.policy = RetroSpecDecisionPolicy(config)
         self.state = RetroSpecBatchState(self.max_batch_size, device)
         self.sparse_attention = RetroSpecSparseAttention(vllm_config, device)
+        self.performance_stats = self.sparse_attention.performance_stats
         self.index_update_state = RetroSpecIndexUpdateState(
             max_batch_size=self.max_batch_size,
             update_interval=config.retrospec_index_update_interval,
@@ -450,6 +452,7 @@ class RetroSpecProposer:
         compute_margin: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         assert self.model is not None
+        model_timer = self.performance_stats.start_cuda_timer("draft_model")
 
         exceeds_max_model_len = positions >= self.max_model_len
         runnable_mask = active_mask & ~exceeds_max_model_len
@@ -548,6 +551,7 @@ class RetroSpecProposer:
         )
         sampled_token_ids = sampler_output.sampled_token_ids.view(-1).to(torch.int32)
 
+        self.performance_stats.stop_cuda_timer(model_timer)
         return sampled_token_ids, margin, attention_mass
 
     def _run_draft_step(
@@ -797,6 +801,13 @@ class RetroSpecProposer:
         if num_tokens > self.max_parallel_tokens:
             raise ValueError("Parallel verification exceeds the configured capacity")
 
+        timer_name = (
+            "sparse_verify_model"
+            if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY
+            else "expanded_verify_model"
+        )
+        model_timer = self.performance_stats.start_cuda_timer(timer_name)
+
         request_indices = request_indices.to(torch.int64)
         token_indices = token_indices.to(torch.int64)
         positions = (
@@ -905,6 +916,7 @@ class RetroSpecProposer:
             sampling_metadata,
             sampled_output,
         )
+        self.performance_stats.stop_cuda_timer(model_timer)
         return RetroSpecParallelVerificationOutput(
             request_indices=request_indices,
             token_indices=token_indices,
@@ -927,6 +939,10 @@ class RetroSpecProposer:
             round_start_counts,
             draft_counts,
             verification_active,
+        )
+        self.performance_stats.add_counter(
+            "sparse_verify_tokens",
+            request_indices.numel(),
         )
 
         if request_indices.numel() == 0:
@@ -1061,6 +1077,10 @@ class RetroSpecProposer:
             expanded_token_indices = sparse.token_indices.index_select(
                 0, expanded_sparse_indices
             )
+            self.performance_stats.add_counter(
+                "expanded_verify_tokens",
+                expanded_request_indices.numel(),
+            )
             expanded_request_mask = torch.zeros_like(self.state.active_mask)
             expanded_request_mask.scatter_(0, expanded_request_indices, True)
             self.state.set_stage(expanded_request_mask, RetroSpecStage.EXPANDED_VERIFY)
@@ -1141,11 +1161,16 @@ class RetroSpecProposer:
                 "Random sampling requires draft probabilities."
             )
 
+        proposal_started_at = perf_counter() if self.performance_stats.enabled else 0.0
+
         batch_size = common_attn_metadata.batch_size()
         if len(request_ids) != batch_size:
             raise ValueError("request_ids must match the proposal batch size")
         if len(committed_positions) != batch_size:
             raise ValueError("committed_positions must match the proposal batch size")
+
+        self.performance_stats.add_counter("proposal_calls")
+        self.performance_stats.add_counter("proposal_requests", batch_size)
 
         self.state.begin_batch(batch_size)
         self.index_update_state.begin_batch(request_ids, committed_positions)
@@ -1174,6 +1199,11 @@ class RetroSpecProposer:
                 )
                 if not draft_round_mask.any().item():
                     break
+
+                self.performance_stats.add_gpu_counter(
+                    "draft_round_requests",
+                    draft_round_mask,
+                )
 
                 # Append this round after the existing pending prefix.
                 round_start_counts = self.state.pending_counts.clone()
@@ -1214,6 +1244,10 @@ class RetroSpecProposer:
 
                     emitted_counts = draft_stage_mask.to(torch.int32)
                     self.state.add_draft_counts(emitted_counts)
+                    self.performance_stats.add_gpu_counter(
+                        "draft_tokens",
+                        emitted_counts,
+                    )
 
                     # Draft tokens are not pending until sparse verification.
                     # Only provide the projected count to the decision policy.
@@ -1264,6 +1298,10 @@ class RetroSpecProposer:
                     round_start_counts,
                     common_attn_metadata,
                     sampling_metadata,
+                )
+                self.performance_stats.add_gpu_counter(
+                    "verified_tokens",
+                    verification.verified_counts,
                 )
 
                 # Discard the unverified suffix of the current round.
@@ -1325,10 +1363,21 @@ class RetroSpecProposer:
                     )
                 )
 
+        self.performance_stats.add_gpu_counter(
+            "proposed_tokens",
+            self.state.pending_counts,
+        )
         pending_counts_cpu = self.state.pending_counts.cpu().tolist()
         pending_token_ids = self._draft_token_ids[:batch_size].cpu().tolist()
 
-        return [
+        result = [
             token_ids[:pending_count]
             for token_ids, pending_count in zip(pending_token_ids, pending_counts_cpu)
         ]
+        if self.performance_stats.enabled:
+            self.performance_stats.record_cpu_time(
+                "proposal_wall",
+                perf_counter() - proposal_started_at,
+            )
+        self.performance_stats.maybe_log()
+        return result

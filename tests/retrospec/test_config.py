@@ -39,6 +39,7 @@ def test_retrospec_defaults():
     assert config.retrospec_hit_attn_threshold is None
     assert config.retrospec_retrieval_attn_threshold is None
     assert config.retrospec_expanded_attn_threshold is None
+    assert config.retrospec_stats_interval_seconds == pytest.approx(0.0)
     assert config.prompt_lookup_min == 0
     assert config.prompt_lookup_max == 0
     assert repr(config) == (
@@ -123,6 +124,7 @@ def test_retrospec_requires_eager():
         ("retrospec_retrieval_attn_threshold", 1.01),
         ("retrospec_expanded_attn_threshold", -0.01),
         ("retrospec_expanded_attn_threshold", 1.01),
+        ("retrospec_stats_interval_seconds", -0.01),
     ],
 )
 def test_retrospec_rejects_out_of_range_values(field: str, value: Any):
@@ -186,6 +188,7 @@ def test_retrospec_hash_tracks_execution_structure(field: str, value: Any):
         ("retrospec_retrieval_attn_threshold", 0.1),
         ("retrospec_expanded_attn_threshold", 0.1),
         ("retrospec_max_pending_cluster_builds", 4),
+        ("retrospec_stats_interval_seconds", 5.0),
     ],
 )
 def test_retrospec_hash_ignores_runtime_only_fields(field: str, value: Any):

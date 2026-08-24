@@ -27,6 +27,7 @@ from .execution import (
     RetroSpecExactPrimaryKVSource,
 )
 from .index import RetroSpecAttentionLevel
+from .performance import RetroSpecPerformanceStats
 from .segmented_index import (
     RetroSpecFullVerificationPlan,
     RetroSpecSegmentedTokenIndex,
@@ -117,6 +118,15 @@ class RetroSpecSparseAttention:
         self.num_speculative_tokens = config.num_speculative_tokens
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
 
+        self.performance_stats = RetroSpecPerformanceStats(
+            device=device,
+            log_interval_seconds=getattr(
+                config,
+                "retrospec_stats_interval_seconds",
+                0.0,
+            ),
+        )
+
         self.index = RetroSpecSegmentedTokenIndex(
             block_size=block_size,
             num_speculative_tokens=config.num_speculative_tokens,
@@ -131,6 +141,9 @@ class RetroSpecSparseAttention:
             cache_ratio=config.retrospec_cache_ratio,
             pin_memory=device.type == "cuda" and is_pin_memory_available(),
             max_resident_requests=vllm_config.scheduler_config.max_num_seqs,
+            performance_stats=(
+                self.performance_stats if self.performance_stats.enabled else None
+            ),
         )
 
         self.exact_execution_buffer = RetroSpecExactExecutionBuffer(
@@ -444,6 +457,10 @@ class RetroSpecSparseAttention:
             tuple(self.original_forwards),
         )
         self.index.begin_full_verification_residency(request_ids)
+        self.performance_stats.add_counter(
+            "full_verify_requests",
+            len(request_ids),
+        )
         try:
             self.full_verification_batch = _RetroSpecFullVerificationBatch(
                 request_ids=request_ids,
@@ -456,6 +473,7 @@ class RetroSpecSparseAttention:
             self.mode = RetroSpecAttentionMode.PASSTHROUGH
             self.full_verification_batch = None
             self.index.end_full_verification_residency()
+            self.performance_stats.maybe_log()
 
     @contextmanager
     def proposal_context(
@@ -1210,6 +1228,9 @@ class RetroSpecSparseAttention:
                 "Full-verification query lengths do not match max_query_len"
             )
 
+        full_timer = self.performance_stats.start_cuda_timer("full_verify_layer")
+        self.performance_stats.add_counter("full_verify_layers")
+
         query = query[:num_actual_tokens]
         key = key[:num_actual_tokens]
         value = value[:num_actual_tokens]
@@ -1251,6 +1272,7 @@ class RetroSpecSparseAttention:
             local_output,
             local_lse,
         )
+        self.performance_stats.stop_cuda_timer(full_timer)
         return output
 
     def _resolve_exact_kv_source(

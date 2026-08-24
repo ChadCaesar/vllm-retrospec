@@ -7,6 +7,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from math import ceil
 from threading import Lock, RLock
+from time import perf_counter
 from typing import Literal
 
 import torch
@@ -17,6 +18,7 @@ from .cluster_identity import (
     RetroSpecClusterGroup,
     RetroSpecClusterIdentity,
 )
+from .performance import RetroSpecPerformanceStats
 from .resident_cache import (
     RetroSpecResidentClusterCache,
     RetroSpecResidentPageAccess,
@@ -525,7 +527,12 @@ class _FullVerificationTransferBuffer:
 
     _MIN_CAPACITY = 64
 
-    def __init__(self, page_size: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        page_size: int,
+        device: torch.device,
+        performance_stats: RetroSpecPerformanceStats | None = None,
+    ) -> None:
         if page_size <= 0:
             raise ValueError("page_size must be positive")
         if device.type != "cuda":
@@ -536,6 +543,7 @@ class _FullVerificationTransferBuffer:
 
         self.page_size = page_size
         self.device = device
+        self.performance_stats = performance_stats
 
         self._dtype: torch.dtype | None = None
         self._head_size: int | None = None
@@ -651,6 +659,14 @@ class _FullVerificationTransferBuffer:
         # execution stream makes it safe to overwrite for the next layer.
         self._transfer_stream.wait_stream(current_stream)
         ready_event = torch.cuda.Event()
+        transfer_timer = (
+            None
+            if self.performance_stats is None
+            else self.performance_stats.start_cuda_timer(
+                "full_verify_h2d",
+                self._transfer_stream,
+            )
+        )
 
         with torch.cuda.stream(self._transfer_stream):
             self._ensure_capacity(
@@ -692,6 +708,27 @@ class _FullVerificationTransferBuffer:
                     block_mapping,
                 )
 
+            if self.performance_stats is not None:
+                transfer_bytes = (
+                    num_pages
+                    * self.page_size
+                    * pool.head_size
+                    * pool.key_pages.element_size()
+                    * 2
+                )
+                self.performance_stats.add_counter(
+                    "full_verify_h2d_pages",
+                    num_pages,
+                )
+                self.performance_stats.add_counter(
+                    "full_verify_h2d_bytes",
+                    transfer_bytes,
+                )
+                self.performance_stats.stop_cuda_timer(
+                    transfer_timer,
+                    self._transfer_stream,
+                )
+
             ready_event.record(self._transfer_stream)
 
         return (
@@ -712,6 +749,7 @@ class RetroSpecClusterPageStore:
         page_size: int,
         pin_memory: bool = False,
         cache_ratio: float = 0.0,
+        performance_stats: RetroSpecPerformanceStats | None = None,
     ) -> None:
         if page_size <= 0:
             raise ValueError("page_size must be positive")
@@ -721,6 +759,7 @@ class RetroSpecClusterPageStore:
         self.page_size = page_size
         self.pin_memory = pin_memory
         self.cache_ratio = cache_ratio
+        self.performance_stats = performance_stats
 
         self._layer_pools: dict[str, _LayerClusterPagePool] = {}
         self._resident_caches: dict[str, RetroSpecResidentClusterCache] = {}
@@ -1545,6 +1584,12 @@ class RetroSpecClusterPageStore:
         if source_device.type != "cuda":
             raise ValueError("CPU-backed cluster staging requires CPU or CUDA inputs")
 
+        if self.performance_stats is not None:
+            self.performance_stats.add_counter(
+                "token_kv_d2h_bytes",
+                token_keys.nbytes + token_values.nbytes,
+            )
+
         if not self.pin_memory:
             return RetroSpecStagedTokenKV(
                 token_keys=token_keys.to(device="cpu", non_blocking=False),
@@ -1614,6 +1659,14 @@ class RetroSpecClusterPageStore:
                 token_offsets_in_cluster=token_offsets_in_cluster,
                 metadata_device=source_device,
                 ready_event=None,
+            )
+
+        if self.performance_stats is not None:
+            self.performance_stats.add_counter(
+                "cluster_metadata_d2h_bytes",
+                assignments.nbytes
+                + cluster_token_counts.nbytes
+                + token_offsets_in_cluster.nbytes,
             )
 
         if not self.pin_memory:
@@ -1727,10 +1780,17 @@ class RetroSpecClusterPageStore:
         staged: RetroSpecStagedClusterInput,
     ) -> RetroSpecClusterBlockTable:
         """Wait for staged D2H copies and construct CPU cluster pages."""
+        wait_started_at = perf_counter()
         try:
             staged.wait()
+            if self.performance_stats is not None:
+                self.performance_stats.record_cpu_time(
+                    "cluster_build_wait",
+                    perf_counter() - wait_started_at,
+                )
 
-            return self.store_clusters(
+            build_started_at = perf_counter()
+            result = self.store_clusters(
                 layer_name=layer_name,
                 request_id=request_id,
                 cluster_start=cluster_start,
@@ -1741,6 +1801,13 @@ class RetroSpecClusterPageStore:
                 token_offsets_in_cluster=staged.token_offsets_in_cluster,
                 metadata_device=staged.metadata_device,
             )
+            if self.performance_stats is not None:
+                self.performance_stats.record_cpu_time(
+                    "cluster_page_build",
+                    perf_counter() - build_started_at,
+                )
+                self.performance_stats.add_counter("cluster_builds")
+            return result
         finally:
             self._release_pinned_staging_slot(staged.staging_slot)
 
@@ -2041,6 +2108,11 @@ class RetroSpecClusterPageStore:
             rounding_mode="floor",
         )
         total_pages = int(cluster_page_counts.sum().item())
+        if self.performance_stats is not None:
+            self.performance_stats.add_counter(
+                "cluster_pages_built",
+                total_pages,
+            )
 
         allocated_storage_page_ids = pool.allocate(total_pages)
         allocated_metadata_page_ids = allocated_storage_page_ids.detach().to(
@@ -2223,6 +2295,7 @@ class RetroSpecClusterPageStore:
             buffer = _FullVerificationTransferBuffer(
                 page_size=self.page_size,
                 device=device,
+                performance_stats=self.performance_stats,
             )
             self._full_verification_buffers[device] = buffer
 
@@ -2356,6 +2429,13 @@ class RetroSpecClusterPageStore:
         try:
             staged.metadata_ready_event.synchronize()
 
+            if self.performance_stats is not None:
+                num_clusters = int((staged.cluster_ids_cpu >= 0).sum().item())
+                self.performance_stats.add_counter(
+                    "prefetch_candidate_clusters",
+                    num_clusters,
+                )
+
             with self._resident_state_lock:
                 metadata = self._materialize_cluster_block_metadata_cpu(
                     staged.layer_name,
@@ -2440,6 +2520,8 @@ class RetroSpecClusterPageStore:
             cluster_ids.device,
         )
         if slot is None:
+            if self.performance_stats is not None:
+                self.performance_stats.add_counter("prefetch_dropped")
             return False
 
         stream = self._get_resident_prefetch_stream(cluster_ids.device)
@@ -2476,6 +2558,8 @@ class RetroSpecClusterPageStore:
                     deque(),
                 ).append(future)
 
+            if self.performance_stats is not None:
+                self.performance_stats.add_counter("prefetch_submitted")
             return True
         except BaseException:
             stream.synchronize()
@@ -2568,6 +2652,22 @@ class RetroSpecClusterPageStore:
             cluster_ids_cpu=cluster_ids_cpu,
             page_ids_cpu=logical_page_ids_cpu,
         )
+
+        if self.performance_stats is not None:
+            valid_clusters_cpu = cluster_ids_cpu >= 0
+            miss_clusters_cpu = (
+                valid_clusters_cpu & resident_access.miss_cluster_mask_cpu
+            )
+            num_misses = int(miss_clusters_cpu.sum().item())
+            num_valid = int(valid_clusters_cpu.sum().item())
+            self.performance_stats.add_counter(
+                "resident_cluster_hits",
+                num_valid - num_misses,
+            )
+            self.performance_stats.add_counter(
+                "resident_cluster_misses",
+                num_misses,
+            )
 
         if verification:
             (

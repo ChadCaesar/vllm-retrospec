@@ -8,6 +8,9 @@ from vllm.v1.spec_decode.retrospec.cluster_scoring import (
     reduce_grouped_cluster_scores,
     score_resident_clusters,
 )
+from vllm.v1.spec_decode.retrospec.index_residency import (
+    RetroSpecResidentBatchView,
+)
 from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecSegmentedTokenIndex,
 )
@@ -521,6 +524,48 @@ def test_cluster_selection_workspace_is_reused_and_resized():
     assert resized.logits.shape == (2, 2, 4, 29)
     assert resized.scores.shape == (2, 2, 29)
     assert resized.topk_indices.shape == (2, 2, 16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_empty_resident_view_uses_selection_workspace():
+    index = RetroSpecSegmentedTokenIndex(
+        block_size=16,
+        num_speculative_tokens=4,
+        retrieval_ratio=0.25,
+        estimation_ratio=0.25,
+        prefill_segment_size_tokens=256,
+        generation_update_interval=64,
+        blocks_per_cluster=2,
+        num_kmeans_iterations=2,
+        max_model_len=4096,
+    )
+    query = torch.randn(2, 8, 64, dtype=torch.float16, device="cuda")
+    view = RetroSpecResidentBatchView(
+        arena=None,
+        request_slot_ids=torch.full((2,), -1, dtype=torch.int64, device="cuda"),
+        max_num_clusters=1,
+        max_pages_per_cluster=0,
+        max_num_pages=0,
+    )
+
+    scores, ranking_scores, candidate_counts, workspace = index._score_resident_view(
+        query, view, scale=0.125, num_kv_heads=2
+    )
+    assert workspace is not None
+    assert scores is workspace.scores
+    assert ranking_scores is workspace.ranking_scores
+    assert candidate_counts is workspace.candidate_counts
+    assert torch.count_nonzero(scores).item() == 0
+    assert torch.isneginf(ranking_scores).all()
+    assert torch.count_nonzero(candidate_counts).item() == 0
+
+    zones = index._select_cluster_zones(
+        scores, ranking_scores, candidate_counts, workspace
+    )
+    assert not zones.sparse_retrieval_mask.any()
+    assert not zones.sparse_estimation_mask.any()
+    assert not zones.expanded_retrieval_mask.any()
+    assert not zones.expanded_estimation_mask.any()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

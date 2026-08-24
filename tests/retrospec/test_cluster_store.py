@@ -14,6 +14,7 @@ from vllm.v1.spec_decode.retrospec.cluster_identity import (
 from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecClusterPageStore,
 )
+from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
 
 
 def make_cluster_data() -> tuple[
@@ -914,7 +915,16 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
 )
 def test_cpu_backing_store_prefetches_resident_clusters_in_background():
     device = torch.device("cuda", torch.cuda.current_device())
-    store = RetroSpecClusterPageStore(page_size=2, pin_memory=True, cache_ratio=0.5)
+    stats = RetroSpecPerformanceStats(
+        device=device,
+        log_interval_seconds=60.0,
+    )
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        pin_memory=True,
+        cache_ratio=0.5,
+        performance_stats=stats,
+    )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
     table = store_cluster_data(
         store,
@@ -937,6 +947,10 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
 
     assert store.prefetch_resident_clusters("layer", cluster_ids)
     store.wait_for_resident_prefetches(("layer",))
+    assert stats._cpu_counters["prefetch_submitted"] == 1
+    assert stats._cpu_counters["prefetch_candidate_clusters"] == 4
+    assert stats._cpu_counters["resident_cluster_hits"] == 0
+    assert stats._cpu_counters["resident_cluster_misses"] == 4
 
     access = store.lookup_resident_clusters(
         "layer", cluster_ids, metadata.page_ids, touch=False
@@ -1171,9 +1185,14 @@ def test_cpu_backing_store_hides_pending_pages_from_draft_but_not_verification()
 )
 def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
     device = torch.device("cuda", torch.cuda.current_device())
+    stats = RetroSpecPerformanceStats(
+        device=device,
+        log_interval_seconds=60.0,
+    )
     store = RetroSpecClusterPageStore(
         page_size=2,
         cache_ratio=0.5,
+        performance_stats=stats,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
 
@@ -1263,6 +1282,11 @@ def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
     assert second_resolved.miss_cluster_mask.all()
     assert store.num_resident_pages("first-layer") == resident_pages_before
     assert store.num_resident_pages("second-layer") == 0
+    assert stats._cpu_counters["full_verify_h2d_pages"] == 12
+    assert stats._cpu_counters["full_verify_h2d_bytes"] == 192
+    torch.cuda.synchronize(device)
+    stats._drain_cuda_samples()
+    assert stats._cuda_times["full_verify_h2d"][1] == 2
 
 
 @pytest.mark.skipif(
@@ -1402,8 +1426,13 @@ def test_cpu_backing_store_stages_and_commits_cpu_inputs():
 
 
 def test_cpu_backing_store_supports_two_phase_staging():
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cpu"),
+        log_interval_seconds=60.0,
+    )
     store = RetroSpecClusterPageStore(
         page_size=2,
+        performance_stats=stats,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
 
@@ -1437,6 +1466,10 @@ def test_cpu_backing_store_supports_two_phase_staging():
 
     assert store.num_allocated_pages("layer") == 6
     assert table.cluster_ids.tolist() == [[0, 1], [2, 3]]
+    assert stats._cpu_counters["cluster_builds"] == 1
+    assert stats._cpu_counters["cluster_pages_built"] == 6
+    assert stats._cpu_times["cluster_build_wait"][1] == 1
+    assert stats._cpu_times["cluster_page_build"][1] == 1
 
 
 @pytest.mark.skipif(
@@ -1445,9 +1478,14 @@ def test_cpu_backing_store_supports_two_phase_staging():
 )
 def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
     device = torch.device("cuda", torch.cuda.current_device())
+    stats = RetroSpecPerformanceStats(
+        device=device,
+        log_interval_seconds=60.0,
+    )
     store = RetroSpecClusterPageStore(
         page_size=2,
         pin_memory=True,
+        performance_stats=stats,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
     keys = keys.to(device)
@@ -1464,6 +1502,7 @@ def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
     assert staged_token_kv.token_values.device.type == "cpu"
     assert staged_token_kv.token_keys.is_pinned()
     assert staged_token_kv.token_values.is_pinned()
+    assert stats._cpu_counters["token_kv_d2h_bytes"] == keys.nbytes + values.nbytes
 
     # Enqueue work after token-KV staging. finish_stage_clusters() must make
     # metadata D2H wait for this work without serializing the earlier KV copy.
@@ -1478,6 +1517,9 @@ def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
 
     assert staged.ready_event is not None
     assert staged.metadata_device == device
+    assert stats._cpu_counters["cluster_metadata_d2h_bytes"] == (
+        assignments.nbytes + cluster_token_counts.nbytes + token_offsets.nbytes
+    )
     assert all(
         tensor.device.type == "cpu" and tensor.is_pinned()
         for tensor in (

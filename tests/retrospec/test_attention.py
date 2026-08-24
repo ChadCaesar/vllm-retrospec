@@ -38,6 +38,7 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 def make_controller(
     cache_ratio: float = 0.0,
     max_pending_cluster_builds: int = 2,
+    stats_interval_seconds: float = 0.0,
 ) -> RetroSpecSparseAttention:
     config = cast(
         VllmConfig,
@@ -53,6 +54,7 @@ def make_controller(
                 retrospec_kmeans_iterations=2,
                 retrospec_max_pending_cluster_builds=max_pending_cluster_builds,
                 retrospec_cache_ratio=cache_ratio,
+                retrospec_stats_interval_seconds=stats_interval_seconds,
             ),
             scheduler_config=SimpleNamespace(max_num_seqs=4),
             cache_config=SimpleNamespace(block_size=2),
@@ -110,6 +112,24 @@ def test_segmented_attention_configures_pending_cluster_build_limit():
 
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
     assert controller.index.max_pending_cluster_builds == 4
+
+
+def test_segmented_attention_shares_enabled_performance_stats():
+    controller = make_controller(stats_interval_seconds=5.0)
+
+    assert controller.performance_stats.enabled
+    assert controller.index.performance_stats is controller.performance_stats
+    assert (
+        controller.index.cluster_store.performance_stats is controller.performance_stats
+    )
+
+
+def test_segmented_attention_does_not_instrument_deep_paths_by_default():
+    controller = make_controller()
+
+    assert not controller.performance_stats.enabled
+    assert controller.index.performance_stats is None
+    assert controller.index.cluster_store.performance_stats is None
 
 
 def make_token_plan(
