@@ -43,6 +43,30 @@ def make_cluster_data() -> tuple[
     return keys, values, assignments, cluster_token_counts
 
 
+def make_token_offsets(
+    assignments: torch.Tensor,
+    cluster_token_counts: torch.Tensor,
+) -> torch.Tensor:
+    num_heads, num_tokens = assignments.shape
+    offsets = torch.empty_like(assignments, dtype=torch.int32)
+
+    for head_idx in range(num_heads):
+        next_offsets = torch.zeros(
+            cluster_token_counts.shape[1],
+            dtype=torch.int32,
+            device=assignments.device,
+        )
+        for token_idx in range(num_tokens):
+            cluster_idx = int(assignments[head_idx, token_idx].item())
+            if not 0 <= cluster_idx < cluster_token_counts.shape[1]:
+                offsets[head_idx, token_idx] = 0
+                continue
+            offsets[head_idx, token_idx] = next_offsets[cluster_idx]
+            next_offsets[cluster_idx] += 1
+
+    return offsets
+
+
 def store_cluster_data(
     store: RetroSpecClusterPageStore,
     layer_name: str,
@@ -61,6 +85,10 @@ def store_cluster_data(
         token_values=token_values,
         assignments=assignments,
         cluster_token_counts=cluster_token_counts,
+        token_offsets_in_cluster=make_token_offsets(
+            assignments,
+            cluster_token_counts,
+        ),
     )
 
 
@@ -155,6 +183,42 @@ def test_cluster_store_packs_per_head_clusters_across_pages():
     )
     assert not gathered_keys[~token_mask.unsqueeze(-1)].any()
     assert not gathered_values[~token_mask.unsqueeze(-1)].any()
+
+
+def test_cluster_store_uses_gpu_generated_offsets_without_sorting_tokens():
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    token_offsets = torch.tensor(
+        [
+            [2, 0, 1, 1, 0],
+            [2, 1, 0, 0, 1],
+        ],
+        dtype=torch.int32,
+    )
+
+    table = store.store_clusters(
+        layer_name="layer",
+        request_id="request",
+        cluster_start=0,
+        token_keys=keys,
+        token_values=values,
+        assignments=assignments,
+        cluster_token_counts=cluster_token_counts,
+        token_offsets_in_cluster=token_offsets,
+    )
+    metadata = get_block_metadata(store, table)
+    gathered_keys, gathered_values, token_mask = store.gather_pages(
+        "layer",
+        metadata.page_ids.unsqueeze(0),
+        metadata.page_token_counts.unsqueeze(0),
+    )
+
+    assert gathered_keys[0, 0, token_mask[0, 0], 0].tolist() == [1, 2, 0, 4, 3]
+    assert gathered_keys[0, 1, token_mask[0, 1], 0].tolist() == [13, 11, 12, 14, 10]
+    torch.testing.assert_close(
+        gathered_values[token_mask.unsqueeze(-1)],
+        gathered_keys[token_mask.unsqueeze(-1)] + 100,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1300,6 +1364,10 @@ def test_cpu_backing_store_stages_and_commits_cpu_inputs():
         token_values=values,
         assignments=assignments,
         cluster_token_counts=cluster_token_counts,
+        token_offsets_in_cluster=make_token_offsets(
+            assignments,
+            cluster_token_counts,
+        ),
     )
 
     assert staged.ready_event is None
@@ -1350,6 +1418,7 @@ def test_cpu_backing_store_supports_two_phase_staging():
         staged_token_kv,
         assignments,
         cluster_token_counts,
+        make_token_offsets(assignments, cluster_token_counts),
     )
 
     assert staged.ready_event is None
@@ -1385,6 +1454,7 @@ def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
     values = values.to(device)
     assignments = assignments.to(device)
     cluster_token_counts = cluster_token_counts.to(device)
+    token_offsets = make_token_offsets(assignments, cluster_token_counts)
 
     staged_token_kv = store.stage_token_kv(keys, values)
 
@@ -1403,6 +1473,7 @@ def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
         staged_token_kv,
         assignments,
         cluster_token_counts,
+        token_offsets,
     )
 
     assert staged.ready_event is not None
@@ -1414,6 +1485,7 @@ def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
             staged.token_values,
             staged.assignments,
             staged.cluster_token_counts,
+            staged.token_offsets_in_cluster,
         )
     )
     assert "layer" not in store._layer_pools
@@ -1467,12 +1539,14 @@ def test_cpu_backing_store_reuses_pinned_staging_slot_after_build():
     values = values.to(device)
     assignments = assignments.to(device)
     cluster_token_counts = cluster_token_counts.to(device)
+    token_offsets = make_token_offsets(assignments, cluster_token_counts)
 
     first = store.stage_clusters(
         keys,
         values,
         assignments,
         cluster_token_counts,
+        token_offsets,
     )
     first_slot = first.staging_slot
     assert first_slot is not None
@@ -1481,6 +1555,7 @@ def test_cpu_backing_store_reuses_pinned_staging_slot_after_build():
         first.token_values.data_ptr(),
         first.assignments.data_ptr(),
         first.cluster_token_counts.data_ptr(),
+        first.token_offsets_in_cluster.data_ptr(),
     )
 
     store.store_staged_clusters("first-layer", "request", 0, first)
@@ -1492,12 +1567,14 @@ def test_cpu_backing_store_reuses_pinned_staging_slot_after_build():
         values,
         assignments,
         cluster_token_counts,
+        token_offsets,
     )
     second_pointers = (
         second.token_keys.data_ptr(),
         second.token_values.data_ptr(),
         second.assignments.data_ptr(),
         second.cluster_token_counts.data_ptr(),
+        second.token_offsets_in_cluster.data_ptr(),
     )
 
     assert second.staging_slot is first_slot
@@ -1588,6 +1665,7 @@ def test_cpu_backing_store_releases_pinned_slot_when_build_fails(monkeypatch):
         values.to(device),
         assignments.to(device),
         cluster_token_counts.to(device),
+        make_token_offsets(assignments, cluster_token_counts).to(device),
     )
     slot = staged.staging_slot
     assert slot is not None
@@ -1647,6 +1725,34 @@ def test_cluster_store_rejects_invalid_storage_metadata():
             assignments,
             cluster_token_counts,
             cluster_start=-1,
+        )
+
+    invalid_offsets = make_token_offsets(assignments, cluster_token_counts)
+    invalid_offsets[0, 0] = cluster_token_counts[0, 0]
+    with pytest.raises(RuntimeError, match="offsets exceed"):
+        store.store_clusters(
+            layer_name="invalid-offset-layer",
+            request_id="request",
+            cluster_start=0,
+            token_keys=keys,
+            token_values=values,
+            assignments=assignments,
+            cluster_token_counts=cluster_token_counts,
+            token_offsets_in_cluster=invalid_offsets,
+        )
+
+    duplicate_offsets = make_token_offsets(assignments, cluster_token_counts)
+    duplicate_offsets[0, 1] = duplicate_offsets[0, 0]
+    with pytest.raises(RuntimeError, match="offsets must be unique"):
+        store.store_clusters(
+            layer_name="duplicate-offset-layer",
+            request_id="request",
+            cluster_start=0,
+            token_keys=keys,
+            token_values=values,
+            assignments=assignments,
+            cluster_token_counts=cluster_token_counts,
+            token_offsets_in_cluster=duplicate_offsets,
         )
 
 

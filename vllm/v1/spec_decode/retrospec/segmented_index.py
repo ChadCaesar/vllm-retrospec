@@ -16,7 +16,7 @@ from .cluster_store import (
     RetroSpecResolvedClusterPages,
     RetroSpecStagedClusterInput,
 )
-from .clustering import segmented_kmeans_assignments
+from .clustering import segmented_kmeans
 from .index import RetroSpecAttentionLevel, RetroSpecIndexBase
 from .index_residency import (
     RetroSpecClusterSummary,
@@ -771,39 +771,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         if cleanup_error is not None:
             raise cleanup_error
 
-    @staticmethod
-    def _cluster_means(
-        vectors: torch.Tensor,
-        assignments: torch.Tensor,
-        cluster_counts: torch.Tensor,
-    ) -> torch.Tensor:
-        """Reduce [heads, tokens, dim] vectors into per-head cluster means."""
-        num_kv_heads, _, head_size = vectors.shape
-        num_clusters = cluster_counts.shape[1]
-
-        expanded_assignments = assignments.unsqueeze(-1).expand(
-            -1,
-            -1,
-            head_size,
-        )
-
-        cluster_sums = torch.zeros(
-            num_kv_heads,
-            num_clusters,
-            head_size,
-            dtype=torch.float32,
-            device=vectors.device,
-        )
-        cluster_sums.scatter_add_(
-            dim=1,
-            index=expanded_assignments,
-            src=vectors.float(),
-        )
-
-        return (
-            cluster_sums / cluster_counts.clamp_min(1).to(torch.float32).unsqueeze(-1)
-        ).to(vectors.dtype)
-
     def build_or_update(
         self,
         layer_name: str,
@@ -948,38 +915,37 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             try:
                 assignment_parts: list[torch.Tensor] = []
                 count_parts: list[torch.Tensor] = []
+                key_parts: list[torch.Tensor] = []
+                value_parts: list[torch.Tensor] = []
+                offset_parts: list[torch.Tensor] = []
                 token_start = 0
                 cluster_offset = 0
 
                 for phase_tokens, phase_segment_size in clustering_phases:
                     token_end = token_start + phase_tokens
-                    phase_assignments, phase_counts = segmented_kmeans_assignments(
-                        features=token_keys[:, token_start:token_end],
+                    phase_result = segmented_kmeans(
+                        token_keys=token_keys[:, token_start:token_end],
+                        token_values=token_values[:, token_start:token_end],
                         segment_size=phase_segment_size,
                         items_per_cluster=self.tokens_per_cluster,
                         num_iterations=self.num_kmeans_iterations,
                     )
-                    assignment_parts.append(phase_assignments + cluster_offset)
-                    count_parts.append(phase_counts)
+                    assignment_parts.append(phase_result.assignments + cluster_offset)
+                    count_parts.append(phase_result.cluster_sizes)
+                    key_parts.append(phase_result.cluster_keys)
+                    value_parts.append(phase_result.cluster_values)
+                    offset_parts.append(phase_result.token_offsets_in_cluster)
                     token_start = token_end
-                    cluster_offset += phase_counts.shape[1]
+                    cluster_offset += phase_result.cluster_sizes.shape[1]
 
                 if token_start != num_new_tokens:
                     raise RuntimeError("Clustering phases do not cover the update")
 
                 local_assignments = torch.cat(assignment_parts, dim=1)
                 cluster_token_counts = torch.cat(count_parts, dim=1)
-
-                cluster_keys = self._cluster_means(
-                    token_keys,
-                    local_assignments,
-                    cluster_token_counts,
-                )
-                cluster_values = self._cluster_means(
-                    token_values,
-                    local_assignments,
-                    cluster_token_counts,
-                )
+                cluster_keys = torch.cat(key_parts, dim=1)
+                cluster_values = torch.cat(value_parts, dim=1)
+                token_offsets_in_cluster = torch.cat(offset_parts, dim=1)
             except BaseException:
                 self.cluster_store.discard_staged_token_kv(staged_token_kv)
                 raise
@@ -1001,6 +967,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     staged_token_kv,
                     local_assignments,
                     cluster_token_counts,
+                    token_offsets_in_cluster,
                 )
             except BaseException:
                 self.cluster_store.discard_staged_token_kv(staged_token_kv)

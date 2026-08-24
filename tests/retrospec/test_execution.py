@@ -402,6 +402,11 @@ def test_execution_buffer_packs_resolved_cpu_backing_pages():
     token_values = token_keys + 10
     assignments = torch.tensor([[0, 0, 1, 1, 2, 2]], dtype=torch.int64, device=device)
     cluster_counts = torch.tensor([[2, 2, 2]], dtype=torch.int32, device=device)
+    token_offsets = torch.tensor(
+        [[0, 1, 0, 1, 0, 1]],
+        dtype=torch.int32,
+        device=device,
+    )
     store = RetroSpecClusterPageStore(
         page_size=page_size,
         cache_ratio=0.5,
@@ -414,6 +419,7 @@ def test_execution_buffer_packs_resolved_cpu_backing_pages():
         token_values=token_values,
         assignments=assignments,
         cluster_token_counts=cluster_counts,
+        token_offsets_in_cluster=token_offsets,
     )
     cluster_ids = table.cluster_ids.to(device=device).unsqueeze(0)
     metadata = store.get_cluster_block_metadata("layer", cluster_ids, device=device)

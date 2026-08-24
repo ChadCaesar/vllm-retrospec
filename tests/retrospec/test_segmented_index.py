@@ -959,7 +959,7 @@ def test_rollback_invalidates_active_view_before_rebuild(monkeypatch):
         raise RuntimeError("clustering failed")
 
     monkeypatch.setattr(
-        "vllm.v1.spec_decode.retrospec.segmented_index.segmented_kmeans_assignments",
+        "vllm.v1.spec_decode.retrospec.segmented_index.segmented_kmeans",
         fail_clustering,
     )
 
@@ -1460,10 +1460,10 @@ def test_cpu_offload_stages_token_kv_before_clustering(monkeypatch):
         call_order.append("finish_stage_clusters")
         return original_finish_stage_clusters(*args, **kwargs)
 
-    original_clustering = segmented_index_module.segmented_kmeans_assignments
+    original_clustering = segmented_index_module.segmented_kmeans
 
-    def segmented_kmeans_assignments(*args, **kwargs):
-        call_order.append("segmented_kmeans_assignments")
+    def segmented_kmeans(*args, **kwargs):
+        call_order.append("segmented_kmeans")
         return original_clustering(*args, **kwargs)
 
     monkeypatch.setattr(index.cluster_store, "stage_token_kv", stage_token_kv)
@@ -1479,8 +1479,8 @@ def test_cpu_offload_stages_token_kv_before_clustering(monkeypatch):
     )
     monkeypatch.setattr(
         segmented_index_module,
-        "segmented_kmeans_assignments",
-        segmented_kmeans_assignments,
+        "segmented_kmeans",
+        segmented_kmeans,
     )
 
     build_index(
@@ -1496,7 +1496,7 @@ def test_cpu_offload_stages_token_kv_before_clustering(monkeypatch):
         assert call_order == [
             "wait_for_cluster_build_slot",
             "stage_token_kv",
-            "segmented_kmeans_assignments",
+            "segmented_kmeans",
             "finish_stage_clusters",
         ]
     finally:
@@ -1525,7 +1525,7 @@ def test_cpu_offload_waits_for_staged_kv_when_clustering_fails(monkeypatch):
 
     monkeypatch.setattr(
         segmented_index_module,
-        "segmented_kmeans_assignments",
+        "segmented_kmeans",
         Mock(side_effect=RuntimeError("clustering failed")),
     )
 

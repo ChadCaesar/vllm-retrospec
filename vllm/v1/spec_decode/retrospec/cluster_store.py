@@ -38,6 +38,7 @@ class _PinnedStagingSlot:
     token_value_storage: torch.Tensor | None = None
     assignment_storage: torch.Tensor | None = None
     cluster_count_storage: torch.Tensor | None = None
+    token_offset_storage: torch.Tensor | None = None
 
     in_use: bool = False
 
@@ -84,7 +85,8 @@ class _PinnedStagingSlot:
         self,
         assignments: torch.Tensor,
         cluster_token_counts: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_offsets_in_cluster: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.in_use:
             raise RuntimeError("Pinned staging slot must be acquired before use")
 
@@ -96,7 +98,15 @@ class _PinnedStagingSlot:
             self.cluster_count_storage,
             cluster_token_counts,
         )
-        return staged_assignments, staged_cluster_token_counts
+        self.token_offset_storage, staged_token_offsets = self._reserve(
+            self.token_offset_storage,
+            token_offsets_in_cluster,
+        )
+        return (
+            staged_assignments,
+            staged_cluster_token_counts,
+            staged_token_offsets,
+        )
 
 
 @dataclass
@@ -204,6 +214,7 @@ class RetroSpecStagedClusterInput:
     token_values: torch.Tensor
     assignments: torch.Tensor
     cluster_token_counts: torch.Tensor
+    token_offsets_in_cluster: torch.Tensor
 
     metadata_device: torch.device
     ready_event: torch.cuda.Event | None
@@ -1373,11 +1384,17 @@ class RetroSpecClusterPageStore:
         token_values: torch.Tensor,
         assignments: torch.Tensor,
         cluster_token_counts: torch.Tensor,
+        token_offsets_in_cluster: torch.Tensor,
     ) -> None:
         cls._validate_token_kv_input(token_keys, token_values)
 
-        if assignments.shape != token_keys.shape[:2]:
+        token_shape = token_keys.shape[:2]
+        if assignments.shape != token_shape:
             raise ValueError("assignments must have shape [num_kv_heads, num_tokens]")
+        if token_offsets_in_cluster.shape != token_shape:
+            raise ValueError(
+                "token_offsets_in_cluster must have shape [num_kv_heads, num_tokens]"
+            )
         if cluster_token_counts.ndim != 2:
             raise ValueError(
                 "cluster_token_counts must have shape [num_kv_heads, num_clusters]"
@@ -1386,31 +1403,32 @@ class RetroSpecClusterPageStore:
             raise ValueError(
                 "cluster_token_counts KV-head count does not match token KV"
             )
-        if assignments.dtype not in (
-            torch.int32,
-            torch.int64,
-        ):
-            raise ValueError("assignments must use an integral dtype")
-        if cluster_token_counts.dtype not in (
-            torch.int32,
-            torch.int64,
-        ):
-            raise ValueError("cluster_token_counts must use an integral dtype")
-        if assignments.device != token_keys.device:
-            raise ValueError("Assignments and token KV must be on one device")
-        if cluster_token_counts.device != token_keys.device:
-            raise ValueError("Cluster counts and token KV must be on one device")
+        metadata = (
+            ("assignments", assignments),
+            ("cluster_token_counts", cluster_token_counts),
+            ("token_offsets_in_cluster", token_offsets_in_cluster),
+        )
+        for name, tensor in metadata:
+            if tensor.dtype not in (torch.int32, torch.int64):
+                raise ValueError(f"{name} must use an integral dtype")
+            if tensor.device != token_keys.device:
+                raise ValueError(f"{name} and token KV must be on one device")
 
     @staticmethod
     def _validate_staged_cluster_metadata(
         staged_token_kv: RetroSpecStagedTokenKV,
         assignments: torch.Tensor,
         cluster_token_counts: torch.Tensor,
+        token_offsets_in_cluster: torch.Tensor,
     ) -> None:
-        token_shape = staged_token_kv.token_keys.shape
+        token_shape = staged_token_kv.token_keys.shape[:2]
 
-        if assignments.shape != token_shape[:2]:
+        if assignments.shape != token_shape:
             raise ValueError("assignments must have shape [num_kv_heads, num_tokens]")
+        if token_offsets_in_cluster.shape != token_shape:
+            raise ValueError(
+                "token_offsets_in_cluster must have shape [num_kv_heads, num_tokens]"
+            )
         if cluster_token_counts.ndim != 2:
             raise ValueError(
                 "cluster_token_counts must have shape [num_kv_heads, num_clusters]"
@@ -1419,14 +1437,16 @@ class RetroSpecClusterPageStore:
             raise ValueError(
                 "cluster_token_counts KV-head count does not match token KV"
             )
-        if assignments.dtype not in (torch.int32, torch.int64):
-            raise ValueError("assignments must use an integral dtype")
-        if cluster_token_counts.dtype not in (torch.int32, torch.int64):
-            raise ValueError("cluster_token_counts must use an integral dtype")
-        if assignments.device != staged_token_kv.source_device:
-            raise ValueError("Assignments must remain on the token KV source device")
-        if cluster_token_counts.device != staged_token_kv.source_device:
-            raise ValueError("Cluster counts must remain on the token KV source device")
+        metadata = (
+            ("Assignments", assignments),
+            ("Cluster counts", cluster_token_counts),
+            ("Cluster token offsets", token_offsets_in_cluster),
+        )
+        for name, tensor in metadata:
+            if tensor.dtype not in (torch.int32, torch.int64):
+                raise ValueError(f"{name} must use an integral dtype")
+            if tensor.device != staged_token_kv.source_device:
+                raise ValueError(f"{name} must remain on the token KV source device")
 
     @staticmethod
     def _canonical_cuda_device(device: torch.device) -> torch.device:
@@ -1574,12 +1594,14 @@ class RetroSpecClusterPageStore:
         staged_token_kv: RetroSpecStagedTokenKV,
         assignments: torch.Tensor,
         cluster_token_counts: torch.Tensor,
+        token_offsets_in_cluster: torch.Tensor,
     ) -> RetroSpecStagedClusterInput:
         """Stage clustering metadata after GPU clustering finishes."""
         self._validate_staged_cluster_metadata(
             staged_token_kv,
             assignments,
             cluster_token_counts,
+            token_offsets_in_cluster,
         )
         source_device = staged_token_kv.source_device
 
@@ -1589,6 +1611,7 @@ class RetroSpecClusterPageStore:
                 token_values=staged_token_kv.token_values,
                 assignments=assignments,
                 cluster_token_counts=cluster_token_counts,
+                token_offsets_in_cluster=token_offsets_in_cluster,
                 metadata_device=source_device,
                 ready_event=None,
             )
@@ -1599,6 +1622,10 @@ class RetroSpecClusterPageStore:
                 token_values=staged_token_kv.token_values,
                 assignments=assignments.to(device="cpu", non_blocking=False),
                 cluster_token_counts=cluster_token_counts.to(
+                    device="cpu",
+                    non_blocking=False,
+                ),
+                token_offsets_in_cluster=token_offsets_in_cluster.to(
                     device="cpu",
                     non_blocking=False,
                 ),
@@ -1613,11 +1640,14 @@ class RetroSpecClusterPageStore:
         offload_stream = self._get_offload_stream(source_device)
 
         try:
-            staged_assignments, staged_cluster_token_counts = (
-                staging_slot.reserve_cluster_metadata(
-                    assignments,
-                    cluster_token_counts,
-                )
+            (
+                staged_assignments,
+                staged_cluster_token_counts,
+                staged_token_offsets,
+            ) = staging_slot.reserve_cluster_metadata(
+                assignments,
+                cluster_token_counts,
+                token_offsets_in_cluster,
             )
 
             current_stream = torch.cuda.current_stream(source_device)
@@ -1634,10 +1664,15 @@ class RetroSpecClusterPageStore:
                     cluster_token_counts,
                     non_blocking=True,
                 )
+                staged_token_offsets.copy_(
+                    token_offsets_in_cluster,
+                    non_blocking=True,
+                )
                 ready_event.record(offload_stream)
 
             assignments.record_stream(offload_stream)
             cluster_token_counts.record_stream(offload_stream)
+            token_offsets_in_cluster.record_stream(offload_stream)
         except BaseException:
             # Ownership remains with staged_token_kv until this method returns.
             # Synchronize partially queued metadata copies before it is discarded.
@@ -1649,6 +1684,7 @@ class RetroSpecClusterPageStore:
             token_values=staged_token_kv.token_values,
             assignments=staged_assignments,
             cluster_token_counts=staged_cluster_token_counts,
+            token_offsets_in_cluster=staged_token_offsets,
             metadata_device=source_device,
             ready_event=ready_event,
             staging_slot=staging_slot,
@@ -1660,6 +1696,7 @@ class RetroSpecClusterPageStore:
         token_values: torch.Tensor,
         assignments: torch.Tensor,
         cluster_token_counts: torch.Tensor,
+        token_offsets_in_cluster: torch.Tensor,
     ) -> RetroSpecStagedClusterInput:
         """Stage complete inputs when overlap is not controlled by the caller."""
         self._validate_cluster_input_metadata(
@@ -1667,6 +1704,7 @@ class RetroSpecClusterPageStore:
             token_values,
             assignments,
             cluster_token_counts,
+            token_offsets_in_cluster,
         )
         staged_token_kv = self.stage_token_kv(token_keys, token_values)
 
@@ -1675,6 +1713,7 @@ class RetroSpecClusterPageStore:
                 staged_token_kv,
                 assignments,
                 cluster_token_counts,
+                token_offsets_in_cluster,
             )
         except BaseException:
             self.discard_staged_token_kv(staged_token_kv)
@@ -1699,6 +1738,7 @@ class RetroSpecClusterPageStore:
                 token_values=staged.token_values,
                 assignments=staged.assignments,
                 cluster_token_counts=staged.cluster_token_counts,
+                token_offsets_in_cluster=staged.token_offsets_in_cluster,
                 metadata_device=staged.metadata_device,
             )
         finally:
@@ -1746,9 +1786,11 @@ class RetroSpecClusterPageStore:
     def _validate_cluster_assignment_counts(
         assignments: torch.Tensor,
         cluster_token_counts: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_offsets_in_cluster: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assignments_int64 = assignments.to(torch.int64)
         cluster_token_counts_int64 = cluster_token_counts.to(torch.int64)
+        token_offsets_int64 = token_offsets_in_cluster.to(torch.int64)
         num_clusters = cluster_token_counts.shape[1]
 
         if assignments_int64.numel():
@@ -1772,7 +1814,34 @@ class RetroSpecClusterPageStore:
                 "Cluster assignment count does not match cluster_token_counts"
             )
 
-        return assignments_int64, cluster_token_counts_int64
+        assigned_cluster_counts = torch.gather(
+            cluster_token_counts_int64,
+            dim=1,
+            index=assignments_int64,
+        )
+        invalid_offsets = (token_offsets_int64 < 0) | (
+            token_offsets_int64 >= assigned_cluster_counts
+        )
+        if torch.any(invalid_offsets).item():
+            raise RuntimeError("Cluster token offsets exceed cluster boundaries")
+
+        cluster_starts = (
+            torch.cumsum(cluster_token_counts_int64, dim=1) - cluster_token_counts_int64
+        )
+        compact_positions = (
+            torch.gather(cluster_starts, dim=1, index=assignments_int64)
+            + token_offsets_int64
+        )
+        occupied_positions = torch.zeros_like(assignments_int64)
+        occupied_positions.scatter_add_(
+            dim=1,
+            index=compact_positions,
+            src=torch.ones_like(compact_positions),
+        )
+        if not torch.all(occupied_positions == 1).item():
+            raise RuntimeError("Cluster token offsets must be unique within clusters")
+
+        return assignments_int64, cluster_token_counts_int64, token_offsets_int64
 
     def _pack_cluster_pages(
         self,
@@ -1780,7 +1849,7 @@ class RetroSpecClusterPageStore:
         storage_keys: torch.Tensor,
         storage_values: torch.Tensor,
         storage_assignments: torch.Tensor,
-        storage_cluster_counts: torch.Tensor,
+        storage_token_offsets: torch.Tensor,
         cluster_page_counts: torch.Tensor,
         total_pages: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1792,43 +1861,6 @@ class RetroSpecClusterPageStore:
         if num_tokens == 0:
             return packed_keys, packed_values
 
-        # Clusters are ordered by cluster ID. stable=True preserves the
-        # original logical-token order within each cluster.
-        sorted_token_indices = torch.argsort(
-            storage_assignments,
-            dim=1,
-            stable=True,
-        )
-        sorted_assignments = torch.gather(
-            storage_assignments,
-            dim=1,
-            index=sorted_token_indices,
-        )
-
-        gather_indices = sorted_token_indices.unsqueeze(-1).expand(
-            -1,
-            -1,
-            head_size,
-        )
-        sorted_keys = torch.gather(
-            storage_keys,
-            dim=1,
-            index=gather_indices,
-        )
-        sorted_values = torch.gather(
-            storage_values,
-            dim=1,
-            index=gather_indices,
-        )
-
-        cluster_token_offsets = (
-            torch.cumsum(
-                storage_cluster_counts,
-                dim=1,
-            )
-            - storage_cluster_counts
-        )
-
         flat_cluster_page_counts = cluster_page_counts.reshape(-1)
         flat_cluster_page_offsets = (
             torch.cumsum(
@@ -1839,36 +1871,24 @@ class RetroSpecClusterPageStore:
         )
         cluster_page_offsets = flat_cluster_page_offsets.view_as(cluster_page_counts)
 
-        sorted_cluster_token_offsets = torch.gather(
-            cluster_token_offsets,
-            dim=1,
-            index=sorted_assignments,
-        )
-        sorted_cluster_page_offsets = torch.gather(
+        token_page_offsets = torch.gather(
             cluster_page_offsets,
             dim=1,
-            index=sorted_assignments,
+            index=storage_assignments,
         )
-
-        sorted_token_positions = torch.arange(
-            num_tokens,
-            dtype=torch.int64,
-            device=pool.storage_device,
-        ).view(1, num_tokens)
-        token_offsets_in_cluster = sorted_token_positions - sorted_cluster_token_offsets
         packed_token_positions = (
-            sorted_cluster_page_offsets * self.page_size + token_offsets_in_cluster
+            token_page_offsets * self.page_size + storage_token_offsets
         ).reshape(-1)
 
         packed_keys.view(-1, head_size).index_copy_(
             0,
             packed_token_positions,
-            sorted_keys.reshape(num_kv_heads * num_tokens, head_size),
+            storage_keys.reshape(num_kv_heads * num_tokens, head_size),
         )
         packed_values.view(-1, head_size).index_copy_(
             0,
             packed_token_positions,
-            sorted_values.reshape(num_kv_heads * num_tokens, head_size),
+            storage_values.reshape(num_kv_heads * num_tokens, head_size),
         )
 
         return packed_keys, packed_values
@@ -1968,9 +1988,10 @@ class RetroSpecClusterPageStore:
         token_values: torch.Tensor,
         assignments: torch.Tensor,
         cluster_token_counts: torch.Tensor,
+        token_offsets_in_cluster: torch.Tensor,
         metadata_device: torch.device | None = None,
     ) -> RetroSpecClusterBlockTable:
-        """Reorder token KV into stable per-head, per-cluster backing pages."""
+        """Pack token KV into per-head, per-cluster backing pages."""
         if cluster_start < 0:
             raise ValueError("cluster_start must be non-negative")
 
@@ -1979,6 +2000,7 @@ class RetroSpecClusterPageStore:
             token_values,
             assignments,
             cluster_token_counts,
+            token_offsets_in_cluster,
         )
 
         if torch.any(cluster_token_counts < 0).item():
@@ -1998,12 +2020,19 @@ class RetroSpecClusterPageStore:
         storage_cluster_counts = self._move_to_storage(
             cluster_token_counts, pool.storage_device
         )
+        storage_token_offsets = self._move_to_storage(
+            token_offsets_in_cluster,
+            pool.storage_device,
+        )
 
-        storage_assignments, storage_cluster_counts = (
-            self._validate_cluster_assignment_counts(
-                storage_assignments,
-                storage_cluster_counts,
-            )
+        (
+            storage_assignments,
+            storage_cluster_counts,
+            storage_token_offsets,
+        ) = self._validate_cluster_assignment_counts(
+            storage_assignments,
+            storage_cluster_counts,
+            storage_token_offsets,
         )
 
         cluster_page_counts = torch.div(
@@ -2024,7 +2053,7 @@ class RetroSpecClusterPageStore:
                 storage_keys=storage_keys,
                 storage_values=storage_values,
                 storage_assignments=storage_assignments,
-                storage_cluster_counts=storage_cluster_counts,
+                storage_token_offsets=storage_token_offsets,
                 cluster_page_counts=cluster_page_counts,
                 total_pages=total_pages,
             )
