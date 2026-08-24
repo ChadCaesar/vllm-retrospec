@@ -200,17 +200,7 @@ def build_retrospec_long_context_capacity(
         + max_resident_requests * 20
         for spec in attention_specs
     )
-    # Commit 49 retains a compatibility packed view until resident scoring
-    # consumes request slots directly. Packed clusters store ID/count/mask
-    # metadata, padded page metadata and one dense logical-token mask.
-    packed_cluster_metadata_bytes = sum(
-        total_resident_clusters * spec.num_kv_heads * 13
-        + cluster_pages_per_head * spec.num_kv_heads * 12
-        + max_resident_requests * max_model_len
-        for spec in attention_specs
-    )
     persistent_index_bytes = cluster_summary_bytes + persistent_cluster_metadata_bytes
-    packed_index_bytes = cluster_summary_bytes + packed_cluster_metadata_bytes
 
     max_full_verify_workspace = 0
     max_cluster_build_workspace = 0
@@ -251,7 +241,9 @@ def build_retrospec_long_context_capacity(
 
         max_full_verify_workspace = max(
             max_full_verify_workspace,
-            transfer_buffer_bytes + execution_buffer_bytes,
+            transfer_buffer_bytes
+            + execution_buffer_bytes
+            + cluster_pages_per_head * num_kv_heads * 12,
         )
 
         # GPU k-means temporarily retains token K/V, assignments, centroids
@@ -273,7 +265,7 @@ def build_retrospec_long_context_capacity(
     )
 
     phase_workspace_bytes = max(
-        max_full_verify_workspace + selection_workspace_bytes + packed_index_bytes,
+        max_full_verify_workspace + selection_workspace_bytes,
         max_cluster_build_workspace,
     )
 

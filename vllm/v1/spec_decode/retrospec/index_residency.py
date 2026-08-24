@@ -70,20 +70,7 @@ class RetroSpecResidentBatchView:
     request_slot_ids: torch.Tensor
     max_num_clusters: int
     max_pages_per_cluster: int
-
-
-@dataclass(frozen=True)
-class RetroSpecResidentIndex:
-    indexed_token_mask: torch.Tensor
-
-    cluster_ids: torch.Tensor
-    cluster_keys: torch.Tensor
-    cluster_values: torch.Tensor
-    cluster_token_counts: torch.Tensor
-    cluster_mask: torch.Tensor
-
-    cluster_page_ids: torch.Tensor
-    cluster_page_token_counts: torch.Tensor
+    max_num_pages: int
 
 
 @dataclass(frozen=True)
@@ -98,15 +85,8 @@ class _ResidentRequestState:
     max_pages_per_cluster: int
 
 
-@dataclass(frozen=True)
-class _ResidentIndexEntry:
-    request_ids: tuple[str, ...]
-    max_num_tokens: int
-    index: RetroSpecResidentIndex
-
-
 class RetroSpecGPUIndexResidencyManager:
-    """Own request-slot layer arenas and temporary compatibility views."""
+    """Own request-slot layer arenas and active batch descriptors."""
 
     def __init__(
         self,
@@ -128,7 +108,6 @@ class RetroSpecGPUIndexResidencyManager:
         self.max_pages_per_head_per_request = max_pages_per_head_per_request
 
         self._active_request_ids: tuple[str, ...] | None = None
-        self._entries: dict[str, _ResidentIndexEntry] = {}
         self._active_views: dict[str, RetroSpecResidentBatchView] = {}
 
         self._request_slots: dict[str, int] = {}
@@ -162,10 +141,6 @@ class RetroSpecGPUIndexResidencyManager:
     def num_resident_layers(self) -> int:
         return sum(bool(states) for states in self._resident_states.values())
 
-    @property
-    def num_packed_layers(self) -> int:
-        return len(self._entries)
-
     def activate(self, request_ids: Sequence[str]) -> None:
         if self._active_request_ids is not None:
             raise RuntimeError("A RetroSpec GPU index residency set is already active")
@@ -179,7 +154,6 @@ class RetroSpecGPUIndexResidencyManager:
                 f"{len(request_ids)} > {self.max_resident_requests}"
             )
 
-        self._entries.clear()
         self._active_views.clear()
         self._active_request_ids = request_ids
 
@@ -187,7 +161,6 @@ class RetroSpecGPUIndexResidencyManager:
         if self._active_request_ids is None:
             raise RuntimeError("No RetroSpec GPU index residency set is active")
 
-        self._entries.clear()
         self._active_views.clear()
         self._active_request_ids = None
 
@@ -201,41 +174,6 @@ class RetroSpecGPUIndexResidencyManager:
             raise RuntimeError(
                 "RetroSpec request order does not match the active GPU residency set"
             )
-
-    def get(
-        self,
-        layer_name: str,
-        request_ids: Sequence[str],
-        max_num_tokens: int,
-    ) -> RetroSpecResidentIndex | None:
-        request_ids = tuple(request_ids)
-        self._validate_active_requests(request_ids)
-
-        entry = self._entries.get(layer_name)
-        if (
-            entry is None
-            or entry.request_ids != request_ids
-            or entry.max_num_tokens != max_num_tokens
-        ):
-            return None
-
-        return entry.index
-
-    def put(
-        self,
-        layer_name: str,
-        request_ids: Sequence[str],
-        max_num_tokens: int,
-        index: RetroSpecResidentIndex,
-    ) -> None:
-        request_ids = tuple(request_ids)
-        self._validate_active_requests(request_ids)
-
-        self._entries[layer_name] = _ResidentIndexEntry(
-            request_ids=request_ids,
-            max_num_tokens=max_num_tokens,
-            index=index,
-        )
 
     def _get_or_allocate_request_slot(self, request_id: str) -> int:
         slot = self._request_slots.get(request_id)
@@ -560,7 +498,6 @@ class RetroSpecGPUIndexResidencyManager:
                 arena.num_clusters[state.slot] = state.num_clusters
                 arena.indexed_starts[state.slot] = state.indexed_start
                 arena.indexed_ends[state.slot] = state.indexed_end
-            self._entries.pop(layer_name, None)
             self._active_views.pop(layer_name, None)
 
     def get_active_view(
@@ -570,12 +507,10 @@ class RetroSpecGPUIndexResidencyManager:
         device: torch.device,
     ) -> RetroSpecResidentBatchView:
         request_ids = tuple(request_ids)
-        cache_active = self._active_request_ids is not None
-        if cache_active:
-            self._validate_active_requests(request_ids)
+        self._validate_active_requests(request_ids)
 
-        cached = self._active_views.get(layer_name) if cache_active else None
-        if cached is not None:
+        cached = self._active_views.get(layer_name)
+        if cached is not None and cached.request_slot_ids.device == device:
             return cached
 
         arena = self._layer_arenas.get(layer_name)
@@ -601,15 +536,23 @@ class RetroSpecGPUIndexResidencyManager:
             ),
             default=0,
         )
+        max_num_pages = max(
+            (
+                max(state.page_ends, default=0)
+                for request_id in request_ids
+                if (state := layer_states.get(request_id)) is not None
+            ),
+            default=0,
+        )
 
         view = RetroSpecResidentBatchView(
             arena=arena,
             request_slot_ids=request_slot_ids,
             max_num_clusters=max(max_num_clusters, 1),
             max_pages_per_cluster=max_pages_per_cluster,
+            max_num_pages=max_num_pages,
         )
-        if cache_active:
-            self._active_views[layer_name] = view
+        self._active_views[layer_name] = view
         return view
 
     def get_num_clusters(self, layer_name: str, request_id: str) -> int:
@@ -620,166 +563,7 @@ class RetroSpecGPUIndexResidencyManager:
         state = self._resident_states.get(layer_name, {}).get(request_id)
         return None if state is None else state.indexed_end
 
-    def materialize_packed(
-        self,
-        layer_name: str,
-        request_ids: Sequence[str],
-        max_num_tokens: int,
-        key_cache: torch.Tensor,
-    ) -> RetroSpecResidentIndex:
-        request_ids = tuple(request_ids)
-        cache_active = self._active_request_ids is not None
-        cached = None
-        if cache_active:
-            self._validate_active_requests(request_ids)
-            cached = self.get(layer_name, request_ids, max_num_tokens)
-        if cached is not None:
-            return cached
-
-        batch_size = len(request_ids)
-        num_kv_heads = key_cache.shape[2]
-        head_size = key_cache.shape[3]
-        view = self.get_active_view(layer_name, request_ids, key_cache.device)
-        arena = view.arena
-        layer_states = self._resident_states.get(layer_name, {})
-
-        indexed_token_mask = torch.zeros(
-            batch_size,
-            max_num_tokens,
-            dtype=torch.bool,
-            device=key_cache.device,
-        )
-        cluster_ids = torch.full(
-            (batch_size, num_kv_heads, view.max_num_clusters),
-            -1,
-            dtype=torch.int64,
-            device=key_cache.device,
-        )
-        cluster_keys = torch.zeros(
-            batch_size,
-            num_kv_heads,
-            view.max_num_clusters,
-            head_size,
-            dtype=key_cache.dtype,
-            device=key_cache.device,
-        )
-        cluster_values = torch.zeros_like(cluster_keys)
-        cluster_token_counts = torch.zeros(
-            cluster_ids.shape, dtype=torch.int32, device=key_cache.device
-        )
-        cluster_mask = torch.zeros(
-            cluster_ids.shape, dtype=torch.bool, device=key_cache.device
-        )
-
-        page_shape = (
-            batch_size,
-            num_kv_heads,
-            view.max_num_clusters,
-            view.max_pages_per_cluster,
-        )
-        cluster_page_ids = torch.full(
-            page_shape, -1, dtype=torch.int64, device=key_cache.device
-        )
-        cluster_page_token_counts = torch.zeros(
-            page_shape, dtype=torch.int32, device=key_cache.device
-        )
-
-        if arena is not None:
-            if arena.cluster_keys.device != key_cache.device:
-                raise RuntimeError(
-                    "Resident RetroSpec arena and attention KV use different devices"
-                )
-            if arena.cluster_keys.dtype != key_cache.dtype:
-                raise RuntimeError(
-                    "Resident RetroSpec arena and attention KV use different dtypes"
-                )
-            if arena.cluster_keys.shape[1] != num_kv_heads:
-                raise RuntimeError("Resident RetroSpec arena changed KV-head count")
-            if arena.cluster_keys.shape[3] != head_size:
-                raise RuntimeError("Resident RetroSpec arena changed head size")
-
-            page_offsets = torch.arange(
-                view.max_pages_per_cluster,
-                dtype=torch.int64,
-                device=key_cache.device,
-            )
-
-            for row, request_id in enumerate(request_ids):
-                state = layer_states.get(request_id)
-                if state is None:
-                    continue
-
-                slot = state.slot
-                num_clusters = state.num_clusters
-                indexed_end = min(state.indexed_end, max_num_tokens)
-                if indexed_end > state.indexed_start:
-                    indexed_token_mask[row, state.indexed_start : indexed_end] = True
-
-                cluster_ids[row, :, :num_clusters].copy_(
-                    arena.cluster_ids[slot, :, :num_clusters]
-                )
-                cluster_keys[row, :, :num_clusters].copy_(
-                    arena.cluster_keys[slot, :, :num_clusters]
-                )
-                cluster_values[row, :, :num_clusters].copy_(
-                    arena.cluster_values[slot, :, :num_clusters]
-                )
-                cluster_token_counts[row, :, :num_clusters].copy_(
-                    arena.cluster_token_counts[slot, :, :num_clusters]
-                )
-
-                request_cluster_ids = cluster_ids[row, :, :num_clusters]
-                request_cluster_counts = cluster_token_counts[row, :, :num_clusters]
-                cluster_mask[row, :, :num_clusters].copy_(
-                    (request_cluster_ids >= 0) & (request_cluster_counts > 0)
-                )
-
-                if view.max_pages_per_cluster == 0:
-                    continue
-
-                page_starts = arena.cluster_page_offsets[slot, :, :num_clusters]
-                page_ends = arena.cluster_page_offsets[slot, :, 1 : num_clusters + 1]
-                page_positions = page_starts.unsqueeze(-1) + page_offsets
-                valid_pages = page_positions < page_ends.unsqueeze(-1)
-                safe_positions = page_positions.clamp(
-                    min=0,
-                    max=self.max_pages_per_head_per_request - 1,
-                )
-
-                expanded_page_ids = (
-                    arena.page_ids[slot].unsqueeze(1).expand(-1, num_clusters, -1)
-                )
-                expanded_page_counts = (
-                    arena.page_token_counts[slot]
-                    .unsqueeze(1)
-                    .expand(-1, num_clusters, -1)
-                )
-                selected_page_ids = expanded_page_ids.gather(2, safe_positions)
-                selected_page_counts = expanded_page_counts.gather(2, safe_positions)
-
-                cluster_page_ids[row, :, :num_clusters].copy_(
-                    selected_page_ids.masked_fill(~valid_pages, -1)
-                )
-                cluster_page_token_counts[row, :, :num_clusters].copy_(
-                    selected_page_counts.masked_fill(~valid_pages, 0)
-                )
-
-        packed = RetroSpecResidentIndex(
-            indexed_token_mask=indexed_token_mask,
-            cluster_ids=cluster_ids,
-            cluster_keys=cluster_keys,
-            cluster_values=cluster_values,
-            cluster_token_counts=cluster_token_counts,
-            cluster_mask=cluster_mask,
-            cluster_page_ids=cluster_page_ids,
-            cluster_page_token_counts=cluster_page_token_counts,
-        )
-        if cache_active:
-            self.put(layer_name, request_ids, max_num_tokens, packed)
-        return packed
-
-    def invalidate_packed_layer(self, layer_name: str) -> None:
-        self._entries.pop(layer_name, None)
+    def invalidate_active_view(self, layer_name: str) -> None:
         self._active_views.pop(layer_name, None)
 
     def discard_request_layer(self, layer_name: str, request_id: str) -> None:
@@ -795,7 +579,6 @@ class RetroSpecGPUIndexResidencyManager:
         arena.num_clusters[state.slot] = 0
         arena.indexed_starts[state.slot] = 0
         arena.indexed_ends[state.slot] = 0
-        self._entries.pop(layer_name, None)
         self._active_views.pop(layer_name, None)
 
     def invalidate_requests(self, request_ids: Sequence[str]) -> None:
@@ -812,8 +595,6 @@ class RetroSpecGPUIndexResidencyManager:
                 arena.num_clusters[state.slot] = 0
                 arena.indexed_starts[state.slot] = 0
                 arena.indexed_ends[state.slot] = 0
-
-            self._entries.pop(layer_name, None)
 
         self._active_views.clear()
 

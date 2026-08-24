@@ -6,24 +6,10 @@ import torch
 
 from vllm.v1.spec_decode.retrospec.index_residency import (
     RetroSpecGPUIndexResidencyManager,
-    RetroSpecResidentIndex,
     RetroSpecResidentSegment,
 )
 
 pytestmark = pytest.mark.cpu_test
-
-
-def make_resident_index() -> RetroSpecResidentIndex:
-    return RetroSpecResidentIndex(
-        indexed_token_mask=torch.ones(1, 2, dtype=torch.bool),
-        cluster_ids=torch.zeros(1, 1, 1, dtype=torch.int64),
-        cluster_keys=torch.zeros(1, 1, 1, 1),
-        cluster_values=torch.zeros(1, 1, 1, 1),
-        cluster_token_counts=torch.ones(1, 1, 1, dtype=torch.int32),
-        cluster_mask=torch.ones(1, 1, 1, dtype=torch.bool),
-        cluster_page_ids=torch.zeros(1, 1, 1, 1, dtype=torch.int64),
-        cluster_page_token_counts=torch.ones(1, 1, 1, 1, dtype=torch.int32),
-    )
 
 
 def make_manager(max_resident_requests: int = 2):
@@ -62,21 +48,18 @@ def make_resident_segment(
     )
 
 
-def test_residency_manager_scopes_indices_to_active_request_set():
+def test_residency_manager_scopes_views_to_active_request_set():
     manager = make_manager()
-    packed = make_resident_index()
 
     manager.activate(["first", "second"])
     assert manager.active_request_ids == ("first", "second")
-    assert manager.get("layer", ["first", "second"], 16) is None
-
-    manager.put("layer", ["first", "second"], 16, packed)
-    assert manager.get("layer", ["first", "second"], 16) is packed
-    assert manager.num_packed_layers == 1
+    first = manager.get_active_view("layer", ["first", "second"], torch.device("cpu"))
+    second = manager.get_active_view("layer", ["first", "second"], torch.device("cpu"))
+    assert first is second
+    assert first.request_slot_ids.tolist() == [-1, -1]
 
     manager.deactivate()
     assert manager.active_request_ids == ()
-    assert manager.num_packed_layers == 0
 
 
 def test_residency_manager_enforces_capacity_and_request_order():
@@ -88,7 +71,7 @@ def test_residency_manager_enforces_capacity_and_request_order():
     manager.activate(["first", "second"])
     try:
         with pytest.raises(RuntimeError, match="request order"):
-            manager.get("layer", ["second", "first"], 16)
+            manager.get_active_view("layer", ["second", "first"], torch.device("cpu"))
     finally:
         manager.deactivate()
 
@@ -100,7 +83,7 @@ def test_residency_manager_rejects_duplicate_or_unscoped_requests():
         manager.activate(["request", "request"])
 
     with pytest.raises(RuntimeError, match="active proposal"):
-        manager.get("layer", ["request"], 16)
+        manager.get_active_view("layer", ["request"], torch.device("cpu"))
 
 
 def test_resident_segments_survive_batch_deactivation():
@@ -112,11 +95,10 @@ def test_resident_segments_survive_batch_deactivation():
     assert manager.num_resident_layers == 1
 
     manager.activate(["request"])
-    manager.put("layer", ["request"], 16, make_resident_index())
-    assert manager.num_packed_layers == 1
+    view = manager.get_active_view("layer", ["request"], torch.device("cpu"))
+    assert view.request_slot_ids.tolist() == [0]
     manager.deactivate()
 
-    assert manager.num_packed_layers == 0
     assert manager.get_num_clusters("layer", "request") == 1
     assert manager.get_indexed_end("layer", "request") == 4
 
@@ -261,6 +243,7 @@ def test_resident_arena_uses_request_slots_and_ragged_page_offsets():
         assert view.request_slot_ids.tolist() == [0]
         assert view.max_num_clusters == 3
         assert view.max_pages_per_cluster == 2
+        assert view.max_num_pages == 4
 
         arena = view.arena
         assert arena.indexed_starts[0].item() == 2
@@ -270,19 +253,9 @@ def test_resident_arena_uses_request_slots_and_ragged_page_offsets():
         assert arena.page_ids[0, 0, :3].tolist() == [20, 21, 22]
         assert arena.page_ids[0, 1, :4].tolist() == [23, 24, 25, 26]
 
-        key_cache = torch.empty(1, 2, 2, 1)
-        packed = manager.materialize_packed(
-            "layer", ["request"], max_num_tokens=10, key_cache=key_cache
-        )
-        assert packed.indexed_token_mask.tolist() == [
-            [False, False, True, True, True, True, True, True, False, False]
-        ]
-        assert packed.cluster_ids.tolist() == [[[10, 11, -1], [12, 13, 14]]]
-        assert packed.cluster_page_ids.tolist() == [
-            [
-                [[20, 21], [22, -1], [-1, -1]],
-                [[23, -1], [24, 25], [26, -1]],
-            ]
+        assert arena.cluster_ids[0, :, :3].tolist() == [
+            [10, 11, -1],
+            [12, 13, 14],
         ]
     finally:
         manager.deactivate()

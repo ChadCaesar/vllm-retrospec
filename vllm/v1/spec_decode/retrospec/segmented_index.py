@@ -9,7 +9,7 @@ from math import ceil
 
 import torch
 
-from .cluster_scoring import reduce_grouped_cluster_scores
+from .cluster_scoring import reduce_grouped_cluster_scores, score_resident_clusters
 from .cluster_store import (
     RetroSpecClusterBlockTable,
     RetroSpecClusterPageStore,
@@ -21,7 +21,7 @@ from .index import RetroSpecAttentionLevel, RetroSpecIndexBase
 from .index_residency import (
     RetroSpecClusterSummary,
     RetroSpecGPUIndexResidencyManager,
-    RetroSpecResidentIndex,
+    RetroSpecResidentBatchView,
     RetroSpecResidentSegment,
     RetroSpecStagedClusterSummary,
 )
@@ -145,6 +145,7 @@ class _ClusterSelectionWorkspace:
     scores: torch.Tensor
     softmax_lse: torch.Tensor
     ranking_scores: torch.Tensor
+    candidate_counts: torch.Tensor
     topk_values: torch.Tensor
     topk_indices: torch.Tensor
 
@@ -442,7 +443,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 layer_changed = True
 
             if layer_changed:
-                self._gpu_index_residency.invalidate_packed_layer(layer_name)
+                self._gpu_index_residency.invalidate_active_view(layer_name)
 
     def begin_proposal(self, request_ids: Sequence[str]) -> None:
         if self._proposal_active:
@@ -1034,20 +1035,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 self.flush_staged_updates()
 
         if layer_changed:
-            self._gpu_index_residency.invalidate_packed_layer(layer_name)
+            self._gpu_index_residency.invalidate_active_view(layer_name)
 
-    def _pack_indices(
+    def _get_resident_view(
         self,
         layer_name: str,
         request_ids: Sequence[str],
         key_cache: torch.Tensor,
-        block_table: torch.Tensor,
-    ) -> RetroSpecResidentIndex:
-        batch_size, max_num_blocks = block_table.shape
+    ) -> RetroSpecResidentBatchView:
         request_ids = tuple(request_ids)
-
-        if len(request_ids) != batch_size:
-            raise ValueError("request_ids batch size does not match block_table")
 
         layer_indices = self._indices.get(layer_name, {})
         for request_id in request_ids:
@@ -1070,12 +1066,41 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                         "CPU and GPU RetroSpec indexed prefixes are inconsistent"
                     )
 
-        return self._gpu_index_residency.materialize_packed(
-            layer_name=layer_name,
-            request_ids=request_ids,
-            max_num_tokens=max_num_blocks * self.block_size,
-            key_cache=key_cache,
+        view = self._gpu_index_residency.get_active_view(
+            layer_name, request_ids, key_cache.device
         )
+        arena = view.arena
+        if arena is not None:
+            if arena.cluster_keys.device != key_cache.device:
+                raise RuntimeError(
+                    "Resident RetroSpec arena and attention KV use different devices"
+                )
+            if arena.cluster_keys.dtype != key_cache.dtype:
+                raise RuntimeError(
+                    "Resident RetroSpec arena and attention KV use different dtypes"
+                )
+            if arena.cluster_keys.shape[1] != key_cache.shape[2]:
+                raise RuntimeError("Resident RetroSpec arena changed KV-head count")
+            if arena.cluster_keys.shape[3] != key_cache.shape[3]:
+                raise RuntimeError("Resident RetroSpec arena changed head size")
+        return view
+
+    @staticmethod
+    def _get_resident_indexed_bounds(
+        view: RetroSpecResidentBatchView,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = view.request_slot_ids.shape[0]
+        if view.arena is None:
+            zeros = torch.zeros(batch_size, dtype=torch.int64, device=device)
+            valid = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            return zeros, zeros, valid
+
+        valid_requests = view.request_slot_ids >= 0
+        safe_slots = view.request_slot_ids.clamp_min(0)
+        indexed_starts = view.arena.indexed_starts.index_select(0, safe_slots)
+        indexed_ends = view.arena.indexed_ends.index_select(0, safe_slots)
+        return indexed_starts, indexed_ends, valid_requests
 
     def _build_token_layout(
         self,
@@ -1339,18 +1364,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     def _get_cluster_selection_workspace(
         self,
         query: torch.Tensor,
-        cluster_keys: torch.Tensor,
+        num_kv_heads: int,
+        num_clusters: int,
     ) -> _ClusterSelectionWorkspace:
         """Return a reusable CUDA workspace for cluster selection."""
         if query.device.type != "cuda":
             raise ValueError("Cluster selection workspace requires CUDA")
-        if cluster_keys.device != query.device:
-            raise ValueError("Query and cluster keys must be on one CUDA device")
 
         batch_size, num_query_heads, _ = query.shape
-        num_kv_heads = cluster_keys.shape[1]
-        num_clusters = cluster_keys.shape[2]
-
         if num_kv_heads <= 0:
             raise ValueError("Cluster keys must contain at least one KV head")
         if num_query_heads % num_kv_heads != 0:
@@ -1396,6 +1417,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             and workspace.scores.shape == scores_shape
             and workspace.softmax_lse.shape == lse_shape
             and workspace.ranking_scores.shape == scores_shape
+            and workspace.candidate_counts.shape == scores_shape[:2]
             and workspace.topk_values.shape == topk_shape
             and workspace.topk_indices.shape == topk_shape
         ):
@@ -1422,6 +1444,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 dtype=torch.float32,
                 device=query.device,
             ),
+            candidate_counts=torch.empty(
+                scores_shape[:2],
+                dtype=torch.int32,
+                device=query.device,
+            ),
             topk_values=torch.empty(
                 topk_shape,
                 dtype=torch.float32,
@@ -1435,6 +1462,80 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         )
         self._cluster_selection_workspace = workspace
         return workspace
+
+    def _score_resident_view(
+        self,
+        query: torch.Tensor,
+        view: RetroSpecResidentBatchView,
+        scale: float,
+        num_kv_heads: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        _ClusterSelectionWorkspace | None,
+    ]:
+        workspace = None
+        if query.device.type == "cuda":
+            workspace = self._get_cluster_selection_workspace(
+                query, num_kv_heads, view.max_num_clusters
+            )
+
+        arena = view.arena
+        if arena is None:
+            shape = (query.shape[0], num_kv_heads, view.max_num_clusters)
+            scores = torch.zeros(shape, dtype=torch.float32, device=query.device)
+            ranking_scores = torch.full_like(scores, float("-inf"))
+            candidate_counts = torch.zeros(
+                shape[:2], dtype=torch.int32, device=query.device
+            )
+            return scores, ranking_scores, candidate_counts, workspace
+
+        cluster_keys = arena.cluster_keys[:, :, : view.max_num_clusters]
+        cluster_ids = arena.cluster_ids[:, :, : view.max_num_clusters]
+        token_counts = arena.cluster_token_counts[:, :, : view.max_num_clusters]
+        if workspace is not None:
+            scores = score_resident_clusters(
+                query=query,
+                cluster_keys=cluster_keys,
+                cluster_ids=cluster_ids,
+                cluster_token_counts=token_counts,
+                num_clusters=arena.num_clusters,
+                request_slot_ids=view.request_slot_ids,
+                scale=scale,
+                logits=workspace.logits,
+                output=workspace.scores,
+                softmax_lse=workspace.softmax_lse,
+                ranking_output=workspace.ranking_scores,
+                candidate_counts=workspace.candidate_counts,
+            )
+            return (
+                scores,
+                workspace.ranking_scores,
+                workspace.candidate_counts,
+                workspace,
+            )
+
+        safe_slots = view.request_slot_ids.clamp_min(0)
+        packed_keys = cluster_keys.index_select(0, safe_slots)
+        packed_ids = cluster_ids.index_select(0, safe_slots)
+        packed_counts = token_counts.index_select(0, safe_slots)
+        request_num_clusters = arena.num_clusters.index_select(0, safe_slots)
+        cluster_offsets = torch.arange(
+            view.max_num_clusters, dtype=torch.int64, device=query.device
+        )
+        cluster_mask = (
+            (view.request_slot_ids >= 0)[:, None, None]
+            & (cluster_offsets[None, None, :] < request_num_clusters[:, None, None])
+            & (packed_ids >= 0)
+            & (packed_counts > 0)
+        )
+        scores = self._score_clusters(
+            query, packed_keys, cluster_mask, packed_counts, scale
+        )
+        ranking_scores = scores.masked_fill(~cluster_mask, float("-inf"))
+        candidate_counts = cluster_mask.sum(dim=2, dtype=torch.int32)
+        return scores, ranking_scores, candidate_counts, None
 
     @staticmethod
     def _slice_rank_range(
@@ -1481,16 +1582,19 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     def _select_cluster_zones(
         self,
         cluster_scores: torch.Tensor,
-        cluster_mask: torch.Tensor,
+        ranking_scores: torch.Tensor,
+        candidate_counts: torch.Tensor,
         workspace: _ClusterSelectionWorkspace | None = None,
     ) -> _PackedClusterZones:
         """Rank relevant clusters once and return compact zone indices."""
-        if cluster_scores.shape != cluster_mask.shape:
-            raise ValueError("Cluster scores and mask must have equal shapes")
         if cluster_scores.ndim != 3:
             raise ValueError(
                 "Cluster scores must have shape [batch, num_kv_heads, num_clusters]"
             )
+        if ranking_scores.shape != cluster_scores.shape:
+            raise ValueError("Ranking scores and cluster scores must match")
+        if candidate_counts.shape != cluster_scores.shape[:2]:
+            raise ValueError("Candidate counts do not match cluster scores")
 
         num_clusters = cluster_scores.shape[2]
         (
@@ -1501,10 +1605,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         max_total_compute = max_retrieval + max_estimation
 
-        candidate_counts = cluster_mask.sum(
-            dim=2,
-            dtype=torch.int64,
-        )
+        candidate_counts = candidate_counts.to(torch.int64)
 
         retrieval_counts = torch.ceil(
             candidate_counts.float() * self.retrieval_ratio
@@ -1529,10 +1630,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         )
 
         if workspace is None:
-            ranking_scores = cluster_scores.masked_fill(
-                ~cluster_mask,
-                float("-inf"),
-            )
             ranked_indices = torch.topk(
                 ranking_scores,
                 k=max_total_compute,
@@ -1545,6 +1642,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 raise ValueError(
                     "Workspace ranking scores do not belong to cluster scores"
                 )
+            if ranking_scores is not workspace.ranking_scores:
+                raise ValueError("Workspace ranking output does not match")
             expected_topk_shape = (
                 cluster_scores.shape[0],
                 cluster_scores.shape[1],
@@ -1719,45 +1818,65 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         return selected_scores.sum(dim=2)
 
     @staticmethod
-    def _build_exact_cluster_selection(
-        cluster_ids: torch.Tensor,
-        cluster_page_ids: torch.Tensor,
-        cluster_page_token_counts: torch.Tensor,
+    def _build_resident_exact_cluster_selection(
+        view: RetroSpecResidentBatchView,
         packed_cluster_indices: torch.Tensor,
         packed_cluster_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size, num_kv_heads, _, max_pages = cluster_page_ids.shape
-        max_selected_clusters = packed_cluster_indices.shape[2]
-
-        selected_cluster_ids = cluster_ids.gather(
-            dim=2,
-            index=packed_cluster_indices,
+        batch_size, num_kv_heads, max_selected = packed_cluster_indices.shape
+        max_pages = view.max_pages_per_cluster
+        device = packed_cluster_indices.device
+        selected_cluster_ids = torch.full(
+            (batch_size, num_kv_heads, max_selected),
+            -1,
+            dtype=torch.int64,
+            device=device,
         )
-
-        page_indices = packed_cluster_indices.unsqueeze(-1).expand(
-            batch_size,
-            num_kv_heads,
-            max_selected_clusters,
-            max_pages,
+        selected_page_ids = torch.full(
+            (batch_size, num_kv_heads, max_selected, max_pages),
+            -1,
+            dtype=torch.int64,
+            device=device,
         )
-
-        selected_page_ids = cluster_page_ids.gather(
-            dim=2,
-            index=page_indices,
+        selected_page_token_counts = torch.zeros_like(
+            selected_page_ids, dtype=torch.int32
         )
-        selected_page_token_counts = cluster_page_token_counts.gather(
-            dim=2,
-            index=page_indices,
-        )
+        if view.arena is None or max_selected == 0 or max_pages == 0:
+            return selected_cluster_ids, selected_page_ids, selected_page_token_counts
 
-        valid_clusters = packed_cluster_mask & (selected_cluster_ids >= 0)
+        arena = view.arena
+        slots = view.request_slot_ids.clamp_min(0)
+        slot_indices = slots[:, None, None].expand_as(packed_cluster_indices)
+        head_indices = torch.arange(num_kv_heads, dtype=torch.int64, device=device)[
+            None, :, None
+        ].expand_as(packed_cluster_indices)
+        valid_clusters = packed_cluster_mask & (
+            view.request_slot_ids[:, None, None] >= 0
+        )
+        selected_cluster_ids = arena.cluster_ids[
+            slot_indices, head_indices, packed_cluster_indices
+        ]
+        valid_clusters &= selected_cluster_ids >= 0
         selected_cluster_ids.masked_fill_(~valid_clusters, -1)
 
-        valid_pages = (
-            valid_clusters.unsqueeze(-1)
-            & (selected_page_ids >= 0)
-            & (selected_page_token_counts > 0)
+        page_starts = arena.cluster_page_offsets[
+            slot_indices, head_indices, packed_cluster_indices
+        ]
+        page_ends = arena.cluster_page_offsets[
+            slot_indices, head_indices, packed_cluster_indices + 1
+        ]
+        page_offsets = torch.arange(max_pages, dtype=torch.int64, device=device)
+        flat_page_indices = page_starts.unsqueeze(-1) + page_offsets
+        valid_pages = valid_clusters.unsqueeze(-1) & (
+            flat_page_indices < page_ends.unsqueeze(-1)
         )
+        flat_page_indices.clamp_(min=0, max=arena.page_ids.shape[2] - 1)
+        page_slots = slot_indices.unsqueeze(-1).expand_as(flat_page_indices)
+        page_heads = head_indices.unsqueeze(-1).expand_as(flat_page_indices)
+        selected_page_ids = arena.page_ids[page_slots, page_heads, flat_page_indices]
+        selected_page_token_counts = arena.page_token_counts[
+            page_slots, page_heads, flat_page_indices
+        ]
         selected_page_ids.masked_fill_(~valid_pages, -1)
         selected_page_token_counts.masked_fill_(~valid_pages, 0)
 
@@ -1768,40 +1887,45 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         )
 
     @staticmethod
-    def _build_estimation_selection(
-        cluster_keys: torch.Tensor,
-        cluster_values: torch.Tensor,
-        cluster_token_counts: torch.Tensor,
+    def _build_resident_estimation_selection(
+        view: RetroSpecResidentBatchView,
         packed_indices: torch.Tensor,
         packed_mask: torch.Tensor,
+        head_size: int,
+        dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size, num_kv_heads, max_num_clusters, head_size = cluster_keys.shape
-        del max_num_clusters
-
-        max_selected_clusters = packed_indices.shape[2]
-        vector_indices = packed_indices.unsqueeze(-1).expand(
+        batch_size, num_kv_heads, max_selected_clusters = packed_indices.shape
+        output_shape = (
             batch_size,
             num_kv_heads,
             max_selected_clusters,
             head_size,
         )
+        if view.arena is None or max_selected_clusters == 0:
+            keys = torch.zeros(output_shape, dtype=dtype, device=packed_indices.device)
+            values = torch.zeros_like(keys)
+            counts = torch.zeros(
+                output_shape[:-1], dtype=torch.int32, device=packed_indices.device
+            )
+            return keys, values, counts
 
-        estimation_keys = cluster_keys.gather(2, vector_indices)
-        estimation_values = cluster_values.gather(2, vector_indices)
-        estimation_token_counts = cluster_token_counts.gather(
-            2,
-            packed_indices,
-        )
-
-        estimation_keys.masked_fill_(
-            ~packed_mask.unsqueeze(-1),
-            0.0,
-        )
-        estimation_values.masked_fill_(
-            ~packed_mask.unsqueeze(-1),
-            0.0,
-        )
-        estimation_token_counts.masked_fill_(~packed_mask, 0)
+        arena = view.arena
+        slots = view.request_slot_ids.clamp_min(0)
+        slot_indices = slots[:, None, None].expand_as(packed_indices)
+        head_indices = torch.arange(
+            num_kv_heads, dtype=torch.int64, device=packed_indices.device
+        )[None, :, None].expand_as(packed_indices)
+        valid = packed_mask & (view.request_slot_ids[:, None, None] >= 0)
+        estimation_keys = arena.cluster_keys[slot_indices, head_indices, packed_indices]
+        estimation_values = arena.cluster_values[
+            slot_indices, head_indices, packed_indices
+        ]
+        estimation_token_counts = arena.cluster_token_counts[
+            slot_indices, head_indices, packed_indices
+        ]
+        estimation_keys.masked_fill_(~valid.unsqueeze(-1), 0.0)
+        estimation_values.masked_fill_(~valid.unsqueeze(-1), 0.0)
+        estimation_token_counts.masked_fill_(~valid, 0)
 
         return (
             estimation_keys.contiguous(),
@@ -1816,9 +1940,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         cluster_zones: _PackedClusterZones,
         sparse_attn: torch.Tensor,
         expanded_attn: torch.Tensor,
-        packed: RetroSpecResidentIndex,
+        view: RetroSpecResidentBatchView,
+        num_kv_heads: int,
+        head_size: int,
+        dtype: torch.dtype,
     ) -> RetroSpecTokenSelectionPlan:
-        num_kv_heads = packed.cluster_keys.shape[1]
         per_head_forced_exact = forced_exact_mask.unsqueeze(1).expand(
             -1,
             num_kv_heads,
@@ -1851,10 +1977,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             sparse_exact_cluster_ids,
             sparse_exact_page_ids,
             sparse_exact_page_token_counts,
-        ) = self._build_exact_cluster_selection(
-            packed.cluster_ids,
-            packed.cluster_page_ids,
-            packed.cluster_page_token_counts,
+        ) = self._build_resident_exact_cluster_selection(
+            view,
             cluster_zones.sparse_retrieval_indices,
             cluster_zones.sparse_retrieval_mask,
         )
@@ -1863,10 +1987,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             expanded_exact_cluster_ids,
             expanded_exact_page_ids,
             expanded_exact_page_token_counts,
-        ) = self._build_exact_cluster_selection(
-            packed.cluster_ids,
-            packed.cluster_page_ids,
-            packed.cluster_page_token_counts,
+        ) = self._build_resident_exact_cluster_selection(
+            view,
             cluster_zones.expanded_retrieval_indices,
             cluster_zones.expanded_retrieval_mask,
         )
@@ -1875,23 +1997,23 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             sparse_estimation_keys,
             sparse_estimation_values,
             sparse_estimation_token_counts,
-        ) = self._build_estimation_selection(
-            packed.cluster_keys,
-            packed.cluster_values,
-            packed.cluster_token_counts,
+        ) = self._build_resident_estimation_selection(
+            view,
             cluster_zones.sparse_estimation_indices,
             cluster_zones.sparse_estimation_mask,
+            head_size,
+            dtype,
         )
         (
             expanded_estimation_keys,
             expanded_estimation_values,
             expanded_estimation_token_counts,
-        ) = self._build_estimation_selection(
-            packed.cluster_keys,
-            packed.cluster_values,
-            packed.cluster_token_counts,
+        ) = self._build_resident_estimation_selection(
+            view,
             cluster_zones.expanded_estimation_indices,
             cluster_zones.expanded_estimation_mask,
+            head_size,
+            dtype,
         )
 
         return RetroSpecTokenSelectionPlan(
@@ -1961,9 +2083,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     def _materialize_draft_selection(
         self,
         plan: RetroSpecTokenSelectionPlan,
-        packed: RetroSpecResidentIndex,
+        view: RetroSpecResidentBatchView,
         cluster_zones: _PackedClusterZones,
         cluster_scores: torch.Tensor,
+        has_clusters: torch.Tensor,
+        head_size: int,
+        dtype: torch.dtype,
         active_mask: torch.Tensor,
     ) -> RetroSpecTokenAttentionSelection:
         """Use resident retrieval clusters and estimate selected cache misses."""
@@ -2000,12 +2125,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             miss_estimation_keys,
             miss_estimation_values,
             miss_estimation_token_counts,
-        ) = self._build_estimation_selection(
-            packed.cluster_keys,
-            packed.cluster_values,
-            packed.cluster_token_counts,
+        ) = self._build_resident_estimation_selection(
+            view,
             cluster_zones.sparse_retrieval_indices,
             miss_cluster_mask,
+            head_size,
+            dtype,
         )
 
         estimation_keys = torch.cat(
@@ -2036,7 +2161,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             hit_cluster_mask,
         )
 
-        has_clusters = packed.cluster_mask.any(dim=2)
         hit_gate_ready_by_head = (
             cluster_zones.sparse_retrieval_mask & resolved_pages.hit_gate_ready_mask
         ).any(dim=2)
@@ -2244,6 +2368,49 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         return exact_keys, exact_values, exact_token_mask
 
+    @staticmethod
+    def _build_full_verification_pages(
+        view: RetroSpecResidentBatchView,
+        num_kv_heads: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = view.request_slot_ids.shape[0]
+        device = view.request_slot_ids.device
+        shape = (batch_size, num_kv_heads, 1, view.max_num_pages)
+        page_ids = torch.full(shape, -1, dtype=torch.int64, device=device)
+        page_token_counts = torch.zeros_like(page_ids, dtype=torch.int32)
+        if view.arena is None or view.max_num_pages == 0:
+            return page_ids, page_token_counts
+
+        arena = view.arena
+        slots = view.request_slot_ids.clamp_min(0)
+        slot_indices = slots[:, None, None].expand(
+            batch_size, num_kv_heads, view.max_num_pages
+        )
+        head_indices = torch.arange(num_kv_heads, dtype=torch.int64, device=device)[
+            None, :, None
+        ].expand_as(slot_indices)
+        page_indices = torch.arange(
+            view.max_num_pages, dtype=torch.int64, device=device
+        )[None, None, :].expand_as(slot_indices)
+        request_num_clusters = arena.num_clusters.index_select(0, slots)
+        request_heads = torch.arange(num_kv_heads, dtype=torch.int64, device=device)[
+            None, :
+        ].expand(batch_size, num_kv_heads)
+        request_slots = slots[:, None].expand_as(request_heads)
+        page_ends = arena.cluster_page_offsets[
+            request_slots, request_heads, request_num_clusters[:, None]
+        ]
+        valid = (view.request_slot_ids[:, None, None] >= 0) & (
+            page_indices < page_ends.unsqueeze(-1)
+        )
+        page_ids[:, :, 0] = arena.page_ids[
+            slot_indices, head_indices, page_indices
+        ].masked_fill(~valid, -1)
+        page_token_counts[:, :, 0] = arena.page_token_counts[
+            slot_indices, head_indices, page_indices
+        ].masked_fill(~valid, 0)
+        return page_ids, page_token_counts
+
     def _pack_full_verification_page_ids_cpu(
         self,
         layer_name: str,
@@ -2264,22 +2431,24 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             if record is None:
                 continue
 
+            page_offsets = [0] * output_shape[1]
             for segment in record.segments:
                 metadata = self.cluster_store.get_cluster_block_metadata(
                     layer_name=layer_name,
                     cluster_ids=segment.cluster_blocks.cluster_ids,
                     device=torch.device("cpu"),
                 )
-                num_clusters = segment.cluster_keys.shape[1]
-                cluster_end = segment.cluster_start + num_clusters
-                num_pages = metadata.page_ids.shape[-1]
-
-                page_ids_cpu[
-                    row,
-                    :,
-                    segment.cluster_start : cluster_end,
-                    :num_pages,
-                ].copy_(metadata.page_ids)
+                for head_index in range(output_shape[1]):
+                    valid_pages = metadata.page_ids[head_index] >= 0
+                    flat_pages = metadata.page_ids[head_index].masked_select(
+                        valid_pages
+                    )
+                    page_start = page_offsets[head_index]
+                    page_end = page_start + flat_pages.numel()
+                    page_ids_cpu[row, head_index, 0, page_start:page_end].copy_(
+                        flat_pages
+                    )
+                    page_offsets[head_index] = page_end
 
         return page_ids_cpu
 
@@ -2344,30 +2513,34 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                         "Full verification requires rolled-back cluster state "
                         "to be rebuilt first"
                     )
-                indexed_token_count = record.indexed_end - self.block_size
+                indexed_token_count = (
+                    record.indexed_end - record.segments[0].indexed_start
+                )
 
             primary_token_counts.append(seq_len - indexed_token_count)
 
-        packed = self._pack_indices(
-            layer_name,
-            request_ids,
-            key_cache,
-            block_table,
-        )
+        view = self._get_resident_view(layer_name, request_ids, key_cache)
 
         seq_lens_tensor = torch.tensor(
             seq_lens,
             dtype=torch.int64,
             device=block_table.device,
         )
-        _, valid_token_mask, _ = self._build_token_layout(
+        logical_token_ids, valid_token_mask, _ = self._build_token_layout(
             block_table,
             seq_lens_tensor,
         )
 
         # Every committed token not owned by a complete clustered segment is
         # part of the exact primary/steady zone.
-        primary_token_mask = valid_token_mask & ~packed.indexed_token_mask
+        indexed_starts, indexed_ends, indexed_requests = (
+            self._get_resident_indexed_bounds(view, block_table.device)
+        )
+        primary_token_mask = valid_token_mask & (
+            ~indexed_requests.unsqueeze(1)
+            | (logical_token_ids.unsqueeze(0) < indexed_starts.unsqueeze(1))
+            | (logical_token_ids.unsqueeze(0) >= indexed_ends.unsqueeze(1))
+        )
         num_kv_heads = key_cache.shape[2]
         per_head_primary_mask = primary_token_mask.unsqueeze(1).expand(
             -1,
@@ -2387,7 +2560,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             dim=2,
             dtype=torch.int32,
         )
-        clustered_exact_token_counts = packed.cluster_page_token_counts.sum(
+        exact_page_ids, exact_page_token_counts = self._build_full_verification_pages(
+            view, num_kv_heads
+        )
+        clustered_exact_token_counts = exact_page_token_counts.sum(
             dim=(2, 3),
             dtype=torch.int32,
         )
@@ -2397,16 +2573,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         exact_page_ids_cpu = self._pack_full_verification_page_ids_cpu(
             layer_name,
             request_ids,
-            packed.cluster_page_ids.shape,
+            exact_page_ids.shape,
         )
 
         return RetroSpecFullVerificationPlan(
             layer_name=layer_name,
             primary_exact_token_indices=primary_exact_token_indices,
             primary_exact_token_mask=primary_exact_token_mask,
-            exact_page_ids=packed.cluster_page_ids,
+            exact_page_ids=exact_page_ids,
             exact_page_ids_cpu=exact_page_ids_cpu,
-            exact_page_token_counts=packed.cluster_page_token_counts,
+            exact_page_token_counts=exact_page_token_counts,
             exact_token_counts=exact_token_counts,
         )
 
@@ -2436,41 +2612,43 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 "Segmented token index request order does not match proposal order"
             )
 
-        packed = self._pack_indices(
-            layer_name,
-            request_ids,
-            key_cache,
-            block_table,
-        )
+        view = self._get_resident_view(layer_name, request_ids, key_cache)
 
-        _, valid_token_mask, forced_exact_mask = self._build_token_layout(
-            block_table,
-            seq_lens,
+        logical_token_ids, valid_token_mask, forced_exact_mask = (
+            self._build_token_layout(
+                block_table,
+                seq_lens,
+            )
         )
 
         # All valid tokens not covered by a complete clustered segment remain
         # in the exact steady zone.
-        forced_exact_mask |= valid_token_mask & ~packed.indexed_token_mask
+        indexed_starts, indexed_ends, indexed_requests = (
+            self._get_resident_indexed_bounds(view, block_table.device)
+        )
+        forced_exact_mask |= valid_token_mask & (
+            ~indexed_requests.unsqueeze(1)
+            | (logical_token_ids.unsqueeze(0) < indexed_starts.unsqueeze(1))
+            | (logical_token_ids.unsqueeze(0) >= indexed_ends.unsqueeze(1))
+        )
 
-        workspace = None
-        if query.device.type == "cuda":
-            workspace = self._get_cluster_selection_workspace(
-                query,
-                packed.cluster_keys,
-            )
-
-        cluster_scores = self._score_clusters(
-            query,
-            packed.cluster_keys,
-            packed.cluster_mask,
-            packed.cluster_token_counts,
-            scale,
+        num_kv_heads = key_cache.shape[2]
+        (
+            cluster_scores,
+            ranking_scores,
+            candidate_counts,
             workspace,
+        ) = self._score_resident_view(
+            query,
+            view,
+            scale,
+            num_kv_heads,
         )
 
         cluster_zones = self._select_cluster_zones(
             cluster_scores,
-            packed.cluster_mask,
+            ranking_scores,
+            candidate_counts,
             workspace,
         )
 
@@ -2485,7 +2663,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             cluster_zones.expanded_retrieval_mask,
         )
 
-        has_clusters = packed.cluster_mask.any(dim=2)
+        has_clusters = candidate_counts > 0
         sparse_attn_by_head = torch.where(
             has_clusters,
             sparse_attn_by_head,
@@ -2517,14 +2695,20 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             cluster_zones=cluster_zones,
             sparse_attn=sparse_attn,
             expanded_attn=expanded_attn,
-            packed=packed,
+            view=view,
+            num_kv_heads=num_kv_heads,
+            head_size=key_cache.shape[3],
+            dtype=key_cache.dtype,
         )
 
         return self._materialize_draft_selection(
             plan=plan,
-            packed=packed,
+            view=view,
             cluster_zones=cluster_zones,
             cluster_scores=cluster_scores,
+            has_clusters=has_clusters,
+            head_size=key_cache.shape[3],
+            dtype=key_cache.dtype,
             active_mask=active_mask,
         )
 

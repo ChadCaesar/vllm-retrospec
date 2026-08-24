@@ -482,12 +482,12 @@ def test_segmented_index_excludes_empty_clusters_from_selection():
     build_index(index, 14, keys, values, block_table)
 
     with active_residency(index, ["request"]):
-        packed = index._pack_indices("layer", ["request"], keys, block_table)
-
-    assert packed.cluster_token_counts.tolist() == [[[8, 0]]]
-    assert packed.cluster_mask.tolist() == [[[True, False]]]
-    assert packed.cluster_ids[0, 0, 0].item() >= 0
-    assert packed.cluster_ids[0, 0, 1].item() == -1
+        view = index._get_resident_view("layer", ["request"], keys)
+        assert view.arena is not None
+        slot = view.request_slot_ids.item()
+        assert view.arena.cluster_token_counts[slot, 0, :2].tolist() == [8, 0]
+        assert view.arena.cluster_ids[slot, 0, 0].item() >= 0
+        assert view.arena.cluster_ids[slot, 0, 1].item() == -1
 
 
 @pytest.mark.parametrize(
@@ -531,7 +531,11 @@ def test_compact_cluster_zones_match_full_mask_selection(
         ]
     )
 
-    zones = index._select_cluster_zones(cluster_scores, cluster_mask)
+    ranking_scores = cluster_scores.masked_fill(~cluster_mask, float("-inf"))
+    candidate_counts = cluster_mask.sum(dim=2, dtype=torch.int32)
+    zones = index._select_cluster_zones(
+        cluster_scores, ranking_scores, candidate_counts
+    )
     expected_zones = index._select_zone_masks(
         cluster_scores.flatten(0, 1),
         cluster_mask.flatten(0, 1),
@@ -655,7 +659,7 @@ def test_segmented_index_handles_mixed_long_and_short_requests():
 
 
 def test_full_verification_plan_covers_clustered_and_primary_tokens():
-    index = make_index()
+    index = make_index(max_resident_requests=2)
     keys, values = make_cache(num_kv_heads=2)
     block_table = torch.arange(7, dtype=torch.int32).repeat(2, 1)
     index.build_or_update(
@@ -669,13 +673,17 @@ def test_full_verification_plan_covers_clustered_and_primary_tokens():
         block_table=block_table,
     )
 
-    plan = index.build_full_verification_plan(
-        request_ids=["long", "short"],
-        layer_name="layer",
-        seq_lens=[10, 3],
-        key_cache=keys,
-        block_table=block_table,
-    )
+    index.begin_full_verification_residency(["long", "short"])
+    try:
+        plan = index.build_full_verification_plan(
+            request_ids=["long", "short"],
+            layer_name="layer",
+            seq_lens=[10, 3],
+            key_cache=keys,
+            block_table=block_table,
+        )
+    finally:
+        index.end_full_verification_residency()
 
     assert plan.layer_name == "layer"
     assert plan.exact_token_counts.tolist() == [[10, 10], [3, 3]]
@@ -697,7 +705,7 @@ def test_full_verification_plan_covers_clustered_and_primary_tokens():
         plan.primary_exact_token_mask[1, 0]
     ]
     assert short_primary_indices.tolist() == [0, 1, 2]
-    assert (plan.exact_page_ids[0] >= 0).any(dim=-1).sum(dim=1).tolist() == [2, 2]
+    assert (plan.exact_page_ids[0] >= 0).sum(dim=(1, 2)).tolist() == [2, 2]
     assert not (plan.exact_page_ids[1] >= 0).any()
     assert torch.equal(plan.exact_page_ids_cpu, plan.exact_page_ids.cpu())
 
@@ -708,13 +716,17 @@ def test_full_verification_plan_handles_request_without_cluster_pages():
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 3, keys, values, block_table)
 
-    plan = index.build_full_verification_plan(
-        request_ids=["request"],
-        layer_name="layer",
-        seq_lens=[3],
-        key_cache=keys,
-        block_table=block_table,
-    )
+    index.begin_full_verification_residency(["request"])
+    try:
+        plan = index.build_full_verification_plan(
+            request_ids=["request"],
+            layer_name="layer",
+            seq_lens=[3],
+            key_cache=keys,
+            block_table=block_table,
+        )
+    finally:
+        index.end_full_verification_residency()
 
     assert plan.exact_token_counts.tolist() == [[3]]
     assert plan.primary_exact_token_indices.tolist() == [[[0, 1, 2]]]
@@ -830,13 +842,17 @@ def test_prepare_full_verification_rolls_back_uncommitted_clusters():
         context_lens=[5],
         layer_names=["layer"],
     )
-    plan = index.build_full_verification_plan(
-        request_ids=["request"],
-        layer_name="layer",
-        seq_lens=[5],
-        key_cache=keys,
-        block_table=block_table,
-    )
+    index.begin_full_verification_residency(["request"])
+    try:
+        plan = index.build_full_verification_plan(
+            request_ids=["request"],
+            layer_name="layer",
+            seq_lens=[5],
+            key_cache=keys,
+            block_table=block_table,
+        )
+    finally:
+        index.end_full_verification_residency()
 
     record = index._indices["layer"]["request"]
     assert record.segments == []
@@ -850,13 +866,17 @@ def test_full_verification_plan_accepts_an_empty_context():
     keys, _ = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
 
-    plan = index.build_full_verification_plan(
-        request_ids=["request"],
-        layer_name="layer",
-        seq_lens=[0],
-        key_cache=keys,
-        block_table=block_table,
-    )
+    index.begin_full_verification_residency(["request"])
+    try:
+        plan = index.build_full_verification_plan(
+            request_ids=["request"],
+            layer_name="layer",
+            seq_lens=[0],
+            key_cache=keys,
+            block_table=block_table,
+        )
+    finally:
+        index.end_full_verification_residency()
 
     assert plan.exact_token_counts.tolist() == [[0]]
     assert plan.primary_exact_token_indices.shape == (1, 1, 0)
@@ -929,12 +949,11 @@ def test_segmented_index_appends_complete_segments_and_handles_rollback():
     assert index.cluster_store.num_allocated_pages("layer") == 0
 
 
-def test_rollback_invalidates_packed_page_ids_before_rebuild(monkeypatch):
+def test_rollback_invalidates_active_view_before_rebuild(monkeypatch):
     index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 14, keys, values, block_table)
-    index._pack_indices("layer", ["request"], keys, block_table)
 
     def fail_clustering(**_kwargs):
         raise RuntimeError("clustering failed")
@@ -944,10 +963,14 @@ def test_rollback_invalidates_packed_page_ids_before_rebuild(monkeypatch):
         fail_clustering,
     )
 
-    with pytest.raises(RuntimeError, match="clustering failed"):
-        build_index(index, 10, keys, values, block_table)
+    with active_residency(index, ["request"]):
+        original = index._get_resident_view("layer", ["request"], keys)
+        with pytest.raises(RuntimeError, match="clustering failed"):
+            build_index(index, 10, keys, values, block_table)
+        rebuilt = index._get_resident_view("layer", ["request"], keys)
 
-    assert index._gpu_index_residency.num_packed_layers == 0
+    assert rebuilt is not original
+    assert rebuilt.request_slot_ids.tolist() == [-1]
     assert index.cluster_store.num_allocated_pages("layer") == 0
 
 
@@ -1010,47 +1033,40 @@ def test_segmented_index_removes_finished_request_state():
     assert index.cluster_store.num_allocated_pages("layer") == 0
 
 
-def test_segmented_index_reuses_packed_index_until_update():
+def test_segmented_index_reuses_active_view_until_update():
     index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 10, keys, values, block_table)
-    materialize_metadata = Mock(wraps=index.cluster_store.get_cluster_block_metadata)
-    index.cluster_store.get_cluster_block_metadata = materialize_metadata
-
     with active_residency(index, ["request"]):
-        first = index._pack_indices("layer", ["request"], keys, block_table)
-        second = index._pack_indices("layer", ["request"], keys, block_table)
+        first = index._get_resident_view("layer", ["request"], keys)
+        second = index._get_resident_view("layer", ["request"], keys)
         assert second is first
-        assert materialize_metadata.call_count == 0
 
         build_index(index, 14, keys, values, block_table)
-        after_update = index._pack_indices("layer", ["request"], keys, block_table)
+        after_update = index._get_resident_view("layer", ["request"], keys)
 
         assert after_update is not first
 
 
-def test_removing_request_invalidates_packed_index():
+def test_removing_request_invalidates_active_view():
     index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 10, keys, values, block_table)
 
     with active_residency(index, ["request"]):
-        packed = index._pack_indices("layer", ["request"], keys, block_table)
-        assert index._gpu_index_residency.num_packed_layers == 1
+        view = index._get_resident_view("layer", ["request"], keys)
 
         index.remove_requests(["request"])
 
         assert "request" not in index._indices["layer"]
-        assert index._gpu_index_residency.num_packed_layers == 0
-
-        rebuilt = index._pack_indices("layer", ["request"], keys, block_table)
-        assert rebuilt is not packed
-        assert not rebuilt.cluster_mask.any()
+        rebuilt = index._get_resident_view("layer", ["request"], keys)
+        assert rebuilt is not view
+        assert rebuilt.request_slot_ids.tolist() == [-1]
 
 
-def test_packed_index_cache_tracks_request_order_and_block_table_width():
+def test_active_view_tracks_request_order_without_block_table_width():
     index = make_index(max_resident_requests=2)
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).repeat(2, 1)
@@ -1066,15 +1082,13 @@ def test_packed_index_cache_tracks_request_order_and_block_table_width():
     )
 
     with active_residency(index, ["long", "short"]):
-        original = index._pack_indices("layer", ["long", "short"], keys, block_table)
+        original = index._get_resident_view("layer", ["long", "short"], keys)
         with pytest.raises(RuntimeError, match="request order"):
-            index._pack_indices("layer", ["short", "long"], keys, block_table)
-        narrower = index._pack_indices(
-            "layer", ["long", "short"], keys, block_table[:, :5]
-        )
+            index._get_resident_view("layer", ["short", "long"], keys)
+        repeated = index._get_resident_view("layer", ["long", "short"], keys)
 
-        assert narrower is not original
-        assert narrower.indexed_token_mask.shape == (2, 10)
+        assert repeated is original
+        assert original.request_slot_ids.shape == (2,)
 
 
 def test_segmented_index_proposal_lifecycle_tracks_empty_batches():
@@ -1140,17 +1154,15 @@ def test_cpu_offload_keeps_request_indices_after_batch_deactivation():
         "second",
     )
     assert index._gpu_index_residency.num_resident_layers == 1
-    assert index._gpu_index_residency.num_packed_layers == 0
 
     index.begin_proposal(["first", "second"])
     try:
-        packed = index._pack_indices("layer", ["first", "second"], keys, block_table)
-        assert packed.cluster_mask.all()
-        assert index._gpu_index_residency.num_packed_layers == 1
+        view = index._get_resident_view("layer", ["first", "second"], keys)
+        assert view.arena is not None
+        assert (view.request_slot_ids >= 0).all()
     finally:
         index.end_proposal()
 
-    assert index._gpu_index_residency.num_packed_layers == 0
     assert index._gpu_index_residency.num_resident_layers == 1
 
     index.remove_requests(["first"])
@@ -1169,8 +1181,10 @@ def test_cpu_offload_appends_resident_segments_across_index_updates():
 
     index.begin_proposal(["request"])
     try:
-        first_packed = index._pack_indices("layer", ["request"], keys, block_table)
-        assert first_packed.cluster_mask.sum().item() == 2
+        first_view = index._get_resident_view("layer", ["request"], keys)
+        assert first_view.arena is not None
+        first_slot = first_view.request_slot_ids.item()
+        assert first_view.arena.num_clusters[first_slot].item() == 2
     finally:
         index.end_proposal()
 
@@ -1184,12 +1198,13 @@ def test_cpu_offload_appends_resident_segments_across_index_updates():
     assert updated_num_clusters == 4
     assert first_indexed_end == 6
     assert updated_indexed_end == 10
-    assert index._gpu_index_residency.num_packed_layers == 0
 
     index.begin_proposal(["request"])
     try:
-        updated_packed = index._pack_indices("layer", ["request"], keys, block_table)
-        assert updated_packed.cluster_mask.sum().item() == 4
+        updated_view = index._get_resident_view("layer", ["request"], keys)
+        assert updated_view.arena is not None
+        updated_slot = updated_view.request_slot_ids.item()
+        assert updated_view.arena.num_clusters[updated_slot].item() == 4
     finally:
         index.end_proposal()
 
@@ -1642,8 +1657,6 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
         assert persistent_view.arena.cluster_keys.data_ptr() == resident_key_ptr
     finally:
         index.end_proposal()
-    assert index._gpu_index_residency.num_packed_layers == 0
-
     assert cold.resolved_pages is not None
     assert index.cluster_store.num_resident_pages("layer") == 0
     assert cold.exact_token_counts.tolist() == [[6]]

@@ -6,6 +6,7 @@ import torch
 
 from vllm.v1.spec_decode.retrospec.cluster_scoring import (
     reduce_grouped_cluster_scores,
+    score_resident_clusters,
 )
 from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecSegmentedTokenIndex,
@@ -33,6 +34,108 @@ def reference_cluster_scores(
     probabilities = torch.softmax(safe_logits, dim=3)
     probabilities.masked_fill_(~valid_clusters.unsqueeze(2), 0.0)
     return probabilities.mean(dim=2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_resident_cluster_scores_match_request_slot_reference():
+    torch.manual_seed(47)
+    num_slots, batch_size = 3, 3
+    num_query_heads, num_kv_heads = 8, 2
+    num_clusters, head_size = 11, 32
+    queries_per_kv = num_query_heads // num_kv_heads
+    query = torch.randn(
+        batch_size, num_query_heads, head_size, dtype=torch.float16, device="cuda"
+    )
+    cluster_keys = torch.randn(
+        num_slots,
+        num_kv_heads,
+        num_clusters,
+        head_size,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    cluster_ids = torch.arange(
+        num_slots * num_kv_heads * num_clusters,
+        dtype=torch.int64,
+        device="cuda",
+    ).view(num_slots, num_kv_heads, num_clusters)
+    token_counts = torch.randint(
+        1,
+        17,
+        (num_slots, num_kv_heads, num_clusters),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    num_valid = torch.tensor([7, 4, 9], dtype=torch.int32, device="cuda")
+    request_slots = torch.tensor([2, 0, -1], dtype=torch.int64, device="cuda")
+
+    cluster_offsets = torch.arange(num_clusters, device="cuda")
+    valid_arena = cluster_offsets[None, None, :] < num_valid[:, None, None]
+    cluster_ids.masked_fill_(~valid_arena, -1)
+    token_counts.masked_fill_(~valid_arena, 0)
+
+    logits = torch.empty(
+        batch_size,
+        num_kv_heads,
+        queries_per_kv,
+        num_clusters,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    scores = torch.empty(
+        batch_size, num_kv_heads, num_clusters, dtype=torch.float32, device="cuda"
+    )
+    ranking = torch.empty_like(scores)
+    lse = torch.empty(
+        batch_size,
+        num_kv_heads,
+        queries_per_kv,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    candidate_counts = torch.empty(
+        batch_size, num_kv_heads, dtype=torch.int32, device="cuda"
+    )
+    actual = score_resident_clusters(
+        query,
+        cluster_keys,
+        cluster_ids,
+        token_counts,
+        num_valid,
+        request_slots,
+        0.125,
+        logits,
+        scores,
+        lse,
+        ranking,
+        candidate_counts,
+    )
+
+    safe_slots = request_slots.clamp_min(0)
+    packed_keys = cluster_keys.index_select(0, safe_slots)
+    packed_ids = cluster_ids.index_select(0, safe_slots)
+    packed_counts = token_counts.index_select(0, safe_slots)
+    packed_num_valid = num_valid.index_select(0, safe_slots)
+    packed_mask = (
+        (request_slots >= 0)[:, None, None]
+        & (cluster_offsets[None, None, :] < packed_num_valid[:, None, None])
+        & (packed_ids >= 0)
+        & (packed_counts > 0)
+    )
+    reference_logits = RetroSpecSegmentedTokenIndex._compute_cluster_logits(
+        query, packed_keys
+    )
+    expected = reference_cluster_scores(
+        reference_logits, packed_mask, packed_counts, 0.125
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-4)
+    torch.testing.assert_close(
+        ranking,
+        actual.masked_fill(~packed_mask, float("-inf")),
+    )
+    assert candidate_counts.tolist() == packed_mask.sum(dim=2).tolist()
 
 
 @pytest.mark.parametrize(
@@ -402,17 +505,9 @@ def test_cluster_selection_workspace_is_reused_and_resized():
         max_model_len=4096,
     )
     query = torch.randn(2, 8, 64, dtype=torch.float16, device="cuda")
-    cluster_keys = torch.randn(
-        2,
-        2,
-        23,
-        64,
-        dtype=torch.float16,
-        device="cuda",
-    )
 
-    first = index._get_cluster_selection_workspace(query, cluster_keys)
-    second = index._get_cluster_selection_workspace(query, cluster_keys)
+    first = index._get_cluster_selection_workspace(query, 2, 23)
+    second = index._get_cluster_selection_workspace(query, 2, 23)
 
     assert second is first
     assert first.logits.shape == (2, 2, 4, 23)
@@ -420,18 +515,7 @@ def test_cluster_selection_workspace_is_reused_and_resized():
     assert first.softmax_lse.shape == (2, 2, 4)
     assert first.topk_indices.shape == (2, 2, 12)
 
-    larger_cluster_keys = torch.randn(
-        2,
-        2,
-        29,
-        64,
-        dtype=torch.float16,
-        device="cuda",
-    )
-    resized = index._get_cluster_selection_workspace(
-        query,
-        larger_cluster_keys,
-    )
+    resized = index._get_cluster_selection_workspace(query, 2, 29)
 
     assert resized is not first
     assert resized.logits.shape == (2, 2, 4, 29)
@@ -473,7 +557,7 @@ def test_workspace_cluster_selection_matches_allocating_path():
     )
     cluster_token_counts.masked_fill_(~cluster_mask, 0)
 
-    workspace = index._get_cluster_selection_workspace(query, cluster_keys)
+    workspace = index._get_cluster_selection_workspace(query, 2, 37)
     workspace_scores = index._score_clusters(
         query,
         cluster_keys,
@@ -482,9 +566,14 @@ def test_workspace_cluster_selection_matches_allocating_path():
         scale=0.125,
         workspace=workspace,
     )
+    workspace.ranking_scores.copy_(
+        workspace_scores.masked_fill(~cluster_mask, float("-inf"))
+    )
+    workspace.candidate_counts.copy_(cluster_mask.sum(dim=2, dtype=torch.int32))
     workspace_zones = index._select_cluster_zones(
         workspace_scores,
-        cluster_mask,
+        workspace.ranking_scores,
+        workspace.candidate_counts,
         workspace,
     )
 
@@ -497,7 +586,8 @@ def test_workspace_cluster_selection_matches_allocating_path():
     )
     reference_zones = index._select_cluster_zones(
         reference_scores,
-        cluster_mask,
+        reference_scores.masked_fill(~cluster_mask, float("-inf")),
+        cluster_mask.sum(dim=2, dtype=torch.int32),
     )
     torch.cuda.synchronize()
 
@@ -517,6 +607,7 @@ def test_workspace_cluster_selection_matches_allocating_path():
     with pytest.raises(ValueError, match="do not belong"):
         index._select_cluster_zones(
             workspace_scores.clone(),
-            cluster_mask,
+            workspace.ranking_scores,
+            workspace.candidate_counts,
             workspace,
         )
