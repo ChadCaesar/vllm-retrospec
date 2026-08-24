@@ -21,7 +21,7 @@ from vllm.v1.spec_decode.retrospec.capacity import (
     RetroSpecLongContextCapacity,
     build_retrospec_long_context_capacity,
     get_retrospec_native_working_set_tokens,
-    uses_retrospec_cpu_offload,
+    is_retrospec_long_context_enabled,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -38,8 +38,6 @@ def make_capacity_config(
     spec_values = {
         "method": "retrospec",
         "num_speculative_tokens": 64,
-        "retrospec_index_mode": "segmented_cluster",
-        "retrospec_cache_mode": "cpu_offload",
         "retrospec_index_segment_size": 8192,
         "retrospec_index_update_interval": 1024,
         "retrospec_blocks_per_cluster": 1,
@@ -101,8 +99,6 @@ def make_engine_config(
             speculative_config=SimpleNamespace(
                 method="retrospec",
                 num_speculative_tokens=64,
-                retrospec_index_mode="segmented_cluster",
-                retrospec_cache_mode="cpu_offload",
                 retrospec_index_segment_size=8192,
                 retrospec_index_update_interval=1024,
                 retrospec_blocks_per_cluster=1,
@@ -118,16 +114,12 @@ def make_engine_config(
     )
 
 
-def test_cpu_offload_capacity_mode_detection():
+def test_retrospec_long_context_mode_detection():
     config = make_capacity_config()
-    assert uses_retrospec_cpu_offload(config)
+    assert is_retrospec_long_context_enabled(config)
 
-    config.speculative_config.retrospec_cache_mode = "gpu_reference"
-    assert not uses_retrospec_cpu_offload(config)
-
-    config.speculative_config.retrospec_cache_mode = "cpu_offload"
-    config.speculative_config.retrospec_index_mode = "block_mean"
-    assert not uses_retrospec_cpu_offload(config)
+    config.speculative_config.method = "ngram"
+    assert not is_retrospec_long_context_enabled(config)
 
 
 def test_native_working_set_includes_unretired_prefill_chunk():

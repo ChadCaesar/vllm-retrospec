@@ -173,7 +173,7 @@ def test_cluster_store_packs_per_head_clusters_across_pages():
             "cuda",
             marks=pytest.mark.skipif(
                 not torch.cuda.is_available(),
-                reason="CUDA is required for GPU-reference packing",
+                reason="CUDA is required for GPU cluster packing",
             ),
         ),
     ],
@@ -227,19 +227,17 @@ def test_cluster_store_vectorized_packing_matches_cluster_membership(
     for head_index in range(num_kv_heads):
         for cluster_index in range(num_clusters):
             token_count = int(cluster_token_counts[head_index, cluster_index])
-            expected_keys = keys[head_index][
-                assignments[head_index] == cluster_index
-            ].to(device)
+            expected_keys = keys[head_index][assignments[head_index] == cluster_index]
             expected_values = values[head_index][
                 assignments[head_index] == cluster_index
-            ].to(device)
+            ]
 
             valid_pages = metadata.page_ids[head_index, cluster_index] >= 0
             cluster_page_ids = metadata.page_ids[
                 head_index,
                 cluster_index,
                 valid_pages,
-            ].to(device=device, dtype=torch.int64)
+            ].to(dtype=torch.int64)
             cluster_page_token_counts = metadata.page_token_counts[
                 head_index,
                 cluster_index,
@@ -387,7 +385,6 @@ def test_cluster_store_tracks_request_head_local_cluster_identities():
 def test_cluster_store_distributes_soft_targets_by_backing_page_ownership():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -478,7 +475,6 @@ def test_cluster_store_accumulates_group_pages_across_request_segments():
 def test_cluster_store_rejects_drift_in_group_page_accounting():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -559,7 +555,6 @@ def test_cluster_store_releases_pages_when_packing_fails():
 def test_cluster_store_releases_pages_when_resident_resize_fails():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -627,7 +622,6 @@ def test_cluster_store_rejects_storage_access_before_allocation():
 def test_cpu_backing_store_preserves_page_layout_and_reuses_pages():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
 
@@ -643,7 +637,6 @@ def test_cpu_backing_store_preserves_page_layout_and_reuses_pages():
     first_page_ids = first_metadata.page_ids.clone()
     key_pages, value_pages = store.get_page_storage("layer")
 
-    assert store.is_cpu_backed
     assert store.get_storage_device("layer") == torch.device("cpu")
     assert first.cluster_ids.device.type == "cpu"
     assert first_metadata.page_ids.device.type == "cpu"
@@ -685,7 +678,6 @@ def test_cpu_backing_store_preserves_page_layout_and_reuses_pages():
 def test_cpu_backing_store_growth_preserves_existing_logical_pages():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
     )
     first_keys = torch.arange(60, dtype=torch.float32).view(1, 60, 1)
     first_values = first_keys + 1000.0
@@ -745,7 +737,6 @@ def test_cpu_backing_store_growth_preserves_existing_logical_pages():
 def test_cpu_backing_store_keeps_block_metadata_on_pinned_cpu():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         pin_memory=True,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -796,7 +787,6 @@ def test_cpu_backing_store_keeps_block_metadata_on_pinned_cpu():
 def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -855,13 +845,73 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA pinned memory is required for asynchronous resident prefetch",
+)
+def test_cpu_backing_store_prefetches_resident_clusters_in_background():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(page_size=2, pin_memory=True, cache_ratio=0.5)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    cluster_ids = table.cluster_ids.to(device)
+    metadata = get_block_metadata(store, table, device=device)
+
+    # vLLM creates the resident arena on its inference-mode execution thread.
+    # The background worker must explicitly enter inference mode before it can
+    # update those tensors in place.
+    with torch.inference_mode():
+        store.resolve_cluster_blocks(
+            "layer", cluster_ids, metadata.page_ids, mode="resident_only"
+        )
+
+    assert store.prefetch_resident_clusters("layer", cluster_ids)
+    store.wait_for_resident_prefetches(("layer",))
+
+    access = store.lookup_resident_clusters(
+        "layer", cluster_ids, metadata.page_ids, touch=False
+    )
+    assert access.hit_cluster_mask.tolist() == [[True, False], [True, False]]
+    assert access.miss_cluster_mask.tolist() == [[False, True], [False, True]]
+    assert store.num_resident_pages("layer") == 3
+    assert store.num_resident_clusters("layer") == 2
+    assert not store._resident_prefetch_futures
+    assert all(
+        not slot.in_use
+        for slots in store._resident_prefetch_slots.values()
+        for slot in slots
+    )
+
+    resident_keys, resident_values = store.get_resident_page_storage("layer")
+    torch.cuda.current_stream(device).synchronize()
+    backing_keys, backing_values = store.get_page_storage("layer")
+    resident_pages = access.cache_page_ids >= 0
+    resident_slots = access.cache_page_ids[resident_pages].to(torch.int64)
+    logical_ids = metadata.page_ids[resident_pages].cpu().to(torch.int64)
+    torch.testing.assert_close(
+        resident_keys.index_select(0, resident_slots).cpu(),
+        backing_keys.index_select(0, logical_ids),
+    )
+    torch.testing.assert_close(
+        resident_values.index_select(0, resident_slots).cpu(),
+        backing_values.index_select(0, logical_ids),
+    )
+    store.close()
+
+
+@pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA is required to resolve cluster pages",
 )
 def test_cpu_backing_store_stages_before_updating_resident_cache():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -951,7 +1001,6 @@ def test_cpu_backing_store_stages_before_updating_resident_cache():
 def test_cpu_backing_store_resident_only_resolution_does_not_admit_misses():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -1004,7 +1053,6 @@ def test_cpu_backing_store_resident_only_resolution_does_not_admit_misses():
 def test_cpu_backing_store_hides_pending_pages_from_draft_but_not_verification():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -1055,69 +1103,12 @@ def test_cpu_backing_store_hides_pending_pages_from_draft_but_not_verification()
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="CUDA is required to resolve cluster pages",
-)
-def test_gpu_reference_store_resolves_without_staging():
-    store = RetroSpecClusterPageStore(page_size=2)
-    keys, values, assignments, cluster_token_counts = make_cluster_data()
-    table = store_cluster_data(
-        store,
-        "layer",
-        keys.cuda(),
-        values.cuda(),
-        assignments.cuda(),
-        cluster_token_counts.cuda(),
-    )
-    cluster_ids, metadata = get_runtime_blocks(store, table, torch.device("cuda"))
-
-    resolved = store.resolve_cluster_blocks("layer", cluster_ids, metadata.page_ids)
-    stored_keys, stored_values = store.get_page_storage("layer")
-
-    assert torch.equal(resolved.resident_page_ids, metadata.page_ids)
-    assert torch.all(resolved.staging_page_ids == -1)
-    assert resolved.resident_key_pages is stored_keys
-    assert resolved.resident_value_pages is stored_values
-    assert resolved.staging_key_pages.shape[0] == 0
-    assert resolved.staging_value_pages.shape[0] == 0
-    assert resolved.hit_cluster_mask.all()
-    assert not resolved.miss_cluster_mask.any()
-    assert resolved.resident_ready_event is None
-
-
-def test_gpu_reference_full_verification_reuses_backing_pages():
-    store = RetroSpecClusterPageStore(page_size=2)
-    keys, values, assignments, cluster_token_counts = make_cluster_data()
-    table = store_cluster_data(
-        store, "layer", keys, values, assignments, cluster_token_counts
-    )
-    metadata = get_block_metadata(store, table)
-
-    resolved = store.resolve_full_verification_blocks(
-        "layer", table.cluster_ids, metadata.page_ids
-    )
-    stored_keys, stored_values = store.get_page_storage("layer")
-
-    assert torch.equal(resolved.resident_page_ids, metadata.page_ids)
-    assert torch.all(resolved.staging_page_ids == -1)
-    assert resolved.resident_key_pages is stored_keys
-    assert resolved.resident_value_pages is stored_values
-    assert resolved.staging_key_pages.shape[0] == 0
-    assert resolved.staging_value_pages.shape[0] == 0
-    assert resolved.hit_cluster_mask.all()
-    assert not resolved.miss_cluster_mask.any()
-    assert resolved.resident_ready_event is None
-    assert resolved.staging_ready_event is None
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
     reason="CUDA is required for full-verification staging",
 )
 def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
     device = torch.device("cuda", torch.cuda.current_device())
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         cache_ratio=0.5,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -1143,15 +1134,18 @@ def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
     first_metadata = store.get_cluster_block_metadata(
         "first-layer", first_cluster_ids, device=device
     )
+    first_metadata_cpu = store.get_cluster_block_metadata(
+        "first-layer", first_table.cluster_ids, device=torch.device("cpu")
+    )
     first_resolved = store.resolve_full_verification_blocks(
-        "first-layer", first_cluster_ids, first_metadata.page_ids
+        "first-layer", first_metadata.page_ids, first_metadata_cpu.page_ids
     )
     assert first_resolved.staging_ready_event is not None
     torch.cuda.current_stream(device).wait_event(first_resolved.staging_ready_event)
 
     first_valid = first_metadata.page_ids >= 0
     first_slots = first_resolved.staging_page_ids[first_valid].to(torch.int64)
-    first_logical_ids = first_metadata.page_ids[first_valid].cpu().to(torch.int64)
+    first_logical_ids = first_metadata_cpu.page_ids[first_valid.cpu()].to(torch.int64)
     first_backing_keys, first_backing_values = store.get_page_storage("first-layer")
     first_key_snapshot = first_resolved.staging_key_pages.index_select(0, first_slots)
     first_value_snapshot = first_resolved.staging_value_pages.index_select(
@@ -1166,15 +1160,20 @@ def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
     second_metadata = store.get_cluster_block_metadata(
         "second-layer", second_cluster_ids, device=device
     )
+    second_metadata_cpu = store.get_cluster_block_metadata(
+        "second-layer", second_table.cluster_ids, device=torch.device("cpu")
+    )
     second_resolved = store.resolve_full_verification_blocks(
-        "second-layer", second_cluster_ids, second_metadata.page_ids
+        "second-layer", second_metadata.page_ids, second_metadata_cpu.page_ids
     )
     assert second_resolved.staging_ready_event is not None
     torch.cuda.current_stream(device).wait_event(second_resolved.staging_ready_event)
 
     second_valid = second_metadata.page_ids >= 0
     second_slots = second_resolved.staging_page_ids[second_valid].to(torch.int64)
-    second_logical_ids = second_metadata.page_ids[second_valid].cpu().to(torch.int64)
+    second_logical_ids = second_metadata_cpu.page_ids[second_valid.cpu()].to(
+        torch.int64
+    )
     second_backing_keys, second_backing_values = store.get_page_storage("second-layer")
     torch.testing.assert_close(
         first_key_snapshot.cpu(),
@@ -1210,7 +1209,6 @@ def test_full_verification_buffer_grows_for_a_larger_layer():
     device = torch.device("cuda", torch.cuda.current_device())
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
     )
 
     small_keys = torch.arange(4, dtype=torch.float16, device=device).view(1, 4, 1)
@@ -1226,8 +1224,11 @@ def test_full_verification_buffer_grows_for_a_larger_layer():
     small_metadata = store.get_cluster_block_metadata(
         "small-layer", small_cluster_ids, device=device
     )
+    small_metadata_cpu = store.get_cluster_block_metadata(
+        "small-layer", small_table.cluster_ids, device=torch.device("cpu")
+    )
     small_resolved = store.resolve_full_verification_blocks(
-        "small-layer", small_cluster_ids, small_metadata.page_ids
+        "small-layer", small_metadata.page_ids, small_metadata_cpu.page_ids
     )
     small_key_ptr = small_resolved.staging_key_pages.data_ptr()
 
@@ -1244,8 +1245,11 @@ def test_full_verification_buffer_grows_for_a_larger_layer():
     large_metadata = store.get_cluster_block_metadata(
         "large-layer", large_cluster_ids, device=device
     )
+    large_metadata_cpu = store.get_cluster_block_metadata(
+        "large-layer", large_table.cluster_ids, device=torch.device("cpu")
+    )
     large_resolved = store.resolve_full_verification_blocks(
-        "large-layer", large_cluster_ids, large_metadata.page_ids
+        "large-layer", large_metadata.page_ids, large_metadata_cpu.page_ids
     )
     assert large_resolved.staging_ready_event is not None
     torch.cuda.current_stream(device).wait_event(large_resolved.staging_ready_event)
@@ -1268,16 +1272,13 @@ def test_full_verification_buffer_grows_for_a_larger_layer():
     assert large_resolved.staging_key_pages.data_ptr() != small_key_ptr
 
 
-def test_gpu_reference_store_rejects_resident_cache_operations():
+def test_cluster_store_rejects_invalid_resolve_mode():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
     table = store_cluster_data(
         store, "layer", keys, values, assignments, cluster_token_counts
     )
     metadata = get_block_metadata(store, table)
-
-    with pytest.raises(RuntimeError, match="only used by CPU-backed"):
-        store.lookup_resident_clusters("layer", table.cluster_ids, metadata.page_ids)
 
     with pytest.raises(ValueError, match="Unsupported RetroSpec cluster resolve mode"):
         store.resolve_cluster_blocks(
@@ -1291,7 +1292,6 @@ def test_gpu_reference_store_rejects_resident_cache_operations():
 def test_cpu_backing_store_stages_and_commits_cpu_inputs():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
 
@@ -1336,7 +1336,6 @@ def test_cpu_backing_store_stages_and_commits_cpu_inputs():
 def test_cpu_backing_store_supports_two_phase_staging():
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
 
@@ -1379,7 +1378,6 @@ def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
     device = torch.device("cuda", torch.cuda.current_device())
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         pin_memory=True,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -1462,7 +1460,6 @@ def test_cpu_backing_store_reuses_pinned_staging_slot_after_build():
     device = torch.device("cuda", torch.cuda.current_device())
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         pin_memory=True,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -1519,7 +1516,6 @@ def test_cpu_backing_store_does_not_reuse_busy_pinned_staging_slot():
     device = torch.device("cuda", torch.cuda.current_device())
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         pin_memory=True,
     )
     keys, values, _, _ = make_cluster_data()
@@ -1549,7 +1545,6 @@ def test_cpu_backing_store_grows_reused_pinned_staging_slot():
     device = torch.device("cuda", torch.cuda.current_device())
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         pin_memory=True,
     )
     small_keys = torch.arange(4, dtype=torch.float32, device=device).view(1, 4, 1)
@@ -1585,7 +1580,6 @@ def test_cpu_backing_store_releases_pinned_slot_when_build_fails(monkeypatch):
     device = torch.device("cuda", torch.cuda.current_device())
     store = RetroSpecClusterPageStore(
         page_size=2,
-        storage_mode="cpu_offload",
         pin_memory=True,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -1611,12 +1605,6 @@ def test_cpu_backing_store_releases_pinned_slot_when_build_fails(monkeypatch):
 
 
 def test_cluster_store_rejects_invalid_storage_metadata():
-    with pytest.raises(ValueError, match="Unsupported"):
-        RetroSpecClusterPageStore(
-            page_size=2,
-            storage_mode="invalid",  # type: ignore[arg-type]
-        )
-
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
     table = store_cluster_data(
@@ -1662,7 +1650,7 @@ def test_cluster_store_rejects_invalid_storage_metadata():
         )
 
 
-def test_cluster_store_rejects_cluster_id_page_descriptor_mismatch():
+def test_cluster_store_uses_cpu_descriptor_instead_of_gpu_page_contents():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
     table = store_cluster_data(
@@ -1673,8 +1661,57 @@ def test_cluster_store_rejects_cluster_id_page_descriptor_mismatch():
     mismatched_page_ids = metadata.page_ids.clone()
     mismatched_page_ids[0, 0] = metadata.page_ids[0, 1]
 
-    with pytest.raises(RuntimeError, match="stable cluster ID"):
-        store.resolve_cluster_blocks("layer", table.cluster_ids, mismatched_page_ids)
+    cluster_ids_cpu, page_ids_cpu = store._validate_cluster_blocks(
+        "layer",
+        table.cluster_ids,
+        mismatched_page_ids,
+    )
+
+    assert torch.equal(cluster_ids_cpu, table.cluster_ids.cpu())
+    assert torch.equal(page_ids_cpu, metadata.page_ids.cpu())
+
+
+def test_cluster_store_pads_cpu_descriptor_to_packed_page_width():
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
+    )
+    metadata = get_block_metadata(store, table)
+    selected_cluster_ids = table.cluster_ids[0:1, 1:2]
+    packed_page_ids = metadata.page_ids[0:1, 1:2]
+
+    _, page_ids_cpu = store._validate_cluster_blocks(
+        "layer", selected_cluster_ids, packed_page_ids
+    )
+
+    assert page_ids_cpu.shape == packed_page_ids.shape
+    assert page_ids_cpu[0, 0, 0] >= 0
+    assert page_ids_cpu[0, 0, 1] == -1
+
+
+def test_cluster_store_rejects_packed_page_width_smaller_than_descriptor():
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
+    )
+    metadata = get_block_metadata(store, table)
+
+    with pytest.raises(RuntimeError, match="smaller"):
+        store._validate_cluster_blocks(
+            "layer", table.cluster_ids[0:1, 0:1], metadata.page_ids[0:1, 0:1, :1]
+        )
+
+
+def test_cluster_store_close_is_idempotent_and_rejects_new_prefetches():
+    store = RetroSpecClusterPageStore(page_size=2)
+
+    store.close()
+    store.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        store.prefetch_resident_clusters("layer", torch.tensor([0]))
 
 
 def test_cluster_store_rejects_released_cluster_id_after_page_reuse():

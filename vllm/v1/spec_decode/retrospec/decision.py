@@ -342,7 +342,10 @@ class RetroSpecDecisionPolicy:
         self._validate_counts("draft_counts", draft_counts, draft_counts)
         self._validate_vector("request_stages", request_stages, draft_counts)
         if request_stages.dtype not in (
-            torch.int8, torch.int16, torch.int32, torch.int64,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
         ):
             raise ValueError("request_stages must use an integer dtype")
         if not isinstance(current_stage, RetroSpecStage):

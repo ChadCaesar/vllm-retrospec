@@ -26,7 +26,6 @@ def test_retrospec_defaults():
     assert config.retrospec_retrieval_ratio == pytest.approx(0.018)
     assert config.retrospec_estimation_ratio == pytest.approx(0.232)
     assert config.retrospec_cache_ratio == pytest.approx(0.0)
-    assert config.retrospec_index_mode == "block_mean"
     assert config.retrospec_index_segment_size == 8192
     assert config.retrospec_blocks_per_cluster == 1
     assert config.retrospec_kmeans_iterations == 10
@@ -40,7 +39,6 @@ def test_retrospec_defaults():
     assert config.retrospec_hit_attn_threshold is None
     assert config.retrospec_retrieval_attn_threshold is None
     assert config.retrospec_expanded_attn_threshold is None
-    assert config.retrospec_cache_mode == "gpu_reference"
     assert config.prompt_lookup_min == 0
     assert config.prompt_lookup_max == 0
     assert repr(config) == (
@@ -108,7 +106,6 @@ def test_retrospec_requires_eager():
         ("retrospec_estimation_ratio", 1.0),
         ("retrospec_cache_ratio", -0.01),
         ("retrospec_cache_ratio", 1.01),
-        ("retrospec_index_mode", "invalid"),
         ("retrospec_index_segment_size", 0),
         ("retrospec_blocks_per_cluster", 0),
         ("retrospec_kmeans_iterations", 0),
@@ -126,7 +123,6 @@ def test_retrospec_requires_eager():
         ("retrospec_retrieval_attn_threshold", 1.01),
         ("retrospec_expanded_attn_threshold", -0.01),
         ("retrospec_expanded_attn_threshold", 1.01),
-        ("retrospec_cache_mode", "invalid"),
     ],
 )
 def test_retrospec_rejects_out_of_range_values(field: str, value: Any):
@@ -164,7 +160,6 @@ def test_retrospec_clears_prompt_lookup_fields():
         ("retrospec_retrieval_ratio", 0.02),
         ("retrospec_estimation_ratio", 0.25),
         ("retrospec_cache_ratio", 0.1),
-        ("retrospec_index_mode", "segmented_cluster"),
         ("retrospec_index_segment_size", 2048),
         ("retrospec_blocks_per_cluster", 8),
         ("retrospec_kmeans_iterations", 5),
@@ -172,7 +167,6 @@ def test_retrospec_clears_prompt_lookup_fields():
         ("retrospec_min_draft_tokens", 2),
         ("retrospec_max_draft_tokens", 20),
         ("num_speculative_tokens", 80),
-        ("retrospec_cache_mode", "cpu_offload"),
     ],
 )
 def test_retrospec_hash_tracks_execution_structure(field: str, value: Any):

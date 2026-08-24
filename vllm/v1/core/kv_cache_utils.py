@@ -801,10 +801,10 @@ def get_max_concurrency_for_kv_cache_config(
     """
     from vllm.v1.spec_decode.retrospec.capacity import (
         get_retrospec_native_working_set_tokens,
-        uses_retrospec_cpu_offload,
+        is_retrospec_long_context_enabled,
     )
 
-    if uses_retrospec_cpu_offload(vllm_config):
+    if is_retrospec_long_context_enabled(vllm_config):
         block_size = min(
             group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
         )
@@ -1331,10 +1331,10 @@ def _report_kv_cache_config(
 
     from vllm.v1.spec_decode.retrospec.capacity import (
         get_retrospec_native_working_set_tokens,
-        uses_retrospec_cpu_offload,
+        is_retrospec_long_context_enabled,
     )
 
-    if uses_retrospec_cpu_offload(vllm_config):
+    if is_retrospec_long_context_enabled(vllm_config):
         working_set_tokens = get_retrospec_native_working_set_tokens(
             vllm_config,
             min_block_size,
@@ -1558,10 +1558,10 @@ def get_kv_cache_configs(
 
         from vllm.v1.spec_decode.retrospec.capacity import (
             build_retrospec_long_context_capacity,
-            uses_retrospec_cpu_offload,
+            is_retrospec_long_context_enabled,
         )
 
-        use_retrospec_long_context = uses_retrospec_cpu_offload(
+        use_retrospec_long_context = is_retrospec_long_context_enabled(
             vllm_config
         ) and full_kv_memory > min(available_memory)
 

@@ -209,24 +209,17 @@ def test_retrospec_proposer_rejects_unsupported_features(
 
 def test_retrospec_proposer_accepts_cpu_offloaded_cluster_pages():
     proposer = RetroSpecProposer(
-        make_vllm_config(
-            retrospec_index_mode="segmented_cluster",
-            retrospec_cache_mode="cpu_offload",
-        ),
+        make_vllm_config(),
         torch.device("cpu"),
         make_runner(),
     )
 
-    assert proposer.sparse_attention.index.cluster_store.is_cpu_backed
     assert proposer.uses_full_verification_offload
 
 
 def test_retrospec_proposer_delegates_full_verification_context():
     proposer = RetroSpecProposer(
-        make_vllm_config(
-            retrospec_index_mode="segmented_cluster",
-            retrospec_cache_mode="cpu_offload",
-        ),
+        make_vllm_config(),
         torch.device("cpu"),
         make_runner(),
     )
@@ -249,7 +242,7 @@ def test_retrospec_proposer_delegates_full_verification_context():
 
 def test_retrospec_proposer_delegates_phase_aware_index_updates():
     proposer = RetroSpecProposer(
-        make_vllm_config(retrospec_index_mode="segmented_cluster"),
+        make_vllm_config(),
         torch.device("cpu"),
         make_runner(),
     )
@@ -277,10 +270,7 @@ def test_retrospec_proposer_delegates_phase_aware_index_updates():
 
 def test_retrospec_proposer_attaches_kv_cache_group_to_retirement():
     proposer = RetroSpecProposer(
-        make_vllm_config(
-            retrospec_index_mode="segmented_cluster",
-            retrospec_cache_mode="cpu_offload",
-        ),
+        make_vllm_config(),
         torch.device("cpu"),
         make_runner(),
     )
@@ -671,7 +661,7 @@ def make_parallel_verification_output(
 
 def test_propose_stops_draft_at_index_update_boundary(monkeypatch):
     proposer = RetroSpecProposer(
-        make_vllm_config(retrospec_index_update_interval=2),
+        make_vllm_config(retrospec_index_update_interval=4),
         torch.device("cpu"),
         make_runner(),
     )
@@ -702,20 +692,20 @@ def test_propose_stops_draft_at_index_update_boundary(monkeypatch):
         committed_positions=[1],
     )
 
-    assert observed_indices == [0, 1]
-    assert result == [[1, 2]]
+    assert observed_indices == [0, 1, 2, 3]
+    assert result == [[1, 2, 3, 4]]
 
 
 def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch):
     proposer = RetroSpecProposer(
-        make_vllm_config(retrospec_index_update_interval=2),
+        make_vllm_config(retrospec_index_update_interval=4),
         torch.device("cpu"),
         make_runner(),
     )
     initialize_verification(
         proposer,
-        torch.tensor([[10, 20, 30, -1]], dtype=torch.int32),
-        torch.tensor([3], dtype=torch.int32),
+        torch.tensor([[10, 20, 30, 40]], dtype=torch.int32),
+        torch.tensor([4], dtype=torch.int32),
     )
     observed_rows: list[tuple[list[int], list[int]]] = []
 
@@ -730,7 +720,7 @@ def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch)
         assert attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY
         observed_rows.append((list(request_indices), list(token_indices)))
         return make_parallel_verification_output(
-            list(request_indices), list(token_indices), [10, 20, 30]
+            list(request_indices), list(token_indices), [10, 20, 30, 40]
         )
 
     monkeypatch.setattr(
@@ -746,8 +736,8 @@ def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch)
         make_sampling_metadata(all_greedy=True),
     )
 
-    assert observed_rows == [([0, 0, 0], [0, 1, 2])]
-    assert verification.verified_counts.tolist() == [2]
+    assert observed_rows == [([0, 0, 0, 0], [0, 1, 2, 3])]
+    assert verification.verified_counts.tolist() == [4]
     assert verification.require_full.tolist() == [True]
 
 

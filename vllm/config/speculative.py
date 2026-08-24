@@ -162,19 +162,14 @@ class SpeculativeConfig:
 
     # RetroSpec decoding configuration
     retrospec_retrieval_ratio: float = Field(default=0.018, gt=0, lt=1)
-    """Fraction of indexed clusters computed exactly during sparse attention.
-    The GPU-reference implementation treats one vLLM KV block as one
-    retrieval unit."""
+    """Fraction of indexed token clusters computed exactly during sparse
+    attention."""
     retrospec_estimation_ratio: float = Field(default=0.232, ge=0, lt=1)
-    """Fraction of indexed retrieval units represented by K/V summaries."""
+    """Fraction of indexed token clusters represented by K/V summaries."""
     retrospec_cache_ratio: float = Field(default=0.0, ge=0, le=1)
-    """Fraction of offloaded cluster pages retained in the GPU resident cache.
+    """Fraction of CPU-backed cluster pages retained in the GPU resident cache.
     A value of zero automatically provisions approximately three sparse
-    retrieval zones, matching RetroInfer. This field is unused by the
-    GPU-reference implementation."""
-
-    retrospec_index_mode: Literal["block_mean", "segmented_cluster"] = "block_mean"
-    """Block-selection index used by RetroSpec sparse attention."""
+    retrieval zones, matching RetroInfer."""
     retrospec_index_segment_size: int = Field(default=8192, gt=0)
     """Number of tokens clustered independently in one prefill segment.
     This controls only initial prompt-index construction and does not control
@@ -219,9 +214,6 @@ class SpeculativeConfig:
     """Trigger full verification when expanded-zone attention mass is
     below this value."""
 
-    retrospec_cache_mode: Literal["gpu_reference", "cpu_offload"] = "gpu_reference"
-    """RetroSpec auxiliary KV-cache implementation."""
-
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -244,7 +236,6 @@ class SpeculativeConfig:
                     self.retrospec_retrieval_ratio,
                     self.retrospec_estimation_ratio,
                     self.retrospec_cache_ratio,
-                    self.retrospec_index_mode,
                     self.retrospec_index_segment_size,
                     self.retrospec_blocks_per_cluster,
                     self.retrospec_kmeans_iterations,
@@ -252,7 +243,6 @@ class SpeculativeConfig:
                     self.retrospec_max_draft_tokens,
                     self.retrospec_index_update_interval,
                     self.num_speculative_tokens,
-                    self.retrospec_cache_mode,
                 ]
             )
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()

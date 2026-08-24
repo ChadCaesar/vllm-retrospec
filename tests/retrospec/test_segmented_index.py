@@ -3,15 +3,13 @@
 
 import threading
 from concurrent.futures import Future
+from contextlib import contextmanager
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 from vllm.v1.spec_decode.retrospec import segmented_index as segmented_index_module
-from vllm.v1.spec_decode.retrospec.cluster_store import (
-    RetroSpecClusterStorageMode,
-)
 from vllm.v1.spec_decode.retrospec.index import RetroSpecAttentionLevel
 from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecSegmentedTokenIndex,
@@ -24,7 +22,6 @@ def make_index(
     blocks_per_cluster: int = 1,
     retrieval_ratio: float = 0.5,
     estimation_ratio: float = 0.5,
-    cache_mode: RetroSpecClusterStorageMode = "gpu_reference",
     cache_ratio: float = 0.0,
     pin_memory: bool = False,
     max_pending_cluster_builds: int = 2,
@@ -40,7 +37,6 @@ def make_index(
         blocks_per_cluster=blocks_per_cluster,
         num_kmeans_iterations=2,
         max_pending_cluster_builds=max_pending_cluster_builds,
-        cache_mode=cache_mode,
         cache_ratio=cache_ratio,
         pin_memory=pin_memory,
         max_resident_requests=max_resident_requests,
@@ -59,22 +55,28 @@ def make_cache(
     return keys, values
 
 
+@contextmanager
+def active_residency(
+    index: RetroSpecSegmentedTokenIndex,
+    request_ids: list[str],
+):
+    index.begin_full_verification_residency(request_ids)
+    try:
+        yield
+    finally:
+        index.end_full_verification_residency()
+
+
 @pytest.mark.parametrize(
-    ("cache_mode", "cache_ratio", "expected_cache_ratio"),
-    [
-        ("gpu_reference", 0.0, 0.0),
-        ("cpu_offload", 0.0, 0.6),
-        ("cpu_offload", 0.35, 0.35),
-    ],
+    ("cache_ratio", "expected_cache_ratio"),
+    [(0.0, 0.6), (0.35, 0.35)],
 )
 def test_segmented_index_configures_resident_cache_ratio(
-    cache_mode: RetroSpecClusterStorageMode,
     cache_ratio: float,
     expected_cache_ratio: float,
 ):
     index = make_index(
         retrieval_ratio=0.2,
-        cache_mode=cache_mode,
         cache_ratio=cache_ratio,
     )
 
@@ -82,7 +84,7 @@ def test_segmented_index_configures_resident_cache_ratio(
 
 
 def test_sparse_verification_prefetch_masks_inactive_draft_rows():
-    index = make_index(cache_mode="cpu_offload", cache_ratio=0.5, pin_memory=True)
+    index = make_index(cache_ratio=0.5, pin_memory=True)
     plan = Mock(
         layer_name="layer",
         sparse_exact_cluster_ids=torch.tensor([[[0, 1]], [[2, 3]]], dtype=torch.int64),
@@ -90,56 +92,45 @@ def test_sparse_verification_prefetch_masks_inactive_draft_rows():
             [[[[0], [1]]], [[[2], [3]]]], dtype=torch.int64
         ),
     )
-    index.cluster_store.admit_resident_clusters = Mock()
+    index.cluster_store.prefetch_resident_clusters = Mock()
 
     index.prefetch_sparse_verification(
         plan,
         active_mask=torch.tensor([True, False]),
     )
 
-    call_kwargs = index.cluster_store.admit_resident_clusters.call_args.kwargs
+    call_kwargs = index.cluster_store.prefetch_resident_clusters.call_args.kwargs
     assert call_kwargs["layer_name"] == "layer"
     assert call_kwargs["cluster_ids"].tolist() == [[[0, 1]], [[-1, -1]]]
-    assert call_kwargs["page_ids"].tolist() == [
-        [[[0], [1]]],
-        [[[-1], [-1]]],
-    ]
 
 
 def test_sparse_verification_prefetch_skips_empty_page_table():
-    index = make_index(cache_mode="cpu_offload", cache_ratio=0.5, pin_memory=True)
+    index = make_index(cache_ratio=0.5, pin_memory=True)
     plan = Mock(
         sparse_exact_cluster_ids=torch.full((1, 1, 1), -1, dtype=torch.int64),
         sparse_exact_page_ids=torch.empty((1, 1, 1, 0), dtype=torch.int64),
     )
-    index.cluster_store.admit_resident_clusters = Mock()
+    index.cluster_store.prefetch_resident_clusters = Mock()
 
     index.prefetch_sparse_verification(plan, active_mask=torch.tensor([True]))
 
-    index.cluster_store.admit_resident_clusters.assert_not_called()
+    index.cluster_store.prefetch_resident_clusters.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("cache_mode", "pin_memory"),
-    [("gpu_reference", False), ("cpu_offload", False)],
-)
-def test_sparse_verification_prefetch_requires_pinned_cpu_backing(
-    cache_mode: RetroSpecClusterStorageMode,
-    pin_memory: bool,
-):
-    index = make_index(cache_mode=cache_mode, pin_memory=pin_memory)
+def test_sparse_verification_prefetch_requires_pinned_cpu_backing():
+    index = make_index(pin_memory=False)
     plan = Mock(
         sparse_exact_cluster_ids=torch.tensor([[[0]]]),
         sparse_exact_page_ids=torch.tensor([[[[0]]]]),
     )
-    index.cluster_store.admit_resident_clusters = Mock()
+    index.cluster_store.prefetch_resident_clusters = Mock()
 
     index.prefetch_sparse_verification(
         plan,
         active_mask=torch.tensor([True]),
     )
 
-    index.cluster_store.admit_resident_clusters.assert_not_called()
+    index.cluster_store.prefetch_resident_clusters.assert_not_called()
 
 
 def build_index(
@@ -403,7 +394,6 @@ def test_cpu_offload_keeps_incremental_generation_segments_on_cpu():
     index = make_index(
         prefill_segment_size_tokens=8,
         generation_update_interval=4,
-        cache_mode="cpu_offload",
     )
     keys, values = make_cache(num_blocks=12)
     block_table = torch.arange(12, dtype=torch.int32).view(1, -1)
@@ -490,7 +480,8 @@ def test_segmented_index_excludes_empty_clusters_from_selection():
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 14, keys, values, block_table)
 
-    packed = index._pack_indices("layer", ["request"], keys, block_table)
+    with active_residency(index, ["request"]):
+        packed = index._pack_indices("layer", ["request"], keys, block_table)
 
     assert packed.cluster_token_counts.tolist() == [[[8, 0]]]
     assert packed.cluster_mask.tolist() == [[[True, False]]]
@@ -622,7 +613,7 @@ def test_primary_exact_capacity_covers_every_up_to_date_layout():
 
 
 def test_segmented_index_handles_mixed_long_and_short_requests():
-    index = make_index()
+    index = make_index(max_resident_requests=2)
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).repeat(2, 1)
     index.build_or_update(
@@ -705,8 +696,9 @@ def test_full_verification_plan_covers_clustered_and_primary_tokens():
         plan.primary_exact_token_mask[1, 0]
     ]
     assert short_primary_indices.tolist() == [0, 1, 2]
-    assert (plan.exact_cluster_ids[0] >= 0).sum(dim=1).tolist() == [2, 2]
-    assert not (plan.exact_cluster_ids[1] >= 0).any()
+    assert (plan.exact_page_ids[0] >= 0).any(dim=-1).sum(dim=1).tolist() == [2, 2]
+    assert not (plan.exact_page_ids[1] >= 0).any()
+    assert torch.equal(plan.exact_page_ids_cpu, plan.exact_page_ids.cpu())
 
 
 def test_full_verification_plan_handles_request_without_cluster_pages():
@@ -728,11 +720,12 @@ def test_full_verification_plan_handles_request_without_cluster_pages():
     assert plan.primary_exact_token_mask.all()
     assert plan.exact_page_ids.shape == (1, 1, 1, 0)
     assert plan.exact_page_ids.numel() == 0
+    assert plan.exact_page_ids_cpu.shape == plan.exact_page_ids.shape
     assert plan.exact_page_token_counts.numel() == 0
 
 
 def test_cpu_offload_sparse_selection_handles_request_without_cluster_pages():
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 3, keys, values, block_table)
@@ -763,7 +756,7 @@ def test_cpu_offload_sparse_selection_handles_request_without_cluster_pages():
 
 
 def test_full_verification_plan_rejects_staged_index_updates():
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(
@@ -789,7 +782,7 @@ def test_full_verification_plan_rejects_staged_index_updates():
 
 
 def test_full_verification_plan_allows_another_layer_to_be_staged():
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 10, keys, values, block_table)
@@ -1024,15 +1017,16 @@ def test_segmented_index_reuses_packed_index_until_update():
     materialize_metadata = Mock(wraps=index.cluster_store.get_cluster_block_metadata)
     index.cluster_store.get_cluster_block_metadata = materialize_metadata
 
-    first = index._pack_indices("layer", ["request"], keys, block_table)
-    second = index._pack_indices("layer", ["request"], keys, block_table)
-    assert second is first
-    assert materialize_metadata.call_count == 1
+    with active_residency(index, ["request"]):
+        first = index._pack_indices("layer", ["request"], keys, block_table)
+        second = index._pack_indices("layer", ["request"], keys, block_table)
+        assert second is first
+        assert materialize_metadata.call_count == 0
 
-    build_index(index, 14, keys, values, block_table)
-    after_update = index._pack_indices("layer", ["request"], keys, block_table)
+        build_index(index, 14, keys, values, block_table)
+        after_update = index._pack_indices("layer", ["request"], keys, block_table)
 
-    assert after_update is not first
+        assert after_update is not first
 
 
 def test_removing_request_invalidates_packed_index():
@@ -1041,21 +1035,22 @@ def test_removing_request_invalidates_packed_index():
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 10, keys, values, block_table)
 
-    packed = index._pack_indices("layer", ["request"], keys, block_table)
-    assert index._gpu_index_residency.num_packed_layers == 1
+    with active_residency(index, ["request"]):
+        packed = index._pack_indices("layer", ["request"], keys, block_table)
+        assert index._gpu_index_residency.num_packed_layers == 1
 
-    index.remove_requests(["request"])
+        index.remove_requests(["request"])
 
-    assert "request" not in index._indices["layer"]
-    assert index._gpu_index_residency.num_packed_layers == 0
+        assert "request" not in index._indices["layer"]
+        assert index._gpu_index_residency.num_packed_layers == 0
 
-    rebuilt = index._pack_indices("layer", ["request"], keys, block_table)
-    assert rebuilt is not packed
-    assert not rebuilt.cluster_mask.any()
+        rebuilt = index._pack_indices("layer", ["request"], keys, block_table)
+        assert rebuilt is not packed
+        assert not rebuilt.cluster_mask.any()
 
 
 def test_packed_index_cache_tracks_request_order_and_block_table_width():
-    index = make_index()
+    index = make_index(max_resident_requests=2)
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).repeat(2, 1)
     index.build_or_update(
@@ -1069,20 +1064,16 @@ def test_packed_index_cache_tracks_request_order_and_block_table_width():
         block_table=block_table,
     )
 
-    original = index._pack_indices("layer", ["long", "short"], keys, block_table)
-    reordered = index._pack_indices("layer", ["short", "long"], keys, block_table)
-    narrower = index._pack_indices(
-        "layer",
-        ["long", "short"],
-        keys,
-        block_table[:, :5],
-    )
+    with active_residency(index, ["long", "short"]):
+        original = index._pack_indices("layer", ["long", "short"], keys, block_table)
+        with pytest.raises(RuntimeError, match="request order"):
+            index._pack_indices("layer", ["short", "long"], keys, block_table)
+        narrower = index._pack_indices(
+            "layer", ["long", "short"], keys, block_table[:, :5]
+        )
 
-    assert reordered is not original
-    assert not reordered.cluster_mask[0].any()
-    assert reordered.cluster_mask[1].any()
-    assert narrower is not reordered
-    assert narrower.indexed_token_mask.shape == (2, 10)
+        assert narrower is not original
+        assert narrower.indexed_token_mask.shape == (2, 10)
 
 
 def test_segmented_index_proposal_lifecycle_tracks_empty_batches():
@@ -1098,7 +1089,7 @@ def test_segmented_index_proposal_lifecycle_tracks_empty_batches():
 
 
 def test_cpu_offload_keeps_request_indices_after_batch_deactivation():
-    index = make_index(cache_mode="cpu_offload", max_resident_requests=2)
+    index = make_index(max_resident_requests=2)
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).repeat(2, 1)
     index.build_or_update(
@@ -1154,7 +1145,7 @@ def test_cpu_offload_keeps_request_indices_after_batch_deactivation():
 
 
 def test_cpu_offload_appends_resident_segments_across_index_updates():
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 10, keys, values, block_table)
@@ -1193,14 +1184,14 @@ def test_cpu_offload_appends_resident_segments_across_index_updates():
 
 
 def test_cpu_offload_rejects_more_requests_than_reserved_capacity():
-    index = make_index(cache_mode="cpu_offload", max_resident_requests=2)
+    index = make_index(max_resident_requests=2)
 
     with pytest.raises(RuntimeError, match="exceeds max_num_seqs"):
         index.begin_proposal(["first", "second", "third"])
 
 
 def test_cpu_offload_can_defer_flush_and_discard_index_updates():
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
 
@@ -1250,7 +1241,7 @@ def test_cpu_offload_can_defer_flush_and_discard_index_updates():
 
 
 def test_cpu_offload_direct_build_preserves_synchronous_api():
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
 
@@ -1263,7 +1254,7 @@ def test_cpu_offload_direct_build_preserves_synchronous_api():
 
 
 def test_cpu_offload_recreates_builder_for_later_index_transaction():
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
 
@@ -1283,7 +1274,7 @@ def test_cpu_offload_recreates_builder_for_later_index_transaction():
 
 
 def test_cpu_offload_builds_cluster_pages_on_background_worker(monkeypatch):
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_started = threading.Event()
@@ -1331,7 +1322,7 @@ def test_cpu_offload_builds_cluster_pages_on_background_worker(monkeypatch):
 
 
 def test_cpu_offload_backpressure_waits_for_oldest_pending_build():
-    index = make_index(cache_mode="cpu_offload", max_pending_cluster_builds=2)
+    index = make_index(max_pending_cluster_builds=2)
     first_build: Future = Future()
     second_build: Future = Future()
     index._pending_cluster_builds.extend((first_build, second_build))
@@ -1367,7 +1358,7 @@ def test_cpu_offload_backpressure_waits_for_oldest_pending_build():
 
 
 def test_cpu_offload_backpressure_reaps_completed_builds_and_propagates_errors():
-    index = make_index(cache_mode="cpu_offload", max_pending_cluster_builds=2)
+    index = make_index(max_pending_cluster_builds=2)
     completed_build: Future = Future()
     failed_build: Future = Future()
     completed_build.set_result(Mock())
@@ -1381,7 +1372,7 @@ def test_cpu_offload_backpressure_reaps_completed_builds_and_propagates_errors()
 
 
 def test_cpu_offload_flush_rolls_back_all_layers_after_build_failure(monkeypatch):
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     original_store = index.cluster_store.store_staged_clusters
@@ -1422,7 +1413,7 @@ def test_cpu_offload_flush_rolls_back_all_layers_after_build_failure(monkeypatch
 
 
 def test_cpu_offload_stages_token_kv_before_clustering(monkeypatch):
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     call_order: list[str] = []
@@ -1487,7 +1478,7 @@ def test_cpu_offload_stages_token_kv_before_clustering(monkeypatch):
 
 
 def test_cpu_offload_waits_for_staged_kv_when_clustering_fails(monkeypatch):
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     staged_token_kv = Mock()
@@ -1521,7 +1512,7 @@ def test_cpu_offload_waits_for_staged_kv_when_clustering_fails(monkeypatch):
 
 
 def test_cpu_offload_discards_staged_kv_when_metadata_staging_fails(monkeypatch):
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     staged_token_kv = Mock()
@@ -1554,7 +1545,7 @@ def test_cpu_offload_discards_staged_kv_when_metadata_staging_fails(monkeypatch)
 
 
 def test_cpu_offload_discards_staged_clusters_when_submission_fails(monkeypatch):
-    index = make_index(cache_mode="cpu_offload")
+    index = make_index()
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     discard_staged_clusters = Mock(
@@ -1583,7 +1574,6 @@ def test_cpu_offload_discards_staged_clusters_when_submission_fails(monkeypatch)
 def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     device = torch.device("cuda")
     index = make_index(
-        cache_mode="cpu_offload",
         cache_ratio=0.5,
     )
     keys, values = make_cache()
@@ -1709,7 +1699,7 @@ def test_segmented_index_builds_and_selects_on_cuda():
 
     assert selection.exact_cluster_ids.device.type == "cuda"
     assert selection.exact_page_ids.device.type == "cuda"
-    assert selection.exact_token_counts.tolist() == [[8]]
+    assert selection.exact_token_counts.tolist() == [[6]]
     assert selection.estimation_token_counts[0, 0, 0].item() == 2
 
 

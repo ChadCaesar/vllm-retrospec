@@ -28,7 +28,6 @@ def make_resident_index() -> RetroSpecResidentIndex:
 
 def make_manager(max_resident_requests: int = 2):
     return RetroSpecGPUIndexResidencyManager(
-        cpu_offload=True,
         pin_memory=False,
         max_resident_requests=max_resident_requests,
     )
@@ -198,7 +197,6 @@ def test_cluster_summary_is_copied_to_cpu_authoritative_storage():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cluster_summary_offloads_asynchronously_to_pinned_cpu_storage():
     manager = RetroSpecGPUIndexResidencyManager(
-        cpu_offload=True,
         pin_memory=True,
         max_resident_requests=2,
     )

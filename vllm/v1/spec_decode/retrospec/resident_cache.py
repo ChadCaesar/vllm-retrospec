@@ -40,6 +40,9 @@ class RetroSpecResidentPageAccess:
     hit_cluster_mask: torch.Tensor
     miss_cluster_mask: torch.Tensor
     hit_gate_ready_mask: torch.Tensor
+    logical_page_ids_cpu: torch.Tensor
+    miss_cluster_mask_cpu: torch.Tensor
+    ready_event: torch.cuda.Event | None
 
 
 class RetroSpecResidentClusterCache:
@@ -183,6 +186,20 @@ class RetroSpecResidentClusterCache:
 
         return self._pending_copy_batches[-1].ready_event
 
+    def _pending_event_for_clusters(
+        self,
+        cluster_ids: Collection[_ClusterId],
+    ) -> torch.cuda.Event | None:
+        """Return the last pending event that contains a selected cluster."""
+        selected = set(cluster_ids)
+        ready_event: torch.cuda.Event | None = None
+
+        for batch in self._pending_copy_batches:
+            if selected.intersection(batch.cluster_ids):
+                ready_event = batch.ready_event
+
+        return ready_event
+
     def wait_for_pending_copies(
         self,
         stream: torch.cuda.Stream | None = None,
@@ -233,6 +250,11 @@ class RetroSpecResidentClusterCache:
         if self._physical_capacity:
             new_key_pages[: self._physical_capacity].copy_(self.key_pages)
             new_value_pages[: self._physical_capacity].copy_(self.value_pages)
+
+            # Resizing can run on the prefetch worker's per-thread default
+            # stream. Subsequent admissions use _copy_stream, so preserve the
+            # old resident contents before that stream writes the new arena.
+            self._copy_stream.wait_stream(torch.cuda.current_stream(self.device))
 
         self._free_slots.update(
             range(
@@ -435,6 +457,8 @@ class RetroSpecResidentClusterCache:
         page_ids: torch.Tensor,
         allocated_cluster_ids: Collection[int],
         allocated_page_ids: Collection[int],
+        cluster_ids_cpu: torch.Tensor | None = None,
+        page_ids_cpu: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -452,17 +476,25 @@ class RetroSpecResidentClusterCache:
             raise ValueError("Cluster ID and page-table shapes do not match")
         if page_ids.dtype not in (torch.int32, torch.int64):
             raise ValueError("Cluster page IDs must use an integral dtype")
-        if cluster_ids.device != page_ids.device:
-            raise ValueError("Cluster IDs and page IDs must use one device")
+        if cluster_ids_cpu is None:
+            cluster_ids_cpu = cluster_ids.detach().to(
+                device="cpu",
+                dtype=torch.int64,
+            )
+        if page_ids_cpu is None:
+            page_ids_cpu = page_ids.detach().to(
+                device="cpu",
+                dtype=torch.int64,
+            )
 
-        cluster_ids_cpu = cluster_ids.detach().to(
-            device="cpu",
-            dtype=torch.int64,
-        )
-        page_ids_cpu = page_ids.detach().to(
-            device="cpu",
-            dtype=torch.int64,
-        )
+        if cluster_ids_cpu.device.type != "cpu" or page_ids_cpu.device.type != "cpu":
+            raise ValueError("Parsed cluster metadata must reside on CPU")
+        if cluster_ids_cpu.dtype != torch.int64 or page_ids_cpu.dtype != torch.int64:
+            raise ValueError("Parsed cluster metadata must use int64")
+        if cluster_ids_cpu.shape != cluster_ids.shape:
+            raise ValueError("CPU cluster IDs do not match the selection shape")
+        if page_ids_cpu.shape != page_ids.shape:
+            raise ValueError("CPU page IDs do not match the selection shape")
 
         if torch.any(cluster_ids_cpu < -1).item():
             raise ValueError("Cluster IDs must be at least -1")
@@ -605,6 +637,8 @@ class RetroSpecResidentClusterCache:
         allocated_page_ids: Collection[int],
         touch: bool = True,
         include_pending: bool = True,
+        cluster_ids_cpu: torch.Tensor | None = None,
+        page_ids_cpu: torch.Tensor | None = None,
     ) -> RetroSpecResidentPageAccess:
         """Resolve selected cluster blocks against resident GPU slots.
 
@@ -626,6 +660,8 @@ class RetroSpecResidentClusterCache:
             page_ids,
             allocated_cluster_ids,
             allocated_page_ids,
+            cluster_ids_cpu=cluster_ids_cpu,
+            page_ids_cpu=page_ids_cpu,
         )
         self._validate_cluster_groups(parsed_cluster_ids, cluster_groups)
 
@@ -702,6 +738,8 @@ class RetroSpecResidentClusterCache:
                 if cluster_id in hit_clusters:
                     self._touch_cluster(cluster_id)
 
+        ready_event = self._pending_event_for_clusters(hit_clusters)
+
         return RetroSpecResidentPageAccess(
             cache_page_ids=cache_page_ids_cpu.to(
                 device=page_ids.device,
@@ -719,6 +757,9 @@ class RetroSpecResidentClusterCache:
                 device=cluster_ids.device,
                 non_blocking=False,
             ),
+            logical_page_ids_cpu=page_ids_cpu,
+            miss_cluster_mask_cpu=miss_cluster_mask_cpu,
+            ready_event=ready_event,
         )
 
     def _validate_source_pages(
@@ -782,6 +823,9 @@ class RetroSpecResidentClusterCache:
         source_page_ids: torch.Tensor,
         source_key_pages: torch.Tensor,
         source_value_pages: torch.Tensor,
+        cluster_ids_cpu: torch.Tensor | None = None,
+        page_ids_cpu: torch.Tensor | None = None,
+        reuse_ready_event: torch.cuda.Event | None = None,
     ) -> RetroSpecResidentPageAccess:
         """Admit a priority cluster prefix from CPU or GPU source pages."""
         self._validate_source_pages(source_key_pages, source_value_pages)
@@ -804,6 +848,8 @@ class RetroSpecResidentClusterCache:
             page_ids,
             allocated_cluster_ids,
             allocated_page_ids,
+            cluster_ids_cpu=cluster_ids_cpu,
+            page_ids_cpu=page_ids_cpu,
         )
         self._validate_cluster_groups(parsed_cluster_ids, cluster_groups)
 
@@ -952,8 +998,11 @@ class RetroSpecResidentClusterCache:
                     self._reap_completed_copy_batches()
 
                     # Commit 24 requires this wait to occur after exact packing.
-                    current_stream = torch.cuda.current_stream(self.device)
-                    self._copy_stream.wait_stream(current_stream)
+                    if reuse_ready_event is None:
+                        current_stream = torch.cuda.current_stream(self.device)
+                        self._copy_stream.wait_stream(current_stream)
+                    else:
+                        self._copy_stream.wait_event(reuse_ready_event)
                     copy_batch_started = True
 
                 source_ids = cluster_source_ids[cluster_id]
@@ -996,6 +1045,8 @@ class RetroSpecResidentClusterCache:
             allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=allocated_page_ids,
             touch=False,
+            cluster_ids_cpu=cluster_ids_cpu,
+            page_ids_cpu=page_ids_cpu,
         )
 
     def admit(
@@ -1007,6 +1058,9 @@ class RetroSpecResidentClusterCache:
         allocated_page_ids: Collection[int],
         backing_key_pages: torch.Tensor,
         backing_value_pages: torch.Tensor,
+        cluster_ids_cpu: torch.Tensor | None = None,
+        page_ids_cpu: torch.Tensor | None = None,
+        reuse_ready_event: torch.cuda.Event | None = None,
     ) -> RetroSpecResidentPageAccess:
         """Admit a priority cluster prefix from stable CPU backing pages."""
         self._validate_backing_pages(
@@ -1020,9 +1074,12 @@ class RetroSpecResidentClusterCache:
             cluster_groups=cluster_groups,
             allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=allocated_page_ids,
-            source_page_ids=page_ids,
+            source_page_ids=page_ids if page_ids_cpu is None else page_ids_cpu,
             source_key_pages=backing_key_pages,
             source_value_pages=backing_value_pages,
+            cluster_ids_cpu=cluster_ids_cpu,
+            page_ids_cpu=page_ids_cpu,
+            reuse_ready_event=reuse_ready_event,
         )
 
     def admit_staged(
@@ -1035,6 +1092,8 @@ class RetroSpecResidentClusterCache:
         staging_page_ids: torch.Tensor,
         staging_key_pages: torch.Tensor,
         staging_value_pages: torch.Tensor,
+        cluster_ids_cpu: torch.Tensor | None = None,
+        page_ids_cpu: torch.Tensor | None = None,
     ) -> RetroSpecResidentPageAccess:
         """Admit a priority cluster prefix from temporary GPU staging pages."""
         self._validate_source_pages(
@@ -1053,6 +1112,8 @@ class RetroSpecResidentClusterCache:
             source_page_ids=staging_page_ids,
             source_key_pages=staging_key_pages,
             source_value_pages=staging_value_pages,
+            cluster_ids_cpu=cluster_ids_cpu,
+            page_ids_cpu=page_ids_cpu,
         )
 
     def invalidate(

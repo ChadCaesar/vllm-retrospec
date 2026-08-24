@@ -64,6 +64,8 @@ class _ResidentCacheTestAdapter(RetroSpecResidentClusterCache):
         cluster_ids=None,
         cluster_groups=None,
         allocated_cluster_ids=None,
+        cluster_ids_cpu=None,
+        page_ids_cpu=None,
     ):
         if cluster_ids is None:
             cluster_ids = _cluster_ids_from_pages(page_ids)
@@ -81,6 +83,8 @@ class _ResidentCacheTestAdapter(RetroSpecResidentClusterCache):
             allocated_page_ids=allocated_page_ids,
             touch=touch,
             include_pending=include_pending,
+            cluster_ids_cpu=cluster_ids_cpu,
+            page_ids_cpu=page_ids_cpu,
         )
 
     def admit(

@@ -404,7 +404,6 @@ def test_execution_buffer_packs_resolved_cpu_backing_pages():
     cluster_counts = torch.tensor([[2, 2, 2]], dtype=torch.int32, device=device)
     store = RetroSpecClusterPageStore(
         page_size=page_size,
-        storage_mode="cpu_offload",
         cache_ratio=0.5,
     )
     table = store.store_clusters(

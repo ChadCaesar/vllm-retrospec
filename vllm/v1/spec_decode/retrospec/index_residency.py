@@ -66,8 +66,8 @@ class _ResidentIndexEntry:
 class RetroSpecGPUIndexResidencyManager:
     """Own persistent request indices and temporary packed batch views.
 
-    CPU-offload mode keeps authoritative cluster summaries on CPU. Once a
-    cluster segment has been published, the summary and page metadata needed
+    Authoritative cluster summaries remain on CPU. Once a cluster segment has
+    been published, the summary and page metadata needed
     for coarse scoring stay on the execution device until the request is
     removed or the corresponding layer is rolled back. Proposal and full
     verification contexts may additionally cache one packed batch view.
@@ -75,15 +75,13 @@ class RetroSpecGPUIndexResidencyManager:
 
     def __init__(
         self,
-        cpu_offload: bool,
         pin_memory: bool,
         max_resident_requests: int,
     ) -> None:
         if max_resident_requests <= 0:
             raise ValueError("max_resident_requests must be positive")
 
-        self.cpu_offload = cpu_offload
-        self.pin_memory = pin_memory if cpu_offload else False
+        self.pin_memory = pin_memory
         self.max_resident_requests = max_resident_requests
 
         self._active_request_ids: tuple[str, ...] | None = None
@@ -120,8 +118,6 @@ class RetroSpecGPUIndexResidencyManager:
         return len(self._entries)
 
     def activate(self, request_ids: Sequence[str]) -> None:
-        if not self.cpu_offload:
-            return
         if self._active_request_ids is not None:
             raise RuntimeError("A RetroSpec GPU index residency set is already active")
 
@@ -138,8 +134,6 @@ class RetroSpecGPUIndexResidencyManager:
         self._active_request_ids = request_ids
 
     def deactivate(self) -> None:
-        if not self.cpu_offload:
-            return
         if self._active_request_ids is None:
             raise RuntimeError("No RetroSpec GPU index residency set is active")
 
@@ -147,8 +141,6 @@ class RetroSpecGPUIndexResidencyManager:
         self._active_request_ids = None
 
     def _validate_active_requests(self, request_ids: tuple[str, ...]) -> None:
-        if not self.cpu_offload:
-            return
         if self._active_request_ids is None:
             raise RuntimeError(
                 "CPU-backed RetroSpec indices may be packed only inside an "
@@ -200,9 +192,6 @@ class RetroSpecGPUIndexResidencyManager:
         layer_name: str,
         request_id: str,
     ) -> tuple[RetroSpecResidentSegment, ...]:
-        if not self.cpu_offload:
-            return ()
-
         return self._resident_segments.get(layer_name, {}).get(request_id, ())
 
     def build_resident_segment(
@@ -217,8 +206,6 @@ class RetroSpecGPUIndexResidencyManager:
         cluster_page_ids: torch.Tensor,
         cluster_page_token_counts: torch.Tensor,
     ) -> RetroSpecResidentSegment:
-        if not self.cpu_offload:
-            raise RuntimeError("Persistent resident segments require CPU-offload mode")
         if indexed_start < 0 or indexed_end <= indexed_start:
             raise ValueError("Resident segment token range is invalid")
         if cluster_start < 0:
@@ -277,7 +264,7 @@ class RetroSpecGPUIndexResidencyManager:
         self,
         segments: Sequence[RetroSpecResidentSegment],
     ) -> None:
-        if not self.cpu_offload or not segments:
+        if not segments:
             return
 
         incoming_request_ids = {segment.request_id for segment in segments}
@@ -389,15 +376,6 @@ class RetroSpecGPUIndexResidencyManager:
             cluster_values=cluster_values,
             cluster_token_counts=cluster_token_counts,
         )
-
-        if not self.cpu_offload:
-            return RetroSpecStagedClusterSummary(
-                cluster_keys=cluster_keys,
-                cluster_values=cluster_values,
-                cluster_token_counts=cluster_token_counts,
-                resident_summary=resident_summary,
-                ready_event=None,
-            )
 
         host_keys = torch.empty_like(
             cluster_keys, device="cpu", pin_memory=self.pin_memory

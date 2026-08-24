@@ -26,11 +26,7 @@ from vllm.v1.spec_decode.retrospec.execution import (
     RetroSpecExactExecution,
     RetroSpecExactKVSource,
 )
-from vllm.v1.spec_decode.retrospec.index import (
-    RetroSpecAttentionLevel,
-    RetroSpecAttentionSelection,
-    RetroSpecSelectionPlan,
-)
+from vllm.v1.spec_decode.retrospec.index import RetroSpecAttentionLevel
 from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecFullVerificationPlan,
     RetroSpecSegmentedTokenIndex,
@@ -40,8 +36,6 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 
 
 def make_controller(
-    index_mode: str = "block_mean",
-    cache_mode: str = "gpu_reference",
     cache_ratio: float = 0.0,
     max_pending_cluster_builds: int = 2,
 ) -> RetroSpecSparseAttention:
@@ -53,13 +47,11 @@ def make_controller(
                 num_speculative_tokens=2,
                 retrospec_retrieval_ratio=0.25,
                 retrospec_estimation_ratio=0.5,
-                retrospec_index_mode=index_mode,
                 retrospec_index_segment_size=4,
                 retrospec_index_update_interval=2,
                 retrospec_blocks_per_cluster=1,
                 retrospec_kmeans_iterations=2,
                 retrospec_max_pending_cluster_builds=max_pending_cluster_builds,
-                retrospec_cache_mode=cache_mode,
                 retrospec_cache_ratio=cache_ratio,
             ),
             scheduler_config=SimpleNamespace(max_num_seqs=4),
@@ -78,20 +70,17 @@ def mark_installed(controller: RetroSpecSparseAttention) -> None:
 
 @pytest.mark.parametrize(
     (
-        "cache_mode",
         "cache_ratio",
         "pin_memory_available",
         "expected_pin_memory",
         "expected_cache_ratio",
     ),
     [
-        ("gpu_reference", 0.0, True, False, 0.0),
-        ("cpu_offload", 0.0, False, False, 0.75),
-        ("cpu_offload", 0.4, True, True, 0.4),
+        (0.0, False, False, 0.75),
+        (0.4, True, False, 0.4),
     ],
 )
 def test_segmented_attention_configures_cluster_backing_store(
-    cache_mode: str,
     cache_ratio: float,
     pin_memory_available: bool,
     expected_pin_memory: bool,
@@ -102,13 +91,10 @@ def test_segmented_attention_configures_cluster_backing_store(
         return_value=pin_memory_available,
     ):
         controller = make_controller(
-            index_mode="segmented_cluster",
-            cache_mode=cache_mode,
             cache_ratio=cache_ratio,
         )
 
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
-    assert controller.index.cluster_store.storage_mode == cache_mode
     assert controller.index.cluster_store.pin_memory is expected_pin_memory
     assert controller.index.cluster_store.cache_ratio == pytest.approx(
         expected_cache_ratio
@@ -118,42 +104,11 @@ def test_segmented_attention_configures_cluster_backing_store(
 
 def test_segmented_attention_configures_pending_cluster_build_limit():
     controller = make_controller(
-        index_mode="segmented_cluster",
         max_pending_cluster_builds=4,
     )
 
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
     assert controller.index.max_pending_cluster_builds == 4
-
-
-def make_plan(batch_size: int, width: int = 0) -> RetroSpecSelectionPlan:
-    indices = torch.zeros(batch_size, width, dtype=torch.int64)
-    mask = torch.zeros(batch_size, width, dtype=torch.bool)
-    return RetroSpecSelectionPlan(
-        sparse_exact_indices=indices,
-        sparse_exact_mask=mask,
-        sparse_estimation_indices=indices,
-        sparse_estimation_mask=mask,
-        expanded_exact_indices=indices,
-        expanded_exact_mask=mask,
-        expanded_estimation_indices=indices,
-        expanded_estimation_mask=mask,
-        valid_token_counts=torch.zeros(batch_size, width, dtype=torch.int64),
-        sparse_attn=torch.ones(batch_size),
-        expanded_attn=torch.ones(batch_size),
-    )
-
-
-def make_selection(batch_size: int = 2) -> RetroSpecAttentionSelection:
-    return RetroSpecAttentionSelection(
-        exact_block_table=torch.empty(batch_size, 0, dtype=torch.int32),
-        exact_seq_lens=torch.zeros(batch_size, dtype=torch.int32),
-        estimation_keys=torch.empty(batch_size, 0, 1, 1),
-        estimation_values=torch.empty(batch_size, 0, 1, 1),
-        estimation_token_counts=torch.empty(batch_size, 0, dtype=torch.int32),
-        attention_mass=torch.ones(batch_size),
-        plan=make_plan(batch_size),
-    )
 
 
 def make_token_plan(
@@ -214,6 +169,31 @@ def make_token_plan(
         expanded_estimation_token_counts=estimation_counts,
         sparse_attn=torch.ones(batch_size),
         expanded_attn=torch.ones(batch_size),
+    )
+
+
+def make_plan(batch_size: int, width: int = 0) -> RetroSpecTokenSelectionPlan:
+    return make_token_plan(
+        batch_size,
+        num_kv_heads=1,
+        exact_width=width,
+        estimation_width=0,
+    )
+
+
+def make_selection(batch_size: int = 2) -> RetroSpecTokenAttentionSelection:
+    plan = make_plan(batch_size)
+    return RetroSpecTokenAttentionSelection(
+        exact_cluster_ids=plan.sparse_exact_cluster_ids,
+        exact_page_ids=plan.sparse_exact_page_ids,
+        exact_page_token_counts=plan.sparse_exact_page_token_counts,
+        exact_token_counts=torch.zeros(batch_size, 1, dtype=torch.int32),
+        estimation_keys=plan.sparse_estimation_keys,
+        estimation_values=plan.sparse_estimation_values,
+        estimation_token_counts=plan.sparse_estimation_token_counts,
+        attention_mass=torch.ones(batch_size),
+        plan=plan,
+        resolved_pages=None,
     )
 
 
@@ -337,7 +317,7 @@ def test_forward_uses_original_attention_outside_proposal():
 
 
 def test_passthrough_forward_builds_segmented_index_after_target_attention():
-    controller = make_controller("segmented_cluster")
+    controller = make_controller()
     mark_installed(controller)
     events: list[str] = []
 
@@ -385,7 +365,7 @@ def test_passthrough_forward_builds_segmented_index_after_target_attention():
 
 
 def test_index_update_context_restores_state_after_exception():
-    controller = make_controller("segmented_cluster")
+    controller = make_controller()
     discard_staged_updates = Mock(
         wraps=controller.index.discard_staged_updates,
     )
@@ -407,7 +387,7 @@ def test_index_update_context_restores_state_after_exception():
 
 
 def test_index_update_context_restores_state_after_flush_failure():
-    controller = make_controller("segmented_cluster")
+    controller = make_controller()
     controller.index.flush_staged_updates = Mock(
         side_effect=RuntimeError("flush failure")
     )
@@ -427,7 +407,7 @@ def test_index_update_context_restores_state_after_flush_failure():
 
 
 def test_generation_index_context_forwards_generation_phase():
-    controller = make_controller("segmented_cluster")
+    controller = make_controller()
     mark_installed(controller)
     controller.index.build_or_update = Mock()
     kv_cache = torch.ones(2, 8, 2, 1, 1)
@@ -455,10 +435,7 @@ def test_generation_index_context_forwards_generation_phase():
 
 
 def test_full_verification_context_prepares_and_restores_attention_state():
-    controller = make_controller(
-        index_mode="segmented_cluster",
-        cache_mode="cpu_offload",
-    )
+    controller = make_controller()
     mark_installed(controller)
     controller.index.prepare_full_verification = Mock(
         wraps=controller.index.prepare_full_verification
@@ -485,10 +462,7 @@ def test_full_verification_context_prepares_and_restores_attention_state():
 
 
 def test_full_verification_context_restores_state_after_exception():
-    controller = make_controller(
-        index_mode="segmented_cluster",
-        cache_mode="cpu_offload",
-    )
+    controller = make_controller()
     mark_installed(controller)
 
     with (
@@ -506,10 +480,7 @@ def test_full_verification_context_restores_state_after_exception():
 
 
 def test_proposal_context_rejects_excess_residency_without_state_leak():
-    controller = make_controller(
-        index_mode="segmented_cluster",
-        cache_mode="cpu_offload",
-    )
+    controller = make_controller()
     mark_installed(controller)
     request_ids = [f"request-{index}" for index in range(5)]
 
@@ -525,10 +496,7 @@ def test_proposal_context_rejects_excess_residency_without_state_leak():
 
 
 def test_attention_reports_only_new_fully_stored_retirement_ranges():
-    controller = make_controller(
-        index_mode="segmented_cluster",
-        cache_mode="cpu_offload",
-    )
+    controller = make_controller()
     mark_installed(controller)
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
     controller.index.get_fully_stored_indexed_end = Mock(return_value=6)
@@ -549,10 +517,7 @@ def test_attention_reports_only_new_fully_stored_retirement_ranges():
 
 
 def test_full_verification_rejects_rollback_behind_retired_boundary():
-    controller = make_controller(
-        index_mode="segmented_cluster",
-        cache_mode="cpu_offload",
-    )
+    controller = make_controller()
     mark_installed(controller)
     controller._retired_block_ends["request"] = 3
 
@@ -568,10 +533,7 @@ def test_full_verification_rejects_rollback_behind_retired_boundary():
 
 
 def test_forward_dispatches_full_verification_and_updates_index():
-    controller = make_controller(
-        index_mode="segmented_cluster",
-        cache_mode="cpu_offload",
-    )
+    controller = make_controller()
     mark_installed(controller)
     impl = object.__new__(FlashAttentionImpl)
     layer = SimpleNamespace(impl=impl)
@@ -624,21 +586,24 @@ def test_forward_dispatches_full_verification_and_updates_index():
 def test_estimation_attention_weights_centroids_by_token_count():
     controller = make_controller()
     impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
-    selection = RetroSpecAttentionSelection(
-        exact_block_table=torch.empty(2, 0, dtype=torch.int32),
-        exact_seq_lens=torch.zeros(2, dtype=torch.int32),
-        estimation_keys=torch.zeros(2, 2, 1, 1, dtype=torch.bfloat16),
+    plan = make_token_plan(2, 1, exact_width=0, estimation_width=2)
+    selection = RetroSpecTokenAttentionSelection(
+        exact_cluster_ids=plan.sparse_exact_cluster_ids,
+        exact_page_ids=plan.sparse_exact_page_ids,
+        exact_page_token_counts=plan.sparse_exact_page_token_counts,
+        exact_token_counts=torch.zeros(2, 1, dtype=torch.int32),
+        estimation_keys=torch.zeros(2, 1, 2, 1, dtype=torch.bfloat16),
         estimation_values=torch.tensor(
             [
-                [[[[2.0]]], [[[4.0]]]],
-                [[[[8.0]]], [[[9.0]]]],
-            ]
-        )
-        .view(2, 2, 1, 1)
-        .to(torch.bfloat16),
-        estimation_token_counts=torch.tensor([[1, 3], [0, 0]], dtype=torch.int32),
+                [[[[2.0], [4.0]]]],
+                [[[[8.0], [9.0]]]],
+            ],
+            dtype=torch.bfloat16,
+        ).view(2, 1, 2, 1),
+        estimation_token_counts=torch.tensor([[[1, 3]], [[0, 0]]], dtype=torch.int32),
         attention_mass=torch.ones(2),
-        plan=make_plan(2),
+        plan=plan,
+        resolved_pages=None,
     )
 
     output, lse = controller._run_estimation_attention(
@@ -652,7 +617,7 @@ def test_estimation_attention_weights_centroids_by_token_count():
 
 
 def test_grouped_reference_attention_keeps_kv_heads_independent():
-    controller = make_controller("segmented_cluster")
+    controller = make_controller()
     impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
     query = torch.zeros(1, 4, 1, dtype=torch.bfloat16)
     keys = torch.zeros(1, 2, 2, 1, dtype=torch.bfloat16)
@@ -835,7 +800,7 @@ def test_full_verification_attention_matches_dense_causal_reference_on_cuda():
 
 
 def test_token_exact_attention_uses_reference_fallback_on_cpu():
-    controller = make_controller("segmented_cluster")
+    controller = make_controller()
     impl = cast(
         FlashAttentionImpl,
         SimpleNamespace(scale=1.0, vllm_flash_attn_version=2),
@@ -887,7 +852,6 @@ def test_token_exact_attention_uses_reference_fallback_on_cpu():
     ):
         result = controller._run_exact_attention(
             impl,
-            Mock(),
             query,
             torch.empty(0),
             torch.empty(0),
@@ -907,8 +871,6 @@ def test_token_exact_attention_uses_reference_fallback_on_cpu():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
     controller = make_controller(
-        index_mode="segmented_cluster",
-        cache_mode="cpu_offload",
         cache_ratio=0.5,
     )
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
@@ -968,7 +930,6 @@ def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
     ):
         result = controller._run_exact_attention(
             cast(FlashAttentionImpl, SimpleNamespace()),
-            cast(torch.nn.Module, SimpleNamespace()),
             torch.ones(1, 1, 1, dtype=torch.float32, device=device),
             torch.empty(0, device=device),
             torch.empty(0, device=device),
@@ -989,15 +950,15 @@ def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
 
 
 def test_full_verification_source_skips_resolution_without_cluster_pages():
-    controller = make_controller("segmented_cluster")
+    controller = make_controller()
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
 
     plan = RetroSpecFullVerificationPlan(
         layer_name="layer",
         primary_exact_token_indices=torch.tensor([[[0, 1, 2]]]),
         primary_exact_token_mask=torch.ones(1, 1, 3, dtype=torch.bool),
-        exact_cluster_ids=torch.full((1, 1, 1), -1, dtype=torch.int64),
         exact_page_ids=torch.empty(1, 1, 1, 0, dtype=torch.int64),
+        exact_page_ids_cpu=torch.empty(1, 1, 1, 0, dtype=torch.int64),
         exact_page_token_counts=torch.empty(1, 1, 1, 0, dtype=torch.int32),
         exact_token_counts=torch.tensor([[3]], dtype=torch.int32),
     )
@@ -1025,18 +986,17 @@ def test_full_verification_source_skips_resolution_without_cluster_pages():
 
 
 def test_full_verification_source_resolves_all_cluster_pages():
-    controller = make_controller("segmented_cluster")
+    controller = make_controller()
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
 
-    cluster_ids = torch.tensor([[[0, 1]]], dtype=torch.int64)
     page_ids = torch.tensor([[[[2], [3]]]], dtype=torch.int64)
     page_counts = torch.tensor([[[[2], [1]]]], dtype=torch.int32)
     plan = RetroSpecFullVerificationPlan(
         layer_name="layer",
         primary_exact_token_indices=torch.tensor([[[0, 4]]]),
         primary_exact_token_mask=torch.ones(1, 1, 2, dtype=torch.bool),
-        exact_cluster_ids=cluster_ids,
         exact_page_ids=page_ids,
+        exact_page_ids_cpu=page_ids.cpu(),
         exact_page_token_counts=page_counts,
         exact_token_counts=torch.tensor([[5]], dtype=torch.int32),
     )
@@ -1078,8 +1038,8 @@ def test_full_verification_source_resolves_all_cluster_pages():
     resolve_full = controller.index.cluster_store.resolve_full_verification_blocks
     resolve_full.assert_called_once_with(
         layer_name="layer",
-        cluster_ids=cluster_ids,
         logical_page_ids=page_ids,
+        logical_page_ids_cpu=plan.exact_page_ids_cpu,
     )
     assert source.primary.token_indices is plan.primary_exact_token_indices
     assert source.primary.token_mask is plan.primary_exact_token_mask
@@ -1093,8 +1053,6 @@ def test_full_verification_source_resolves_all_cluster_pages():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_full_verification_packs_cpu_backed_cluster_pages_on_cuda():
     controller = make_controller(
-        index_mode="segmented_cluster",
-        cache_mode="cpu_offload",
         cache_ratio=0.5,
     )
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
@@ -1139,7 +1097,6 @@ def test_full_verification_packs_cpu_backed_cluster_pages_on_cuda():
         controller.index.end_full_verification_residency()
 
     assert resolved_pages is not None
-    assert controller.index.cluster_store.is_cpu_backed
     assert execution.exact_seq_lens.tolist() == [10]
     assert plan.primary_exact_token_mask.sum().item() == 6
     assert plan.exact_page_token_counts.sum().item() == 4
@@ -1266,7 +1223,7 @@ def test_grouped_flash_exact_attention_handles_zero_lengths_on_cuda():
 
 
 def test_token_estimation_attention_uses_per_head_cluster_sizes():
-    controller = make_controller("segmented_cluster")
+    controller = make_controller()
     impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
     plan = make_token_plan(
         batch_size=1,
@@ -1303,27 +1260,6 @@ def test_token_estimation_attention_uses_per_head_cluster_sizes():
     assert lse[:, 0].tolist() == pytest.approx(
         [torch.log(torch.tensor(4.0)).item()] * 4
     )
-
-
-def test_get_grouped_estimation_converts_block_layout():
-    selection = RetroSpecAttentionSelection(
-        exact_block_table=torch.empty(1, 0, dtype=torch.int32),
-        exact_seq_lens=torch.zeros(1, dtype=torch.int32),
-        estimation_keys=torch.arange(12, dtype=torch.float32).view(1, 3, 2, 2),
-        estimation_values=torch.arange(12, 24, dtype=torch.float32).view(1, 3, 2, 2),
-        estimation_token_counts=torch.tensor([[1, 2, 3]], dtype=torch.int32),
-        attention_mass=torch.ones(1),
-        plan=make_plan(1),
-    )
-
-    keys, values, counts = RetroSpecSparseAttention._get_grouped_estimation(selection)
-
-    assert keys.shape == (1, 2, 3, 2)
-    assert keys.dtype == torch.float32
-    assert values.shape == keys.shape
-    assert counts.tolist() == [[[1, 2, 3], [1, 2, 3]]]
-    assert keys[0, 0, :, 0].tolist() == [0, 4, 8]
-    assert keys[0, 1, :, 0].tolist() == [2, 6, 10]
 
 
 def test_get_grouped_estimation_keeps_token_layout():
@@ -1363,8 +1299,6 @@ def test_exact_attention_resolves_resident_and_staging_pages(
     expect_admission: bool,
 ):
     controller = make_controller(
-        index_mode="segmented_cluster",
-        cache_mode="cpu_offload",
         cache_ratio=0.5,
     )
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
@@ -1459,7 +1393,6 @@ def test_exact_attention_resolves_resident_and_staging_pages(
     value_cache = key_cache.clone()
     result = controller._run_exact_attention(
         cast(FlashAttentionImpl, SimpleNamespace()),
-        cast(torch.nn.Module, SimpleNamespace()),
         torch.zeros(1, 1, 1, dtype=torch.float16, device=device),
         key_cache,
         value_cache,
@@ -1519,7 +1452,7 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
     controller = make_controller()
     mark_installed(controller)
     selection = make_selection(batch_size=1)
-    controller.index.select = Mock(return_value=selection)
+    controller.index.select_segmented = Mock(return_value=selection)
     controller.index.materialize = Mock(return_value=selection)
     controller._run_exact_attention = Mock(
         return_value=(torch.zeros(1, 1, 1), torch.zeros(1, 1))
@@ -1560,7 +1493,7 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
         )
         controller.end_step()
 
-        controller.index.select.assert_called_once()
+        controller.index.select_segmented.assert_called_once()
         controller.index.materialize.assert_called_once()
         materialize_args = controller.index.materialize.call_args.args
         assert materialize_args[0] is selection.plan
@@ -1572,8 +1505,6 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
 
 def test_segmented_draft_prefetches_sparse_plan_after_attention():
     controller = make_controller(
-        index_mode="segmented_cluster",
-        cache_mode="cpu_offload",
         cache_ratio=0.5,
     )
     mark_installed(controller)
@@ -1637,40 +1568,8 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
     )
 
 
-def test_parallel_verification_gathers_block_plan_rows_by_request_and_token():
-    controller = make_controller()
-    mark_installed(controller)
-    step_zero = replace(
-        make_plan(batch_size=2, width=2),
-        sparse_exact_indices=torch.tensor([[0, 1], [2, 3]]),
-        sparse_attn=torch.tensor([0.1, 0.2]),
-    )
-    step_one = replace(
-        make_plan(batch_size=2, width=2),
-        sparse_exact_indices=torch.tensor([[4, 5], [6, 7]]),
-        sparse_attn=torch.tensor([0.3, 0.4]),
-    )
-
-    with controller.proposal_context(["request-0", "request-1"]):
-        controller.selection_plans[0]["layer"] = step_zero
-        controller.selection_plans[1]["layer"] = step_one
-        controller.begin_parallel_step(
-            RetroSpecAttentionMode.SPARSE_VERIFY,
-            request_indices=[1, 0, 1],
-            token_indices=[0, 1, 1],
-        )
-
-        plan = controller._gather_parallel_plan("layer")
-        assert isinstance(plan, RetroSpecSelectionPlan)
-        assert plan.sparse_exact_indices.tolist() == [[2, 3], [4, 5], [6, 7]]
-        assert plan.sparse_attn.tolist() == pytest.approx([0.2, 0.3, 0.4])
-
-        controller.attention_mass_layer_count = 1
-        controller.end_step()
-
-
 def test_parallel_verification_gathers_segmented_token_plan_rows():
-    controller = make_controller(index_mode="segmented_cluster")
+    controller = make_controller()
     mark_installed(controller)
     step_zero = replace(
         make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),

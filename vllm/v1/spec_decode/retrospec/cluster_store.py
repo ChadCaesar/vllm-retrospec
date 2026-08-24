@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import deque
+from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from math import ceil
-from threading import Lock
+from threading import Lock, RLock
 from typing import Literal
 
 import torch
@@ -19,10 +22,6 @@ from .resident_cache import (
     RetroSpecResidentPageAccess,
 )
 
-RetroSpecClusterStorageMode = Literal[
-    "gpu_reference",
-    "cpu_offload",
-]
 RetroSpecClusterResolveMode = Literal[
     "resident_only",
     "verification",
@@ -98,6 +97,43 @@ class _PinnedStagingSlot:
             cluster_token_counts,
         )
         return staged_assignments, staged_cluster_token_counts
+
+
+@dataclass
+class _PinnedSelectionSlot:
+    """Reusable pinned cluster-ID buffer for one asynchronous prefetch."""
+
+    cluster_id_storage: torch.Tensor | None = None
+    in_use: bool = False
+
+    def reserve(self, source: torch.Tensor) -> torch.Tensor:
+        if not self.in_use:
+            raise RuntimeError("Pinned selection slot must be acquired before use")
+
+        required_numel = source.numel()
+        if (
+            self.cluster_id_storage is None
+            or self.cluster_id_storage.numel() < required_numel
+        ):
+            self.cluster_id_storage = torch.empty(
+                required_numel,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+
+        return self.cluster_id_storage[:required_numel].view(source.shape)
+
+
+@dataclass(frozen=True)
+class _StagedResidentPrefetch:
+    """Cluster IDs staged for background descriptor parsing and admission."""
+
+    layer_name: str
+    cluster_ids_cpu: torch.Tensor
+    metadata_ready_event: torch.cuda.Event
+    reuse_ready_event: torch.cuda.Event
+    slot: _PinnedSelectionSlot = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -553,6 +589,7 @@ class _FullVerificationTransferBuffer:
         self,
         pool: _LayerClusterPagePool,
         logical_page_ids: torch.Tensor,
+        logical_page_ids_cpu: torch.Tensor,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -570,11 +607,12 @@ class _FullVerificationTransferBuffer:
             raise ValueError("Logical page IDs must be on the transfer device")
         if logical_page_ids.dtype not in (torch.int32, torch.int64):
             raise ValueError("Logical page IDs must use an integral dtype")
-
-        logical_page_ids_cpu = logical_page_ids.detach().to(
-            device="cpu",
-            dtype=torch.int64,
-        )
+        if logical_page_ids_cpu.device.type != "cpu":
+            raise ValueError("CPU logical page IDs must reside on CPU")
+        if logical_page_ids_cpu.dtype != torch.int64:
+            raise ValueError("CPU logical page IDs must use int64")
+        if logical_page_ids_cpu.shape != logical_page_ids.shape:
+            raise ValueError("CPU and GPU logical page layouts do not match")
         valid_page_mask_cpu = logical_page_ids_cpu >= 0
         source_page_ids = logical_page_ids_cpu[valid_page_mask_cpu].contiguous()
         num_pages = source_page_ids.numel()
@@ -654,37 +692,23 @@ class _FullVerificationTransferBuffer:
 
 
 class RetroSpecClusterPageStore:
-    """Per-layer secondary KV store organized by token clusters.
+    """CPU cluster-page backing store with a bounded GPU resident cache."""
 
-    gpu_reference stores complete cluster pages on the model CUDA device.
-
-    cpu_offload stores complete cluster pages in CPU memory. When supported,
-    pinned memory enables asynchronous host-to-device admission into a bounded
-    GPU resident cluster cache.
-    """
+    _RESIDENT_PREFETCH_RING_SIZE = 2
 
     def __init__(
         self,
         page_size: int,
-        storage_mode: RetroSpecClusterStorageMode = "gpu_reference",
         pin_memory: bool = False,
         cache_ratio: float = 0.0,
     ) -> None:
         if page_size <= 0:
             raise ValueError("page_size must be positive")
-        if storage_mode not in (
-            "gpu_reference",
-            "cpu_offload",
-        ):
-            raise ValueError(
-                f"Unsupported RetroSpec cluster storage mode: {storage_mode}"
-            )
         if not 0.0 <= cache_ratio <= 1.0:
             raise ValueError("cache_ratio must be between zero and one")
 
         self.page_size = page_size
-        self.storage_mode = storage_mode
-        self.pin_memory = pin_memory if storage_mode == "cpu_offload" else False
+        self.pin_memory = pin_memory
         self.cache_ratio = cache_ratio
 
         self._layer_pools: dict[str, _LayerClusterPagePool] = {}
@@ -720,9 +744,18 @@ class RetroSpecClusterPageStore:
             torch.device, _FullVerificationTransferBuffer
         ] = {}
 
-    @property
-    def is_cpu_backed(self) -> bool:
-        return self.storage_mode == "cpu_offload"
+        self._resident_prefetch_streams: dict[torch.device, torch.cuda.Stream] = {}
+        self._resident_prefetch_slots: dict[
+            tuple[torch.device, str], list[_PinnedSelectionSlot]
+        ] = {}
+        self._resident_prefetch_futures: dict[str, deque[Future[None]]] = {}
+        self._resident_prefetch_lock = Lock()
+        self._resident_prefetch_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="retrospec-resident-prefetch",
+        )
+        self._resident_state_lock = RLock()
+        self._closed = False
 
     def _allocate_cluster_ids(
         self,
@@ -1004,7 +1037,7 @@ class RetroSpecClusterPageStore:
         layer_name: str,
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if page_ids.ndim != cluster_ids.ndim + 1:
             raise ValueError("Cluster pages must add one page dimension to cluster IDs")
         if page_ids.shape[:-1] != cluster_ids.shape:
@@ -1015,34 +1048,15 @@ class RetroSpecClusterPageStore:
             raise ValueError("Cluster IDs and page IDs must use one device")
 
         cluster_ids_cpu = self._validate_cluster_ids(layer_name, cluster_ids)
-        page_ids_cpu = page_ids.detach().to(device="cpu", dtype=torch.int64)
+        metadata = self._materialize_cluster_block_metadata_cpu(
+            layer_name,
+            cluster_ids_cpu,
+            page_width=page_ids.shape[-1],
+        )
+        if metadata.page_ids.shape != page_ids.shape:
+            raise RuntimeError("Cluster-page descriptor shape is inconsistent")
 
-        if torch.any(page_ids_cpu < -1).item():
-            raise ValueError("Cluster page IDs must be at least -1")
-
-        descriptors = self._cluster_block_descriptors[layer_name]
-        flat_cluster_ids = cluster_ids_cpu.reshape(-1).tolist()
-        flat_page_ids = page_ids_cpu.reshape(
-            len(flat_cluster_ids), page_ids_cpu.shape[-1]
-        ).tolist()
-
-        for cluster_id, page_row in zip(flat_cluster_ids, flat_page_ids):
-            logical_pages = tuple(page_id for page_id in page_row if page_id >= 0)
-
-            if cluster_id < 0:
-                if logical_pages:
-                    raise ValueError(
-                        "A padded cluster ID cannot reference logical pages"
-                    )
-                continue
-
-            expected_pages = descriptors[cluster_id].page_ids
-            if logical_pages != expected_pages:
-                raise RuntimeError(
-                    "Cluster page descriptor does not match its stable cluster ID"
-                )
-
-        return cluster_ids_cpu
+        return cluster_ids_cpu, metadata.page_ids
 
     def max_pages_per_cluster(
         self,
@@ -1069,9 +1083,40 @@ class RetroSpecClusterPageStore:
     ) -> RetroSpecClusterBlockMetadata:
         """Materialize CPU-owned block descriptors for an active selection."""
         cluster_ids_cpu = self._validate_cluster_ids(layer_name, cluster_ids)
+        metadata = self._materialize_cluster_block_metadata_cpu(
+            layer_name,
+            cluster_ids_cpu,
+        )
+        target_device = cluster_ids.device if device is None else device
+
+        if target_device.type == "cpu":
+            return metadata
+
+        return RetroSpecClusterBlockMetadata(
+            page_ids=metadata.page_ids.to(
+                device=target_device,
+                non_blocking=self.pin_memory,
+            ),
+            page_token_counts=metadata.page_token_counts.to(
+                device=target_device,
+                non_blocking=self.pin_memory,
+            ),
+        )
+
+    def _materialize_cluster_block_metadata_cpu(
+        self,
+        layer_name: str,
+        cluster_ids_cpu: torch.Tensor,
+        page_width: int | None = None,
+    ) -> RetroSpecClusterBlockMetadata:
+        if cluster_ids_cpu.device.type != "cpu":
+            raise ValueError("CPU cluster IDs must reside on CPU")
+        if cluster_ids_cpu.dtype != torch.int64:
+            raise ValueError("CPU cluster IDs must use int64")
+
         descriptors = self._cluster_block_descriptors[layer_name]
 
-        max_pages = max(
+        natural_page_width = max(
             (
                 len(descriptors[cluster_id].page_ids)
                 for cluster_id in cluster_ids_cpu.reshape(-1).tolist()
@@ -1079,6 +1124,14 @@ class RetroSpecClusterPageStore:
             ),
             default=0,
         )
+        if page_width is None:
+            max_pages = natural_page_width
+        else:
+            if page_width < natural_page_width:
+                raise RuntimeError(
+                    "Packed cluster-page width is smaller than the CPU descriptor"
+                )
+            max_pages = page_width
         output_shape = (*cluster_ids_cpu.shape, max_pages)
 
         page_ids_cpu = torch.full(
@@ -1115,13 +1168,9 @@ class RetroSpecClusterPageStore:
                 descriptor.page_token_counts, dtype=torch.int32
             )
 
-        target_device = cluster_ids.device if device is None else device
-
         return RetroSpecClusterBlockMetadata(
-            page_ids=page_ids_cpu.to(device=target_device, non_blocking=False),
-            page_token_counts=page_token_counts_cpu.to(
-                device=target_device, non_blocking=False
-            ),
+            page_ids=page_ids_cpu,
+            page_token_counts=page_token_counts_cpu,
         )
 
     def num_allocated_clusters(
@@ -1130,14 +1179,6 @@ class RetroSpecClusterPageStore:
     ) -> int:
         allocated = self._allocated_cluster_ids.get(layer_name)
         return 0 if allocated is None else len(allocated)
-
-    def _get_storage_device(
-        self,
-        vectors: torch.Tensor,
-    ) -> torch.device:
-        if self.is_cpu_backed:
-            return torch.device("cpu")
-        return vectors.device
 
     def _get_or_create_pool(
         self,
@@ -1154,7 +1195,7 @@ class RetroSpecClusterPageStore:
             metadata_device = vectors.device
 
         head_size = vectors.shape[2]
-        storage_device = self._get_storage_device(vectors)
+        storage_device = torch.device("cpu")
         pool = self._layer_pools.get(layer_name)
 
         if pool is None:
@@ -1184,8 +1225,6 @@ class RetroSpecClusterPageStore:
         self,
         pool: _LayerClusterPagePool,
     ) -> int:
-        if not self.is_cpu_backed:
-            return 0
         if pool.num_allocated_pages == 0:
             return 0
 
@@ -1283,11 +1322,6 @@ class RetroSpecClusterPageStore:
         _LayerClusterPagePool,
         RetroSpecResidentClusterCache,
     ]:
-        if not self.is_cpu_backed:
-            raise RuntimeError(
-                "Resident GPU cache is only used by CPU-backed cluster storage"
-            )
-
         pool = self._layer_pools.get(layer_name)
         if pool is None:
             raise RuntimeError(
@@ -1477,9 +1511,6 @@ class RetroSpecClusterPageStore:
         token_values: torch.Tensor,
     ) -> RetroSpecStagedTokenKV:
         """Start staging token KV before segmented clustering."""
-        if not self.is_cpu_backed:
-            raise RuntimeError("Token KV staging is only used by CPU-backed storage")
-
         self._validate_token_kv_input(token_keys, token_values)
         source_device = token_keys.device
 
@@ -1545,11 +1576,6 @@ class RetroSpecClusterPageStore:
         cluster_token_counts: torch.Tensor,
     ) -> RetroSpecStagedClusterInput:
         """Stage clustering metadata after GPU clustering finishes."""
-        if not self.is_cpu_backed:
-            raise RuntimeError(
-                "Cluster metadata staging is only used by CPU-backed storage"
-            )
-
         self._validate_staged_cluster_metadata(
             staged_token_kv,
             assignments,
@@ -2016,26 +2042,25 @@ class RetroSpecClusterPageStore:
             pool.free(allocated_storage_page_ids)
             raise
 
-        try:
-            cluster_ids = self._allocate_cluster_ids(
-                layer_name=layer_name,
-                request_id=request_id,
-                cluster_start=cluster_start,
-                cluster_token_counts=cluster_token_counts,
-                page_ids=page_ids,
-                page_token_counts=page_token_counts,
-            )
-        except Exception:
-            pool.free(allocated_storage_page_ids)
-            raise
+        cluster_ids: torch.Tensor | None = None
+        with self._resident_state_lock:
+            try:
+                cluster_ids = self._allocate_cluster_ids(
+                    layer_name=layer_name,
+                    request_id=request_id,
+                    cluster_start=cluster_start,
+                    cluster_token_counts=cluster_token_counts,
+                    page_ids=page_ids,
+                    page_token_counts=page_token_counts,
+                )
+                self._resize_resident_cache(layer_name, pool)
+            except Exception:
+                if cluster_ids is not None:
+                    self._free_cluster_ids(layer_name, cluster_ids)
+                pool.free(allocated_storage_page_ids)
+                raise
 
-        try:
-            self._resize_resident_cache(layer_name, pool)
-        except Exception:
-            self._free_cluster_ids(layer_name, cluster_ids)
-            pool.free(allocated_storage_page_ids)
-            raise
-
+        assert cluster_ids is not None
         return RetroSpecClusterBlockTable(cluster_ids=cluster_ids)
 
     def free(
@@ -2043,25 +2068,28 @@ class RetroSpecClusterPageStore:
         layer_name: str,
         block_table: RetroSpecClusterBlockTable,
     ) -> None:
-        pool = self._layer_pools.get(layer_name)
-        if pool is None:
-            raise RuntimeError(
-                f"No RetroSpec page pool exists for layer {layer_name!r}"
+        self.wait_for_resident_prefetches((layer_name,))
+
+        with self._resident_state_lock:
+            pool = self._layer_pools.get(layer_name)
+            if pool is None:
+                raise RuntimeError(
+                    f"No RetroSpec page pool exists for layer {layer_name!r}"
+                )
+
+            block_metadata = self.get_cluster_block_metadata(
+                layer_name=layer_name,
+                cluster_ids=block_table.cluster_ids,
+                device=torch.device("cpu"),
             )
 
-        block_metadata = self.get_cluster_block_metadata(
-            layer_name=layer_name,
-            cluster_ids=block_table.cluster_ids,
-            device=torch.device("cpu"),
-        )
+            resident_cache = self._resident_caches.get(layer_name)
+            if resident_cache is not None:
+                resident_cache.invalidate(block_table.cluster_ids)
 
-        resident_cache = self._resident_caches.get(layer_name)
-        if resident_cache is not None:
-            resident_cache.invalidate(block_table.cluster_ids)
-
-        pool.free(block_metadata.page_ids)
-        self._free_cluster_ids(layer_name, block_table.cluster_ids)
-        self._resize_resident_cache(layer_name, pool)
+            pool.free(block_metadata.page_ids)
+            self._free_cluster_ids(layer_name, block_table.cluster_ids)
+            self._resize_resident_cache(layer_name, pool)
 
     def gather_pages(
         self,
@@ -2176,6 +2204,8 @@ class RetroSpecClusterPageStore:
         pool: _LayerClusterPagePool,
         logical_page_ids: torch.Tensor,
         miss_cluster_mask: torch.Tensor,
+        logical_page_ids_cpu: torch.Tensor,
+        miss_cluster_mask_cpu: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Copy non-resident selected pages into a temporary GPU page pool."""
         if logical_page_ids.ndim < 1:
@@ -2185,14 +2215,14 @@ class RetroSpecClusterPageStore:
         if pool.metadata_device.type != "cuda":
             raise RuntimeError("Temporary cluster-page staging requires CUDA metadata")
 
-        logical_page_ids_cpu = logical_page_ids.detach().to(
-            device="cpu",
-            dtype=torch.int64,
-        )
-        miss_cluster_mask_cpu = miss_cluster_mask.detach().to(
-            device="cpu",
-            dtype=torch.bool,
-        )
+        if logical_page_ids_cpu.device.type != "cpu":
+            raise ValueError("CPU logical page IDs must reside on CPU")
+        if miss_cluster_mask_cpu.device.type != "cpu":
+            raise ValueError("CPU miss mask must reside on CPU")
+        if logical_page_ids_cpu.shape != logical_page_ids.shape:
+            raise ValueError("CPU logical page IDs do not match the GPU layout")
+        if miss_cluster_mask_cpu.shape != miss_cluster_mask.shape:
+            raise ValueError("CPU miss mask does not match the GPU layout")
 
         missing_page_mask_cpu = miss_cluster_mask_cpu.unsqueeze(-1) & (
             logical_page_ids_cpu >= 0
@@ -2246,7 +2276,218 @@ class RetroSpecClusterPageStore:
             staging_value_pages,
         )
 
+    def _get_resident_prefetch_stream(
+        self,
+        device: torch.device,
+    ) -> torch.cuda.Stream:
+        device = self._canonical_cuda_device(device)
+        stream = self._resident_prefetch_streams.get(device)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._resident_prefetch_streams[device] = stream
+        return stream
+
+    def _acquire_resident_prefetch_slot(
+        self,
+        layer_name: str,
+        device: torch.device,
+    ) -> _PinnedSelectionSlot | None:
+        device = self._canonical_cuda_device(device)
+        key = (device, layer_name)
+
+        with self._resident_prefetch_lock:
+            slots = self._resident_prefetch_slots.setdefault(
+                key,
+                [
+                    _PinnedSelectionSlot()
+                    for _ in range(self._RESIDENT_PREFETCH_RING_SIZE)
+                ],
+            )
+            for slot in slots:
+                if not slot.in_use:
+                    slot.in_use = True
+                    return slot
+
+        return None
+
+    def _release_resident_prefetch_slot(
+        self,
+        slot: _PinnedSelectionSlot,
+    ) -> None:
+        with self._resident_prefetch_lock:
+            if not slot.in_use:
+                raise RuntimeError("Resident prefetch slot was already released")
+            slot.in_use = False
+
+    @torch.inference_mode()
+    def _finish_resident_prefetch(
+        self,
+        staged: _StagedResidentPrefetch,
+    ) -> None:
+        try:
+            staged.metadata_ready_event.synchronize()
+
+            with self._resident_state_lock:
+                metadata = self._materialize_cluster_block_metadata_cpu(
+                    staged.layer_name,
+                    staged.cluster_ids_cpu,
+                )
+                pool, resident_cache = self._get_or_create_resident_cache(
+                    staged.layer_name
+                )
+                cluster_groups = self._get_cluster_groups(
+                    staged.layer_name,
+                    staged.cluster_ids_cpu,
+                )
+
+                with torch.cuda.device(pool.metadata_device):
+                    resident_cache.admit(
+                        cluster_ids=staged.cluster_ids_cpu,
+                        page_ids=metadata.page_ids,
+                        cluster_groups=cluster_groups,
+                        allocated_cluster_ids=self._get_allocated_cluster_ids(
+                            staged.layer_name
+                        ),
+                        allocated_page_ids=pool.allocated_page_ids,
+                        backing_key_pages=pool.key_pages,
+                        backing_value_pages=pool.value_pages,
+                        cluster_ids_cpu=staged.cluster_ids_cpu,
+                        page_ids_cpu=metadata.page_ids,
+                        reuse_ready_event=staged.reuse_ready_event,
+                    )
+        finally:
+            self._release_resident_prefetch_slot(staged.slot)
+
+    def _reap_resident_prefetches(
+        self,
+        layer_names: Sequence[str] | None = None,
+        wait: bool = False,
+    ) -> None:
+        if layer_names is None:
+            layer_names = tuple(self._resident_prefetch_futures)
+
+        ready: list[Future[None]] = []
+        with self._resident_prefetch_lock:
+            for layer_name in layer_names:
+                futures = self._resident_prefetch_futures.get(layer_name)
+                if futures is None:
+                    continue
+
+                retained: deque[Future[None]] = deque()
+                while futures:
+                    future = futures.popleft()
+                    if wait or future.done():
+                        ready.append(future)
+                    else:
+                        retained.append(future)
+
+                if retained:
+                    self._resident_prefetch_futures[layer_name] = retained
+                else:
+                    self._resident_prefetch_futures.pop(layer_name, None)
+
+        for future in ready:
+            future.result()
+
+    def prefetch_resident_clusters(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+    ) -> bool:
+        """Queue descriptor parsing and resident admission without host waits."""
+        if self._closed:
+            raise RuntimeError("RetroSpec cluster page store is closed")
+        self._reap_resident_prefetches((layer_name,), wait=False)
+
+        if not self.pin_memory or cluster_ids.numel() == 0:
+            return False
+        if cluster_ids.device.type != "cuda":
+            raise ValueError("Asynchronous resident prefetch requires CUDA cluster IDs")
+        if cluster_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Cluster IDs must use an integral dtype")
+
+        slot = self._acquire_resident_prefetch_slot(
+            layer_name,
+            cluster_ids.device,
+        )
+        if slot is None:
+            return False
+
+        stream = self._get_resident_prefetch_stream(cluster_ids.device)
+        current_stream = torch.cuda.current_stream(cluster_ids.device)
+
+        try:
+            cluster_ids_cpu = slot.reserve(cluster_ids)
+            stream.wait_stream(current_stream)
+
+            with torch.cuda.stream(stream):
+                cluster_ids_cpu.copy_(cluster_ids, non_blocking=True)
+                metadata_ready_event = torch.cuda.Event()
+                metadata_ready_event.record(stream)
+
+            reuse_ready_event = torch.cuda.Event()
+            reuse_ready_event.record(current_stream)
+            cluster_ids.record_stream(stream)
+
+            staged = _StagedResidentPrefetch(
+                layer_name=layer_name,
+                cluster_ids_cpu=cluster_ids_cpu,
+                metadata_ready_event=metadata_ready_event,
+                reuse_ready_event=reuse_ready_event,
+                slot=slot,
+            )
+            future = self._resident_prefetch_executor.submit(
+                self._finish_resident_prefetch,
+                staged,
+            )
+
+            with self._resident_prefetch_lock:
+                self._resident_prefetch_futures.setdefault(
+                    layer_name,
+                    deque(),
+                ).append(future)
+
+            return True
+        except BaseException:
+            stream.synchronize()
+            self._release_resident_prefetch_slot(slot)
+            raise
+
+    def wait_for_resident_prefetches(
+        self,
+        layer_names: Sequence[str] | None = None,
+    ) -> None:
+        self._reap_resident_prefetches(layer_names, wait=True)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+
+        self._closed = True
+        try:
+            self.wait_for_resident_prefetches()
+        finally:
+            self._resident_prefetch_executor.shutdown(wait=True)
+
     def resolve_cluster_blocks(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+        logical_page_ids: torch.Tensor,
+        mode: RetroSpecClusterResolveMode = "verification",
+    ) -> RetroSpecResolvedClusterPages:
+        if mode == "verification":
+            self.wait_for_resident_prefetches((layer_name,))
+
+        with self._resident_state_lock:
+            return self._resolve_cluster_blocks_locked(
+                layer_name,
+                cluster_ids,
+                logical_page_ids,
+                mode,
+            )
+
+    def _resolve_cluster_blocks_locked(
         self,
         layer_name: str,
         cluster_ids: torch.Tensor,
@@ -2266,7 +2507,7 @@ class RetroSpecClusterPageStore:
         if logical_page_ids.device != cluster_ids.device:
             raise ValueError("Cluster IDs and logical pages must use one device")
 
-        cluster_ids_cpu = self._validate_cluster_blocks(
+        cluster_ids_cpu, logical_page_ids_cpu = self._validate_cluster_blocks(
             layer_name,
             cluster_ids,
             logical_page_ids,
@@ -2279,23 +2520,6 @@ class RetroSpecClusterPageStore:
             )
 
         allocated_cluster_ids = self._get_allocated_cluster_ids(layer_name)
-
-        if not self.is_cpu_backed:
-            staging_page_ids = torch.full_like(logical_page_ids, -1)
-            hit_cluster_mask = cluster_ids >= 0
-
-            return RetroSpecResolvedClusterPages(
-                resident_page_ids=logical_page_ids,
-                staging_page_ids=staging_page_ids,
-                resident_key_pages=pool.key_pages,
-                resident_value_pages=pool.value_pages,
-                staging_key_pages=pool.key_pages[:0],
-                staging_value_pages=pool.value_pages[:0],
-                hit_cluster_mask=hit_cluster_mask,
-                miss_cluster_mask=torch.zeros_like(hit_cluster_mask),
-                hit_gate_ready_mask=hit_cluster_mask,
-                resident_ready_event=None,
-            )
 
         cluster_groups = self._get_cluster_groups(
             layer_name,
@@ -2312,6 +2536,8 @@ class RetroSpecClusterPageStore:
             allocated_page_ids=pool.allocated_page_ids,
             touch=True,
             include_pending=verification,
+            cluster_ids_cpu=cluster_ids_cpu,
+            page_ids_cpu=logical_page_ids_cpu,
         )
 
         if verification:
@@ -2323,8 +2549,10 @@ class RetroSpecClusterPageStore:
                 pool,
                 logical_page_ids,
                 resident_access.miss_cluster_mask,
+                resident_access.logical_page_ids_cpu,
+                resident_access.miss_cluster_mask_cpu,
             )
-            resident_ready_event = resident_cache.pending_copy_event()
+            resident_ready_event = resident_access.ready_event
         else:
             staging_page_ids = torch.full_like(logical_page_ids, -1)
             staging_key_pages = resident_cache.key_pages[:0]
@@ -2347,48 +2575,33 @@ class RetroSpecClusterPageStore:
     def resolve_full_verification_blocks(
         self,
         layer_name: str,
-        cluster_ids: torch.Tensor,
         logical_page_ids: torch.Tensor,
+        logical_page_ids_cpu: torch.Tensor,
     ) -> RetroSpecResolvedClusterPages:
         """Stage every clustered KV page required by full verification."""
-        if logical_page_ids.shape[:-1] != cluster_ids.shape:
-            raise ValueError("Logical page-table shape does not match cluster IDs")
-        if logical_page_ids.device != cluster_ids.device:
-            raise ValueError("Cluster IDs and logical pages must use one device")
+        self.wait_for_resident_prefetches((layer_name,))
 
-        if not self.is_cpu_backed:
-            return self.resolve_cluster_blocks(
-                layer_name=layer_name,
-                cluster_ids=cluster_ids,
+        with self._resident_state_lock:
+            pool = self._layer_pools.get(layer_name)
+            if pool is None:
+                raise RuntimeError(
+                    f"No RetroSpec page pool exists for layer {layer_name!r}"
+                )
+
+            transfer_buffer = self._get_full_verification_buffer(pool)
+            (
+                staging_page_ids,
+                staging_key_pages,
+                staging_value_pages,
+                staging_ready_event,
+            ) = transfer_buffer.stage(
+                pool=pool,
                 logical_page_ids=logical_page_ids,
-                mode="verification",
+                logical_page_ids_cpu=logical_page_ids_cpu,
             )
-
-        self._validate_cluster_blocks(
-            layer_name,
-            cluster_ids,
-            logical_page_ids,
-        )
-
-        pool = self._layer_pools.get(layer_name)
-        if pool is None:
-            raise RuntimeError(
-                f"No RetroSpec page pool exists for layer {layer_name!r}"
-            )
-
-        transfer_buffer = self._get_full_verification_buffer(pool)
-        (
-            staging_page_ids,
-            staging_key_pages,
-            staging_value_pages,
-            staging_ready_event,
-        ) = transfer_buffer.stage(
-            pool=pool,
-            logical_page_ids=logical_page_ids,
-        )
 
         resident_page_ids = torch.full_like(logical_page_ids, -1)
-        valid_cluster_mask = (cluster_ids >= 0) & (logical_page_ids >= 0).any(dim=-1)
+        valid_cluster_mask = (logical_page_ids >= 0).any(dim=-1)
 
         return RetroSpecResolvedClusterPages(
             resident_page_ids=resident_page_ids,
@@ -2411,24 +2624,27 @@ class RetroSpecClusterPageStore:
         page_ids: torch.Tensor,
         touch: bool = True,
     ) -> RetroSpecResidentPageAccess:
-        cluster_ids_cpu = self._validate_cluster_blocks(
-            layer_name,
-            cluster_ids,
-            page_ids,
-        )
-        pool, resident_cache = self._get_or_create_resident_cache(layer_name)
-
-        return resident_cache.lookup(
-            cluster_ids=cluster_ids,
-            page_ids=page_ids,
-            cluster_groups=self._get_cluster_groups(
+        with self._resident_state_lock:
+            cluster_ids_cpu, page_ids_cpu = self._validate_cluster_blocks(
                 layer_name,
-                cluster_ids_cpu,
-            ),
-            allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
-            allocated_page_ids=pool.allocated_page_ids,
-            touch=touch,
-        )
+                cluster_ids,
+                page_ids,
+            )
+            pool, resident_cache = self._get_or_create_resident_cache(layer_name)
+
+            return resident_cache.lookup(
+                cluster_ids=cluster_ids,
+                page_ids=page_ids,
+                cluster_groups=self._get_cluster_groups(
+                    layer_name,
+                    cluster_ids_cpu,
+                ),
+                allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
+                allocated_page_ids=pool.allocated_page_ids,
+                touch=touch,
+                cluster_ids_cpu=cluster_ids_cpu,
+                page_ids_cpu=page_ids_cpu,
+            )
 
     def admit_resident_clusters(
         self,
@@ -2436,25 +2652,28 @@ class RetroSpecClusterPageStore:
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
     ) -> RetroSpecResidentPageAccess:
-        cluster_ids_cpu = self._validate_cluster_blocks(
-            layer_name,
-            cluster_ids,
-            page_ids,
-        )
-        pool, resident_cache = self._get_or_create_resident_cache(layer_name)
-
-        return resident_cache.admit(
-            cluster_ids=cluster_ids,
-            page_ids=page_ids,
-            cluster_groups=self._get_cluster_groups(
+        with self._resident_state_lock:
+            cluster_ids_cpu, page_ids_cpu = self._validate_cluster_blocks(
                 layer_name,
-                cluster_ids_cpu,
-            ),
-            allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
-            allocated_page_ids=pool.allocated_page_ids,
-            backing_key_pages=pool.key_pages,
-            backing_value_pages=pool.value_pages,
-        )
+                cluster_ids,
+                page_ids,
+            )
+            pool, resident_cache = self._get_or_create_resident_cache(layer_name)
+
+            return resident_cache.admit(
+                cluster_ids=cluster_ids,
+                page_ids=page_ids,
+                cluster_groups=self._get_cluster_groups(
+                    layer_name,
+                    cluster_ids_cpu,
+                ),
+                allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
+                allocated_page_ids=pool.allocated_page_ids,
+                backing_key_pages=pool.key_pages,
+                backing_value_pages=pool.value_pages,
+                cluster_ids_cpu=cluster_ids_cpu,
+                page_ids_cpu=page_ids_cpu,
+            )
 
     def admit_staged_clusters(
         self,
@@ -2465,26 +2684,29 @@ class RetroSpecClusterPageStore:
         staging_key_pages: torch.Tensor,
         staging_value_pages: torch.Tensor,
     ) -> RetroSpecResidentPageAccess:
-        cluster_ids_cpu = self._validate_cluster_blocks(
-            layer_name,
-            cluster_ids,
-            logical_page_ids,
-        )
-        pool, resident_cache = self._get_or_create_resident_cache(layer_name)
-
-        return resident_cache.admit_staged(
-            cluster_ids=cluster_ids,
-            page_ids=logical_page_ids,
-            cluster_groups=self._get_cluster_groups(
+        with self._resident_state_lock:
+            cluster_ids_cpu, page_ids_cpu = self._validate_cluster_blocks(
                 layer_name,
-                cluster_ids_cpu,
-            ),
-            allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
-            allocated_page_ids=pool.allocated_page_ids,
-            staging_page_ids=staging_page_ids,
-            staging_key_pages=staging_key_pages,
-            staging_value_pages=staging_value_pages,
-        )
+                cluster_ids,
+                logical_page_ids,
+            )
+            pool, resident_cache = self._get_or_create_resident_cache(layer_name)
+
+            return resident_cache.admit_staged(
+                cluster_ids=cluster_ids,
+                page_ids=logical_page_ids,
+                cluster_groups=self._get_cluster_groups(
+                    layer_name,
+                    cluster_ids_cpu,
+                ),
+                allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
+                allocated_page_ids=pool.allocated_page_ids,
+                staging_page_ids=staging_page_ids,
+                staging_key_pages=staging_key_pages,
+                staging_value_pages=staging_value_pages,
+                cluster_ids_cpu=cluster_ids_cpu,
+                page_ids_cpu=page_ids_cpu,
+            )
 
     def get_resident_page_storage(
         self,

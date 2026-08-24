@@ -26,12 +26,7 @@ from .execution import (
     RetroSpecExactPageKVSource,
     RetroSpecExactPrimaryKVSource,
 )
-from .index import (
-    RetroSpecAttentionLevel,
-    RetroSpecAttentionSelection,
-    RetroSpecBlockIndex,
-    RetroSpecSelectionPlan,
-)
+from .index import RetroSpecAttentionLevel
 from .segmented_index import (
     RetroSpecFullVerificationPlan,
     RetroSpecSegmentedTokenIndex,
@@ -40,8 +35,8 @@ from .segmented_index import (
 )
 from .weighted_attention import merge_weighted_estimation
 
-RetroSpecSelection = RetroSpecAttentionSelection | RetroSpecTokenAttentionSelection
-RetroSpecPlan = RetroSpecSelectionPlan | RetroSpecTokenSelectionPlan
+RetroSpecSelection = RetroSpecTokenAttentionSelection
+RetroSpecPlan = RetroSpecTokenSelectionPlan
 
 
 @dataclass(frozen=True)
@@ -122,39 +117,24 @@ class RetroSpecSparseAttention:
         self.num_speculative_tokens = config.num_speculative_tokens
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
 
-        if config.retrospec_index_mode == "block_mean":
-            self.index = RetroSpecBlockIndex(
-                block_size=block_size,
-                num_speculative_tokens=config.num_speculative_tokens,
-                retrieval_ratio=config.retrospec_retrieval_ratio,
-                estimation_ratio=config.retrospec_estimation_ratio,
-            )
-        else:
-            self.index = RetroSpecSegmentedTokenIndex(
-                block_size=block_size,
-                num_speculative_tokens=config.num_speculative_tokens,
-                retrieval_ratio=config.retrospec_retrieval_ratio,
-                estimation_ratio=config.retrospec_estimation_ratio,
-                prefill_segment_size_tokens=config.retrospec_index_segment_size,
-                generation_update_interval=config.retrospec_index_update_interval,
-                blocks_per_cluster=config.retrospec_blocks_per_cluster,
-                num_kmeans_iterations=config.retrospec_kmeans_iterations,
-                max_pending_cluster_builds=config.retrospec_max_pending_cluster_builds,
-                cache_mode=config.retrospec_cache_mode,
-                cache_ratio=config.retrospec_cache_ratio,
-                pin_memory=(
-                    config.retrospec_cache_mode == "cpu_offload"
-                    and is_pin_memory_available()
-                ),
-                max_resident_requests=vllm_config.scheduler_config.max_num_seqs,
-            )
+        self.index = RetroSpecSegmentedTokenIndex(
+            block_size=block_size,
+            num_speculative_tokens=config.num_speculative_tokens,
+            retrieval_ratio=config.retrospec_retrieval_ratio,
+            estimation_ratio=config.retrospec_estimation_ratio,
+            prefill_segment_size_tokens=config.retrospec_index_segment_size,
+            generation_update_interval=config.retrospec_index_update_interval,
+            blocks_per_cluster=config.retrospec_blocks_per_cluster,
+            num_kmeans_iterations=config.retrospec_kmeans_iterations,
+            max_pending_cluster_builds=config.retrospec_max_pending_cluster_builds,
+            cache_ratio=config.retrospec_cache_ratio,
+            pin_memory=device.type == "cuda" and is_pin_memory_available(),
+            max_resident_requests=vllm_config.scheduler_config.max_num_seqs,
+        )
 
-        self.exact_execution_buffer: RetroSpecExactExecutionBuffer | None = None
-
-        if isinstance(self.index, RetroSpecSegmentedTokenIndex):
-            self.exact_execution_buffer = RetroSpecExactExecutionBuffer(
-                page_size=block_size
-            )
+        self.exact_execution_buffer = RetroSpecExactExecutionBuffer(
+            page_size=block_size
+        )
 
         self.proposal_request_ids: tuple[str, ...] = ()
 
@@ -193,10 +173,7 @@ class RetroSpecSparseAttention:
 
     @property
     def uses_full_verification_offload(self) -> bool:
-        return (
-            isinstance(self.index, RetroSpecSegmentedTokenIndex)
-            and self.index.cluster_store.is_cpu_backed
-        )
+        return True
 
     @contextmanager
     def index_update_context(
@@ -234,10 +211,7 @@ class RetroSpecSparseAttention:
         if any(row < 0 or row >= len(request_ids) for row in build_rows):
             raise IndexError("RetroSpec index build row is out of range")
 
-        segmented_index = (
-            self.index if isinstance(self.index, RetroSpecSegmentedTokenIndex) else None
-        )
-        if segmented_index is not None and segmented_index.has_staged_updates:
+        if self.index.has_staged_updates:
             raise RuntimeError("A previous RetroSpec update left staged index changes")
 
         self.index_update_active = True
@@ -250,12 +224,10 @@ class RetroSpecSparseAttention:
         try:
             yield
         except BaseException:
-            if segmented_index is not None:
-                segmented_index.discard_staged_updates()
+            self.index.discard_staged_updates()
             raise
         else:
-            if segmented_index is not None:
-                segmented_index.flush_staged_updates()
+            self.index.flush_staged_updates()
         finally:
             self.index_update_active = False
             self.index_update_request_ids = ()
@@ -271,9 +243,6 @@ class RetroSpecSparseAttention:
         is_prefill: bool,
         prefill_complete: bool,
     ) -> bool:
-        if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
-            return False
-
         return self.index.needs_update(
             request_id,
             seq_len,
@@ -297,8 +266,6 @@ class RetroSpecSparseAttention:
     ) -> list[tuple[str, int, int]]:
         """Return newly replaceable native block ranges."""
         if not self.uses_full_verification_offload:
-            return []
-        if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
             return []
         if self.index.has_staged_updates:
             raise RuntimeError("Cannot retire KV blocks before index commit")
@@ -329,8 +296,7 @@ class RetroSpecSparseAttention:
     def remove_requests(self, request_ids: Sequence[str]) -> None:
         request_ids = tuple(request_ids)
 
-        if isinstance(self.index, RetroSpecSegmentedTokenIndex):
-            self.index.remove_requests(request_ids)
+        self.index.remove_requests(request_ids)
 
         for request_id in request_ids:
             self._retired_block_ends.pop(request_id, None)
@@ -419,6 +385,7 @@ class RetroSpecSparseAttention:
 
         self.original_forwards.clear()
         self.forward_wrappers.clear()
+        self.index.cluster_store.close()
 
     @contextmanager
     def full_verification_context(
@@ -469,7 +436,6 @@ class RetroSpecSparseAttention:
                     f"behind retired KV boundary {retired_end}"
                 )
 
-        assert isinstance(self.index, RetroSpecSegmentedTokenIndex)
         self.index.prepare_full_verification(
             request_ids,
             context_lens,
@@ -501,8 +467,7 @@ class RetroSpecSparseAttention:
                 "RetroSpec attention must be installed before proposing."
             )
         request_ids = tuple(request_ids)
-        if isinstance(self.index, RetroSpecSegmentedTokenIndex):
-            self.index.begin_proposal(request_ids)
+        self.index.begin_proposal(request_ids)
 
         try:
             self.proposal_request_ids = request_ids
@@ -521,8 +486,7 @@ class RetroSpecSparseAttention:
             self.parallel_plan_rows = ()
             self.attention_mass_layer_count = 0
 
-            if isinstance(self.index, RetroSpecSegmentedTokenIndex):
-                self.index.end_proposal()
+            self.index.end_proposal()
             self.proposal_request_ids = ()
 
             for plans in self.selection_plans:
@@ -641,10 +605,6 @@ class RetroSpecSparseAttention:
             plans.append(plan)
             request_indices.append(request_index)
 
-        first_plan = plans[0]
-        if any(type(plan) is not type(first_plan) for plan in plans[1:]):
-            raise RuntimeError("Parallel verification plans use different formats.")
-
         def gather(name: str) -> torch.Tensor:
             rows = [
                 getattr(plan, name)[request_index : request_index + 1]
@@ -658,47 +618,25 @@ class RetroSpecSparseAttention:
                     "incompatible per-step shapes."
                 ) from exc
 
-        if isinstance(first_plan, RetroSpecTokenSelectionPlan):
-            return RetroSpecTokenSelectionPlan(
-                layer_name=layer_name,
-                primary_exact_token_indices=gather("primary_exact_token_indices"),
-                primary_exact_token_mask=gather("primary_exact_token_mask"),
-                sparse_exact_cluster_ids=gather("sparse_exact_cluster_ids"),
-                sparse_exact_page_ids=gather("sparse_exact_page_ids"),
-                sparse_exact_page_token_counts=gather("sparse_exact_page_token_counts"),
-                sparse_estimation_keys=gather("sparse_estimation_keys"),
-                sparse_estimation_values=gather("sparse_estimation_values"),
-                sparse_estimation_token_counts=gather("sparse_estimation_token_counts"),
-                expanded_exact_cluster_ids=gather("expanded_exact_cluster_ids"),
-                expanded_exact_page_ids=gather("expanded_exact_page_ids"),
-                expanded_exact_page_token_counts=gather(
-                    "expanded_exact_page_token_counts"
-                ),
-                expanded_estimation_keys=gather("expanded_estimation_keys"),
-                expanded_estimation_values=gather("expanded_estimation_values"),
-                expanded_estimation_token_counts=gather(
-                    "expanded_estimation_token_counts"
-                ),
-                sparse_attn=gather("sparse_attn"),
-                expanded_attn=gather("expanded_attn"),
-            )
-
-        if isinstance(first_plan, RetroSpecSelectionPlan):
-            return RetroSpecSelectionPlan(
-                sparse_exact_indices=gather("sparse_exact_indices"),
-                sparse_exact_mask=gather("sparse_exact_mask"),
-                sparse_estimation_indices=gather("sparse_estimation_indices"),
-                sparse_estimation_mask=gather("sparse_estimation_mask"),
-                expanded_exact_indices=gather("expanded_exact_indices"),
-                expanded_exact_mask=gather("expanded_exact_mask"),
-                expanded_estimation_indices=gather("expanded_estimation_indices"),
-                expanded_estimation_mask=gather("expanded_estimation_mask"),
-                valid_token_counts=gather("valid_token_counts"),
-                sparse_attn=gather("sparse_attn"),
-                expanded_attn=gather("expanded_attn"),
-            )
-
-        raise TypeError(f"Unsupported RetroSpec plan type: {type(first_plan)!r}")
+        return RetroSpecTokenSelectionPlan(
+            layer_name=layer_name,
+            primary_exact_token_indices=gather("primary_exact_token_indices"),
+            primary_exact_token_mask=gather("primary_exact_token_mask"),
+            sparse_exact_cluster_ids=gather("sparse_exact_cluster_ids"),
+            sparse_exact_page_ids=gather("sparse_exact_page_ids"),
+            sparse_exact_page_token_counts=gather("sparse_exact_page_token_counts"),
+            sparse_estimation_keys=gather("sparse_estimation_keys"),
+            sparse_estimation_values=gather("sparse_estimation_values"),
+            sparse_estimation_token_counts=gather("sparse_estimation_token_counts"),
+            expanded_exact_cluster_ids=gather("expanded_exact_cluster_ids"),
+            expanded_exact_page_ids=gather("expanded_exact_page_ids"),
+            expanded_exact_page_token_counts=gather("expanded_exact_page_token_counts"),
+            expanded_estimation_keys=gather("expanded_estimation_keys"),
+            expanded_estimation_values=gather("expanded_estimation_values"),
+            expanded_estimation_token_counts=gather("expanded_estimation_token_counts"),
+            sparse_attn=gather("sparse_attn"),
+            expanded_attn=gather("expanded_attn"),
+        )
 
     def _maybe_update_index(
         self,
@@ -706,11 +644,7 @@ class RetroSpecSparseAttention:
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
     ) -> None:
-        if (
-            not self.index_update_active
-            or not self.index_update_build_rows
-            or not isinstance(self.index, RetroSpecSegmentedTokenIndex)
-        ):
+        if not self.index_update_active or not self.index_update_build_rows:
             return
 
         key_cache, value_cache = kv_cache.unbind(0)
@@ -1230,10 +1164,6 @@ class RetroSpecSparseAttention:
         batch = self.full_verification_batch
         if batch is None:
             raise RuntimeError("No full-verification batch is active")
-        if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
-            raise RuntimeError("Full verification requires the segmented index")
-        if self.exact_execution_buffer is None:
-            raise RuntimeError("RetroSpec exact execution buffer is not initialized")
         if not attn_metadata.causal:
             raise RuntimeError("Full verification requires causal decoder attention")
 
@@ -1301,16 +1231,12 @@ class RetroSpecSparseAttention:
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
     ) -> tuple[RetroSpecExactKVSource, RetroSpecResolvedClusterPages | None]:
-        if not isinstance(self.index, RetroSpecSegmentedTokenIndex):
-            raise RuntimeError("Token selection requires the segmented index")
-
         full_verification = isinstance(selection, RetroSpecFullVerificationPlan)
 
         if full_verification:
             layer_name = selection.layer_name
             primary_token_indices = selection.primary_exact_token_indices
             primary_token_mask = selection.primary_exact_token_mask
-            exact_cluster_ids = selection.exact_cluster_ids
             exact_page_ids = selection.exact_page_ids
             exact_page_token_counts = selection.exact_page_token_counts
             resolved_pages = None
@@ -1328,8 +1254,8 @@ class RetroSpecSparseAttention:
                 resolved_pages = (
                     self.index.cluster_store.resolve_full_verification_blocks(
                         layer_name=layer_name,
-                        cluster_ids=exact_cluster_ids,
                         logical_page_ids=exact_page_ids,
+                        logical_page_ids_cpu=selection.exact_page_ids_cpu,
                     )
                 )
             else:
@@ -1375,69 +1301,24 @@ class RetroSpecSparseAttention:
     def _run_exact_attention(
         self,
         impl: FlashAttentionImpl,
-        layer: torch.nn.Module,
         query: torch.Tensor,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
         selection: RetroSpecSelection,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(selection, RetroSpecTokenAttentionSelection):
-            if not isinstance(
-                self.index,
-                RetroSpecSegmentedTokenIndex,
-            ):
-                raise RuntimeError("Token selection requires the segmented index")
-
-            if query.device.type != "cuda" or query.dtype not in (
-                torch.float16,
-                torch.bfloat16,
-            ):
-                exact_keys, exact_values, exact_token_mask = (
-                    self.index.materialize_exact_reference(
-                        selection,
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table,
-                    )
+        if query.device.type != "cuda" or query.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            exact_keys, exact_values, exact_token_mask = (
+                self.index.materialize_exact_reference(
+                    selection,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_table,
                 )
-
-                if (
-                    self.mode
-                    in (
-                        RetroSpecAttentionMode.SPARSE_VERIFY,
-                        RetroSpecAttentionMode.EXPANDED_VERIFY,
-                    )
-                    and query.device.type == "cuda"
-                    and self.index.cluster_store.is_cpu_backed
-                    and selection.exact_page_ids.numel()
-                ):
-                    self.index.cluster_store.admit_resident_clusters(
-                        layer_name=selection.plan.layer_name,
-                        cluster_ids=selection.exact_cluster_ids,
-                        page_ids=selection.exact_page_ids,
-                    )
-
-                return self._run_grouped_reference_attention(
-                    impl,
-                    query,
-                    exact_keys,
-                    exact_values,
-                    exact_token_mask.to(torch.int32),
-                )
-
-            if self.exact_execution_buffer is None:
-                raise RuntimeError(
-                    "RetroSpec exact execution buffer is not initialized"
-                )
-
-            source, resolved_pages = self._resolve_exact_kv_source(
-                selection=selection,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                block_table=attn_metadata.block_table,
             )
-            execution = self.exact_execution_buffer.pack(source)
 
             if (
                 self.mode
@@ -1445,111 +1326,64 @@ class RetroSpecSparseAttention:
                     RetroSpecAttentionMode.SPARSE_VERIFY,
                     RetroSpecAttentionMode.EXPANDED_VERIFY,
                 )
-                and self.index.cluster_store.is_cpu_backed
+                and query.device.type == "cuda"
                 and selection.exact_page_ids.numel()
             ):
-                if resolved_pages is None:
-                    raise RuntimeError(
-                        "Verification cache update requires resolved cluster pages"
-                    )
-
-                self.index.cluster_store.admit_staged_clusters(
+                self.index.cluster_store.admit_resident_clusters(
                     layer_name=selection.plan.layer_name,
                     cluster_ids=selection.exact_cluster_ids,
-                    logical_page_ids=selection.exact_page_ids,
-                    staging_page_ids=resolved_pages.staging_page_ids,
-                    staging_key_pages=resolved_pages.staging_key_pages,
-                    staging_value_pages=resolved_pages.staging_value_pages,
+                    page_ids=selection.exact_page_ids,
                 )
 
-            return self._run_grouped_flash_exact_attention(
+            return self._run_grouped_reference_attention(
                 impl,
                 query,
-                execution,
+                exact_keys,
+                exact_values,
+                exact_token_mask.to(torch.int32),
             )
 
-        # block_mean mode continues to use the primary vLLM paged KV cache.
-        from vllm.v1.attention.backends.fa_utils import (
-            flash_attn_varlen_func,
+        source, resolved_pages = self._resolve_exact_kv_source(
+            selection=selection,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=attn_metadata.block_table,
         )
+        execution = self.exact_execution_buffer.pack(source)
 
-        batch_size = query.shape[0]
-        descale_shape = (batch_size, impl.num_kv_heads)
+        if (
+            self.mode
+            in (
+                RetroSpecAttentionMode.SPARSE_VERIFY,
+                RetroSpecAttentionMode.EXPANDED_VERIFY,
+            )
+            and selection.exact_page_ids.numel()
+        ):
+            if resolved_pages is None:
+                raise RuntimeError(
+                    "Verification cache update requires resolved cluster pages"
+                )
 
-        q_descale = layer._q_scale.expand(descale_shape)
-        k_descale = layer._k_scale.expand(descale_shape)
-        v_descale = layer._v_scale.expand(descale_shape)
+            self.index.cluster_store.admit_staged_clusters(
+                layer_name=selection.plan.layer_name,
+                cluster_ids=selection.exact_cluster_ids,
+                logical_page_ids=selection.exact_page_ids,
+                staging_page_ids=resolved_pages.staging_page_ids,
+                staging_key_pages=resolved_pages.staging_key_pages,
+                staging_value_pages=resolved_pages.staging_value_pages,
+            )
 
-        exact_output, exact_lse = flash_attn_varlen_func(
-            q=query,
-            k=key_cache,
-            v=value_cache,
-            out=None,
-            cu_seqlens_q=attn_metadata.query_start_loc,
-            max_seqlen_q=attn_metadata.max_query_len,
-            seqused_k=selection.exact_seq_lens,
-            max_seqlen_k=(selection.exact_block_table.shape[1] * self.block_size),
-            softmax_scale=impl.scale,
-            causal=attn_metadata.causal,
-            alibi_slopes=None,
-            window_size=[-1, -1],
-            block_table=selection.exact_block_table,
-            softcap=0.0,
-            return_softmax_lse=True,
-            scheduler_metadata=None,
-            fa_version=impl.vllm_flash_attn_version,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            num_splits=0,
-            s_aux=None,
-        )
-
-        return exact_output, exact_lse
+        return self._run_grouped_flash_exact_attention(impl, query, execution)
 
     @staticmethod
     def _get_grouped_estimation(
         selection: RetroSpecSelection,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return estimation tensors in grouped KV-head layout."""
-        if isinstance(selection, RetroSpecTokenAttentionSelection):
-            return (
-                selection.estimation_keys,
-                selection.estimation_values,
-                selection.estimation_token_counts,
-            )
-
-        # block_mean stores centroids as:
-        #
-        #   [batch, estimates, kv_heads, head_size]
-        #
-        # Both the reference and fused weighted paths consume:
-        #
-        #   [batch, kv_heads, estimates, head_size]
-        estimation_keys = selection.estimation_keys.permute(
-            0,
-            2,
-            1,
-            3,
-        ).contiguous()
-        estimation_values = selection.estimation_values.permute(
-            0,
-            2,
-            1,
-            3,
-        ).contiguous()
-
-        num_kv_heads = estimation_keys.shape[1]
-        estimation_token_counts = (
-            selection.estimation_token_counts[:, None, :]
-            .expand(-1, num_kv_heads, -1)
-            .contiguous()
-        )
-
         return (
-            estimation_keys,
-            estimation_values,
-            estimation_token_counts,
+            selection.estimation_keys,
+            selection.estimation_values,
+            selection.estimation_token_counts,
         )
 
     @classmethod
@@ -1599,31 +1433,17 @@ class RetroSpecSparseAttention:
         key_cache, value_cache = kv_cache.unbind(0)
 
         if self.mode == RetroSpecAttentionMode.DRAFT:
-            if isinstance(
-                self.index,
-                RetroSpecSegmentedTokenIndex,
-            ):
-                selection = self.index.select_segmented(
-                    request_ids=self.proposal_request_ids,
-                    layer_name=layer_name,
-                    query=query,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    block_table=attn_metadata.block_table,
-                    seq_lens=attn_metadata.seq_lens,
-                    active_mask=self.active_mask,
-                    scale=impl.scale,
-                )
-            else:
-                selection = self.index.select(
-                    query,
-                    key_cache,
-                    value_cache,
-                    attn_metadata.block_table,
-                    attn_metadata.seq_lens,
-                    self.active_mask,
-                    impl.scale,
-                )
+            selection = self.index.select_segmented(
+                request_ids=self.proposal_request_ids,
+                layer_name=layer_name,
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                active_mask=self.active_mask,
+                scale=impl.scale,
+            )
             self.selection_plans[self.step_index][layer_name] = selection.plan
         else:
             if self.parallel_plan_rows:
@@ -1650,7 +1470,6 @@ class RetroSpecSparseAttention:
 
         exact_output, exact_lse = self._run_exact_attention(
             impl,
-            layer,
             query,
             key_cache,
             value_cache,
@@ -1698,12 +1517,7 @@ class RetroSpecSparseAttention:
         self.attention_mass_sum[: self.batch_size].add_(selection.attention_mass)
         self.attention_mass_layer_count += 1
 
-        if self.mode == RetroSpecAttentionMode.DRAFT and isinstance(
-            self.index, RetroSpecSegmentedTokenIndex
-        ):
-            if not isinstance(selection.plan, RetroSpecTokenSelectionPlan):
-                raise RuntimeError("Segmented draft produced an incompatible plan")
-
+        if self.mode == RetroSpecAttentionMode.DRAFT:
             self.index.prefetch_sparse_verification(
                 plan=selection.plan,
                 active_mask=self.active_mask,

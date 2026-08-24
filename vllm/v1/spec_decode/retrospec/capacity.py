@@ -22,14 +22,9 @@ class RetroSpecLongContextCapacity:
         return self.native_memory_bytes + self.auxiliary_memory_bytes
 
 
-def uses_retrospec_cpu_offload(vllm_config: VllmConfig) -> bool:
+def is_retrospec_long_context_enabled(vllm_config: VllmConfig) -> bool:
     config = vllm_config.speculative_config
-    return (
-        config is not None
-        and config.method == "retrospec"
-        and config.retrospec_index_mode == "segmented_cluster"
-        and config.retrospec_cache_mode == "cpu_offload"
-    )
+    return config is not None and config.method == "retrospec"
 
 
 def get_retrospec_native_working_set_tokens(
@@ -125,10 +120,8 @@ def build_retrospec_long_context_capacity(
     vllm_config: VllmConfig,
     kv_cache_specs: Mapping[str, KVCacheSpec],
 ) -> RetroSpecLongContextCapacity:
-    if not uses_retrospec_cpu_offload(vllm_config):
-        raise ValueError(
-            "RetroSpec long-context capacity requires CPU-backed segmented storage"
-        )
+    if not is_retrospec_long_context_enabled(vllm_config):
+        raise ValueError("RetroSpec long-context capacity requires RetroSpec")
 
     config = vllm_config.speculative_config
     assert config is not None
