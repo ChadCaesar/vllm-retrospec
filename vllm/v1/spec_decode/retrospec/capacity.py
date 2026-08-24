@@ -189,17 +189,25 @@ def build_retrospec_long_context_capacity(
 
     max_model_len = vllm_config.model_config.max_model_len
 
-    # Persistent cluster IDs, counts and masks use approximately 13 bytes per
-    # cluster; page IDs and counts use 12 bytes per page.
+    # The persistent arena stores an int64 ID, an int32 token count and an
+    # int64 page offset per cluster. Each request/head also owns one trailing
+    # page offset. Page IDs and page token counts use 12 bytes per page, while
+    # request-level cluster counts and indexed ranges use another 20 bytes.
     persistent_cluster_metadata_bytes = sum(
-        total_resident_clusters * spec.num_kv_heads * 13
+        total_resident_clusters * spec.num_kv_heads * 20
+        + max_resident_requests * spec.num_kv_heads * 8
         + cluster_pages_per_head * spec.num_kv_heads * 12
+        + max_resident_requests * 20
         for spec in attention_specs
     )
-    # A proposal/full-verification packed view additionally owns one logical
-    # indexed-token mask per request and layer.
-    packed_cluster_metadata_bytes = persistent_cluster_metadata_bytes + sum(
-        max_resident_requests * max_model_len for _ in attention_specs
+    # Commit 49 retains a compatibility packed view until resident scoring
+    # consumes request slots directly. Packed clusters store ID/count/mask
+    # metadata, padded page metadata and one dense logical-token mask.
+    packed_cluster_metadata_bytes = sum(
+        total_resident_clusters * spec.num_kv_heads * 13
+        + cluster_pages_per_head * spec.num_kv_heads * 12
+        + max_resident_requests * max_model_len
+        for spec in attention_specs
     )
     persistent_index_bytes = cluster_summary_bytes + persistent_cluster_metadata_bytes
     packed_index_bytes = cluster_summary_bytes + packed_cluster_metadata_bytes

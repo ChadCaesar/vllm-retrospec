@@ -36,6 +36,7 @@ def make_index(
         generation_update_interval=generation_update_interval,
         blocks_per_cluster=blocks_per_cluster,
         num_kmeans_iterations=2,
+        max_model_len=64,
         max_pending_cluster_builds=max_pending_cluster_builds,
         cache_ratio=cache_ratio,
         pin_memory=pin_memory,
@@ -1109,17 +1110,30 @@ def test_cpu_offload_keeps_request_indices_after_batch_deactivation():
         assert segment.cluster_values.device.type == "cpu"
         assert segment.cluster_token_counts.device.type == "cpu"
 
-        resident_segments = index._gpu_index_residency.get_resident_segments(
-            "layer", request_id
+    index.begin_proposal(["first", "second"])
+    try:
+        view = index._gpu_index_residency.get_active_view(
+            "layer", ["first", "second"], keys.device
         )
-        assert len(resident_segments) == 1
-        resident = resident_segments[0]
-        assert resident.indexed_start == segment.indexed_start
-        assert resident.indexed_end == segment.indexed_end
-        assert resident.cluster_start == segment.cluster_start
-        assert torch.equal(resident.cluster_keys, segment.cluster_keys)
-        assert torch.equal(resident.cluster_values, segment.cluster_values)
-        assert torch.equal(resident.cluster_token_counts, segment.cluster_token_counts)
+        assert view.arena is not None
+        for row, request_id in enumerate(("first", "second")):
+            segment = index._indices["layer"][request_id].segments[0]
+            slot = int(view.request_slot_ids[row].item())
+            num_clusters = segment.cluster_token_counts.shape[1]
+            assert torch.equal(
+                view.arena.cluster_keys[slot, :, :num_clusters],
+                segment.cluster_keys,
+            )
+            assert torch.equal(
+                view.arena.cluster_values[slot, :, :num_clusters],
+                segment.cluster_values,
+            )
+            assert torch.equal(
+                view.arena.cluster_token_counts[slot, :, :num_clusters],
+                segment.cluster_token_counts,
+            )
+    finally:
+        index.end_proposal()
 
     assert index._gpu_index_residency.resident_request_ids == (
         "first",
@@ -1141,7 +1155,7 @@ def test_cpu_offload_keeps_request_indices_after_batch_deactivation():
 
     index.remove_requests(["first"])
     assert index._gpu_index_residency.resident_request_ids == ("second",)
-    assert index._gpu_index_residency.get_resident_segments("layer", "first") == ()
+    assert index._gpu_index_residency.get_num_clusters("layer", "first") == 0
 
 
 def test_cpu_offload_appends_resident_segments_across_index_updates():
@@ -1150,9 +1164,8 @@ def test_cpu_offload_appends_resident_segments_across_index_updates():
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 10, keys, values, block_table)
 
-    first_segment = index._gpu_index_residency.get_resident_segments(
-        "layer", "request"
-    )[0]
+    first_num_clusters = index._gpu_index_residency.get_num_clusters("layer", "request")
+    first_indexed_end = index._gpu_index_residency.get_indexed_end("layer", "request")
 
     index.begin_proposal(["request"])
     try:
@@ -1163,16 +1176,14 @@ def test_cpu_offload_appends_resident_segments_across_index_updates():
 
     build_index(index, 14, keys, values, block_table)
 
-    resident_segments = index._gpu_index_residency.get_resident_segments(
+    updated_num_clusters = index._gpu_index_residency.get_num_clusters(
         "layer", "request"
     )
-    assert len(resident_segments) == 2
-    assert resident_segments[0] is first_segment
-    assert resident_segments[0].indexed_end == resident_segments[1].indexed_start
-    assert (
-        resident_segments[0].cluster_start + resident_segments[0].cluster_keys.shape[1]
-        == resident_segments[1].cluster_start
-    )
+    updated_indexed_end = index._gpu_index_residency.get_indexed_end("layer", "request")
+    assert first_num_clusters == 2
+    assert updated_num_clusters == 4
+    assert first_indexed_end == 6
+    assert updated_indexed_end == 10
     assert index._gpu_index_residency.num_packed_layers == 0
 
     index.begin_proposal(["request"])
@@ -1586,13 +1597,20 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     ).view(1, -1)
     build_index(index, 10, keys, values, block_table)
 
-    resident = index._gpu_index_residency.get_resident_segments("layer", "request")[0]
-    resident_key_ptr = resident.cluster_keys.data_ptr()
-    assert resident.cluster_keys.device.type == "cuda"
-    assert resident.cluster_values.device.type == "cuda"
-    assert resident.cluster_token_counts.device.type == "cuda"
-    assert resident.cluster_ids.device.type == "cuda"
-    assert resident.cluster_page_ids.device.type == "cuda"
+    index.begin_proposal(["request"])
+    try:
+        resident_view = index._gpu_index_residency.get_active_view(
+            "layer", ["request"], device
+        )
+        assert resident_view.arena is not None
+        resident_key_ptr = resident_view.arena.cluster_keys.data_ptr()
+        assert resident_view.arena.cluster_keys.device.type == "cuda"
+        assert resident_view.arena.cluster_values.device.type == "cuda"
+        assert resident_view.arena.cluster_token_counts.device.type == "cuda"
+        assert resident_view.arena.cluster_ids.device.type == "cuda"
+        assert resident_view.arena.page_ids.device.type == "cuda"
+    finally:
+        index.end_proposal()
     assert index._indices["layer"]["request"].segments[0].cluster_keys.device.type == (
         "cpu"
     )
@@ -1615,8 +1633,15 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     finally:
         index.end_proposal()
 
-    persistent = index._gpu_index_residency.get_resident_segments("layer", "request")[0]
-    assert persistent.cluster_keys.data_ptr() == resident_key_ptr
+    index.begin_proposal(["request"])
+    try:
+        persistent_view = index._gpu_index_residency.get_active_view(
+            "layer", ["request"], device
+        )
+        assert persistent_view.arena is not None
+        assert persistent_view.arena.cluster_keys.data_ptr() == resident_key_ptr
+    finally:
+        index.end_proposal()
     assert index._gpu_index_residency.num_packed_layers == 0
 
     assert cold.resolved_pages is not None
@@ -1725,6 +1750,7 @@ def test_segmented_index_rejects_invalid_configuration(kwargs, message):
         "generation_update_interval": 2,
         "blocks_per_cluster": 1,
         "num_kmeans_iterations": 2,
+        "max_model_len": 64,
     }
     values.update(kwargs)
 

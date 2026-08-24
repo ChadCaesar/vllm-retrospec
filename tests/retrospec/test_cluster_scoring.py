@@ -399,6 +399,7 @@ def test_cluster_selection_workspace_is_reused_and_resized():
         generation_update_interval=64,
         blocks_per_cluster=2,
         num_kmeans_iterations=2,
+        max_model_len=4096,
     )
     query = torch.randn(2, 8, 64, dtype=torch.float16, device="cuda")
     cluster_keys = torch.randn(
@@ -450,6 +451,7 @@ def test_workspace_cluster_selection_matches_allocating_path():
         generation_update_interval=64,
         blocks_per_cluster=2,
         num_kmeans_iterations=2,
+        max_model_len=4096,
     )
     query = torch.randn(2, 8, 64, dtype=torch.float16, device="cuda")
     cluster_keys = torch.randn(

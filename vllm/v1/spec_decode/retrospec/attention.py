@@ -126,6 +126,7 @@ class RetroSpecSparseAttention:
             generation_update_interval=config.retrospec_index_update_interval,
             blocks_per_cluster=config.retrospec_blocks_per_cluster,
             num_kmeans_iterations=config.retrospec_kmeans_iterations,
+            max_model_len=vllm_config.model_config.max_model_len,
             max_pending_cluster_builds=config.retrospec_max_pending_cluster_builds,
             cache_ratio=config.retrospec_cache_ratio,
             pin_memory=device.type == "cuda" and is_pin_memory_available(),

@@ -30,6 +30,8 @@ def make_manager(max_resident_requests: int = 2):
     return RetroSpecGPUIndexResidencyManager(
         pin_memory=False,
         max_resident_requests=max_resident_requests,
+        max_clusters_per_request=16,
+        max_pages_per_head_per_request=32,
     )
 
 
@@ -43,7 +45,7 @@ def make_resident_segment(
 ) -> RetroSpecResidentSegment:
     keys = torch.tensor([[[float(cluster_start + 1)]]])
     values = keys + 10
-    counts = torch.ones(1, 1, dtype=torch.int32)
+    counts = torch.full((1, 1), 2, dtype=torch.int32)
     staged = manager.stage_cluster_summary(keys, values, counts)
     manager.finish_cluster_summary(staged)
 
@@ -115,7 +117,8 @@ def test_resident_segments_survive_batch_deactivation():
     manager.deactivate()
 
     assert manager.num_packed_layers == 0
-    assert manager.get_resident_segments("layer", "request") == (segment,)
+    assert manager.get_num_clusters("layer", "request") == 1
+    assert manager.get_indexed_end("layer", "request") == 4
 
 
 def test_residency_manager_appends_and_invalidates_request_segments():
@@ -132,15 +135,16 @@ def test_residency_manager_appends_and_invalidates_request_segments():
 
     assert manager.resident_request_ids == ("other", "request")
     assert manager.num_resident_layers == 2
-    assert manager.get_resident_segments("layer", "request") == (first, second)
+    assert manager.get_num_clusters("layer", "request") == 2
+    assert manager.get_indexed_end("layer", "request") == 6
 
     manager.invalidate_requests(["other"])
     assert manager.resident_request_ids == ("request",)
-    assert manager.get_resident_segments("layer", "other") == ()
+    assert manager.get_num_clusters("layer", "other") == 0
 
     manager.discard_request_layer("layer", "request")
-    assert manager.get_resident_segments("layer", "request") == ()
-    assert manager.get_resident_segments("other-layer", "request") == (other_layer,)
+    assert manager.get_num_clusters("layer", "request") == 0
+    assert manager.get_num_clusters("other-layer", "request") == 1
 
 
 def test_residency_manager_enforces_persistent_request_capacity_atomically():
@@ -153,8 +157,8 @@ def test_residency_manager_enforces_persistent_request_capacity_atomically():
         manager.publish_resident_segments([second])
 
     assert manager.resident_request_ids == ("first",)
-    assert manager.get_resident_segments("layer", "first") == (first,)
-    assert manager.get_resident_segments("layer", "second") == ()
+    assert manager.get_num_clusters("layer", "first") == 1
+    assert manager.get_num_clusters("layer", "second") == 0
 
 
 def test_residency_manager_rejects_noncontiguous_segment_publish():
@@ -170,7 +174,152 @@ def test_residency_manager_rejects_noncontiguous_segment_publish():
     with pytest.raises(RuntimeError, match="indexed token prefix"):
         manager.publish_resident_segments([noncontiguous])
 
-    assert manager.get_resident_segments("layer", "request") == (first,)
+    assert manager.get_num_clusters("layer", "request") == 1
+    assert manager.get_indexed_end("layer", "request") == 4
+
+
+def test_failed_publish_releases_new_request_slot():
+    manager = make_manager(max_resident_requests=1)
+    invalid = make_resident_segment(
+        manager,
+        request_id="invalid",
+        cluster_start=1,
+    )
+
+    with pytest.raises(RuntimeError, match="start at cluster zero"):
+        manager.publish_resident_segments([invalid])
+
+    assert manager.resident_request_ids == ()
+    manager.publish_resident_segments(
+        [make_resident_segment(manager, request_id="replacement")]
+    )
+    assert manager.resident_request_ids == ("replacement",)
+
+
+def test_resident_segment_rejects_inconsistent_cpu_page_descriptors():
+    manager = make_manager()
+    keys = torch.ones(1, 1, 1)
+    staged = manager.stage_cluster_summary(
+        keys,
+        keys,
+        torch.tensor([[2]], dtype=torch.int32),
+    )
+
+    with pytest.raises(ValueError, match="do not match page descriptors"):
+        manager.build_resident_segment(
+            layer_name="layer",
+            request_id="request",
+            indexed_start=2,
+            indexed_end=4,
+            cluster_start=0,
+            staged_summary=staged,
+            cluster_ids=torch.tensor([[0]]),
+            cluster_page_ids=torch.tensor([[[0]]]),
+            cluster_page_token_counts=torch.tensor([[[1]]], dtype=torch.int32),
+        )
+
+
+def test_resident_arena_uses_request_slots_and_ragged_page_offsets():
+    manager = make_manager()
+    keys = torch.tensor(
+        [
+            [[1.0], [2.0], [3.0]],
+            [[4.0], [5.0], [6.0]],
+        ]
+    )
+    values = keys + 10
+    counts = torch.tensor([[3, 1, 0], [1, 3, 1]], dtype=torch.int32)
+    staged = manager.stage_cluster_summary(keys, values, counts)
+    segment = manager.build_resident_segment(
+        layer_name="layer",
+        request_id="request",
+        indexed_start=2,
+        indexed_end=8,
+        cluster_start=0,
+        staged_summary=staged,
+        cluster_ids=torch.tensor([[10, 11, -1], [12, 13, 14]]),
+        cluster_page_ids=torch.tensor(
+            [
+                [[20, 21, -1], [22, -1, -1], [-1, -1, -1]],
+                [[23, -1, -1], [24, 25, -1], [26, -1, -1]],
+            ]
+        ),
+        cluster_page_token_counts=torch.tensor(
+            [
+                [[2, 1, 0], [1, 0, 0], [0, 0, 0]],
+                [[1, 0, 0], [2, 1, 0], [1, 0, 0]],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    manager.publish_resident_segments([segment])
+
+    manager.activate(["request"])
+    try:
+        view = manager.get_active_view("layer", ["request"], torch.device("cpu"))
+        assert view.arena is not None
+        assert view.request_slot_ids.tolist() == [0]
+        assert view.max_num_clusters == 3
+        assert view.max_pages_per_cluster == 2
+
+        arena = view.arena
+        assert arena.indexed_starts[0].item() == 2
+        assert arena.indexed_ends[0].item() == 8
+        assert arena.cluster_page_offsets[0, 0, :4].tolist() == [0, 2, 3, 3]
+        assert arena.cluster_page_offsets[0, 1, :4].tolist() == [0, 1, 3, 4]
+        assert arena.page_ids[0, 0, :3].tolist() == [20, 21, 22]
+        assert arena.page_ids[0, 1, :4].tolist() == [23, 24, 25, 26]
+
+        key_cache = torch.empty(1, 2, 2, 1)
+        packed = manager.materialize_packed(
+            "layer", ["request"], max_num_tokens=10, key_cache=key_cache
+        )
+        assert packed.indexed_token_mask.tolist() == [
+            [False, False, True, True, True, True, True, True, False, False]
+        ]
+        assert packed.cluster_ids.tolist() == [[[10, 11, -1], [12, 13, 14]]]
+        assert packed.cluster_page_ids.tolist() == [
+            [
+                [[20, 21], [22, -1], [-1, -1]],
+                [[23, -1], [24, 25], [26, -1]],
+            ]
+        ]
+    finally:
+        manager.deactivate()
+
+
+def test_request_slot_is_stable_until_removal_and_then_reused():
+    manager = make_manager(max_resident_requests=2)
+    manager.publish_resident_segments(
+        [make_resident_segment(manager, request_id="first")]
+    )
+
+    manager.activate(["first"])
+    try:
+        first_view = manager.get_active_view("layer", ["first"], torch.device("cpu"))
+        first_slot = first_view.request_slot_ids.item()
+    finally:
+        manager.deactivate()
+
+    manager.activate(["first"])
+    try:
+        repeated_view = manager.get_active_view("layer", ["first"], torch.device("cpu"))
+        assert repeated_view.request_slot_ids.item() == first_slot
+    finally:
+        manager.deactivate()
+
+    manager.invalidate_requests(["first"])
+    manager.publish_resident_segments(
+        [make_resident_segment(manager, request_id="replacement")]
+    )
+    manager.activate(["replacement"])
+    try:
+        replacement_view = manager.get_active_view(
+            "layer", ["replacement"], torch.device("cpu")
+        )
+        assert replacement_view.request_slot_ids.item() == first_slot
+    finally:
+        manager.deactivate()
 
 
 def test_cluster_summary_is_copied_to_cpu_authoritative_storage():
@@ -199,6 +348,8 @@ def test_cluster_summary_offloads_asynchronously_to_pinned_cpu_storage():
     manager = RetroSpecGPUIndexResidencyManager(
         pin_memory=True,
         max_resident_requests=2,
+        max_clusters_per_request=16,
+        max_pages_per_head_per_request=32,
     )
     keys = torch.arange(8, dtype=torch.float32, device="cuda").view(1, 2, 4)
     values = keys + 10

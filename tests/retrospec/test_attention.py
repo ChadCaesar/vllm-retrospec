@@ -56,6 +56,7 @@ def make_controller(
             ),
             scheduler_config=SimpleNamespace(max_num_seqs=4),
             cache_config=SimpleNamespace(block_size=2),
+            model_config=SimpleNamespace(max_model_len=64),
         ),
     )
     return RetroSpecSparseAttention(config, torch.device("cpu"))
