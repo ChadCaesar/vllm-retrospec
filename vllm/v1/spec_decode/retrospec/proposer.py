@@ -150,6 +150,62 @@ class RetroSpecProposer:
             self.num_speculative_tokens, dtype=torch.int64, device=device
         )
 
+        # Fixed-capacity verification control workspace. Model execution still
+        # uses only the compact valid prefix, so inactive pair slots do not
+        # replicate long-context block tables or enter the target model.
+        self._verification_pair_mask = torch.zeros(
+            self.max_parallel_tokens, dtype=torch.bool, device=device
+        )
+        self._verification_prefix = torch.empty(
+            self.max_parallel_tokens, dtype=torch.int64, device=device
+        )
+        self._verification_destinations = torch.empty(
+            self.max_parallel_tokens, dtype=torch.int64, device=device
+        )
+        self._verification_valid_destinations = torch.empty(
+            self.max_parallel_tokens, dtype=torch.int64, device=device
+        )
+        self._verification_flat_indices = torch.arange(
+            self.max_parallel_tokens, dtype=torch.int64, device=device
+        )
+        self._verification_compact_indices = torch.empty(
+            self.max_parallel_tokens, dtype=torch.int64, device=device
+        )
+        self._verification_request_indices = torch.empty(
+            self.max_parallel_tokens, dtype=torch.int64, device=device
+        )
+        self._verification_token_indices = torch.empty(
+            self.max_parallel_tokens, dtype=torch.int64, device=device
+        )
+        self._verification_round_starts = torch.empty(
+            self.max_parallel_tokens, dtype=torch.int32, device=device
+        )
+        self._verification_boundary_candidates = torch.empty(
+            self.max_parallel_tokens, dtype=torch.int64, device=device
+        )
+        self._verification_first_boundaries = torch.empty(
+            self.max_batch_size, dtype=torch.int64, device=device
+        )
+        self._verification_boundary_requests = torch.empty(
+            self.max_batch_size, dtype=torch.int64, device=device
+        )
+        self._verification_expanded_indices = torch.empty(
+            self.max_batch_size, dtype=torch.int64, device=device
+        )
+        self._verification_verified_counts = torch.zeros(
+            self.max_batch_size, dtype=torch.int32, device=device
+        )
+        self._verification_require_full = torch.zeros(
+            self.max_batch_size, dtype=torch.bool, device=device
+        )
+        self._sparse_sampled_token_ids = torch.empty(
+            self.max_parallel_tokens, dtype=torch.int32, device=device
+        )
+        self._expanded_sampled_token_ids = torch.empty(
+            self.max_batch_size, dtype=torch.int32, device=device
+        )
+        self._verification_step_logits: torch.Tensor | None = None
+
         self.backup_next_token_ids = CpuGpuBuffer(
             self.max_batch_size,
             dtype=torch.int32,
@@ -514,6 +570,51 @@ class RetroSpecProposer:
             compute_margin=(self.policy.draft_margin_threshold is not None),
         )
 
+    def _compact_mask_indices(
+        self,
+        mask: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compact true positions into a fixed-capacity output buffer."""
+        if mask.ndim != 1 or mask.dtype != torch.bool:
+            raise ValueError("Compaction mask must be one-dimensional and boolean")
+        workspace_device = self._verification_pair_mask.device
+        if mask.device != workspace_device:
+            raise ValueError("Compaction mask must be on the model device")
+        if output.ndim != 1 or output.dtype != torch.int64:
+            raise ValueError("Compaction output must be one-dimensional int64")
+        if output.device != workspace_device:
+            raise ValueError("Compaction output must be on the model device")
+
+        capacity = mask.shape[0]
+        if capacity > self.max_parallel_tokens or output.shape[0] < capacity:
+            raise ValueError("Compaction exceeds the verification workspace capacity")
+        if capacity == 0:
+            return output[:0]
+
+        flat_indices = self._verification_flat_indices[:capacity]
+        prefix = self._verification_prefix[:capacity]
+        destinations = self._verification_destinations[:capacity]
+        valid_destinations = self._verification_valid_destinations[:capacity]
+        torch.cumsum(mask, dim=0, dtype=torch.int64, out=prefix)
+
+        # The model metadata still needs a host-visible valid-prefix length.
+        num_selected = int(prefix[-1].item())
+
+        # Valid rows occupy the compact prefix. Invalid rows are assigned the
+        # remaining destinations, making destinations a conflict-free
+        # permutation for scatter_.
+        valid_destinations.copy_(prefix)
+        valid_destinations.sub_(1)
+        destinations.copy_(flat_indices)
+        destinations.sub_(prefix)
+        destinations.add_(num_selected)
+        torch.where(mask, valid_destinations, destinations, out=destinations)
+
+        compacted = output[:capacity]
+        compacted.scatter_(0, destinations, flat_indices)
+        return compacted[:num_selected]
+
     def _build_verification_pairs(
         self,
         batch_size: int,
@@ -521,7 +622,7 @@ class RetroSpecProposer:
         draft_counts: torch.Tensor,
         verification_active: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compact active request-token pairs in request-major order."""
+        """Compact active request-token pairs into reusable GPU buffers."""
         if round_start_counts.shape != (batch_size,):
             raise ValueError("round_start_counts must match the verification batch")
         if draft_counts.shape != (batch_size,):
@@ -529,19 +630,48 @@ class RetroSpecProposer:
         if verification_active.shape != (batch_size,):
             raise ValueError("verification_active must match the verification batch")
 
-        token_offsets = self.verification_token_offsets
-        pair_mask = verification_active.unsqueeze(1) & (
-            token_offsets.unsqueeze(0) < draft_counts.unsqueeze(1)
+        capacity = batch_size * self.num_speculative_tokens
+        pair_mask = self._verification_pair_mask[:capacity]
+        pair_mask_2d = pair_mask.view(batch_size, self.num_speculative_tokens)
+        torch.lt(
+            self.verification_token_offsets.unsqueeze(0),
+            draft_counts.unsqueeze(1),
+            out=pair_mask_2d,
         )
-        request_indices, local_token_indices = torch.nonzero(pair_mask, as_tuple=True)
-        token_indices = round_start_counts.index_select(0, request_indices).to(
-            torch.int64
+        pair_mask_2d.logical_and_(verification_active.unsqueeze(1))
+
+        source_indices = self._compact_mask_indices(
+            pair_mask,
+            self._verification_compact_indices,
         )
-        token_indices.add_(local_token_indices)
+        num_pairs = source_indices.shape[0]
+        request_indices = self._verification_request_indices[:num_pairs]
+        token_indices = self._verification_token_indices[:num_pairs]
+
+        torch.div(
+            source_indices,
+            self.num_speculative_tokens,
+            rounding_mode="floor",
+            out=request_indices,
+        )
+        torch.remainder(
+            source_indices,
+            self.num_speculative_tokens,
+            out=token_indices,
+        )
+
+        round_starts = self._verification_round_starts[:num_pairs]
+        torch.index_select(
+            round_start_counts,
+            0,
+            request_indices,
+            out=round_starts,
+        )
+        token_indices.add_(round_starts)
         return request_indices, token_indices
 
-    @staticmethod
     def _find_first_boundary_indices(
+        self,
         batch_size: int,
         request_indices: torch.Tensor,
         boundary_mask: torch.Tensor,
@@ -553,16 +683,12 @@ class RetroSpecProposer:
             raise ValueError("boundary_mask must use boolean dtype")
 
         num_pairs = boundary_mask.shape[0]
-        flat_indices = torch.arange(
-            num_pairs, dtype=torch.int64, device=request_indices.device
-        )
-        boundary_candidates = torch.where(boundary_mask, flat_indices, num_pairs)
-        first_boundary_indices = torch.full(
-            (batch_size,),
-            num_pairs,
-            dtype=torch.int64,
-            device=request_indices.device,
-        )
+        flat_indices = self._verification_flat_indices[:num_pairs]
+        boundary_candidates = self._verification_boundary_candidates[:num_pairs]
+        first_boundary_indices = self._verification_first_boundaries[:batch_size]
+        boundary_candidates.copy_(flat_indices)
+        boundary_candidates.masked_fill_(~boundary_mask, num_pairs)
+        first_boundary_indices.fill_(num_pairs)
         first_boundary_indices.scatter_reduce_(
             0,
             request_indices,
@@ -572,6 +698,27 @@ class RetroSpecProposer:
         )
         return first_boundary_indices
 
+    def _get_verification_step_logits(
+        self,
+        logits: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        workspace = self._verification_step_logits
+        expected_shape = (self.max_batch_size, logits.shape[-1])
+        if (
+            workspace is None
+            or workspace.shape != expected_shape
+            or workspace.dtype != logits.dtype
+            or workspace.device != logits.device
+        ):
+            workspace = torch.empty(
+                expected_shape,
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            self._verification_step_logits = workspace
+        return workspace[:batch_size]
+
     def _sample_parallel_logits(
         self,
         batch_size: int,
@@ -579,25 +726,27 @@ class RetroSpecProposer:
         request_indices: torch.Tensor,
         token_indices: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        output: torch.Tensor,
     ) -> torch.Tensor:
-        sampled_token_ids = torch.empty(
-            logits.shape[0], dtype=torch.int32, device=logits.device
-        )
+        if output.shape[0] < logits.shape[0]:
+            raise ValueError("Sample output exceeds its verification workspace")
+
+        sampled_token_ids = output[: logits.shape[0]]
+        sampled_token_ids.fill_(-1)
 
         for token_index in range(self.num_speculative_tokens):
-            flat_indices = torch.nonzero(
-                token_indices == token_index, as_tuple=False
-            ).flatten()
+            token_mask = self._verification_pair_mask[: token_indices.shape[0]]
+            torch.eq(token_indices, token_index, out=token_mask)
+            flat_indices = self._compact_mask_indices(
+                token_mask,
+                self._verification_compact_indices,
+            )
             if flat_indices.numel() == 0:
                 continue
 
             request_rows = request_indices.index_select(0, flat_indices)
-            step_logits = torch.zeros(
-                batch_size,
-                logits.shape[-1],
-                dtype=logits.dtype,
-                device=logits.device,
-            )
+            step_logits = self._get_verification_step_logits(logits, batch_size)
+            step_logits.zero_()
             step_logits.index_copy_(
                 0, request_rows, logits.index_select(0, flat_indices)
             )
@@ -743,12 +892,18 @@ class RetroSpecProposer:
             top2_logits = torch.topk(logits.float(), k=2, dim=-1).values
             margin = top2_logits[:, 0] - top2_logits[:, 1]
 
+        if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
+            sampled_output = self._sparse_sampled_token_ids
+        else:
+            sampled_output = self._expanded_sampled_token_ids
+
         token_ids = self._sample_parallel_logits(
             batch_size,
             logits,
             request_indices,
             token_indices,
             sampling_metadata,
+            sampled_output,
         )
         return RetroSpecParallelVerificationOutput(
             request_indices=request_indices,
@@ -776,8 +931,8 @@ class RetroSpecProposer:
 
         if request_indices.numel() == 0:
             return RetroSpecVerificationResult(
-                verified_counts=torch.zeros_like(draft_counts),
-                require_full=torch.zeros_like(self.state.active_mask),
+                verified_counts=self._verification_verified_counts[:batch_size].zero_(),
+                require_full=self._verification_require_full[:batch_size].zero_(),
             )
 
         self.state.set_stage(verification_active, RetroSpecStage.SPARSE_VERIFY)
@@ -837,12 +992,15 @@ class RetroSpecProposer:
         )
 
         num_pairs = sparse.request_indices.shape[0]
-        flat_indices = torch.arange(num_pairs, dtype=torch.int64, device=self.device)
+        flat_indices = self._verification_flat_indices[:num_pairs]
         request_boundary_indices = first_boundary_indices.index_select(
             0, sparse.request_indices
         )
         accepted_mask = flat_indices <= request_boundary_indices
-        accepted_flat_indices = torch.nonzero(accepted_mask, as_tuple=False).flatten()
+        accepted_flat_indices = self._compact_mask_indices(
+            accepted_mask,
+            self._verification_compact_indices,
+        )
         accepted_requests = sparse.request_indices.index_select(
             0, accepted_flat_indices
         )
@@ -850,7 +1008,8 @@ class RetroSpecProposer:
         accepted_token_ids = sparse.token_ids.index_select(0, accepted_flat_indices)
         self._draft_token_ids[accepted_requests, accepted_tokens] = accepted_token_ids
 
-        verified_counts = torch.zeros_like(draft_counts)
+        verified_counts = self._verification_verified_counts[:batch_size]
+        verified_counts.zero_()
         verified_counts.scatter_add_(
             0,
             sparse.request_indices,
@@ -858,14 +1017,16 @@ class RetroSpecProposer:
         )
 
         boundary_request_mask = first_boundary_indices < num_pairs
-        boundary_requests = torch.nonzero(
-            boundary_request_mask, as_tuple=False
-        ).flatten()
+        boundary_requests = self._compact_mask_indices(
+            boundary_request_mask,
+            self._verification_boundary_requests,
+        )
         boundary_flat_indices = first_boundary_indices.index_select(
             0, boundary_requests
         )
 
-        require_full = torch.zeros_like(self.state.active_mask)
+        require_full = self._verification_require_full[:batch_size]
+        require_full.zero_()
         sparse_boundary_require_full = sparse_decision.require_full.index_select(
             0, boundary_flat_indices
         )
@@ -879,7 +1040,19 @@ class RetroSpecProposer:
             sparse_decision.require_expanded.index_select(0, boundary_flat_indices)
         )
         run_expanded = sparse_boundary_require_expanded & ~sparse_boundary_require_full
-        expanded_sparse_indices = boundary_flat_indices.masked_select(run_expanded)
+        expanded_boundary_offsets = self._compact_mask_indices(
+            run_expanded,
+            self._verification_compact_indices,
+        )
+        expanded_sparse_indices = self._verification_expanded_indices[
+            : expanded_boundary_offsets.shape[0]
+        ]
+        torch.index_select(
+            boundary_flat_indices,
+            0,
+            expanded_boundary_offsets,
+            out=expanded_sparse_indices,
+        )
 
         if expanded_sparse_indices.numel() > 0:
             expanded_request_indices = sparse.request_indices.index_select(

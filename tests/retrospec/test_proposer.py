@@ -683,6 +683,10 @@ def test_verification_pair_compaction_stays_on_device(device):
 
     assert request_indices.device.type == device.type
     assert token_indices.device.type == device.type
+    assert (
+        request_indices.data_ptr() == proposer._verification_request_indices.data_ptr()
+    )
+    assert token_indices.data_ptr() == proposer._verification_token_indices.data_ptr()
     assert request_indices.tolist() == [0, 0, 0, 2, 3, 3, 3, 3]
     assert token_indices.tolist() == [0, 1, 2, 2, 0, 1, 2, 3]
 
@@ -699,17 +703,52 @@ def test_verification_pair_compaction_stays_on_device(device):
         ),
     ],
 )
+def test_verification_compaction_reuses_fixed_output(device):
+    proposer = RetroSpecProposer(make_vllm_config(), device, make_runner())
+    output = torch.empty(8, dtype=torch.int64, device=device)
+
+    selected = proposer._compact_mask_indices(
+        torch.tensor(
+            [True, False, True, True, False, False, True, False],
+            device=device,
+        ),
+        output,
+    )
+
+    assert selected.device.type == device.type
+    assert selected.data_ptr() == output.data_ptr()
+    assert selected.tolist() == [0, 2, 3, 6]
+
+    empty = proposer._compact_mask_indices(
+        torch.zeros(8, dtype=torch.bool, device=device),
+        output,
+    )
+    assert empty.numel() == 0
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        torch.device("cpu"),
+        pytest.param(
+            torch.device("cuda"),
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is required"
+            ),
+        ),
+    ],
+)
 def test_first_verification_boundary_reduces_by_request(device):
+    proposer = RetroSpecProposer(make_vllm_config(), device, make_runner())
     request_indices = torch.tensor([0, 0, 1, 1, 1, 2], dtype=torch.int64, device=device)
     boundary_mask = torch.tensor(
         [False, True, False, False, True, False], device=device
     )
 
-    first = RetroSpecProposer._find_first_boundary_indices(
-        4, request_indices, boundary_mask
-    )
+    first = proposer._find_first_boundary_indices(4, request_indices, boundary_mask)
 
     assert first.device.type == device.type
+    assert first.data_ptr() == proposer._verification_first_boundaries.data_ptr()
     assert first.tolist() == [1, 4, 6, 6]
 
 
@@ -1312,6 +1351,12 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     assert result.request_indices.tolist() == [1, 0, 1]
     assert result.token_indices.tolist() == [0, 1, 1]
     assert result.token_ids.tolist() == [1, 0, 2]
+    expected_output = (
+        proposer._sparse_sampled_token_ids
+        if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY
+        else proposer._expanded_sampled_token_ids
+    )
+    assert result.token_ids.data_ptr() == expected_output.data_ptr()
     assert (result.margin is not None) is expect_margin
     if result.margin is not None:
         assert result.margin.tolist() == [1.0, 2.0, 3.0]
