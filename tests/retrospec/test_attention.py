@@ -1588,8 +1588,8 @@ def test_parallel_verification_gathers_segmented_token_plan_rows():
         controller.selection_plans[1]["layer"] = step_one
         controller.begin_parallel_step(
             RetroSpecAttentionMode.EXPANDED_VERIFY,
-            request_indices=[1, 0, 1],
-            token_indices=[0, 1, 1],
+            request_indices=torch.tensor([1, 0, 1], dtype=torch.int64),
+            token_indices=torch.tensor([0, 1, 1], dtype=torch.int64),
         )
 
         plan = controller._gather_parallel_plan("layer")
@@ -1603,6 +1603,24 @@ def test_parallel_verification_gathers_segmented_token_plan_rows():
 
         controller.attention_mass_layer_count = 1
         controller.end_step()
+
+
+def test_parallel_verification_rejects_missing_token_plan():
+    controller = make_controller()
+    mark_installed(controller)
+
+    with controller.proposal_context(["request"]):
+        controller.selection_plans[0]["layer"] = make_token_plan(
+            1, num_kv_heads=1, exact_width=1, estimation_width=1
+        )
+        controller.begin_parallel_step(
+            RetroSpecAttentionMode.SPARSE_VERIFY,
+            request_indices=torch.tensor([0], dtype=torch.int64),
+            token_indices=torch.tensor([1], dtype=torch.int64),
+        )
+
+        with pytest.raises(RuntimeError, match="selection plan is missing"):
+            controller._gather_parallel_plan("layer")
 
 
 def test_end_step_requires_completed_attention_layer():

@@ -659,6 +659,60 @@ def make_parallel_verification_output(
     )
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        torch.device("cpu"),
+        pytest.param(
+            torch.device("cuda"),
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is required"
+            ),
+        ),
+    ],
+)
+def test_verification_pair_compaction_stays_on_device(device):
+    proposer = RetroSpecProposer(make_vllm_config(), device, make_runner())
+    round_starts = torch.tensor([0, 1, 2, 0], dtype=torch.int32, device=device)
+    draft_counts = torch.tensor([3, 2, 1, 4], dtype=torch.int32, device=device)
+    active = torch.tensor([True, False, True, True], device=device)
+
+    request_indices, token_indices = proposer._build_verification_pairs(
+        4, round_starts, draft_counts, active
+    )
+
+    assert request_indices.device.type == device.type
+    assert token_indices.device.type == device.type
+    assert request_indices.tolist() == [0, 0, 0, 2, 3, 3, 3, 3]
+    assert token_indices.tolist() == [0, 1, 2, 2, 0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        torch.device("cpu"),
+        pytest.param(
+            torch.device("cuda"),
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is required"
+            ),
+        ),
+    ],
+)
+def test_first_verification_boundary_reduces_by_request(device):
+    request_indices = torch.tensor([0, 0, 1, 1, 1, 2], dtype=torch.int64, device=device)
+    boundary_mask = torch.tensor(
+        [False, True, False, False, True, False], device=device
+    )
+
+    first = RetroSpecProposer._find_first_boundary_indices(
+        4, request_indices, boundary_mask
+    )
+
+    assert first.device.type == device.type
+    assert first.tolist() == [1, 4, 6, 6]
+
+
 def test_propose_stops_draft_at_index_update_boundary(monkeypatch):
     proposer = RetroSpecProposer(
         make_vllm_config(retrospec_index_update_interval=4),
@@ -738,6 +792,53 @@ def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch)
 
     assert observed_rows == [([0, 0, 0, 0], [0, 1, 2, 3])]
     assert verification.verified_counts.tolist() == [4]
+    assert verification.require_full.tolist() == [True]
+
+
+def test_sparse_full_trigger_skips_expanded_verification(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_sparse_margin_threshold=0.5),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer.max_model_len = 2
+    initialize_verification(
+        proposer,
+        torch.tensor([[10, 20, -1, -1]], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+    )
+    observed_modes: list[RetroSpecAttentionMode] = []
+
+    def fake_run_parallel_verification(
+        batch_size,
+        request_indices,
+        token_indices,
+        common_attn_metadata,
+        sampling_metadata,
+        attention_mode,
+    ):
+        observed_modes.append(attention_mode)
+        return make_parallel_verification_output(
+            list(request_indices),
+            list(token_indices),
+            [10, 20],
+            margin=[0.1, 0.1],
+        )
+
+    monkeypatch.setattr(
+        proposer,
+        "_run_parallel_verification",
+        fake_run_parallel_verification,
+    )
+    verification = proposer._verify_draft_tokens(
+        1,
+        torch.zeros(1, dtype=torch.int32),
+        make_common_metadata([1]),
+        make_sampling_metadata(all_greedy=True),
+    )
+
+    assert observed_modes == [RetroSpecAttentionMode.SPARSE_VERIFY]
+    assert verification.verified_counts.tolist() == [1]
     assert verification.require_full.tolist() == [True]
 
 
@@ -1201,8 +1302,8 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
 
     result = proposer._run_parallel_verification(
         batch_size=2,
-        request_indices=[1, 0, 1],
-        token_indices=[0, 1, 1],
+        request_indices=torch.tensor([1, 0, 1], dtype=torch.int64),
+        token_indices=torch.tensor([0, 1, 1], dtype=torch.int64),
         common_attn_metadata=common_attn_metadata,
         sampling_metadata=make_sampling_metadata(all_greedy=True),
         attention_mode=attention_mode,
@@ -1215,7 +1316,9 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     if result.margin is not None:
         assert result.margin.tolist() == [1.0, 2.0, 3.0]
     assert len(sampling_calls) == 2
-    proposer.sparse_attention.begin_parallel_step.assert_called_once_with(
-        attention_mode, [1, 0, 1], [0, 1, 1]
-    )
+    proposer.sparse_attention.begin_parallel_step.assert_called_once()
+    begin_args = proposer.sparse_attention.begin_parallel_step.call_args.args
+    assert begin_args[0] == attention_mode
+    assert torch.equal(begin_args[1], torch.tensor([1, 0, 1], dtype=torch.int64))
+    assert torch.equal(begin_args[2], torch.tensor([0, 1, 1], dtype=torch.int64))
     proposer.sparse_attention.end_step.assert_called_once_with()

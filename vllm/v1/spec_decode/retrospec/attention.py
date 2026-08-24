@@ -158,7 +158,8 @@ class RetroSpecSparseAttention:
         self.step_index = -1
         self.active_mask: torch.Tensor | None = None
         self.batch_size = 0
-        self.parallel_plan_rows: tuple[tuple[int, int], ...] = ()
+        self.parallel_request_indices: torch.Tensor | None = None
+        self.parallel_token_indices: torch.Tensor | None = None
 
         self.attention_mass_layer_count = 0
         self.attention_mass_sum = torch.zeros(
@@ -484,7 +485,8 @@ class RetroSpecSparseAttention:
             self.step_index = -1
             self.active_mask = None
             self.batch_size = 0
-            self.parallel_plan_rows = ()
+            self.parallel_request_indices = None
+            self.parallel_token_indices = None
             self.attention_mass_layer_count = 0
 
             self.index.end_proposal()
@@ -520,7 +522,8 @@ class RetroSpecSparseAttention:
         self.step_index = step_index
         self.batch_size = active_mask.shape[0]
         self.active_mask = active_mask
-        self.parallel_plan_rows = ()
+        self.parallel_request_indices = None
+        self.parallel_token_indices = None
 
         self.attention_mass_sum[: self.batch_size].zero_()
         self.attention_mass_layer_count = 0
@@ -529,8 +532,8 @@ class RetroSpecSparseAttention:
     def begin_parallel_step(
         self,
         mode: RetroSpecAttentionMode,
-        request_indices: Sequence[int],
-        token_indices: Sequence[int],
+        request_indices: torch.Tensor,
+        token_indices: torch.Tensor,
     ) -> None:
         if not self.in_proposal:
             raise RuntimeError(
@@ -543,29 +546,33 @@ class RetroSpecSparseAttention:
             raise ValueError("Parallel steps are supported only for verification.")
         if self.step_active:
             raise RuntimeError("The previous RetroSpec attention step is still active.")
-        if len(request_indices) != len(token_indices):
+        if request_indices.ndim != 1 or token_indices.ndim != 1:
+            raise ValueError("Parallel plan indices must be one-dimensional.")
+        if request_indices.shape != token_indices.shape:
             raise ValueError(
-                "request_indices and token_indices must have equal length."
+                "request_indices and token_indices must have equal shapes."
             )
-        if not request_indices:
-            raise ValueError("A parallel verification step cannot be empty.")
-        if len(request_indices) > self.max_parallel_tokens:
-            raise ValueError("Parallel verification exceeds the configured capacity.")
+        if request_indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("request_indices must use an integer dtype.")
+        if token_indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("token_indices must use an integer dtype.")
+        if request_indices.device != self.device or token_indices.device != self.device:
+            raise ValueError("Parallel plan indices must be on the attention device.")
 
-        rows = tuple(zip(request_indices, token_indices))
-        for request_index, token_index in rows:
-            if not 0 <= request_index < len(self.proposal_request_ids):
-                raise ValueError("request_index is outside the proposal batch.")
-            if not 0 <= token_index < self.num_speculative_tokens:
-                raise ValueError("token_index is outside the speculative token range.")
+        num_tokens = request_indices.shape[0]
+        if num_tokens == 0:
+            raise ValueError("A parallel verification step cannot be empty.")
+        if num_tokens > self.max_parallel_tokens:
+            raise ValueError("Parallel verification exceeds the configured capacity.")
 
         self.mode = mode
         self.step_index = -1
-        self.batch_size = len(rows)
+        self.batch_size = num_tokens
         self.active_mask = torch.ones(
             self.batch_size, dtype=torch.bool, device=self.device
         )
-        self.parallel_plan_rows = rows
+        self.parallel_request_indices = request_indices
+        self.parallel_token_indices = token_indices
 
         self.attention_mass_sum[: self.batch_size].zero_()
         self.attention_mass_layer_count = 0
@@ -586,38 +593,59 @@ class RetroSpecSparseAttention:
         self.step_index = -1
         self.active_mask = None
         self.batch_size = 0
-        self.parallel_plan_rows = ()
+        self.parallel_request_indices = None
+        self.parallel_token_indices = None
         self.attention_mass_layer_count = 0
 
         return attention_mass
 
     def _gather_parallel_plan(self, layer_name: str) -> RetroSpecPlan:
-        plans: list[RetroSpecPlan] = []
-        request_indices: list[int] = []
+        request_indices = self.parallel_request_indices
+        token_indices = self.parallel_token_indices
+        if request_indices is None or token_indices is None:
+            raise RuntimeError("No parallel verification plan is active.")
 
-        for request_index, token_index in self.parallel_plan_rows:
-            try:
-                plan = self.selection_plans[token_index][layer_name]
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"No draft selection plan for step {token_index}, "
-                    f"layer {layer_name!r}."
-                ) from exc
-            plans.append(plan)
-            request_indices.append(request_index)
+        covered_rows = torch.zeros(
+            self.batch_size, dtype=torch.bool, device=self.device
+        )
+        plan_groups: list[tuple[RetroSpecPlan, torch.Tensor, torch.Tensor]] = []
+        for token_index, layer_plans in enumerate(self.selection_plans):
+            plan = layer_plans.get(layer_name)
+            if plan is None:
+                continue
+
+            flat_indices = torch.nonzero(
+                token_indices == token_index, as_tuple=False
+            ).flatten()
+            request_rows = request_indices.index_select(0, flat_indices)
+            covered_rows.index_fill_(0, flat_indices, True)
+            plan_groups.append((plan, flat_indices, request_rows))
+
+        if not plan_groups:
+            raise RuntimeError(
+                f"No draft selection plan exists for layer {layer_name!r}."
+            )
+        torch._assert_async(
+            covered_rows.all(),
+            f"A draft selection plan is missing for layer {layer_name!r}.",
+        )
 
         def gather(name: str) -> torch.Tensor:
-            rows = [
-                getattr(plan, name)[request_index : request_index + 1]
-                for plan, request_index in zip(plans, request_indices)
-            ]
-            try:
-                return torch.cat(rows, dim=0)
-            except RuntimeError as exc:
-                raise RuntimeError(
-                    f"Parallel verification plan field {name!r} has "
-                    "incompatible per-step shapes."
-                ) from exc
+            output: torch.Tensor | None = None
+            for plan, flat_indices, request_rows in plan_groups:
+                source = getattr(plan, name)
+                if output is None:
+                    output = torch.empty(
+                        (self.batch_size, *source.shape[1:]),
+                        dtype=source.dtype,
+                        device=source.device,
+                    )
+
+                selected_rows = source.index_select(0, request_rows)
+                output.index_copy_(0, flat_indices, selected_rows)
+
+            assert output is not None
+            return output
 
         return RetroSpecTokenSelectionPlan(
             layer_name=layer_name,
@@ -1420,7 +1448,8 @@ class RetroSpecSparseAttention:
         output: torch.Tensor,
     ) -> torch.Tensor:
         assert self.active_mask is not None
-        assert self.step_index >= 0 or self.parallel_plan_rows
+        has_parallel_plan = self.parallel_request_indices is not None
+        assert self.step_index >= 0 or has_parallel_plan
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         if num_actual_tokens != self.batch_size:
@@ -1447,7 +1476,7 @@ class RetroSpecSparseAttention:
             )
             self.selection_plans[self.step_index][layer_name] = selection.plan
         else:
-            if self.parallel_plan_rows:
+            if has_parallel_plan:
                 plan = self._gather_parallel_plan(layer_name)
             else:
                 try:
