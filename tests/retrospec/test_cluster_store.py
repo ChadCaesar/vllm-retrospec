@@ -480,6 +480,9 @@ def test_cluster_store_distributes_soft_targets_by_backing_page_ownership():
         RetroSpecClusterGroup("second", 0): 1,
         RetroSpecClusterGroup("second", 1): 1,
     }
+    assert store.resident_group_target_pages(
+        "layer", ["first", "missing", "second"], num_kv_heads=2
+    ) == ((2, 2), (0, 0), (1, 1))
 
     store.free("layer", first)
     capacity = store._resident_target_capacity(store._layer_pools["layer"])
@@ -496,6 +499,22 @@ def test_cluster_store_distributes_soft_targets_by_backing_page_ownership():
     store.free("layer", second)
     assert store._group_backing_page_counts["layer"] == {}
     assert store._resident_group_targets("layer", 0) == {}
+
+
+def test_cluster_store_synchronizes_background_prefetch_and_resident_copies():
+    store = RetroSpecClusterPageStore(page_size=2)
+    first_cache = Mock()
+    second_cache = Mock()
+    store._resident_caches = {"first": first_cache, "second": second_cache}
+    store.wait_for_resident_prefetches = Mock()
+
+    store.synchronize_resident_prefetches(["second", "first", "second", "missing"])
+
+    store.wait_for_resident_prefetches.assert_called_once_with(
+        ("second", "first", "missing")
+    )
+    first_cache.synchronize_pending_copies.assert_called_once_with()
+    second_cache.synchronize_pending_copies.assert_called_once_with()
 
 
 def test_cluster_store_accumulates_group_pages_across_request_segments():

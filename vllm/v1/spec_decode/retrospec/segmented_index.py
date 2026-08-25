@@ -169,6 +169,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         cache_ratio: float = 0.0,
         pin_memory: bool = False,
         max_resident_requests: int = 1,
+        prefill_warmup_multiplier: int = 4,
         performance_stats: RetroSpecPerformanceStats | None = None,
     ) -> None:
         super().__init__(
@@ -192,6 +193,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             raise ValueError("num_kmeans_iterations must be positive")
         if max_pending_cluster_builds <= 0:
             raise ValueError("max_pending_cluster_builds must be positive")
+        if prefill_warmup_multiplier <= 0:
+            raise ValueError("prefill_warmup_multiplier must be positive")
         if max_model_len <= 0:
             raise ValueError("max_model_len must be positive")
 
@@ -212,6 +215,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self.tokens_per_cluster = tokens_per_cluster
         self.num_kmeans_iterations = num_kmeans_iterations
         self.max_pending_cluster_builds = max_pending_cluster_builds
+        self.prefill_warmup_multiplier = prefill_warmup_multiplier
         self.performance_stats = performance_stats
         effective_cache_ratio = cache_ratio
         if cache_ratio == 0.0:
@@ -252,6 +256,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         self._proposal_active = False
         self._proposal_request_ids: tuple[str, ...] = ()
+
+        # request_id -> layers whose prefill-selected clusters are being
+        # admitted into the GPU resident cache.
+        self._prefill_warm_layers_by_request: dict[str, set[str]] = {}
 
         # Shared across model layers. Selection results are copied into each
         # plan before the workspace is reused.
@@ -397,6 +405,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         request_ids = tuple(request_ids)
         self._gpu_index_residency.invalidate_requests(request_ids)
 
+        for request_id in request_ids:
+            self._prefill_warm_layers_by_request.pop(request_id, None)
+
         for layer_name, layer_indices in self._indices.items():
             for request_id in request_ids:
                 record = layer_indices.pop(request_id, None)
@@ -458,6 +469,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             )
 
         request_ids = tuple(request_ids)
+        warm_layers: set[str] = set()
+        for request_id in request_ids:
+            warm_layers.update(self._prefill_warm_layers_by_request.pop(request_id, ()))
+
+        if warm_layers:
+            self.cluster_store.synchronize_resident_prefetches(
+                tuple(sorted(warm_layers))
+            )
+
         self._gpu_index_residency.activate(request_ids)
         self._proposal_active = True
         self._proposal_request_ids = request_ids
@@ -1883,6 +1903,39 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         )
 
     @staticmethod
+    def _gather_prefill_warm_cluster_ids(
+        view: RetroSpecResidentBatchView,
+        ranked_indices: torch.Tensor,
+        ranked_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if ranked_indices.shape != ranked_mask.shape:
+            raise ValueError("Ranked cluster indices and mask must match")
+
+        selected_cluster_ids = torch.full(
+            ranked_indices.shape,
+            -1,
+            dtype=torch.int64,
+            device=ranked_indices.device,
+        )
+        if view.arena is None or ranked_indices.shape[2] == 0:
+            return selected_cluster_ids
+
+        arena = view.arena
+        safe_slots = view.request_slot_ids.clamp_min(0)
+        packed_cluster_ids = arena.cluster_ids[
+            :, :, : view.max_num_clusters
+        ].index_select(0, safe_slots)
+
+        selected_cluster_ids = packed_cluster_ids.gather(2, ranked_indices)
+        valid = (
+            ranked_mask
+            & (view.request_slot_ids[:, None, None] >= 0)
+            & (selected_cluster_ids >= 0)
+        )
+        selected_cluster_ids.masked_fill_(~valid, -1)
+        return selected_cluster_ids.contiguous()
+
+    @staticmethod
     def _build_resident_estimation_selection(
         view: RetroSpecResidentBatchView,
         packed_indices: torch.Tensor,
@@ -2226,6 +2279,138 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             layer_name=plan.layer_name,
             cluster_ids=prefetch_cluster_ids,
         )
+
+    def prefetch_prefill_clusters(
+        self,
+        request_ids: Sequence[str],
+        layer_name: str,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        scale: float,
+    ) -> bool:
+        """Warm resident pages using each request's final prefill query."""
+        if not self.cluster_store.pin_memory:
+            return False
+
+        request_ids = tuple(request_ids)
+        if not request_ids:
+            return False
+        if query.ndim != 3:
+            raise ValueError("Prefill warmup query must be three-dimensional")
+        if query.shape[0] != len(request_ids):
+            raise ValueError("Prefill warmup query batch does not match request_ids")
+        if key_cache.ndim != 4:
+            raise ValueError("Prefill warmup KV cache must be four-dimensional")
+        if query.device != key_cache.device:
+            raise ValueError("Prefill warmup query and KV cache must use one device")
+
+        num_kv_heads = key_cache.shape[2]
+        if query.shape[1] % num_kv_heads != 0:
+            raise ValueError("Query-head count must be divisible by KV-head count")
+
+        self._gpu_index_residency.activate(request_ids)
+        try:
+            view = self._get_resident_view(layer_name, request_ids, key_cache)
+            if view.arena is None:
+                return False
+
+            _, ranking_scores, candidate_counts, _ = self._score_resident_view(
+                query=query,
+                view=view,
+                scale=scale,
+                num_kv_heads=num_kv_heads,
+            )
+
+            max_warm_clusters = min(
+                ceil(view.max_num_clusters * self.retrieval_ratio)
+                * self.prefill_warmup_multiplier,
+                view.max_num_clusters,
+            )
+            if max_warm_clusters == 0:
+                return False
+
+            ranked_indices = torch.topk(
+                ranking_scores,
+                k=max_warm_clusters,
+                dim=2,
+                largest=True,
+                sorted=True,
+            ).indices
+
+            candidate_counts = candidate_counts.to(torch.int64)
+            retrieval_counts = torch.ceil(
+                candidate_counts.float() * self.retrieval_ratio
+            ).to(torch.int64)
+            warm_cluster_counts = torch.minimum(
+                retrieval_counts * self.prefill_warmup_multiplier,
+                candidate_counts,
+            )
+
+            rank_offsets = torch.arange(
+                max_warm_clusters,
+                dtype=torch.int64,
+                device=query.device,
+            )
+            count_mask = rank_offsets[None, None, :] < warm_cluster_counts.unsqueeze(-1)
+
+            arena = view.arena
+            safe_slots = view.request_slot_ids.clamp_min(0)
+            cluster_page_counts = (
+                arena.cluster_page_offsets[:, :, 1 : view.max_num_clusters + 1]
+                - arena.cluster_page_offsets[:, :, : view.max_num_clusters]
+            ).index_select(0, safe_slots)
+            ranked_page_counts = cluster_page_counts.gather(2, ranked_indices)
+
+            group_targets = self.cluster_store.resident_group_target_pages(
+                layer_name,
+                request_ids,
+                num_kv_heads,
+            )
+            group_targets_gpu = torch.tensor(
+                group_targets,
+                dtype=torch.int64,
+                device=query.device,
+            )
+
+            # Leave at least half of each request/head replacement domain for
+            # clusters selected by later generation queries.
+            page_budgets = torch.div(
+                group_targets_gpu + 1,
+                2,
+                rounding_mode="floor",
+            )
+            cumulative_pages = ranked_page_counts.cumsum(dim=2)
+            page_budget_mask = cumulative_pages <= page_budgets.unsqueeze(-1)
+            warm_mask = count_mask & page_budget_mask
+
+            warm_cluster_ids = self._gather_prefill_warm_cluster_ids(
+                view,
+                ranked_indices,
+                warm_mask,
+            )
+        finally:
+            self._gpu_index_residency.deactivate()
+
+        queued = self.cluster_store.prefetch_resident_clusters(
+            layer_name=layer_name,
+            cluster_ids=warm_cluster_ids,
+        )
+        if not queued:
+            return False
+
+        for request_id in request_ids:
+            self._prefill_warm_layers_by_request.setdefault(
+                request_id,
+                set(),
+            ).add(layer_name)
+
+        if self.performance_stats is not None:
+            self.performance_stats.add_counter(
+                "prefill_warmup_request_layers",
+                len(request_ids),
+            )
+
+        return True
 
     def _materialize_token_selection(
         self,

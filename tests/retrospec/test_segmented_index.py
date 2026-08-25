@@ -26,6 +26,7 @@ def make_index(
     pin_memory: bool = False,
     max_pending_cluster_builds: int = 2,
     max_resident_requests: int = 1,
+    prefill_warmup_multiplier: int = 4,
 ) -> RetroSpecSegmentedTokenIndex:
     return RetroSpecSegmentedTokenIndex(
         block_size=2,
@@ -41,6 +42,7 @@ def make_index(
         cache_ratio=cache_ratio,
         pin_memory=pin_memory,
         max_resident_requests=max_resident_requests,
+        prefill_warmup_multiplier=prefill_warmup_multiplier,
     )
 
 
@@ -132,6 +134,106 @@ def test_sparse_verification_prefetch_requires_pinned_cpu_backing():
     )
 
     index.cluster_store.prefetch_resident_clusters.assert_not_called()
+
+
+def test_prefill_warmup_ranks_clusters_and_caps_admission_to_half_lru():
+    index = make_index(retrieval_ratio=0.5, cache_ratio=1.0)
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+
+    record = index._indices["layer"]["request"]
+    cluster_ids = record.segments[0].cluster_blocks.cluster_ids
+    assert cluster_ids.shape == (1, 2)
+
+    index.cluster_store.pin_memory = True
+    index.cluster_store.resident_group_target_pages = Mock(return_value=((2,),))
+    index.cluster_store.prefetch_resident_clusters = Mock(return_value=True)
+    index._score_resident_view = Mock(
+        return_value=(
+            torch.tensor([[[0.25, 0.75]]]),
+            torch.tensor([[[0.25, 0.75]]]),
+            torch.tensor([[2]], dtype=torch.int32),
+            None,
+        )
+    )
+
+    queued = index.prefetch_prefill_clusters(
+        request_ids=["request"],
+        layer_name="layer",
+        query=torch.ones(1, 1, 1),
+        key_cache=keys,
+        scale=1.0,
+    )
+
+    assert queued
+    call_kwargs = index.cluster_store.prefetch_resident_clusters.call_args.kwargs
+    assert call_kwargs["layer_name"] == "layer"
+    assert call_kwargs["cluster_ids"].tolist() == [[[int(cluster_ids[0, 1]), -1]]]
+
+
+def test_first_proposal_waits_for_prefill_warmup_once():
+    index = make_index()
+    index._prefill_warm_layers_by_request["request"] = {"second", "first"}
+    index.cluster_store.synchronize_resident_prefetches = Mock()
+
+    index.begin_proposal(["request"])
+    index.end_proposal()
+    index.begin_proposal(["request"])
+    index.end_proposal()
+
+    index.cluster_store.synchronize_resident_prefetches.assert_called_once_with(
+        ("first", "second")
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_prefill_warmup_makes_first_proposal_cluster_resident():
+    device = torch.device("cuda")
+    index = make_index(
+        retrieval_ratio=0.5,
+        cache_ratio=1.0,
+        pin_memory=True,
+    )
+    keys, values = make_cache()
+    keys = keys.to(device=device, dtype=torch.bfloat16)
+    values = values.to(device=device, dtype=torch.bfloat16)
+    block_table = torch.arange(7, dtype=torch.int32, device=device).view(1, -1)
+    build_index(index, 10, keys, values, block_table, prefill_complete=True)
+
+    query = torch.ones(1, 1, 1, dtype=torch.bfloat16, device=device)
+    assert index.prefetch_prefill_clusters(
+        request_ids=["request"],
+        layer_name="layer",
+        query=query,
+        key_cache=keys,
+        scale=1.0,
+    )
+
+    index.begin_proposal(["request"])
+    try:
+        selection = index.select_segmented(
+            request_ids=["request"],
+            layer_name="layer",
+            query=query,
+            key_cache=keys,
+            value_cache=values,
+            block_table=block_table,
+            seq_lens=torch.tensor([10], dtype=torch.int32, device=device),
+            active_mask=torch.tensor([True], device=device),
+            scale=1.0,
+        )
+    finally:
+        index.end_proposal()
+
+    assert index.cluster_store.num_resident_pages("layer") == 1
+    assert selection.resolved_pages is not None
+    assert selection.resolved_pages.hit_cluster_mask.all()
+    assert selection.exact_token_counts.tolist() == [[8]]
+    # Prefill intentionally occupies at most half the request/head target, so
+    # hit-based stage transitions remain cold-protected until generation fills
+    # the remaining LRU capacity.
+    assert not selection.resolved_pages.hit_gate_ready_mask.any()
 
 
 def build_index(

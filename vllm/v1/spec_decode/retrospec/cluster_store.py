@@ -1346,6 +1346,39 @@ class RetroSpecClusterPageStore:
 
         return targets
 
+    def resident_group_target_pages(
+        self,
+        layer_name: str,
+        request_ids: Sequence[str],
+        num_kv_heads: int,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Return the resident-page target for each request/KV-head group."""
+        if num_kv_heads <= 0:
+            raise ValueError("num_kv_heads must be positive")
+
+        request_ids = tuple(request_ids)
+        with self._resident_state_lock:
+            pool = self._layer_pools.get(layer_name)
+            if pool is None:
+                return tuple((0,) * num_kv_heads for _ in request_ids)
+
+            capacity = self._resident_target_capacity(pool)
+            targets = self._resident_group_targets(layer_name, capacity)
+
+            return tuple(
+                tuple(
+                    targets.get(
+                        RetroSpecClusterGroup(
+                            request_id=request_id,
+                            kv_head_index=head_index,
+                        ),
+                        0,
+                    )
+                    for head_index in range(num_kv_heads)
+                )
+                for request_id in request_ids
+            )
+
     def _resize_resident_cache(
         self,
         layer_name: str,
@@ -2571,6 +2604,24 @@ class RetroSpecClusterPageStore:
         layer_names: Sequence[str] | None = None,
     ) -> None:
         self._reap_resident_prefetches(layer_names, wait=True)
+
+    def synchronize_resident_prefetches(
+        self,
+        layer_names: Sequence[str],
+    ) -> None:
+        """Wait for background admission and resident H2D copies to finish."""
+        layer_names = tuple(dict.fromkeys(layer_names))
+        self.wait_for_resident_prefetches(layer_names)
+
+        with self._resident_state_lock:
+            resident_caches = tuple(
+                resident_cache
+                for layer_name in layer_names
+                if (resident_cache := self._resident_caches.get(layer_name)) is not None
+            )
+
+        for resident_cache in resident_caches:
+            resident_cache.synchronize_pending_copies()
 
     def close(self) -> None:
         if self._closed:

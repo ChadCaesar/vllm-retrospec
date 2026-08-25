@@ -385,6 +385,53 @@ def test_passthrough_forward_builds_segmented_index_after_target_attention():
     assert controller.index_update_build_rows == ()
 
 
+def test_prefill_completion_warms_from_each_requests_last_query():
+    controller = make_controller()
+    mark_installed(controller)
+    controller.index.cluster_store.pin_memory = True
+    controller.index.build_or_update = Mock()
+    controller.index.flush_staged_updates = Mock()
+    controller.index.prefetch_prefill_clusters = Mock(return_value=True)
+
+    impl = object.__new__(FlashAttentionImpl)
+    impl.scale = 0.5
+    layer = SimpleNamespace(impl=impl)
+    query = torch.arange(5, dtype=torch.float32).view(5, 1, 1)
+    kv_cache = torch.ones(2, 4, 2, 1, 1)
+    metadata = SimpleNamespace(
+        block_table=torch.arange(4, dtype=torch.int32).repeat(2, 1),
+        query_start_loc=torch.tensor([0, 3, 5], dtype=torch.int32),
+    )
+
+    with controller.index_update_context(
+        ["first", "second"],
+        [6, 4],
+        [True, True],
+        [True, True],
+        [0, 1],
+    ):
+        controller.forward(
+            "layer",
+            Mock(return_value=torch.tensor([3.0])),
+            layer,
+            query,
+            torch.ones_like(query),
+            torch.ones_like(query),
+            kv_cache,
+            metadata,
+        )
+
+    call_kwargs = controller.index.prefetch_prefill_clusters.call_args.kwargs
+    assert call_kwargs["request_ids"] == ("first", "second")
+    assert call_kwargs["layer_name"] == "layer"
+    assert call_kwargs["query"].flatten().tolist() == [2.0, 4.0]
+    assert call_kwargs["key_cache"].data_ptr() == kv_cache[0].data_ptr()
+    assert call_kwargs["scale"] == pytest.approx(0.5)
+    assert controller.index_update_prefill_warmup_request_ids == ()
+    assert controller.index_update_prefill_warmup_query_end_rows is None
+    assert controller.prefill_warmups == {}
+
+
 def test_index_update_context_restores_state_after_exception():
     controller = make_controller()
     discard_staged_updates = Mock(

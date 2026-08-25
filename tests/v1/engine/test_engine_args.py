@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from argparse import ArgumentError
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -10,6 +12,49 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.hashing import _xxhash
+
+
+@pytest.mark.parametrize(
+    ("speculative_config", "expected_max_num_seqs"),
+    [
+        ({"method": "retrospec", "num_speculative_tokens": 64}, 8),
+        ({"method": "ngram", "num_speculative_tokens": 4}, 256),
+        (None, 256),
+    ],
+)
+def test_retrospec_uses_resource_constrained_default_max_num_seqs(
+    speculative_config, expected_max_num_seqs
+):
+    engine_args = EngineArgs(
+        model="unused",
+        speculative_config=speculative_config,
+        max_num_batched_tokens=512,
+    )
+    engine_args.get_batch_defaults = Mock(return_value=({None: 512}, {None: 256}))
+
+    engine_args._set_default_max_num_seqs_and_batched_tokens_args(
+        None,
+        SimpleNamespace(max_model_len=64),
+    )
+
+    assert engine_args.max_num_seqs == expected_max_num_seqs
+
+
+def test_retrospec_preserves_explicit_max_num_seqs():
+    engine_args = EngineArgs(
+        model="unused",
+        speculative_config={"method": "retrospec", "num_speculative_tokens": 64},
+        max_num_batched_tokens=128,
+        max_num_seqs=3,
+    )
+    engine_args.get_batch_defaults = Mock(return_value=({None: 128}, {None: 256}))
+
+    engine_args._set_default_max_num_seqs_and_batched_tokens_args(
+        None,
+        SimpleNamespace(max_model_len=64),
+    )
+
+    assert engine_args.max_num_seqs == 3
 
 
 def test_prefix_caching_from_cli():
