@@ -1094,14 +1094,18 @@ class RetroSpecResidentClusterCache:
         staging_value_pages: torch.Tensor,
         cluster_ids_cpu: torch.Tensor | None = None,
         page_ids_cpu: torch.Tensor | None = None,
+        reuse_ready_event: torch.cuda.Event | None = None,
     ) -> RetroSpecResidentPageAccess:
-        """Admit a priority cluster prefix from temporary GPU staging pages."""
+        """Admit a priority cluster prefix from bounded CPU/GPU staging pages."""
         self._validate_source_pages(
             staging_key_pages,
             staging_value_pages,
         )
-        if staging_key_pages.device != self.device:
-            raise ValueError("Staging pages must use the resident cache CUDA device")
+        if (
+            staging_key_pages.device.type != "cpu"
+            and staging_key_pages.device != self.device
+        ):
+            raise ValueError("Staging pages must use CPU or the resident CUDA device")
 
         return self._admit_from_sources(
             cluster_ids=cluster_ids,
@@ -1114,6 +1118,7 @@ class RetroSpecResidentClusterCache:
             source_value_pages=staging_value_pages,
             cluster_ids_cpu=cluster_ids_cpu,
             page_ids_cpu=page_ids_cpu,
+            reuse_ready_event=reuse_ready_event,
         )
 
     def invalidate(

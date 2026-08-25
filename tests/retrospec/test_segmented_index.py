@@ -406,13 +406,12 @@ def test_completed_prefill_clusters_aligned_tail():
     record = index._indices["layer"]["request"]
     assert record.indexed_end == 12
     assert record.num_clusters == 5
-    cluster_token_counts = record.segments[0].cluster_token_counts
-    assert cluster_token_counts.shape == (1, 5)
-    assert cluster_token_counts[0, :4].sum().item() == 8
-    assert cluster_token_counts[0, 4].item() == 2
+    assert record.segments[0].cluster_token_counts.shape == (1, 4)
+    assert record.segments[0].cluster_token_counts.sum().item() == 8
+    assert record.segments[1].cluster_token_counts.tolist() == [[2]]
     assert [
         (segment.indexed_start, segment.indexed_end) for segment in record.segments
-    ] == [(2, 12)]
+    ] == [(2, 10), (10, 12)]
 
 
 def test_completed_chunked_prefill_appends_only_adaptive_tail():

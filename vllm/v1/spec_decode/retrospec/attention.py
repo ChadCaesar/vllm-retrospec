@@ -10,6 +10,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention import Attention
+from vllm.utils.mem_constants import GiB_bytes, MiB_bytes
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn import (
@@ -153,6 +154,12 @@ class RetroSpecSparseAttention:
                 config,
                 "retrospec_prefill_warmup_multiplier",
                 4,
+            ),
+            cpu_page_slab_bytes=(
+                getattr(config, "retrospec_cpu_page_slab_size_mib", 256) * MiB_bytes
+            ),
+            max_pinned_memory_bytes=int(
+                getattr(config, "retrospec_max_pinned_memory", 1.0) * GiB_bytes
             ),
             performance_stats=(
                 self.performance_stats if self.performance_stats.enabled else None

@@ -170,6 +170,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         pin_memory: bool = False,
         max_resident_requests: int = 1,
         prefill_warmup_multiplier: int = 4,
+        cpu_page_slab_bytes: int = 1 << 20,
+        max_pinned_memory_bytes: int = 64 << 20,
         performance_stats: RetroSpecPerformanceStats | None = None,
     ) -> None:
         super().__init__(
@@ -195,6 +197,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             raise ValueError("max_pending_cluster_builds must be positive")
         if prefill_warmup_multiplier <= 0:
             raise ValueError("prefill_warmup_multiplier must be positive")
+        if cpu_page_slab_bytes <= 0:
+            raise ValueError("cpu_page_slab_bytes must be positive")
+        if max_pinned_memory_bytes <= 0:
+            raise ValueError("max_pinned_memory_bytes must be positive")
         if max_model_len <= 0:
             raise ValueError("max_model_len must be positive")
 
@@ -230,6 +236,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             page_size=block_size,
             pin_memory=pin_memory,
             cache_ratio=effective_cache_ratio,
+            cpu_page_slab_bytes=cpu_page_slab_bytes,
+            max_pinned_memory_bytes=max_pinned_memory_bytes,
+            max_pending_cluster_builds=max_pending_cluster_builds,
             performance_stats=performance_stats,
         )
 
@@ -341,14 +350,17 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 raise RuntimeError(
                     "New indexed region must contain complete phase-specific segments"
                 )
-            return ((num_tokens, segment_size),)
+            return tuple(
+                (segment_size, segment_size) for _ in range(num_tokens // segment_size)
+            )
 
         regular_tokens = num_tokens // segment_size * segment_size
         tail_tokens = num_tokens - regular_tokens
         phases: list[tuple[int, int]] = []
 
-        if regular_tokens:
-            phases.append((regular_tokens, segment_size))
+        phases.extend(
+            (segment_size, segment_size) for _ in range(regular_tokens // segment_size)
+        )
         if tail_tokens:
             if tail_tokens % self.tokens_per_cluster != 0:
                 raise RuntimeError(
@@ -574,6 +586,93 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             return
 
         self._pending_cluster_builds.popleft().result()
+
+    def _stage_clustering_phase(
+        self,
+        layer_name: str,
+        request_id: str,
+        indexed_start: int,
+        cluster_start: int,
+        segment_size: int,
+        token_keys: torch.Tensor,
+        token_values: torch.Tensor,
+    ) -> int:
+        """Overlap one bounded segment's D2H copy, k-means, and CPU build."""
+        self._wait_for_cluster_build_slot()
+        staged_token_kv = self.cluster_store.stage_token_kv(token_keys, token_values)
+
+        try:
+            kmeans_timer = (
+                None
+                if self.performance_stats is None
+                else self.performance_stats.start_cuda_timer("segmented_kmeans")
+            )
+            phase_result = segmented_kmeans(
+                token_keys=token_keys,
+                token_values=token_values,
+                segment_size=segment_size,
+                items_per_cluster=self.tokens_per_cluster,
+                num_iterations=self.num_kmeans_iterations,
+            )
+            if self.performance_stats is not None:
+                self.performance_stats.stop_cuda_timer(kmeans_timer)
+                self.performance_stats.add_counter(
+                    "indexed_token_layers", token_keys.shape[1]
+                )
+                self.performance_stats.add_counter(
+                    "cluster_slots_built", phase_result.cluster_sizes.numel()
+                )
+        except BaseException:
+            self.cluster_store.discard_staged_token_kv(staged_token_kv)
+            raise
+
+        try:
+            staged_summary = self._gpu_index_residency.stage_cluster_summary(
+                phase_result.cluster_keys,
+                phase_result.cluster_values,
+                phase_result.cluster_sizes,
+            )
+        except BaseException:
+            self.cluster_store.discard_staged_token_kv(staged_token_kv)
+            raise
+
+        try:
+            staged_clusters = self.cluster_store.finish_stage_clusters(
+                staged_token_kv,
+                phase_result.assignments,
+                phase_result.cluster_sizes,
+                phase_result.token_offsets_in_cluster,
+            )
+        except BaseException:
+            self.cluster_store.discard_staged_token_kv(staged_token_kv)
+            self._gpu_index_residency.discard_cluster_summary(staged_summary)
+            raise
+
+        try:
+            build_future = self._submit_cluster_build(
+                layer_name=layer_name,
+                request_id=request_id,
+                cluster_start=cluster_start,
+                staged_clusters=staged_clusters,
+            )
+        except BaseException:
+            self.cluster_store.discard_staged_clusters(staged_clusters)
+            self._gpu_index_residency.discard_cluster_summary(staged_summary)
+            raise
+
+        indexed_end = indexed_start + token_keys.shape[1]
+        self._staged_segments.append(
+            _StagedRequestLayerSegment(
+                layer_name=layer_name,
+                request_id=request_id,
+                indexed_start=indexed_start,
+                indexed_end=indexed_end,
+                cluster_start=cluster_start,
+                cluster_summary=staged_summary,
+                build_future=build_future,
+            )
+        )
+        return phase_result.cluster_sizes.shape[1]
 
     def _release_built_segments(
         self,
@@ -884,164 +983,52 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 request_prefill_complete,
             )
 
-            first_logical_block = indexed_start // self.block_size
-            logical_block_end = desired_end // self.block_size
-
-            logical_block_ids = torch.arange(
-                first_logical_block,
-                logical_block_end,
-                dtype=torch.int64,
-                device=block_table.device,
-            )
-            physical_block_ids = (
-                block_table[row]
-                .index_select(
-                    0,
-                    logical_block_ids,
-                )
-                .to(torch.int64)
-            )
-
-            key_blocks = key_cache.index_select(
-                0,
-                physical_block_ids,
-            )
-            value_blocks = value_cache.index_select(
-                0,
-                physical_block_ids,
-            )
-
             num_kv_heads = key_cache.shape[2]
             head_size = key_cache.shape[3]
-
-            token_keys = (
-                key_blocks.reshape(
-                    num_new_tokens,
-                    num_kv_heads,
-                    head_size,
-                )
-                .transpose(0, 1)
-                .contiguous()
-            )
-            token_values = (
-                value_blocks.reshape(
-                    num_new_tokens,
-                    num_kv_heads,
-                    head_size,
-                )
-                .transpose(0, 1)
-                .contiguous()
-            )
-
-            self._wait_for_cluster_build_slot()
-            # Start token-KV D2H before clustering. Both streams only read the
-            # token tensors, so transfer and k-means can safely overlap.
-            staged_token_kv = self.cluster_store.stage_token_kv(
-                token_keys,
-                token_values,
-            )
-
-            try:
-                assignment_parts: list[torch.Tensor] = []
-                count_parts: list[torch.Tensor] = []
-                key_parts: list[torch.Tensor] = []
-                value_parts: list[torch.Tensor] = []
-                offset_parts: list[torch.Tensor] = []
-                token_start = 0
-                cluster_offset = 0
-
-                for phase_tokens, phase_segment_size in clustering_phases:
-                    token_end = token_start + phase_tokens
-                    kmeans_timer = (
-                        None
-                        if self.performance_stats is None
-                        else self.performance_stats.start_cuda_timer("segmented_kmeans")
-                    )
-                    phase_result = segmented_kmeans(
-                        token_keys=token_keys[:, token_start:token_end],
-                        token_values=token_values[:, token_start:token_end],
-                        segment_size=phase_segment_size,
-                        items_per_cluster=self.tokens_per_cluster,
-                        num_iterations=self.num_kmeans_iterations,
-                    )
-                    if self.performance_stats is not None:
-                        self.performance_stats.stop_cuda_timer(kmeans_timer)
-                        self.performance_stats.add_counter(
-                            "indexed_token_layers",
-                            phase_tokens,
-                        )
-                        self.performance_stats.add_counter(
-                            "cluster_slots_built",
-                            phase_result.cluster_sizes.numel(),
-                        )
-                    assignment_parts.append(phase_result.assignments + cluster_offset)
-                    count_parts.append(phase_result.cluster_sizes)
-                    key_parts.append(phase_result.cluster_keys)
-                    value_parts.append(phase_result.cluster_values)
-                    offset_parts.append(phase_result.token_offsets_in_cluster)
-                    token_start = token_end
-                    cluster_offset += phase_result.cluster_sizes.shape[1]
-
-                if token_start != num_new_tokens:
-                    raise RuntimeError("Clustering phases do not cover the update")
-
-                local_assignments = torch.cat(assignment_parts, dim=1)
-                cluster_token_counts = torch.cat(count_parts, dim=1)
-                cluster_keys = torch.cat(key_parts, dim=1)
-                cluster_values = torch.cat(value_parts, dim=1)
-                token_offsets_in_cluster = torch.cat(offset_parts, dim=1)
-            except BaseException:
-                self.cluster_store.discard_staged_token_kv(staged_token_kv)
-                raise
-
             cluster_start = 0 if record is None else record.num_clusters
-
-            try:
-                staged_summary = self._gpu_index_residency.stage_cluster_summary(
-                    cluster_keys,
-                    cluster_values,
-                    cluster_token_counts,
-                )
-            except BaseException:
-                self.cluster_store.discard_staged_token_kv(staged_token_kv)
-                raise
-
-            try:
-                staged_clusters = self.cluster_store.finish_stage_clusters(
-                    staged_token_kv,
-                    local_assignments,
-                    cluster_token_counts,
-                    token_offsets_in_cluster,
-                )
-            except BaseException:
-                self.cluster_store.discard_staged_token_kv(staged_token_kv)
-                self._gpu_index_residency.discard_cluster_summary(staged_summary)
-                raise
-
-            try:
-                build_future = self._submit_cluster_build(
-                    layer_name=layer_name,
-                    request_id=request_id,
-                    cluster_start=cluster_start,
-                    staged_clusters=staged_clusters,
-                )
-            except BaseException:
-                self.cluster_store.discard_staged_clusters(staged_clusters)
-                self._gpu_index_residency.discard_cluster_summary(staged_summary)
-                raise
-
-            self._staged_segments.append(
-                _StagedRequestLayerSegment(
-                    layer_name=layer_name,
-                    request_id=request_id,
-                    indexed_start=indexed_start,
-                    indexed_end=desired_end,
-                    cluster_start=cluster_start,
-                    cluster_summary=staged_summary,
-                    build_future=build_future,
-                )
-            )
             self._staged_segment_keys.add(staged_key)
+            phase_start = indexed_start
+
+            for phase_tokens, phase_segment_size in clustering_phases:
+                phase_end = phase_start + phase_tokens
+                first_logical_block = phase_start // self.block_size
+                logical_block_end = phase_end // self.block_size
+                logical_block_ids = torch.arange(
+                    first_logical_block,
+                    logical_block_end,
+                    dtype=torch.int64,
+                    device=block_table.device,
+                )
+                physical_block_ids = (
+                    block_table[row].index_select(0, logical_block_ids).to(torch.int64)
+                )
+                key_blocks = key_cache.index_select(0, physical_block_ids)
+                value_blocks = value_cache.index_select(0, physical_block_ids)
+                token_keys = (
+                    key_blocks.reshape(phase_tokens, num_kv_heads, head_size)
+                    .transpose(0, 1)
+                    .contiguous()
+                )
+                token_values = (
+                    value_blocks.reshape(phase_tokens, num_kv_heads, head_size)
+                    .transpose(0, 1)
+                    .contiguous()
+                )
+
+                num_phase_clusters = self._stage_clustering_phase(
+                    layer_name=layer_name,
+                    request_id=request_id,
+                    indexed_start=phase_start,
+                    cluster_start=cluster_start,
+                    segment_size=phase_segment_size,
+                    token_keys=token_keys,
+                    token_values=token_values,
+                )
+                phase_start = phase_end
+                cluster_start += num_phase_clusters
+
+            if phase_start != desired_end:
+                raise RuntimeError("Clustering phases do not cover the update")
             if not defer_cpu_store:
                 self.flush_staged_updates()
 

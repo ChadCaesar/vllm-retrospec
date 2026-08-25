@@ -184,6 +184,12 @@ class SpeculativeConfig:
     retrospec_max_pending_cluster_builds: int = Field(default=2, gt=0)
     """Maximum number of in-flight CPU cluster-page builds, including the active
     build. Prefill waits before staging more token KV when this limit is reached."""
+    retrospec_cpu_page_slab_size_mib: int = Field(default=256, gt=0)
+    """Size in MiB of each pageable CPU cluster-page slab. New slabs are
+    appended without reallocating or copying previously stored cluster KV."""
+    retrospec_max_pinned_memory: float = Field(default=1.0, gt=0)
+    """Maximum pinned-memory budget in GiB for RetroSpec D2H/H2D KV staging.
+    Long-lived CPU cluster KV is stored in pageable slabs."""
     retrospec_prefill_warmup_multiplier: int = Field(default=4, ge=1)
     """Maximum number of high-quality prefill clusters considered for resident
     cache warmup, relative to the normal sparse retrieval-cluster count. The

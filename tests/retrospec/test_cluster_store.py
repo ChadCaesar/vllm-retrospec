@@ -135,7 +135,8 @@ def test_cluster_store_packs_per_head_clusters_across_pages():
     assert store.num_allocated_pages("layer") == 6
     assert store.num_allocated_clusters("layer") == 4
 
-    key_pages, value_pages = store.get_page_storage("layer")
+    valid_page_ids = metadata.page_ids[metadata.page_ids >= 0]
+    key_pages, value_pages = store.read_page_storage("layer", valid_page_ids)
     assert key_pages.shape[1:] == (2, 1)
     assert value_pages.shape == key_pages.shape
 
@@ -287,8 +288,6 @@ def test_cluster_store_vectorized_packing_matches_cluster_membership(
         cluster_token_counts.to(device),
     )
     metadata = get_block_metadata(store, table)
-    key_pages, value_pages = store.get_page_storage("layer")
-
     for head_index in range(num_kv_heads):
         for cluster_index in range(num_clusters):
             token_count = int(cluster_token_counts[head_index, cluster_index])
@@ -314,8 +313,9 @@ def test_cluster_store_vectorized_packing_matches_cluster_membership(
                 assert cluster_page_ids.numel() == 0
                 continue
 
-            cluster_key_pages = key_pages.index_select(0, cluster_page_ids)
-            cluster_value_pages = value_pages.index_select(0, cluster_page_ids)
+            cluster_key_pages, cluster_value_pages = store.read_page_storage(
+                "layer", cluster_page_ids
+            )
             token_mask = torch.arange(
                 page_size,
                 device=cluster_page_token_counts.device,
@@ -700,7 +700,7 @@ def test_cluster_store_rejects_storage_access_before_allocation():
     store = RetroSpecClusterPageStore(page_size=2)
 
     with pytest.raises(RuntimeError, match="No RetroSpec page pool"):
-        store.get_page_storage("missing")
+        store.read_page_storage("missing", torch.empty(0, dtype=torch.int64))
 
 
 def test_cpu_backing_store_preserves_page_layout_and_reuses_pages():
@@ -719,7 +719,8 @@ def test_cpu_backing_store_preserves_page_layout_and_reuses_pages():
     )
     first_metadata = get_block_metadata(store, first)
     first_page_ids = first_metadata.page_ids.clone()
-    key_pages, value_pages = store.get_page_storage("layer")
+    valid_page_ids = first_metadata.page_ids[first_metadata.page_ids >= 0]
+    key_pages, value_pages = store.read_page_storage("layer", valid_page_ids)
 
     assert store.get_storage_device("layer") == torch.device("cpu")
     assert first.cluster_ids.device.type == "cpu"
@@ -759,6 +760,59 @@ def test_cpu_backing_store_preserves_page_layout_and_reuses_pages():
     assert not torch.equal(second.cluster_ids, first.cluster_ids)
 
 
+def test_cpu_backing_store_appends_pageable_slabs_without_migration():
+    store = RetroSpecClusterPageStore(page_size=2, cpu_page_slab_bytes=32)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+
+    first = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
+    )
+    first_metadata = get_block_metadata(store, first)
+    pool = store._layer_pools["layer"]
+
+    assert pool.pages_per_slab == 2
+    assert pool.num_slabs == 3
+    assert first_metadata.page_ids[first_metadata.page_ids >= 0].tolist() == [
+        0,
+        1,
+        1 << 32,
+        (1 << 32) + 1,
+        2 << 32,
+        (2 << 32) + 1,
+    ]
+    slab_pointers = [slab.key_pages.data_ptr() for slab in pool._slabs]
+    assert all(not slab.key_pages.is_pinned() for slab in pool._slabs)
+    assert all(not slab.value_pages.is_pinned() for slab in pool._slabs)
+
+    second = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
+    )
+    assert pool.num_slabs == 6
+    assert [slab.key_pages.data_ptr() for slab in pool._slabs[:3]] == slab_pointers
+
+    gathered_keys, gathered_values, token_mask = store.gather_pages(
+        "layer",
+        first_metadata.page_ids.unsqueeze(0),
+        first_metadata.page_token_counts.unsqueeze(0),
+    )
+    for head_index in range(keys.shape[0]):
+        gathered_head_keys = gathered_keys[0, head_index, token_mask[0, head_index]]
+        gathered_head_values = gathered_values[0, head_index, token_mask[0, head_index]]
+        torch.testing.assert_close(
+            gathered_head_keys[:, 0].sort().values, keys[head_index, :, 0]
+        )
+        torch.testing.assert_close(gathered_head_values, gathered_head_keys + 100.0)
+
+    store.free("layer", first)
+    reused = store_cluster_data(
+        store, "layer", keys, values, assignments, cluster_token_counts
+    )
+    reused_metadata = get_block_metadata(store, reused)
+    torch.testing.assert_close(reused_metadata.page_ids, first_metadata.page_ids)
+    store.free("layer", second)
+    store.free("layer", reused)
+
+
 def test_cpu_backing_store_growth_preserves_existing_logical_pages():
     store = RetroSpecClusterPageStore(
         page_size=2,
@@ -790,9 +844,9 @@ def test_cpu_backing_store_growth_preserves_existing_logical_pages():
         second_counts,
     )
 
-    key_pages, value_pages = store.get_page_storage("layer")
-    assert key_pages.shape[0] == 128
-    assert value_pages.shape == key_pages.shape
+    pool = store._layer_pools["layer"]
+    assert pool.num_slabs == 1
+    assert pool.capacity >= 80
     assert store.num_allocated_pages("layer") == 80
 
     gathered_keys, gathered_values, token_mask = store.gather_pages(
@@ -834,18 +888,15 @@ def test_cpu_backing_store_keeps_block_metadata_on_pinned_cpu():
         cluster_token_counts.cuda(),
     )
     metadata = get_block_metadata(store, table)
-    key_pages, value_pages = store.get_page_storage("layer")
-
     assert table.cluster_ids.device.type == "cpu"
     assert table.cluster_ids.is_pinned()
     assert metadata.page_ids.device.type == "cpu"
     assert metadata.page_ids.is_pinned()
     assert metadata.page_token_counts.device.type == "cpu"
     assert metadata.page_token_counts.is_pinned()
-    assert key_pages.device.type == "cpu"
-    assert value_pages.device.type == "cpu"
-    assert key_pages.is_pinned()
-    assert value_pages.is_pinned()
+    pool = store._layer_pools["layer"]
+    assert all(not slab.key_pages.is_pinned() for slab in pool._slabs)
+    assert all(not slab.value_pages.is_pinned() for slab in pool._slabs)
 
     gathered_keys, gathered_values, token_mask = store.gather_pages(
         "layer",
@@ -906,17 +957,17 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     assert len(resident_cache._pending_copy_batches) == 1
 
     cache_keys, cache_values = store.get_resident_page_storage("layer")
-    backing_keys, backing_values = store.get_page_storage("layer")
     valid = access.cache_page_ids >= 0
     slots = access.cache_page_ids[valid].to(torch.int64)
     logical_ids = metadata.page_ids[valid].cpu().to(torch.int64)
+    backing_keys, backing_values = store.read_page_storage("layer", logical_ids)
     torch.testing.assert_close(
         cache_keys.index_select(0, slots).cpu(),
-        backing_keys.index_select(0, logical_ids),
+        backing_keys,
     )
     torch.testing.assert_close(
         cache_values.index_select(0, slots).cpu(),
-        backing_values.index_select(0, logical_ids),
+        backing_values,
     )
 
     store.free("layer", table)
@@ -987,17 +1038,17 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
 
     resident_keys, resident_values = store.get_resident_page_storage("layer")
     torch.cuda.current_stream(device).synchronize()
-    backing_keys, backing_values = store.get_page_storage("layer")
     resident_pages = access.cache_page_ids >= 0
     resident_slots = access.cache_page_ids[resident_pages].to(torch.int64)
     logical_ids = metadata.page_ids[resident_pages].cpu().to(torch.int64)
+    backing_keys, backing_values = store.read_page_storage("layer", logical_ids)
     torch.testing.assert_close(
         resident_keys.index_select(0, resident_slots).cpu(),
-        backing_keys.index_select(0, logical_ids),
+        backing_keys,
     )
     torch.testing.assert_close(
         resident_values.index_select(0, resident_slots).cpu(),
-        backing_values.index_select(0, logical_ids),
+        backing_values,
     )
     store.close()
 
@@ -1044,17 +1095,17 @@ def test_cpu_backing_store_stages_before_updating_resident_cache():
     assert store.num_resident_pages("layer") == 0
     assert store.num_resident_clusters("layer") == 0
 
-    backing_keys, backing_values = store.get_page_storage("layer")
     staging_slots = resolved.staging_page_ids[staging_pages].to(torch.int64)
     staging_logical_ids = metadata.page_ids[staging_pages].cpu().to(torch.int64)
+    backing_keys, backing_values = store.read_page_storage("layer", staging_logical_ids)
 
     torch.testing.assert_close(
         resolved.staging_key_pages.index_select(0, staging_slots).cpu(),
-        backing_keys.index_select(0, staging_logical_ids),
+        backing_keys,
     )
     torch.testing.assert_close(
         resolved.staging_value_pages.index_select(0, staging_slots).cpu(),
-        backing_values.index_select(0, staging_logical_ids),
+        backing_values,
     )
 
     access = store.admit_staged_clusters(
@@ -1081,13 +1132,16 @@ def test_cpu_backing_store_stages_before_updating_resident_cache():
     resident_pages = access.cache_page_ids >= 0
     resident_slots = access.cache_page_ids[resident_pages].to(torch.int64)
     resident_logical_ids = metadata.page_ids[resident_pages].cpu().to(torch.int64)
+    resident_backing_keys, resident_backing_values = store.read_page_storage(
+        "layer", resident_logical_ids
+    )
     torch.testing.assert_close(
         resident_keys.index_select(0, resident_slots).cpu(),
-        backing_keys.index_select(0, resident_logical_ids),
+        resident_backing_keys,
     )
     torch.testing.assert_close(
         resident_values.index_select(0, resident_slots).cpu(),
-        backing_values.index_select(0, resident_logical_ids),
+        resident_backing_values,
     )
 
 
@@ -1248,7 +1302,9 @@ def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
     first_valid = first_metadata.page_ids >= 0
     first_slots = first_resolved.staging_page_ids[first_valid].to(torch.int64)
     first_logical_ids = first_metadata_cpu.page_ids[first_valid.cpu()].to(torch.int64)
-    first_backing_keys, first_backing_values = store.get_page_storage("first-layer")
+    first_backing_keys, first_backing_values = store.read_page_storage(
+        "first-layer", first_logical_ids
+    )
     first_key_snapshot = first_resolved.staging_key_pages.index_select(0, first_slots)
     first_value_snapshot = first_resolved.staging_value_pages.index_select(
         0, first_slots
@@ -1276,22 +1332,24 @@ def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
     second_logical_ids = second_metadata_cpu.page_ids[second_valid.cpu()].to(
         torch.int64
     )
-    second_backing_keys, second_backing_values = store.get_page_storage("second-layer")
+    second_backing_keys, second_backing_values = store.read_page_storage(
+        "second-layer", second_logical_ids
+    )
     torch.testing.assert_close(
         first_key_snapshot.cpu(),
-        first_backing_keys.index_select(0, first_logical_ids),
+        first_backing_keys,
     )
     torch.testing.assert_close(
         first_value_snapshot.cpu(),
-        first_backing_values.index_select(0, first_logical_ids),
+        first_backing_values,
     )
     torch.testing.assert_close(
         second_resolved.staging_key_pages.index_select(0, second_slots).cpu(),
-        second_backing_keys.index_select(0, second_logical_ids),
+        second_backing_keys,
     )
     torch.testing.assert_close(
         second_resolved.staging_value_pages.index_select(0, second_slots).cpu(),
-        second_backing_values.index_select(0, second_logical_ids),
+        second_backing_values,
     )
 
     assert second_resolved.staging_key_pages.data_ptr() == first_key_ptr
@@ -1309,13 +1367,15 @@ def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA is required for full-verification staging",
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA and pinned host memory are required",
 )
 def test_full_verification_buffer_grows_for_a_larger_layer():
     device = torch.device("cuda", torch.cuda.current_device())
     store = RetroSpecClusterPageStore(
         page_size=2,
+        pin_memory=True,
+        max_pinned_memory_bytes=64,
     )
 
     small_keys = torch.arange(4, dtype=torch.float16, device=device).view(1, 4, 1)
@@ -1364,19 +1424,28 @@ def test_full_verification_buffer_grows_for_a_larger_layer():
     valid_pages = large_metadata.page_ids >= 0
     staging_slots = large_resolved.staging_page_ids[valid_pages].to(torch.int64)
     logical_page_ids = large_metadata.page_ids[valid_pages].cpu().to(torch.int64)
-    backing_keys, backing_values = store.get_page_storage("large-layer")
+    backing_keys, backing_values = store.read_page_storage(
+        "large-layer", logical_page_ids
+    )
 
     torch.testing.assert_close(
         large_resolved.staging_key_pages.index_select(0, staging_slots).cpu(),
-        backing_keys.index_select(0, logical_page_ids),
+        backing_keys,
     )
     torch.testing.assert_close(
         large_resolved.staging_value_pages.index_select(0, staging_slots).cpu(),
-        backing_values.index_select(0, logical_page_ids),
+        backing_values,
     )
     transfer_buffer = store._full_verification_buffers[device]
     assert transfer_buffer.capacity == 128
     assert large_resolved.staging_key_pages.data_ptr() != small_key_ptr
+    assert len(transfer_buffer._cpu_slots) == 2
+    assert all(slot.key_pages.is_pinned() for slot in transfer_buffer._cpu_slots)
+    pinned_bytes = sum(
+        slot.key_pages.nbytes + slot.value_pages.nbytes
+        for slot in transfer_buffer._cpu_slots
+    )
+    assert pinned_bytes <= store.max_pinned_memory_bytes // 2
 
 
 def test_cluster_store_rejects_invalid_resolve_mode():
@@ -1442,6 +1511,39 @@ def test_cpu_backing_store_stages_and_commits_cpu_inputs():
         gathered_values[token_mask.unsqueeze(-1)],
         gathered_keys[token_mask.unsqueeze(-1)] + 100.0,
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA and pinned host memory are required",
+)
+def test_resident_admission_limits_prefetch_to_fixed_h2d_slot():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        pin_memory=True,
+        cache_ratio=1.0,
+        max_pinned_memory_bytes=64,
+    )
+    keys = torch.arange(4, dtype=torch.float32, device=device).view(1, 4, 1)
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys,
+        keys + 100.0,
+        torch.tensor([[0, 0, 1, 1]], dtype=torch.int64, device=device),
+        torch.tensor([[2, 2]], dtype=torch.int32, device=device),
+    )
+    cluster_ids = table.cluster_ids.to(device)
+    metadata = store.get_cluster_block_metadata("layer", cluster_ids, device=device)
+
+    access = store.admit_resident_clusters("layer", cluster_ids, metadata.page_ids)
+
+    assert access.hit_cluster_mask.tolist() == [[True, False]]
+    assert access.miss_cluster_mask.tolist() == [[False, True]]
+    transfer_buffer = store._full_verification_buffers[device]
+    assert transfer_buffer._cpu_slot_capacity == 1
+    assert store.num_resident_pages("layer") == 1
 
 
 def test_cpu_backing_store_supports_two_phase_staging():
@@ -1571,7 +1673,7 @@ def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
 
     assert pool.storage_device == torch.device("cpu")
     assert pool.metadata_device == device
-    assert pool.key_pages.is_pinned()
+    assert all(not slab.key_pages.is_pinned() for slab in pool._slabs)
     assert gathered_keys[0, 0, token_mask[0, 0], 0].tolist() == [
         0.0,
         1.0,
@@ -1667,12 +1769,36 @@ def test_cpu_backing_store_does_not_reuse_busy_pinned_staging_slot():
     assert second.staging_slot is not None
     assert second.staging_slot is not first.staging_slot
     assert len(store._pinned_staging_slots[device]) == 2
+    with pytest.raises(RuntimeError, match="staging slot is available"):
+        store.stage_token_kv(keys, values)
 
     store.discard_staged_token_kv(first)
     store.discard_staged_token_kv(second)
 
     assert not first.staging_slot.in_use
     assert not second.staging_slot.in_use
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA and pinned host memory are required",
+)
+def test_cpu_backing_store_enforces_pinned_build_slot_budget():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        pin_memory=True,
+        max_pinned_memory_bytes=128,
+        max_pending_cluster_builds=2,
+    )
+    keys, values, _, _ = make_cluster_data()
+
+    with pytest.raises(RuntimeError, match="pinned-memory slot budget"):
+        store.stage_token_kv(keys.to(device), values.to(device))
+
+    slots = store._pinned_staging_slots[device]
+    assert len(slots) == 1
+    assert not slots[0].in_use
 
 
 @pytest.mark.skipif(
