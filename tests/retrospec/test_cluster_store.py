@@ -1201,7 +1201,7 @@ def test_cpu_backing_store_resident_only_resolution_does_not_admit_misses():
     not torch.cuda.is_available(),
     reason="CUDA is required to resolve pending cluster pages",
 )
-def test_cpu_backing_store_hides_pending_pages_from_draft_but_not_verification():
+def test_cpu_backing_store_exposes_pending_pages_only_when_requested():
     store = RetroSpecClusterPageStore(
         page_size=2,
         cache_ratio=0.5,
@@ -1227,6 +1227,12 @@ def test_cpu_backing_store_hides_pending_pages_from_draft_but_not_verification()
         metadata.page_ids,
         mode="resident_only",
     )
+    first_draft = store.resolve_cluster_blocks(
+        "layer",
+        cluster_ids,
+        metadata.page_ids,
+        mode="resident_pending",
+    )
     verification = store.resolve_cluster_blocks(
         "layer",
         cluster_ids,
@@ -1238,6 +1244,18 @@ def test_cpu_backing_store_hides_pending_pages_from_draft_but_not_verification()
     assert draft.miss_cluster_mask.all()
     assert torch.all(draft.resident_page_ids == -1)
     assert draft.resident_ready_event is None
+
+    assert first_draft.hit_cluster_mask.tolist() == [
+        [True, False],
+        [True, False],
+    ]
+    assert first_draft.miss_cluster_mask.tolist() == [
+        [False, True],
+        [False, True],
+    ]
+    assert first_draft.resident_ready_event is not None
+    assert torch.all(first_draft.staging_page_ids == -1)
+    assert first_draft.staging_key_pages.shape[0] == 0
 
     assert verification.hit_cluster_mask.tolist() == [
         [True, False],

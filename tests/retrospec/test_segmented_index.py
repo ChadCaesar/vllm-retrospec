@@ -11,6 +11,9 @@ import torch
 
 from vllm.v1.spec_decode.retrospec import segmented_index as segmented_index_module
 from vllm.v1.spec_decode.retrospec.index import RetroSpecAttentionLevel
+from vllm.v1.spec_decode.retrospec.index_residency import (
+    RetroSpecResidentBatchView,
+)
 from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecSegmentedTokenIndex,
 )
@@ -26,7 +29,7 @@ def make_index(
     pin_memory: bool = False,
     max_pending_cluster_builds: int = 2,
     max_resident_requests: int = 1,
-    prefill_warmup_multiplier: int = 4,
+    first_draft_warmup_multiplier: int = 4,
 ) -> RetroSpecSegmentedTokenIndex:
     return RetroSpecSegmentedTokenIndex(
         block_size=2,
@@ -42,7 +45,7 @@ def make_index(
         cache_ratio=cache_ratio,
         pin_memory=pin_memory,
         max_resident_requests=max_resident_requests,
-        prefill_warmup_multiplier=prefill_warmup_multiplier,
+        first_draft_warmup_multiplier=first_draft_warmup_multiplier,
     )
 
 
@@ -56,6 +59,22 @@ def make_cache(
         keys[block_id].fill_(float(block_id))
         values[block_id].fill_(float(block_id * 10))
     return keys, values
+
+
+def make_empty_resident_view(
+    batch_size: int,
+    num_clusters: int,
+    device: torch.device,
+) -> RetroSpecResidentBatchView:
+    return RetroSpecResidentBatchView(
+        arena=None,
+        request_slot_ids=torch.full(
+            (batch_size,), -1, dtype=torch.int64, device=device
+        ),
+        max_num_clusters=num_clusters,
+        max_pages_per_cluster=0,
+        max_num_pages=0,
+    )
 
 
 @contextmanager
@@ -136,59 +155,50 @@ def test_sparse_verification_prefetch_requires_pinned_cpu_backing():
     index.cluster_store.prefetch_resident_clusters.assert_not_called()
 
 
-def test_prefill_warmup_ranks_clusters_and_caps_admission_to_half_lru():
-    index = make_index(retrieval_ratio=0.5, cache_ratio=1.0)
-    keys, values = make_cache()
-    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
-    build_index(index, 10, keys, values, block_table)
+def test_first_draft_warmup_is_marked_only_with_pinned_cpu_backing():
+    pageable = make_index(pin_memory=False)
+    pageable.mark_first_draft_warmup(["request"], ["first", "second"])
+    assert pageable._first_draft_warm_layers_by_request == {}
 
-    record = index._indices["layer"]["request"]
-    cluster_ids = record.segments[0].cluster_blocks.cluster_ids
-    assert cluster_ids.shape == (1, 2)
+    pinned = make_index(pin_memory=True)
+    pinned.mark_first_draft_warmup(["request"], ["first", "second"])
+    assert pinned._first_draft_warm_layers_by_request == {
+        "request": {"first", "second"}
+    }
 
-    index.cluster_store.pin_memory = True
-    index.cluster_store.resident_group_target_pages = Mock(return_value=((2,),))
-    index.cluster_store.prefetch_resident_clusters = Mock(return_value=True)
-    index._score_resident_view = Mock(
-        return_value=(
-            torch.tensor([[[0.25, 0.75]]]),
-            torch.tensor([[[0.25, 0.75]]]),
-            torch.tensor([[2]], dtype=torch.int32),
-            None,
-        )
+
+def test_first_draft_warmup_waits_for_each_requests_first_active_draft():
+    index = make_index(pin_memory=True)
+    index.mark_first_draft_warmup(["first", "second"], ["layer"])
+
+    first_mask = index._get_first_draft_warmup_mask(
+        ["first", "second"],
+        "layer",
+        torch.tensor([True, False]),
+        warm_first_draft=True,
+    )
+    assert first_mask is not None
+    assert first_mask.tolist() == [True, False]
+    index.complete_first_draft_warmup(
+        ["first", "second"], ["layer"], torch.tensor([True, False])
     )
 
-    queued = index.prefetch_prefill_clusters(
-        request_ids=["request"],
-        layer_name="layer",
-        query=torch.ones(1, 1, 1),
-        key_cache=keys,
-        scale=1.0,
+    second_mask = index._get_first_draft_warmup_mask(
+        ["first", "second"],
+        "layer",
+        torch.tensor([False, True]),
+        warm_first_draft=True,
     )
-
-    assert queued
-    call_kwargs = index.cluster_store.prefetch_resident_clusters.call_args.kwargs
-    assert call_kwargs["layer_name"] == "layer"
-    assert call_kwargs["cluster_ids"].tolist() == [[[int(cluster_ids[0, 1]), -1]]]
-
-
-def test_first_proposal_waits_for_prefill_warmup_once():
-    index = make_index()
-    index._prefill_warm_layers_by_request["request"] = {"second", "first"}
-    index.cluster_store.synchronize_resident_prefetches = Mock()
-
-    index.begin_proposal(["request"])
-    index.end_proposal()
-    index.begin_proposal(["request"])
-    index.end_proposal()
-
-    index.cluster_store.synchronize_resident_prefetches.assert_called_once_with(
-        ("first", "second")
+    assert second_mask is not None
+    assert second_mask.tolist() == [False, True]
+    index.complete_first_draft_warmup(
+        ["first", "second"], ["layer"], torch.tensor([False, True])
     )
+    assert index._first_draft_warm_layers_by_request == {}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_prefill_warmup_makes_first_proposal_cluster_resident():
+def test_first_draft_selection_admits_ranked_cluster_before_attention():
     device = torch.device("cuda")
     index = make_index(
         retrieval_ratio=0.5,
@@ -202,13 +212,9 @@ def test_prefill_warmup_makes_first_proposal_cluster_resident():
     build_index(index, 10, keys, values, block_table, prefill_complete=True)
 
     query = torch.ones(1, 1, 1, dtype=torch.bfloat16, device=device)
-    assert index.prefetch_prefill_clusters(
-        request_ids=["request"],
-        layer_name="layer",
-        query=query,
-        key_cache=keys,
-        scale=1.0,
-    )
+    index.mark_first_draft_warmup(["request"], ["layer"])
+    score_resident_view = Mock(wraps=index._score_resident_view)
+    index._score_resident_view = score_resident_view
 
     index.begin_proposal(["request"])
     try:
@@ -222,17 +228,19 @@ def test_prefill_warmup_makes_first_proposal_cluster_resident():
             seq_lens=torch.tensor([10], dtype=torch.int32, device=device),
             active_mask=torch.tensor([True], device=device),
             scale=1.0,
+            warm_first_draft=True,
         )
     finally:
         index.end_proposal()
 
     assert index.cluster_store.num_resident_pages("layer") == 1
+    score_resident_view.assert_called_once()
     assert selection.resolved_pages is not None
     assert selection.resolved_pages.hit_cluster_mask.all()
+    assert selection.resolved_pages.resident_ready_event is not None
     assert selection.exact_token_counts.tolist() == [[8]]
-    # Prefill intentionally occupies at most half the request/head target, so
-    # hit-based stage transitions remain cold-protected until generation fills
-    # the remaining LRU capacity.
+    # The first draft occupies at most half the request/head target, so the hit
+    # gate stays cold-protected until later drafts fill the remaining capacity.
     assert not selection.resolved_pages.hit_gate_ready_mask.any()
 
 
@@ -635,7 +643,10 @@ def test_compact_cluster_zones_match_full_mask_selection(
     ranking_scores = cluster_scores.masked_fill(~cluster_mask, float("-inf"))
     candidate_counts = cluster_mask.sum(dim=2, dtype=torch.int32)
     zones = index._select_cluster_zones(
-        cluster_scores, ranking_scores, candidate_counts
+        cluster_scores,
+        ranking_scores,
+        candidate_counts,
+        make_empty_resident_view(2, 7, cluster_scores.device),
     )
     expected_zones = index._select_zone_masks(
         cluster_scores.flatten(0, 1),

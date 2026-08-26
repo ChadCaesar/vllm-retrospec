@@ -246,7 +246,7 @@ def test_gather_resident_exact_pages_matches_request_slot_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_selection_output_workspace_uses_step_slots_and_reuses_proposals():
+def test_selection_output_workspace_recycles_step_slots_and_reuses_proposals():
     device = torch.device("cuda", torch.cuda.current_device())
     index = RetroSpecSegmentedTokenIndex(
         block_size=2,
@@ -275,14 +275,14 @@ def test_selection_output_workspace_uses_step_slots_and_reuses_proposals():
         second = index._get_selection_output_workspace(
             "layer", view, 1, 1, 8, torch.float16, device
         )
-        with pytest.raises(RuntimeError, match="selection capacity"):
-            index._get_selection_output_workspace(
-                "layer", view, 1, 1, 8, torch.float16, device
-            )
+        recycled = index._get_selection_output_workspace(
+            "layer", view, 1, 1, 8, torch.float16, device
+        )
     finally:
         index.end_proposal()
 
     assert first is not second
+    assert recycled is first
     assert first.draft_estimation_keys.data_ptr() != (
         second.draft_estimation_keys.data_ptr()
     )

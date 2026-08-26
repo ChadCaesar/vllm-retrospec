@@ -16,6 +16,22 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 )
 
 
+def make_empty_resident_view(
+    batch_size: int,
+    num_clusters: int,
+    device: torch.device,
+) -> RetroSpecResidentBatchView:
+    return RetroSpecResidentBatchView(
+        arena=None,
+        request_slot_ids=torch.full(
+            (batch_size,), -1, dtype=torch.int64, device=device
+        ),
+        max_num_clusters=num_clusters,
+        max_pages_per_cluster=0,
+        max_num_pages=0,
+    )
+
+
 def reference_cluster_scores(
     logits: torch.Tensor,
     cluster_mask: torch.Tensor,
@@ -160,7 +176,7 @@ def test_fused_cluster_scores_match_reference(
     count_dtype: torch.dtype,
 ):
     torch.manual_seed(7)
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     batch_size = 3
     num_kv_heads = 2
     scale = 0.125
@@ -516,14 +532,46 @@ def test_cluster_selection_workspace_is_reused_and_resized():
     assert first.logits.shape == (2, 2, 4, 23)
     assert first.scores.shape == (2, 2, 23)
     assert first.softmax_lse.shape == (2, 2, 4)
-    assert first.topk_indices.shape == (2, 2, 12)
+    assert first.topk_indices.shape == (2, 2, 23)
 
     resized = index._get_cluster_selection_workspace(query, 2, 29)
 
     assert resized is not first
     assert resized.logits.shape == (2, 2, 4, 29)
     assert resized.scores.shape == (2, 2, 29)
-    assert resized.topk_indices.shape == (2, 2, 16)
+    assert resized.topk_indices.shape == (2, 2, 29)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_selection_output_workspace_recycles_across_draft_rounds():
+    index = RetroSpecSegmentedTokenIndex(
+        block_size=16,
+        num_speculative_tokens=2,
+        retrieval_ratio=0.25,
+        estimation_ratio=0.25,
+        prefill_segment_size_tokens=256,
+        generation_update_interval=64,
+        blocks_per_cluster=2,
+        num_kmeans_iterations=2,
+        max_model_len=4096,
+    )
+    device = torch.device("cuda", torch.cuda.current_device())
+    view = make_empty_resident_view(2, 8, device)
+    workspaces = [
+        index._get_selection_output_workspace(
+            "layer",
+            view,
+            batch_size=2,
+            num_kv_heads=2,
+            head_size=64,
+            dtype=torch.float16,
+            device=device,
+        )
+        for _ in range(3)
+    ]
+
+    assert workspaces[0] is not workspaces[1]
+    assert workspaces[2] is workspaces[0]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -540,13 +588,7 @@ def test_empty_resident_view_uses_selection_workspace():
         max_model_len=4096,
     )
     query = torch.randn(2, 8, 64, dtype=torch.float16, device="cuda")
-    view = RetroSpecResidentBatchView(
-        arena=None,
-        request_slot_ids=torch.full((2,), -1, dtype=torch.int64, device="cuda"),
-        max_num_clusters=1,
-        max_pages_per_cluster=0,
-        max_num_pages=0,
-    )
+    view = make_empty_resident_view(2, 1, query.device)
 
     scores, ranking_scores, candidate_counts, workspace = index._score_resident_view(
         query, view, scale=0.125, num_kv_heads=2
@@ -560,7 +602,7 @@ def test_empty_resident_view_uses_selection_workspace():
     assert torch.count_nonzero(candidate_counts).item() == 0
 
     zones = index._select_cluster_zones(
-        scores, ranking_scores, candidate_counts, workspace
+        scores, ranking_scores, candidate_counts, view, workspace=workspace
     )
     assert not zones.sparse_retrieval_mask.any()
     assert not zones.sparse_estimation_mask.any()
@@ -619,7 +661,8 @@ def test_workspace_cluster_selection_matches_allocating_path():
         workspace_scores,
         workspace.ranking_scores,
         workspace.candidate_counts,
-        workspace,
+        make_empty_resident_view(2, 37, query.device),
+        workspace=workspace,
     )
 
     reference_scores = index._score_clusters(
@@ -633,6 +676,7 @@ def test_workspace_cluster_selection_matches_allocating_path():
         reference_scores,
         reference_scores.masked_fill(~cluster_mask, float("-inf")),
         cluster_mask.sum(dim=2, dtype=torch.int32),
+        make_empty_resident_view(2, 37, query.device),
     )
     torch.cuda.synchronize()
 
@@ -654,5 +698,6 @@ def test_workspace_cluster_selection_matches_allocating_path():
             workspace_scores.clone(),
             workspace.ranking_scores,
             workspace.candidate_counts,
-            workspace,
+            make_empty_resident_view(2, 37, query.device),
+            workspace=workspace,
         )

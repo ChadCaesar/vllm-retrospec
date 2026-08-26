@@ -24,6 +24,7 @@ from .resident_cache import (
 
 RetroSpecClusterResolveMode = Literal[
     "resident_only",
+    "resident_pending",
     "verification",
 ]
 
@@ -2973,11 +2974,11 @@ class RetroSpecClusterPageStore:
     ) -> RetroSpecResolvedClusterPages:
         """Resolve selected cluster blocks to physical GPU page sources.
 
-        resident_only exposes only completed resident pages. Verification also
-        exposes pages whose asynchronous H2D copies are pending and returns the
-        event that the execution stream must wait for.
+        resident_only exposes only completed resident pages. resident_pending
+        exposes pending resident pages and their ready event without staging
+        other misses. verification additionally stages every selected miss.
         """
-        if mode not in ("resident_only", "verification"):
+        if mode not in ("resident_only", "resident_pending", "verification"):
             raise ValueError(f"Unsupported RetroSpec cluster resolve mode: {mode}")
         if logical_page_ids.shape[:-1] != cluster_ids.shape:
             raise ValueError("Logical page-table shape does not match cluster IDs")
@@ -3005,6 +3006,7 @@ class RetroSpecClusterPageStore:
         pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
         verification = mode == "verification"
+        include_pending = mode != "resident_only"
         resident_access = resident_cache.lookup(
             cluster_ids=cluster_ids,
             page_ids=logical_page_ids,
@@ -3012,7 +3014,7 @@ class RetroSpecClusterPageStore:
             allocated_cluster_ids=allocated_cluster_ids,
             allocated_page_ids=pool.allocated_page_ids,
             touch=True,
-            include_pending=verification,
+            include_pending=include_pending,
             cluster_ids_cpu=cluster_ids_cpu,
             page_ids_cpu=logical_page_ids_cpu,
         )
@@ -3051,7 +3053,9 @@ class RetroSpecClusterPageStore:
             staging_page_ids = torch.full_like(logical_page_ids, -1)
             staging_key_pages = resident_cache.key_pages[:0]
             staging_value_pages = resident_cache.value_pages[:0]
-            resident_ready_event = None
+            resident_ready_event = (
+                resident_access.ready_event if include_pending else None
+            )
             staging_ready_event = None
 
         return RetroSpecResolvedClusterPages(

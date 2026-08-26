@@ -48,14 +48,6 @@ class _RetroSpecFullVerificationBatch:
     request_indices: torch.Tensor
 
 
-@dataclass(frozen=True)
-class _RetroSpecPrefillWarmup:
-    request_ids: tuple[str, ...]
-    query: torch.Tensor
-    key_cache: torch.Tensor
-    scale: float
-
-
 LayerForward = Callable[..., torch.Tensor]
 
 
@@ -158,9 +150,9 @@ class RetroSpecSparseAttention:
             cache_ratio=config.retrospec_cache_ratio,
             pin_memory=device.type == "cuda" and is_pin_memory_available(),
             max_resident_requests=vllm_config.scheduler_config.max_num_seqs,
-            prefill_warmup_multiplier=getattr(
+            first_draft_warmup_multiplier=getattr(
                 config,
-                "retrospec_prefill_warmup_multiplier",
+                "retrospec_first_draft_warmup_multiplier",
                 4,
             ),
             cpu_page_slab_bytes=(
@@ -193,10 +185,6 @@ class RetroSpecSparseAttention:
         self.index_update_is_prefill: tuple[bool, ...] = ()
         self.index_update_prefill_complete: tuple[bool, ...] = ()
         self.index_update_build_rows: tuple[int, ...] = ()
-        self.index_update_prefill_warmup_request_ids: tuple[str, ...] = ()
-        self.index_update_prefill_warmup_query_end_rows: torch.Tensor | None = None
-        self.prefill_warmups: dict[str, _RetroSpecPrefillWarmup] = {}
-
         self.mode = RetroSpecAttentionMode.PASSTHROUGH
         self.in_proposal = False
         self.step_active = False
@@ -260,13 +248,8 @@ class RetroSpecSparseAttention:
 
         if self.index.has_staged_updates:
             raise RuntimeError("A previous RetroSpec update left staged index changes")
-        if self.prefill_warmups:
-            raise RuntimeError("A previous prefill left unconsumed warmup queries")
-
-        warmup_rows = (
-            tuple(row for row in build_rows if prefill_complete[row])
-            if self.index.cluster_store.pin_memory
-            else ()
+        first_draft_warmup_request_ids = tuple(
+            request_ids[row] for row in build_rows if prefill_complete[row]
         )
 
         self.index_update_active = True
@@ -275,18 +258,6 @@ class RetroSpecSparseAttention:
         self.index_update_is_prefill = is_prefill
         self.index_update_prefill_complete = prefill_complete
         self.index_update_build_rows = build_rows
-        self.index_update_prefill_warmup_request_ids = tuple(
-            request_ids[row] for row in warmup_rows
-        )
-        self.index_update_prefill_warmup_query_end_rows = (
-            torch.tensor(
-                [row + 1 for row in warmup_rows],
-                dtype=torch.int64,
-                device=self.device,
-            )
-            if warmup_rows
-            else None
-        )
 
         try:
             yield
@@ -295,14 +266,10 @@ class RetroSpecSparseAttention:
             raise
         else:
             self.index.flush_staged_updates()
-            for layer_name, warmup in self.prefill_warmups.items():
-                self.index.prefetch_prefill_clusters(
-                    request_ids=warmup.request_ids,
-                    layer_name=layer_name,
-                    query=warmup.query,
-                    key_cache=warmup.key_cache,
-                    scale=warmup.scale,
-                )
+            self.index.mark_first_draft_warmup(
+                first_draft_warmup_request_ids,
+                tuple(self.original_forwards),
+            )
         finally:
             self.index_update_active = False
             self.index_update_request_ids = ()
@@ -310,9 +277,6 @@ class RetroSpecSparseAttention:
             self.index_update_is_prefill = ()
             self.index_update_prefill_complete = ()
             self.index_update_build_rows = ()
-            self.index_update_prefill_warmup_request_ids = ()
-            self.index_update_prefill_warmup_query_end_rows = None
-            self.prefill_warmups.clear()
 
     def needs_index_update(
         self,
@@ -688,6 +652,14 @@ class RetroSpecSparseAttention:
             self.attention_mass_sum[: self.batch_size] / self.attention_mass_layer_count
         )
 
+        if self.mode == RetroSpecAttentionMode.DRAFT:
+            assert self.active_mask is not None
+            self.index.complete_first_draft_warmup(
+                self.proposal_request_ids,
+                tuple(self.original_forwards),
+                self.active_mask,
+            )
+
         self.mode = RetroSpecAttentionMode.PASSTHROUGH
         self.step_active = False
         self.step_index = -1
@@ -790,39 +762,6 @@ class RetroSpecSparseAttention:
             prefill_complete=self.index_update_prefill_complete,
         )
 
-    def _capture_prefill_warmup(
-        self,
-        layer_name: str,
-        impl: FlashAttentionImpl,
-        query: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
-    ) -> None:
-        query_end_rows = self.index_update_prefill_warmup_query_end_rows
-        if query_end_rows is None:
-            return
-        if layer_name in self.prefill_warmups:
-            raise RuntimeError("Prefill warmup query was captured twice for one layer")
-        if attn_metadata.query_start_loc.device != query.device:
-            raise ValueError("Prefill query offsets and query must use one device")
-
-        last_query_indices = (
-            attn_metadata.query_start_loc.index_select(
-                0,
-                query_end_rows,
-            ).to(torch.int64)
-            - 1
-        )
-        last_queries = query.index_select(0, last_query_indices).contiguous()
-
-        key_cache, _ = kv_cache.unbind(0)
-        self.prefill_warmups[layer_name] = _RetroSpecPrefillWarmup(
-            request_ids=self.index_update_prefill_warmup_request_ids,
-            query=last_queries,
-            key_cache=key_cache,
-            scale=impl.scale,
-        )
-
     def forward(
         self,
         layer_name: str,
@@ -850,21 +789,6 @@ class RetroSpecSparseAttention:
                 output_block_scale,
             )
             self._maybe_update_index(layer_name, kv_cache, attn_metadata)
-
-            if self.index_update_prefill_warmup_query_end_rows is not None:
-                impl = getattr(layer, "impl", None)
-                if not isinstance(impl, FlashAttentionImpl):
-                    raise RuntimeError(
-                        "Prefill warmup requires a FlashAttention implementation"
-                    )
-                self._capture_prefill_warmup(
-                    layer_name,
-                    impl,
-                    query,
-                    kv_cache,
-                    attn_metadata,
-                )
-
             return result
 
         if output_scale is not None or output_block_scale is not None:
@@ -1347,6 +1271,7 @@ class RetroSpecSparseAttention:
                 seq_lens=attn_metadata.seq_lens,
                 active_mask=self.active_mask,
                 scale=impl.scale,
+                warm_first_draft=True,
             )
             self.selection_plans[self.step_index][layer_name] = selection.plan
         else:

@@ -367,17 +367,14 @@ def test_passthrough_forward_builds_segmented_index_after_target_attention():
     assert controller.index_update_build_rows == ()
 
 
-def test_prefill_completion_warms_from_each_requests_last_query():
+def test_prefill_completion_marks_each_request_for_first_draft_warmup():
     controller = make_controller()
     mark_installed(controller)
-    controller.index.cluster_store.pin_memory = True
     controller.index.build_or_update = Mock()
     controller.index.flush_staged_updates = Mock()
-    controller.index.prefetch_prefill_clusters = Mock(return_value=True)
+    controller.index.mark_first_draft_warmup = Mock()
 
-    impl = object.__new__(FlashAttentionImpl)
-    impl.scale = 0.5
-    layer = SimpleNamespace(impl=impl)
+    layer = SimpleNamespace()
     query = torch.arange(5, dtype=torch.float32).view(5, 1, 1)
     kv_cache = torch.ones(2, 4, 2, 1, 1)
     metadata = SimpleNamespace(
@@ -403,15 +400,11 @@ def test_prefill_completion_warms_from_each_requests_last_query():
             metadata,
         )
 
-    call_kwargs = controller.index.prefetch_prefill_clusters.call_args.kwargs
-    assert call_kwargs["request_ids"] == ("first", "second")
-    assert call_kwargs["layer_name"] == "layer"
-    assert call_kwargs["query"].flatten().tolist() == [2.0, 4.0]
-    assert call_kwargs["key_cache"].data_ptr() == kv_cache[0].data_ptr()
-    assert call_kwargs["scale"] == pytest.approx(0.5)
-    assert controller.index_update_prefill_warmup_request_ids == ()
-    assert controller.index_update_prefill_warmup_query_end_rows is None
-    assert controller.prefill_warmups == {}
+    controller.index.mark_first_draft_warmup.assert_called_once_with(
+        ("first", "second"), ("layer",)
+    )
+    assert controller.index_update_request_ids == ()
+    assert controller.index_update_build_rows == ()
 
 
 def test_index_update_context_restores_state_after_exception():
@@ -1267,6 +1260,7 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
     controller.index.prefetch_sparse_verification = Mock(
         side_effect=lambda **kwargs: call_order.append("prefetch")
     )
+    controller.index.complete_first_draft_warmup = Mock()
 
     impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
     layer = cast(torch.nn.Module, SimpleNamespace())
@@ -1295,6 +1289,10 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
     controller.index.prefetch_sparse_verification.assert_called_once_with(
         plan=plan,
         active_mask=active_mask,
+    )
+    assert controller.index.select_segmented.call_args.kwargs["warm_first_draft"]
+    controller.index.complete_first_draft_warmup.assert_called_once_with(
+        ("request-0", "request-1"), ("layer",), active_mask
     )
 
 
