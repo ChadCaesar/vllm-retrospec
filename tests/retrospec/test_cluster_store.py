@@ -1352,9 +1352,17 @@ def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
         second_backing_values,
     )
 
-    assert second_resolved.staging_key_pages.data_ptr() == first_key_ptr
-    assert second_resolved.staging_value_pages.data_ptr() == first_value_ptr
+    second_key_ptr = second_resolved.staging_key_pages.data_ptr()
+    second_value_ptr = second_resolved.staging_value_pages.data_ptr()
+    assert second_key_ptr != first_key_ptr
+    assert second_value_ptr != first_value_ptr
     assert len(store._full_verification_buffers) == 1
+    transfer_buffer = store._full_verification_buffers[device]
+    assert transfer_buffer._gpu_arenas[0].key_pages.data_ptr() == first_key_ptr
+    assert transfer_buffer._gpu_arenas[0].value_pages.data_ptr() == first_value_ptr
+    assert transfer_buffer._gpu_arenas[1].key_pages.data_ptr() == second_key_ptr
+    assert transfer_buffer._gpu_arenas[1].value_pages.data_ptr() == second_value_ptr
+    assert transfer_buffer._gpu_arena_cursor == 0
     assert not second_resolved.hit_cluster_mask.any()
     assert second_resolved.miss_cluster_mask.all()
     assert store.num_resident_pages("first-layer") == resident_pages_before

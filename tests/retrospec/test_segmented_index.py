@@ -4,7 +4,7 @@
 import threading
 from concurrent.futures import Future
 from contextlib import contextmanager
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -809,6 +809,109 @@ def test_full_verification_plan_covers_clustered_and_primary_tokens():
     assert (plan.exact_page_ids[0] >= 0).sum(dim=(1, 2)).tolist() == [2, 2]
     assert not (plan.exact_page_ids[1] >= 0).any()
     assert torch.equal(plan.exact_page_ids_cpu, plan.exact_page_ids.cpu())
+
+
+def test_full_verification_plan_reuses_persistent_cpu_page_descriptor():
+    index = make_index()
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+
+    descriptor = index._indices["layer"]["request"].full_verification_page_ids_cpu
+    assert descriptor is not None
+
+    with patch.object(
+        index.cluster_store,
+        "get_cluster_block_metadata",
+        side_effect=AssertionError("full verify rebuilt the CPU descriptor"),
+    ):
+        index.begin_full_verification_residency(["request"])
+        try:
+            plan = index.build_full_verification_plan(
+                request_ids=["request"],
+                layer_name="layer",
+                seq_lens=[10],
+                key_cache=keys,
+                block_table=block_table,
+            )
+        finally:
+            index.end_full_verification_residency()
+
+    assert torch.equal(plan.exact_page_ids_cpu[0, :, 0], descriptor)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for full-verification pipelining",
+)
+def test_full_verification_pipeline_prefetches_next_layer():
+    device = torch.device("cuda", torch.cuda.current_device())
+    index = make_index()
+    keys, values = make_cache()
+    keys = keys.to(device)
+    values = values.to(device)
+    block_table = torch.arange(7, dtype=torch.int32, device=device).view(1, -1)
+
+    for layer_name in ("layer.0", "layer.1"):
+        index.build_or_update(
+            layer_name=layer_name,
+            request_ids=["request"],
+            seq_lens=[10],
+            is_prefill=[True],
+            rows=[0],
+            key_cache=keys,
+            value_cache=values,
+            block_table=block_table,
+        )
+
+    index.begin_full_verification_residency(["request"])
+    try:
+        with patch.object(
+            index.cluster_store,
+            "get_cluster_block_metadata",
+            side_effect=AssertionError("pipeline rebuilt the CPU descriptor"),
+        ):
+            index.begin_full_verification_pipeline(
+                ["request"],
+                {"layer.0": 1, "layer.1": 1},
+                device,
+            )
+            assert index._full_verification_prefetched is not None
+            assert index._full_verification_prefetched.layer_name == "layer.0"
+
+            first = index.build_full_verification_plan(
+                request_ids=["request"],
+                layer_name="layer.0",
+                seq_lens=[10],
+                key_cache=keys,
+                block_table=block_table,
+            )
+            assert first.resolved_pages is not None
+            assert index._full_verification_prefetched is not None
+            assert index._full_verification_prefetched.layer_name == "layer.1"
+
+            second = index.build_full_verification_plan(
+                request_ids=["request"],
+                layer_name="layer.1",
+                seq_lens=[10],
+                key_cache=keys,
+                block_table=block_table,
+            )
+            assert second.resolved_pages is not None
+            assert index._full_verification_prefetched is None
+    finally:
+        index.end_full_verification_pipeline()
+        index.end_full_verification_residency()
+
+    assert first.resolved_pages.staging_ready_event is not None
+    assert second.resolved_pages.staging_ready_event is not None
+    torch.cuda.current_stream(device).wait_event(
+        first.resolved_pages.staging_ready_event
+    )
+    torch.cuda.current_stream(device).wait_event(
+        second.resolved_pages.staging_ready_event
+    )
+    torch.cuda.synchronize(device)
 
 
 def test_full_verification_plan_handles_request_without_cluster_pages():

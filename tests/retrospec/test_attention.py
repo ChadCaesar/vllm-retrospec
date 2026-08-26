@@ -943,6 +943,17 @@ def test_full_verification_source_resolves_all_cluster_pages():
     assert source.staging_pages.page_ids is staging_page_ids
     assert source.staging_pages.ready_event is staging_ready_event
 
+    controller.index.cluster_store.resolve_full_verification_blocks.reset_mock()
+    prefetched_plan = replace(plan, resolved_pages=resolved)
+    _, prefetched_pages = controller._resolve_exact_kv_source(
+        prefetched_plan,
+        key_cache,
+        value_cache,
+        block_table,
+    )
+    assert prefetched_pages is resolved
+    resolve_full.assert_not_called()
+
 
 def test_token_estimation_attention_uses_per_head_cluster_sizes():
     controller = make_controller()

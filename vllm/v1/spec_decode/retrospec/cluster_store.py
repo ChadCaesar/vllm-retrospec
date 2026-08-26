@@ -574,8 +574,17 @@ class _LayerClusterPagePool:
         return key_pages.view(output_shape), value_pages.view(output_shape)
 
 
+@dataclass
+class _FullVerificationGPUArena:
+    dtype: torch.dtype | None = None
+    head_size: int | None = None
+    capacity: int = 0
+    key_pages: torch.Tensor | None = None
+    value_pages: torch.Tensor | None = None
+
+
 class _FullVerificationTransferBuffer:
-    """One reusable full-layer H2D page arena for a CUDA device."""
+    """Two reusable full-layer H2D page arenas for a CUDA device."""
 
     _MIN_CAPACITY = 64
     _RESIDENT_PREFETCH_RING_SIZE = 2
@@ -604,12 +613,11 @@ class _FullVerificationTransferBuffer:
         self.max_pinned_memory_bytes = max_pinned_memory_bytes
         self.pin_memory = pin_memory
 
-        self._dtype: torch.dtype | None = None
-        self._head_size: int | None = None
-        self._capacity = 0
-
-        self.key_pages: torch.Tensor | None = None
-        self.value_pages: torch.Tensor | None = None
+        self._gpu_arenas = [
+            _FullVerificationGPUArena(),
+            _FullVerificationGPUArena(),
+        ]
+        self._gpu_arena_cursor = 0
 
         self._transfer_stream = torch.cuda.Stream(device=device)
         self._cpu_slots: list[_PinnedPageTransferSlot] = []
@@ -624,20 +632,21 @@ class _FullVerificationTransferBuffer:
 
     @property
     def capacity(self) -> int:
-        return self._capacity
+        return max(arena.capacity for arena in self._gpu_arenas)
 
-    def _release_old_storage(self) -> None:
-        if self.key_pages is None or self.value_pages is None:
+    def _release_old_storage(self, arena: _FullVerificationGPUArena) -> None:
+        if arena.key_pages is None or arena.value_pages is None:
             return
 
         # The transfer stream already waits for the execution stream before
         # this method is called. Recording the old tensors on the transfer
         # stream prevents the CUDA allocator from recycling them too early.
-        self.key_pages.record_stream(self._transfer_stream)
-        self.value_pages.record_stream(self._transfer_stream)
+        arena.key_pages.record_stream(self._transfer_stream)
+        arena.value_pages.record_stream(self._transfer_stream)
 
     def _ensure_capacity(
         self,
+        arena: _FullVerificationGPUArena,
         required_pages: int,
         dtype: torch.dtype,
         head_size: int,
@@ -647,26 +656,26 @@ class _FullVerificationTransferBuffer:
         if head_size <= 0:
             raise ValueError("head_size must be positive")
 
-        layout_changed = self._dtype != dtype or self._head_size != head_size
-        if not layout_changed and required_pages <= self._capacity:
+        layout_changed = arena.dtype != dtype or arena.head_size != head_size
+        if not layout_changed and required_pages <= arena.capacity:
             return
 
-        self._release_old_storage()
+        self._release_old_storage(arena)
 
-        self._dtype = dtype
-        self._head_size = head_size
-        self._capacity = max(
+        arena.dtype = dtype
+        arena.head_size = head_size
+        arena.capacity = max(
             self._MIN_CAPACITY,
             self._next_power_of_two(required_pages),
         )
 
         shape = (
-            self._capacity,
+            arena.capacity,
             self.page_size,
             head_size,
         )
-        self.key_pages = torch.empty(shape, dtype=dtype, device=self.device)
-        self.value_pages = torch.empty_like(self.key_pages)
+        arena.key_pages = torch.empty(shape, dtype=dtype, device=self.device)
+        arena.value_pages = torch.empty_like(arena.key_pages)
 
     def _ensure_cpu_slots(self, pool: _LayerClusterPagePool) -> None:
         layout = (pool.dtype, pool.head_size)
@@ -796,9 +805,12 @@ class _FullVerificationTransferBuffer:
             )
 
         current_stream = torch.cuda.current_stream(self.device)
+        arena = self._gpu_arenas[self._gpu_arena_cursor]
+        self._gpu_arena_cursor = (self._gpu_arena_cursor + 1) % len(self._gpu_arenas)
 
-        # The previous layer may still be reading this arena. Waiting on the
-        # execution stream makes it safe to overwrite for the next layer.
+        # This arena was last used two layers ago. Waiting on the execution
+        # stream makes it safe to overwrite while the other arena remains
+        # available to the current layer's attention kernel.
         self._transfer_stream.wait_stream(current_stream)
         ready_event = torch.cuda.Event()
         transfer_timer = (
@@ -812,16 +824,17 @@ class _FullVerificationTransferBuffer:
 
         with torch.cuda.stream(self._transfer_stream):
             self._ensure_capacity(
+                arena=arena,
                 required_pages=num_pages,
                 dtype=pool.dtype,
                 head_size=pool.head_size,
             )
 
-            assert self.key_pages is not None
-            assert self.value_pages is not None
+            assert arena.key_pages is not None
+            assert arena.value_pages is not None
 
-            staging_key_pages = self.key_pages[:num_pages]
-            staging_value_pages = self.value_pages[:num_pages]
+            staging_key_pages = arena.key_pages[:num_pages]
+            staging_value_pages = arena.value_pages[:num_pages]
 
             page_start = 0
             while page_start < num_pages:

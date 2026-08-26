@@ -520,15 +520,27 @@ class RetroSpecSparseAttention:
             tuple(self.original_forwards),
         )
         self.index.begin_full_verification_residency(request_ids)
-        self.performance_stats.add_counter(
-            "full_verify_requests",
-            len(request_ids),
-        )
-        request_indices = torch.repeat_interleave(
-            torch.arange(len(request_ids), dtype=torch.int64, device=self.device),
-            torch.tensor(query_lens, dtype=torch.int64, device=self.device),
-        )
+        pipeline_started = False
         try:
+            if self.device.type == "cuda":
+                layer_num_kv_heads = {
+                    layer_name: impl.num_kv_heads
+                    for layer_name, (impl, _) in self.original_forwards.items()
+                }
+                self.index.begin_full_verification_pipeline(
+                    request_ids,
+                    layer_num_kv_heads,
+                    self.device,
+                )
+                pipeline_started = True
+            self.performance_stats.add_counter(
+                "full_verify_requests",
+                len(request_ids),
+            )
+            request_indices = torch.repeat_interleave(
+                torch.arange(len(request_ids), dtype=torch.int64, device=self.device),
+                torch.tensor(query_lens, dtype=torch.int64, device=self.device),
+            )
             self.full_verification_batch = _RetroSpecFullVerificationBatch(
                 request_ids=request_ids,
                 context_lens=context_lens,
@@ -540,6 +552,8 @@ class RetroSpecSparseAttention:
         finally:
             self.mode = RetroSpecAttentionMode.PASSTHROUGH
             self.full_verification_batch = None
+            if pipeline_started:
+                self.index.end_full_verification_pipeline()
             self.index.end_full_verification_residency()
             self.performance_stats.maybe_log()
 
@@ -1127,7 +1141,7 @@ class RetroSpecSparseAttention:
             primary_token_mask = selection.primary_exact_token_mask
             exact_page_ids = selection.exact_page_ids
             exact_page_token_counts = selection.exact_page_token_counts
-            resolved_pages = None
+            resolved_pages = selection.resolved_pages
         else:
             layer_name = selection.plan.layer_name
             primary_token_indices = selection.plan.primary_exact_token_indices

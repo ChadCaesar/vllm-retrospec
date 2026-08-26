@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from math import ceil
@@ -95,6 +95,7 @@ class RetroSpecFullVerificationPlan:
     exact_page_ids_cpu: torch.Tensor
     exact_page_token_counts: torch.Tensor
     exact_token_counts: torch.Tensor
+    resolved_pages: RetroSpecResolvedClusterPages | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,21 @@ class _RequestLayerIndex:
     segments: list[_RequestLayerSegment]
     num_clusters: int
     indexed_end: int
+    full_verification_page_ids_cpu: torch.Tensor | None
+
+
+@dataclass(frozen=True)
+class _FullVerificationPageLayout:
+    page_ids: torch.Tensor
+    page_ids_cpu: torch.Tensor
+    page_token_counts: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _PrefetchedFullVerificationLayer:
+    layer_name: str
+    layout: _FullVerificationPageLayout
+    resolved_pages: RetroSpecResolvedClusterPages | None
 
 
 @dataclass(frozen=True)
@@ -442,6 +458,18 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             deque()
         )
 
+        # Full verification retains only the current and next layer layouts.
+        # Staging the next layer before returning the current plan overlaps its
+        # H2D copy with the current layer's attention and MLP computation.
+        self._full_verification_pipeline_active = False
+        self._full_verification_request_ids: tuple[str, ...] = ()
+        self._full_verification_layers: tuple[tuple[str, int], ...] = ()
+        self._full_verification_layer_cursor = 0
+        self._full_verification_device: torch.device | None = None
+        self._full_verification_prefetched: _PrefetchedFullVerificationLayer | None = (
+            None
+        )
+
     def _stable_indexed_end(self, seq_len: int) -> int:
         """Return the exclusive end of tokens that may leave native GPU KV."""
         full_block_count = seq_len // self.block_size
@@ -687,6 +715,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             segments=[],
             num_clusters=0,
             indexed_end=indexed_end,
+            full_verification_page_ids_cpu=None,
         )
 
     def _free_record(
@@ -843,6 +872,43 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         for staged_segment, _, cluster_blocks in built_segments:
             self.cluster_store.free(staged_segment.layer_name, cluster_blocks)
 
+    @staticmethod
+    def _append_full_verification_page_descriptor(
+        record: _RequestLayerIndex,
+        page_ids: torch.Tensor,
+    ) -> None:
+        """Append one segment to the persistent CPU full-verify descriptor."""
+        if page_ids.device.type != "cpu":
+            raise ValueError("Full-verification page descriptors must reside on CPU")
+        if page_ids.ndim < 2:
+            raise ValueError("Cluster page IDs must include a KV-head dimension")
+
+        num_kv_heads = page_ids.shape[0]
+        previous = record.full_verification_page_ids_cpu
+        if previous is not None and previous.shape[0] != num_kv_heads:
+            raise RuntimeError("Full-verification descriptor changed KV-head count")
+
+        per_head_pages: list[torch.Tensor] = []
+        for head_index in range(num_kv_heads):
+            new_pages = page_ids[head_index].reshape(-1)
+            new_pages = new_pages[new_pages >= 0]
+            if previous is not None:
+                old_pages = previous[head_index]
+                old_pages = old_pages[old_pages >= 0]
+                new_pages = torch.cat((old_pages, new_pages))
+            per_head_pages.append(new_pages)
+
+        max_num_pages = max((pages.numel() for pages in per_head_pages), default=0)
+        descriptor = torch.full(
+            (num_kv_heads, max_num_pages),
+            -1,
+            dtype=torch.int64,
+            device="cpu",
+        )
+        for head_index, pages in enumerate(per_head_pages):
+            descriptor[head_index, : pages.numel()].copy_(pages)
+        record.full_verification_page_ids_cpu = descriptor
+
     def _publish_built_segments(
         self,
         built_segments: Sequence[
@@ -874,6 +940,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                         segments=list(current_record.segments),
                         num_clusters=current_record.num_clusters,
                         indexed_end=current_record.indexed_end,
+                        full_verification_page_ids_cpu=(
+                            None
+                            if current_record.full_verification_page_ids_cpu is None
+                            else current_record.full_verification_page_ids_cpu.clone()
+                        ),
                     )
 
                 pending_records[key] = record
@@ -904,6 +975,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     cluster_page_ids=block_metadata.page_ids,
                     cluster_page_token_counts=block_metadata.page_token_counts,
                 )
+            )
+            self._append_full_verification_page_descriptor(
+                record,
+                block_metadata.page_ids,
             )
 
             record.segments.append(
@@ -1191,14 +1266,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         if layer_changed:
             self._gpu_index_residency.invalidate_active_view(layer_name)
 
-    def _get_resident_view(
+    def _validate_resident_index(
         self,
         layer_name: str,
         request_ids: Sequence[str],
-        key_cache: torch.Tensor,
-    ) -> RetroSpecResidentBatchView:
-        request_ids = tuple(request_ids)
-
+    ) -> None:
         layer_indices = self._indices.get(layer_name, {})
         for request_id in request_ids:
             record = layer_indices.get(request_id)
@@ -1219,6 +1291,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     raise RuntimeError(
                         "CPU and GPU RetroSpec indexed prefixes are inconsistent"
                     )
+
+    def _get_resident_view(
+        self,
+        layer_name: str,
+        request_ids: Sequence[str],
+        key_cache: torch.Tensor,
+    ) -> RetroSpecResidentBatchView:
+        request_ids = tuple(request_ids)
+        self._validate_resident_index(layer_name, request_ids)
 
         view = self._gpu_index_residency.get_active_view(
             layer_name, request_ids, key_cache.device
@@ -2912,35 +2993,130 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             -1,
             dtype=torch.int64,
             device="cpu",
-            pin_memory=self.cluster_store.pin_memory,
         )
         layer_indices = self._indices.get(layer_name, {})
 
         for row, request_id in enumerate(request_ids):
             record = layer_indices.get(request_id)
-            if record is None:
+            if record is None or record.full_verification_page_ids_cpu is None:
                 continue
 
-            page_offsets = [0] * output_shape[1]
-            for segment in record.segments:
-                metadata = self.cluster_store.get_cluster_block_metadata(
-                    layer_name=layer_name,
-                    cluster_ids=segment.cluster_blocks.cluster_ids,
-                    device=torch.device("cpu"),
+            descriptor = record.full_verification_page_ids_cpu
+            if descriptor.shape[0] != output_shape[1]:
+                raise RuntimeError("Full-verification descriptor changed KV-head count")
+            if descriptor.shape[1] > output_shape[3]:
+                raise RuntimeError(
+                    "Full-verification descriptor exceeds resident page layout"
                 )
-                for head_index in range(output_shape[1]):
-                    valid_pages = metadata.page_ids[head_index] >= 0
-                    flat_pages = metadata.page_ids[head_index].masked_select(
-                        valid_pages
-                    )
-                    page_start = page_offsets[head_index]
-                    page_end = page_start + flat_pages.numel()
-                    page_ids_cpu[row, head_index, 0, page_start:page_end].copy_(
-                        flat_pages
-                    )
-                    page_offsets[head_index] = page_end
+            page_ids_cpu[row, :, 0, : descriptor.shape[1]].copy_(descriptor)
 
         return page_ids_cpu
+
+    def _prefetch_full_verification_layer(
+        self,
+        layer_index: int,
+    ) -> _PrefetchedFullVerificationLayer:
+        if self._full_verification_device is None:
+            raise RuntimeError("Full-verification pipeline has no CUDA device")
+
+        layer_name, num_kv_heads = self._full_verification_layers[layer_index]
+        request_ids = self._full_verification_request_ids
+        self._validate_resident_index(layer_name, request_ids)
+        view = self._gpu_index_residency.get_active_view(
+            layer_name,
+            request_ids,
+            self._full_verification_device,
+        )
+        page_ids, page_token_counts = self._build_full_verification_pages(
+            view,
+            num_kv_heads,
+        )
+        page_ids_cpu = self._pack_full_verification_page_ids_cpu(
+            layer_name,
+            request_ids,
+            page_ids.shape,
+        )
+        layout = _FullVerificationPageLayout(
+            page_ids=page_ids,
+            page_ids_cpu=page_ids_cpu,
+            page_token_counts=page_token_counts,
+        )
+        resolved_pages = None
+        if view.max_num_pages > 0:
+            resolved_pages = self.cluster_store.resolve_full_verification_blocks(
+                layer_name=layer_name,
+                logical_page_ids=page_ids,
+                logical_page_ids_cpu=page_ids_cpu,
+            )
+        return _PrefetchedFullVerificationLayer(
+            layer_name=layer_name,
+            layout=layout,
+            resolved_pages=resolved_pages,
+        )
+
+    def begin_full_verification_pipeline(
+        self,
+        request_ids: Sequence[str],
+        layer_num_kv_heads: Mapping[str, int],
+        device: torch.device,
+    ) -> None:
+        if self._full_verification_pipeline_active:
+            raise RuntimeError("Full-verification pipeline is already active")
+        if not layer_num_kv_heads:
+            raise ValueError("Full-verification pipeline requires model layers")
+        if device.type != "cuda":
+            raise ValueError("Full-verification pipeline requires a CUDA device")
+
+        layers = tuple(
+            (layer_name, int(num_kv_heads))
+            for layer_name, num_kv_heads in layer_num_kv_heads.items()
+        )
+        if any(num_kv_heads <= 0 for _, num_kv_heads in layers):
+            raise ValueError("Full-verification KV-head counts must be positive")
+
+        self._full_verification_pipeline_active = True
+        self._full_verification_request_ids = tuple(request_ids)
+        self._full_verification_layers = layers
+        self._full_verification_layer_cursor = 0
+        self._full_verification_device = device
+        try:
+            self._full_verification_prefetched = self._prefetch_full_verification_layer(
+                0
+            )
+        except BaseException:
+            self.end_full_verification_pipeline()
+            raise
+
+    def consume_full_verification_layer(
+        self,
+        layer_name: str,
+    ) -> tuple[_FullVerificationPageLayout, RetroSpecResolvedClusterPages | None]:
+        if not self._full_verification_pipeline_active:
+            raise RuntimeError("Full-verification pipeline is not active")
+        prefetched = self._full_verification_prefetched
+        if prefetched is None:
+            raise RuntimeError("Full-verification pipeline has no remaining layer")
+        if prefetched.layer_name != layer_name:
+            raise RuntimeError(
+                "Full-verification layer order differs from the installed model"
+            )
+
+        next_cursor = self._full_verification_layer_cursor + 1
+        next_prefetched = None
+        if next_cursor < len(self._full_verification_layers):
+            next_prefetched = self._prefetch_full_verification_layer(next_cursor)
+
+        self._full_verification_layer_cursor = next_cursor
+        self._full_verification_prefetched = next_prefetched
+        return prefetched.layout, prefetched.resolved_pages
+
+    def end_full_verification_pipeline(self) -> None:
+        self._full_verification_pipeline_active = False
+        self._full_verification_request_ids = ()
+        self._full_verification_layers = ()
+        self._full_verification_layer_cursor = 0
+        self._full_verification_device = None
+        self._full_verification_prefetched = None
 
     def build_full_verification_plan(
         self,
@@ -3050,9 +3226,25 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             dim=2,
             dtype=torch.int32,
         )
-        exact_page_ids, exact_page_token_counts = self._build_full_verification_pages(
-            view, num_kv_heads
-        )
+        resolved_pages = None
+        if self._full_verification_pipeline_active:
+            layout, resolved_pages = self.consume_full_verification_layer(layer_name)
+            exact_page_ids = layout.page_ids
+            exact_page_ids_cpu = layout.page_ids_cpu
+            exact_page_token_counts = layout.page_token_counts
+            if exact_page_ids.shape[:2] != (len(request_ids), num_kv_heads):
+                raise RuntimeError(
+                    "Prefetched full-verification layout changed batch shape"
+                )
+        else:
+            exact_page_ids, exact_page_token_counts = (
+                self._build_full_verification_pages(view, num_kv_heads)
+            )
+            exact_page_ids_cpu = self._pack_full_verification_page_ids_cpu(
+                layer_name,
+                request_ids,
+                exact_page_ids.shape,
+            )
         clustered_exact_token_counts = exact_page_token_counts.sum(
             dim=(2, 3),
             dtype=torch.int32,
@@ -3060,12 +3252,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         exact_token_counts = (
             primary_exact_token_counts + clustered_exact_token_counts
         ).contiguous()
-        exact_page_ids_cpu = self._pack_full_verification_page_ids_cpu(
-            layer_name,
-            request_ids,
-            exact_page_ids.shape,
-        )
-
         return RetroSpecFullVerificationPlan(
             layer_name=layer_name,
             primary_exact_token_indices=primary_exact_token_indices,
@@ -3074,6 +3260,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             exact_page_ids_cpu=exact_page_ids_cpu,
             exact_page_token_counts=exact_page_token_counts,
             exact_token_counts=exact_token_counts,
+            resolved_pages=resolved_pages,
         )
 
     def select_segmented(
