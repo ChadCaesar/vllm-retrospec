@@ -21,8 +21,7 @@ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 from .cluster_store import RetroSpecResolvedClusterPages
 from .execution import (
-    RetroSpecExactExecution,
-    RetroSpecExactExecutionBuffer,
+    RetroSpecExactAttentionWorkspace,
     RetroSpecExactKVSource,
     RetroSpecExactPageKVSource,
     RetroSpecExactPrimaryKVSource,
@@ -46,6 +45,7 @@ class _RetroSpecFullVerificationBatch:
     request_ids: tuple[str, ...]
     context_lens: tuple[int, ...]
     query_lens: tuple[int, ...]
+    request_indices: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -126,6 +126,14 @@ class RetroSpecSparseAttention:
         self.block_size = block_size
         self.num_speculative_tokens = config.num_speculative_tokens
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
+        self.max_verification_tokens = max(
+            self.max_parallel_tokens,
+            getattr(
+                vllm_config.scheduler_config,
+                "max_num_batched_tokens",
+                self.max_parallel_tokens,
+            ),
+        )
 
         self.performance_stats = RetroSpecPerformanceStats(
             device=device,
@@ -166,8 +174,9 @@ class RetroSpecSparseAttention:
             ),
         )
 
-        self.exact_execution_buffer = RetroSpecExactExecutionBuffer(
-            page_size=block_size
+        self.exact_attention_workspace = RetroSpecExactAttentionWorkspace(
+            page_size=block_size,
+            max_num_queries=self.max_verification_tokens,
         )
 
         self.proposal_request_ids: tuple[str, ...] = ()
@@ -515,11 +524,16 @@ class RetroSpecSparseAttention:
             "full_verify_requests",
             len(request_ids),
         )
+        request_indices = torch.repeat_interleave(
+            torch.arange(len(request_ids), dtype=torch.int64, device=self.device),
+            torch.tensor(query_lens, dtype=torch.int64, device=self.device),
+        )
         try:
             self.full_verification_batch = _RetroSpecFullVerificationBatch(
                 request_ids=request_ids,
                 context_lens=context_lens,
                 query_lens=query_lens,
+                request_indices=request_indices,
             )
             self.mode = RetroSpecAttentionMode.FULL_VERIFY
             yield
@@ -979,283 +993,6 @@ class RetroSpecSparseAttention:
         return attention_output, output_lse
 
     @staticmethod
-    def _run_grouped_flash_exact_attention(
-        impl: FlashAttentionImpl,
-        query: torch.Tensor,
-        execution: RetroSpecExactExecution,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run grouped FlashAttention over the packed execution buffer."""
-        batch_size, num_query_heads, head_size = query.shape
-
-        if execution.batch_size != batch_size:
-            raise ValueError("Execution-buffer batch size does not match query")
-        if execution.head_size != head_size:
-            raise ValueError("Execution-buffer head size does not match query")
-
-        num_kv_heads = execution.num_kv_heads
-        if num_query_heads % num_kv_heads != 0:
-            raise ValueError(
-                "The number of query heads must be divisible by the number of KV heads"
-            )
-
-        if batch_size == 0:
-            empty_lse = torch.empty(
-                num_query_heads,
-                0,
-                dtype=torch.float32,
-                device=query.device,
-            )
-            return torch.empty_like(query), empty_lse
-
-        if execution.max_exact_seq_len == 0:
-            empty_lse = torch.full(
-                (num_query_heads, batch_size),
-                float("-inf"),
-                dtype=torch.float32,
-                device=query.device,
-            )
-            return torch.zeros_like(query), empty_lse
-
-        num_queries_per_kv = num_query_heads // num_kv_heads
-        num_grouped_sequences = batch_size * num_kv_heads
-
-        grouped_query = (
-            query.reshape(
-                batch_size,
-                num_kv_heads,
-                num_queries_per_kv,
-                head_size,
-            )
-            .reshape(
-                num_grouped_sequences,
-                num_queries_per_kv,
-                head_size,
-            )
-            .contiguous()
-        )
-
-        from vllm.v1.attention.backends.fa_utils import (
-            flash_attn_varlen_func,
-        )
-
-        grouped_output, grouped_lse = flash_attn_varlen_func(
-            q=grouped_query,
-            k=execution.keys,
-            v=execution.values,
-            out=None,
-            cu_seqlens_q=execution.cu_seqlens_q,
-            cu_seqlens_k=execution.cu_seqlens_k,
-            max_seqlen_q=1,
-            max_seqlen_k=execution.max_exact_seq_len,
-            softmax_scale=impl.scale,
-            causal=False,
-            alibi_slopes=None,
-            window_size=[-1, -1],
-            block_table=None,
-            softcap=0.0,
-            return_softmax_lse=True,
-            scheduler_metadata=None,
-            fa_version=impl.vllm_flash_attn_version,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            num_splits=0,
-            s_aux=None,
-        )
-
-        exact_output = (
-            grouped_output.reshape(
-                batch_size,
-                num_kv_heads,
-                num_queries_per_kv,
-                head_size,
-            )
-            .reshape(
-                batch_size,
-                num_query_heads,
-                head_size,
-            )
-            .contiguous()
-        )
-
-        grouped_lse = grouped_lse.as_strided(
-            (num_queries_per_kv, num_grouped_sequences),
-            (num_grouped_sequences, 1),
-        )
-        grouped_lse.masked_fill_(
-            execution.exact_seq_lens.unsqueeze(0) == 0,
-            float("-inf"),
-        )
-
-        exact_lse = (
-            grouped_lse.transpose(0, 1)
-            .reshape(
-                batch_size,
-                num_kv_heads,
-                num_queries_per_kv,
-            )
-            .reshape(
-                batch_size,
-                num_query_heads,
-            )
-            .transpose(0, 1)
-            .contiguous()
-        )
-
-        return exact_output, exact_lse
-
-    @staticmethod
-    def _run_full_prefix_attention(
-        impl: FlashAttentionImpl,
-        query: torch.Tensor,
-        query_lens: tuple[int, ...],
-        execution: RetroSpecExactExecution,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_tokens, num_query_heads, head_size = query.shape
-
-        if execution.batch_size != len(query_lens):
-            raise ValueError("Execution batch size does not match query_lens")
-        if execution.head_size != head_size:
-            raise ValueError("Execution head size does not match the query")
-        if sum(query_lens) != num_tokens:
-            raise ValueError("query_lens do not cover the full query tensor")
-
-        num_kv_heads = execution.num_kv_heads
-        if num_query_heads % num_kv_heads != 0:
-            raise ValueError(
-                "The number of query heads must be divisible by the number of KV heads"
-            )
-
-        if execution.max_exact_seq_len == 0:
-            prefix_lse = torch.full(
-                (num_query_heads, num_tokens),
-                float("-inf"),
-                dtype=torch.float32,
-                device=query.device,
-            )
-            return torch.zeros_like(query), prefix_lse
-
-        num_queries_per_kv = num_query_heads // num_kv_heads
-        grouped_query_chunks: list[torch.Tensor] = []
-        query_offset = 0
-
-        for query_len in query_lens:
-            request_query = query[query_offset : query_offset + query_len]
-            request_query = request_query.reshape(
-                query_len,
-                num_kv_heads,
-                num_queries_per_kv,
-                head_size,
-            )
-            grouped_query_chunks.append(
-                request_query.permute(1, 0, 2, 3).reshape(
-                    num_kv_heads * query_len,
-                    num_queries_per_kv,
-                    head_size,
-                )
-            )
-            query_offset += query_len
-
-        grouped_query = torch.cat(grouped_query_chunks).contiguous()
-        grouped_query_lens = torch.tensor(
-            query_lens,
-            dtype=torch.int32,
-            device=query.device,
-        ).repeat_interleave(num_kv_heads)
-
-        grouped_cu_seqlens_q = torch.zeros(
-            grouped_query_lens.numel() + 1,
-            dtype=torch.int32,
-            device=query.device,
-        )
-        torch.cumsum(
-            grouped_query_lens,
-            dim=0,
-            out=grouped_cu_seqlens_q[1:],
-        )
-
-        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
-
-        grouped_output, grouped_lse = flash_attn_varlen_func(
-            q=grouped_query,
-            k=execution.keys,
-            v=execution.values,
-            out=None,
-            cu_seqlens_q=grouped_cu_seqlens_q,
-            cu_seqlens_k=execution.cu_seqlens_k,
-            max_seqlen_q=max(query_lens),
-            max_seqlen_k=execution.max_exact_seq_len,
-            softmax_scale=impl.scale,
-            causal=False,
-            alibi_slopes=None,
-            window_size=[-1, -1],
-            block_table=None,
-            softcap=0.0,
-            return_softmax_lse=True,
-            scheduler_metadata=None,
-            fa_version=impl.vllm_flash_attn_version,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            num_splits=0,
-            s_aux=None,
-        )
-
-        grouped_lse = grouped_lse.as_strided(
-            (num_queries_per_kv, grouped_query.shape[0]),
-            (grouped_query.shape[0], 1),
-        )
-
-        has_prefix = torch.repeat_interleave(
-            execution.exact_seq_lens > 0,
-            grouped_query_lens.to(torch.int64),
-        )
-        grouped_output.masked_fill_(~has_prefix[:, None, None], 0)
-        grouped_lse.masked_fill_(~has_prefix.unsqueeze(0), float("-inf"))
-
-        prefix_output_chunks: list[torch.Tensor] = []
-        prefix_lse_chunks: list[torch.Tensor] = []
-        grouped_offset = 0
-
-        for query_len in query_lens:
-            grouped_count = num_kv_heads * query_len
-            request_output = grouped_output[
-                grouped_offset : grouped_offset + grouped_count
-            ]
-            request_output = (
-                request_output.reshape(
-                    num_kv_heads,
-                    query_len,
-                    num_queries_per_kv,
-                    head_size,
-                )
-                .permute(1, 0, 2, 3)
-                .reshape(query_len, num_query_heads, head_size)
-            )
-            prefix_output_chunks.append(request_output)
-
-            request_lse = grouped_lse[
-                :,
-                grouped_offset : grouped_offset + grouped_count,
-            ]
-            request_lse = (
-                request_lse.reshape(
-                    num_queries_per_kv,
-                    num_kv_heads,
-                    query_len,
-                )
-                .permute(2, 1, 0)
-                .reshape(query_len, num_query_heads)
-                .transpose(0, 1)
-            )
-            prefix_lse_chunks.append(request_lse)
-            grouped_offset += grouped_count
-
-        prefix_output = torch.cat(prefix_output_chunks).contiguous()
-        prefix_lse = torch.cat(prefix_lse_chunks, dim=1).contiguous()
-        return prefix_output, prefix_lse
-
-    @staticmethod
     def _run_full_local_attention(
         impl: FlashAttentionImpl,
         query: torch.Tensor,
@@ -1351,13 +1088,11 @@ class RetroSpecSparseAttention:
             value_cache=value_cache,
             block_table=attn_metadata.block_table,
         )
-        execution = self.exact_execution_buffer.pack(source)
-
-        prefix_output, prefix_lse = self._run_full_prefix_attention(
-            impl,
+        prefix_output, prefix_lse = self.exact_attention_workspace.run(
+            source,
             query,
-            batch.query_lens,
-            execution,
+            impl.scale,
+            request_indices=batch.request_indices,
         )
         local_output, local_lse = self._run_full_local_attention(
             impl,
@@ -1419,23 +1154,23 @@ class RetroSpecSparseAttention:
                     mode="verification",
                 )
 
-        page_sources: tuple[RetroSpecExactPageKVSource, ...] = ()
-
+        resident_pages = None
+        staging_pages = None
         if resolved_pages is not None:
-            page_sources = (
-                RetroSpecExactPageKVSource(
+            if resolved_pages.resident_key_pages.shape[0] > 0:
+                resident_pages = RetroSpecExactPageKVSource(
                     key_pages=resolved_pages.resident_key_pages,
                     value_pages=resolved_pages.resident_value_pages,
                     page_ids=resolved_pages.resident_page_ids,
                     ready_event=resolved_pages.resident_ready_event,
-                ),
-                RetroSpecExactPageKVSource(
+                )
+            if resolved_pages.staging_key_pages.shape[0] > 0:
+                staging_pages = RetroSpecExactPageKVSource(
                     key_pages=resolved_pages.staging_key_pages,
                     value_pages=resolved_pages.staging_value_pages,
                     page_ids=resolved_pages.staging_page_ids,
                     ready_event=resolved_pages.staging_ready_event,
-                ),
-            )
+                )
 
         source = RetroSpecExactKVSource(
             primary=RetroSpecExactPrimaryKVSource(
@@ -1446,7 +1181,8 @@ class RetroSpecSparseAttention:
                 token_mask=primary_token_mask,
             ),
             page_token_counts=exact_page_token_counts,
-            page_sources=page_sources,
+            resident_pages=resident_pages,
+            staging_pages=staging_pages,
         )
 
         return source, resolved_pages
@@ -1502,7 +1238,7 @@ class RetroSpecSparseAttention:
             value_cache=value_cache,
             block_table=attn_metadata.block_table,
         )
-        execution = self.exact_execution_buffer.pack(source)
+        exact_output = self.exact_attention_workspace.run(source, query, impl.scale)
 
         if (
             self.mode
@@ -1526,7 +1262,7 @@ class RetroSpecSparseAttention:
                 staging_value_pages=resolved_pages.staging_value_pages,
             )
 
-        return self._run_grouped_flash_exact_attention(impl, query, execution)
+        return exact_output
 
     @staticmethod
     def _get_grouped_estimation(

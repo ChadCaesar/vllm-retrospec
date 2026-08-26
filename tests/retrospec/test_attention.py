@@ -14,7 +14,6 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionImpl,
     FlashAttentionMetadata,
 )
-from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.spec_decode.retrospec.attention import (
     RetroSpecAttentionMode,
     RetroSpecSparseAttention,
@@ -23,7 +22,6 @@ from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecResolvedClusterPages,
 )
 from vllm.v1.spec_decode.retrospec.execution import (
-    RetroSpecExactExecution,
     RetroSpecExactKVSource,
 )
 from vllm.v1.spec_decode.retrospec.index import RetroSpecAttentionLevel
@@ -60,7 +58,10 @@ def make_controller(
                 retrospec_cache_ratio=cache_ratio,
                 retrospec_stats_interval_seconds=stats_interval_seconds,
             ),
-            scheduler_config=SimpleNamespace(max_num_seqs=4),
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=4,
+                max_num_batched_tokens=32,
+            ),
             cache_config=SimpleNamespace(block_size=2),
             model_config=SimpleNamespace(max_model_len=64),
         ),
@@ -118,6 +119,14 @@ def test_segmented_attention_configures_pending_cluster_build_limit():
 
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
     assert controller.index.max_pending_cluster_builds == 4
+
+
+def test_exact_attention_workspace_covers_mixed_verification_batch():
+    controller = make_controller()
+
+    assert controller.max_parallel_tokens == 8
+    assert controller.max_verification_tokens == 32
+    assert controller.exact_attention_workspace.max_num_queries == 32
 
 
 def test_segmented_attention_shares_enabled_performance_stats():
@@ -221,39 +230,6 @@ def make_selection(batch_size: int = 2) -> RetroSpecTokenAttentionSelection:
         attention_mass=torch.ones(batch_size),
         plan=plan,
         resolved_pages=None,
-    )
-
-
-def make_exact_execution(
-    keys: torch.Tensor,
-    values: torch.Tensor,
-    token_mask: torch.Tensor,
-) -> RetroSpecExactExecution:
-    batch_size, num_kv_heads, max_exact_seq_len, head_size = keys.shape
-    exact_seq_lens = token_mask.sum(dim=2, dtype=torch.int32).reshape(-1)
-    cu_seqlens_k = torch.zeros(
-        exact_seq_lens.numel() + 1,
-        dtype=torch.int32,
-        device=keys.device,
-    )
-    torch.cumsum(exact_seq_lens, dim=0, out=cu_seqlens_k[1:])
-    packed_keys = keys[token_mask].view(-1, 1, head_size).contiguous()
-    packed_values = values[token_mask].view(-1, 1, head_size).contiguous()
-
-    return RetroSpecExactExecution(
-        keys=packed_keys,
-        values=packed_values,
-        exact_seq_lens=exact_seq_lens,
-        cu_seqlens_q=torch.arange(
-            exact_seq_lens.numel() + 1,
-            dtype=torch.int32,
-            device=keys.device,
-        ),
-        cu_seqlens_k=cu_seqlens_k,
-        batch_size=batch_size,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        max_exact_seq_len=max_exact_seq_len,
     )
 
 
@@ -715,164 +691,6 @@ def test_grouped_reference_attention_keeps_kv_heads_independent():
     )
 
 
-def test_grouped_flash_exact_attention_handles_an_empty_batch():
-    impl = cast(
-        FlashAttentionImpl,
-        SimpleNamespace(scale=1.0, vllm_flash_attn_version=2),
-    )
-    query = torch.empty(0, 4, 8, dtype=torch.bfloat16)
-    keys = torch.empty(0, 2, 3, 8, dtype=torch.bfloat16)
-    values = torch.empty_like(keys)
-    token_mask = torch.empty(0, 2, 3, dtype=torch.bool)
-
-    execution = make_exact_execution(keys, values, token_mask)
-    output, lse = RetroSpecSparseAttention._run_grouped_flash_exact_attention(
-        impl, query, execution
-    )
-
-    assert output.shape == query.shape
-    assert lse.shape == (4, 0)
-
-
-def test_grouped_flash_exact_attention_handles_no_selected_tokens():
-    impl = cast(
-        FlashAttentionImpl,
-        SimpleNamespace(scale=1.0, vllm_flash_attn_version=2),
-    )
-    query = torch.ones(2, 4, 8, dtype=torch.bfloat16)
-    keys = torch.empty(2, 2, 0, 8, dtype=torch.bfloat16)
-    values = torch.ones_like(keys)
-    token_mask = torch.empty(2, 2, 0, dtype=torch.bool)
-
-    execution = make_exact_execution(keys, values, token_mask)
-    output, lse = RetroSpecSparseAttention._run_grouped_flash_exact_attention(
-        impl, query, execution
-    )
-
-    assert not output.any()
-    assert torch.isneginf(lse).all()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_full_verification_attention_matches_dense_causal_reference_on_cuda():
-    device = torch.device("cuda")
-    torch.manual_seed(11)
-
-    query_lens = (2, 3)
-    num_query_heads = 4
-    num_kv_heads = 2
-    queries_per_kv = num_query_heads // num_kv_heads
-    head_size = 64
-    num_tokens = sum(query_lens)
-    scale = head_size**-0.5
-
-    query = torch.randn(
-        num_tokens,
-        num_query_heads,
-        head_size,
-        dtype=torch.float16,
-        device=device,
-    )
-    local_keys = torch.randn(
-        num_tokens,
-        num_kv_heads,
-        head_size,
-        dtype=torch.float16,
-        device=device,
-    )
-    local_values = torch.randn_like(local_keys)
-    first_prefix_keys = torch.randn(
-        3,
-        num_kv_heads,
-        head_size,
-        dtype=torch.float16,
-        device=device,
-    )
-    first_prefix_values = torch.randn_like(first_prefix_keys)
-
-    packed_keys = torch.cat(
-        [first_prefix_keys[:, head].unsqueeze(1) for head in range(num_kv_heads)]
-    )
-    packed_values = torch.cat(
-        [first_prefix_values[:, head].unsqueeze(1) for head in range(num_kv_heads)]
-    )
-    execution = RetroSpecExactExecution(
-        keys=packed_keys,
-        values=packed_values,
-        exact_seq_lens=torch.tensor([3, 3, 0, 0], dtype=torch.int32, device=device),
-        cu_seqlens_q=torch.arange(5, dtype=torch.int32, device=device),
-        cu_seqlens_k=torch.tensor([0, 3, 6, 6, 6], dtype=torch.int32, device=device),
-        batch_size=2,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        max_exact_seq_len=3,
-    )
-    query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32, device=device)
-    metadata = cast(
-        FlashAttentionMetadata,
-        SimpleNamespace(
-            query_start_loc=query_start_loc,
-            max_query_len=3,
-        ),
-    )
-    impl = cast(
-        FlashAttentionImpl,
-        SimpleNamespace(scale=scale, vllm_flash_attn_version=2),
-    )
-
-    prefix_output, prefix_lse = RetroSpecSparseAttention._run_full_prefix_attention(
-        impl,
-        query,
-        query_lens,
-        execution,
-    )
-    local_output, local_lse = RetroSpecSparseAttention._run_full_local_attention(
-        impl,
-        query,
-        local_keys,
-        local_values,
-        metadata,
-    )
-    actual = torch.empty_like(query)
-    merge_attn_states(
-        actual,
-        prefix_output,
-        prefix_lse,
-        local_output,
-        local_lse,
-    )
-
-    expected = torch.empty_like(query)
-    token_offset = 0
-    for request_index, query_len in enumerate(query_lens):
-        for local_index in range(query_len):
-            token_index = token_offset + local_index
-            for query_head in range(num_query_heads):
-                kv_head = query_head // queries_per_kv
-                request_keys = local_keys[token_offset : token_index + 1, kv_head]
-                request_values = local_values[token_offset : token_index + 1, kv_head]
-
-                if request_index == 0:
-                    request_keys = torch.cat(
-                        (first_prefix_keys[:, kv_head], request_keys)
-                    )
-                    request_values = torch.cat(
-                        (first_prefix_values[:, kv_head], request_values)
-                    )
-
-                logits = torch.mv(
-                    request_keys.float(), query[token_index, query_head].float()
-                )
-                weights = torch.softmax(logits * scale, dim=0)
-                expected[token_index, query_head] = torch.mv(
-                    request_values.float().transpose(0, 1), weights
-                ).to(expected.dtype)
-
-        token_offset += query_len
-
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-
 def test_token_exact_attention_uses_reference_fallback_on_cpu():
     controller = make_controller()
     impl = cast(
@@ -920,9 +738,9 @@ def test_token_exact_attention_uses_reference_fallback_on_cpu():
             return_value=expected,
         ) as reference_attention,
         patch.object(
-            controller,
-            "_run_grouped_flash_exact_attention",
-        ) as flash_attention,
+            controller.exact_attention_workspace,
+            "run",
+        ) as exact_attention,
     ):
         result = controller._run_exact_attention(
             impl,
@@ -939,7 +757,7 @@ def test_token_exact_attention_uses_reference_fallback_on_cpu():
     assert result is expected
     materialize_reference.assert_called_once()
     reference_attention.assert_called_once()
-    flash_attention.assert_not_called()
+    exact_attention.assert_not_called()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -1056,7 +874,8 @@ def test_full_verification_source_skips_resolution_without_cluster_pages():
     assert source.primary.token_indices is plan.primary_exact_token_indices
     assert source.primary.token_mask is plan.primary_exact_token_mask
     assert source.page_token_counts is plan.exact_page_token_counts
-    assert source.page_sources == ()
+    assert source.resident_pages is None
+    assert source.staging_pages is None
 
 
 def test_full_verification_source_resolves_all_cluster_pages():
@@ -1118,182 +937,11 @@ def test_full_verification_source_resolves_all_cluster_pages():
     assert source.primary.token_indices is plan.primary_exact_token_indices
     assert source.primary.token_mask is plan.primary_exact_token_mask
     assert source.page_token_counts is page_counts
-    assert len(source.page_sources) == 2
-    assert source.page_sources[0].page_ids is resident_page_ids
-    assert source.page_sources[1].page_ids is staging_page_ids
-    assert source.page_sources[1].ready_event is staging_ready_event
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_full_verification_packs_cpu_backed_cluster_pages_on_cuda():
-    controller = make_controller(
-        cache_ratio=0.5,
-    )
-    assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
-    assert controller.exact_execution_buffer is not None
-
-    device = torch.device("cuda")
-    head_size = 64
-    token_values = torch.arange(16, dtype=torch.float16, device=device)
-    key_cache = token_values.view(8, 2, 1, 1).expand(8, 2, 1, head_size).contiguous()
-    value_cache = key_cache + 100
-    block_table = torch.arange(7, dtype=torch.int32, device=device).view(1, -1)
-
-    controller.index.build_or_update(
-        layer_name="layer",
-        request_ids=["request"],
-        seq_lens=[10],
-        is_prefill=[True],
-        rows=[0],
-        key_cache=key_cache,
-        value_cache=value_cache,
-        block_table=block_table,
-    )
-    controller.index.begin_full_verification_residency(["request"])
-    try:
-        plan = controller.index.build_full_verification_plan(
-            request_ids=["request"],
-            layer_name="layer",
-            seq_lens=[10],
-            key_cache=key_cache,
-            block_table=block_table,
-        )
-
-        source, resolved_pages = controller._resolve_exact_kv_source(
-            plan,
-            key_cache,
-            value_cache,
-            block_table,
-        )
-        execution = controller.exact_execution_buffer.pack(source)
-        torch.cuda.synchronize()
-    finally:
-        controller.index.end_full_verification_residency()
-
-    assert resolved_pages is not None
-    assert execution.exact_seq_lens.tolist() == [10]
-    assert plan.primary_exact_token_mask.sum().item() == 6
-    assert plan.exact_page_token_counts.sum().item() == 4
-
-    actual_keys = execution.keys[:10, 0, 0].sort().values
-    actual_values = execution.values[:10, 0, 0].sort().values
-    expected_keys = torch.arange(10, dtype=torch.float16, device=device)
-    torch.testing.assert_close(actual_keys, expected_keys)
-    torch.testing.assert_close(actual_values, expected_keys + 100)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_grouped_flash_exact_attention_matches_reference_on_cuda():
-    device = torch.device("cuda")
-    torch.manual_seed(0)
-
-    batch_size = 2
-    num_query_heads = 4
-    num_kv_heads = 2
-    head_size = 64
-    max_num_vectors = 5
-    scale = head_size**-0.5
-
-    impl = cast(
-        FlashAttentionImpl,
-        SimpleNamespace(scale=scale, vllm_flash_attn_version=2),
-    )
-    query = torch.randn(
-        batch_size,
-        num_query_heads,
-        head_size,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    keys = torch.randn(
-        batch_size,
-        num_kv_heads,
-        max_num_vectors,
-        head_size,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    values = torch.randn_like(keys)
-    token_mask = torch.tensor(
-        [
-            [[True, True, True, False, False], [False] * 5],
-            [[True, True, True, True, False], [True, False, False, False, False]],
-        ],
-        dtype=torch.bool,
-        device=device,
-    )
-
-    execution = make_exact_execution(keys, values, token_mask)
-    output, lse = RetroSpecSparseAttention._run_grouped_flash_exact_attention(
-        impl, query, execution
-    )
-    reference_output, reference_lse = (
-        RetroSpecSparseAttention._run_grouped_reference_attention(
-            impl,
-            query,
-            keys,
-            values,
-            token_mask.to(torch.int32),
-        )
-    )
-
-    torch.testing.assert_close(output, reference_output, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(lse, reference_lse, atol=1e-4, rtol=1e-4)
-    assert not output[0, 2:].any()
-    assert torch.isneginf(lse[2:, 0]).all()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_grouped_flash_exact_attention_handles_zero_lengths_on_cuda():
-    device = torch.device("cuda")
-    batch_size = 2
-    num_kv_heads = 2
-    num_query_heads = 4
-    head_size = 64
-    max_exact_seq_len = 3
-    num_sequences = batch_size * num_kv_heads
-    impl = cast(
-        FlashAttentionImpl,
-        SimpleNamespace(scale=1.0, vllm_flash_attn_version=2),
-    )
-    execution = RetroSpecExactExecution(
-        keys=torch.empty(
-            num_sequences * max_exact_seq_len,
-            1,
-            head_size,
-            dtype=torch.bfloat16,
-            device=device,
-        ),
-        values=torch.empty(
-            num_sequences * max_exact_seq_len,
-            1,
-            head_size,
-            dtype=torch.bfloat16,
-            device=device,
-        ),
-        exact_seq_lens=torch.zeros(num_sequences, dtype=torch.int32, device=device),
-        cu_seqlens_q=torch.arange(num_sequences + 1, dtype=torch.int32, device=device),
-        cu_seqlens_k=torch.zeros(num_sequences + 1, dtype=torch.int32, device=device),
-        batch_size=batch_size,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        max_exact_seq_len=max_exact_seq_len,
-    )
-
-    output, lse = RetroSpecSparseAttention._run_grouped_flash_exact_attention(
-        impl,
-        torch.ones(
-            batch_size,
-            num_query_heads,
-            head_size,
-            dtype=torch.bfloat16,
-            device=device,
-        ),
-        execution,
-    )
-
-    assert not output.any()
-    assert torch.isneginf(lse).all()
+    assert source.resident_pages is not None
+    assert source.staging_pages is not None
+    assert source.resident_pages.page_ids is resident_page_ids
+    assert source.staging_pages.page_ids is staging_page_ids
+    assert source.staging_pages.ready_event is staging_ready_event
 
 
 def test_token_estimation_attention_uses_per_head_cluster_sizes():
@@ -1445,15 +1093,6 @@ def test_exact_attention_resolves_resident_and_staging_pages(
     controller.index.cluster_store.resolve_cluster_blocks = Mock(return_value=resolved)
 
     call_order: list[str] = []
-    execution = make_exact_execution(
-        torch.zeros(1, 1, 3, 1, dtype=torch.float16, device=device),
-        torch.zeros(1, 1, 3, 1, dtype=torch.float16, device=device),
-        torch.ones(1, 1, 3, dtype=torch.bool, device=device),
-    )
-    pack = Mock(
-        side_effect=lambda *_args, **_kwargs: call_order.append("pack") or execution
-    )
-    controller.exact_execution_buffer = SimpleNamespace(pack=pack)
     controller.index.cluster_store.admit_staged_clusters = Mock(
         side_effect=lambda **_: call_order.append("admit"),
     )
@@ -1461,12 +1100,16 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         torch.zeros(1, 1, 1, dtype=torch.float16, device=device),
         torch.zeros(1, 1, dtype=torch.float32, device=device),
     )
-    controller._run_grouped_flash_exact_attention = Mock(return_value=expected_output)
+    run = Mock(
+        side_effect=lambda *_args, **_kwargs: call_order.append("attention")
+        or expected_output
+    )
+    controller.exact_attention_workspace = SimpleNamespace(run=run)
 
     key_cache = torch.zeros(1, 2, 1, 1, dtype=torch.float16, device=device)
     value_cache = key_cache.clone()
     result = controller._run_exact_attention(
-        cast(FlashAttentionImpl, SimpleNamespace()),
+        cast(FlashAttentionImpl, SimpleNamespace(scale=1.0)),
         torch.zeros(1, 1, 1, dtype=torch.float16, device=device),
         key_cache,
         value_cache,
@@ -1498,20 +1141,22 @@ def test_exact_attention_resolves_resident_and_staging_pages(
             staging_key_pages=staging_keys,
             staging_value_pages=staging_values,
         )
-        assert call_order == ["pack", "admit"]
+        assert call_order == ["attention", "admit"]
     else:
         controller.index.cluster_store.admit_staged_clusters.assert_not_called()
-        assert call_order == ["pack"]
-    source = pack.call_args.args[0]
+        assert call_order == ["attention"]
+    source = run.call_args.args[0]
     assert isinstance(source, RetroSpecExactKVSource)
     assert source.primary.key_cache is key_cache
     assert source.primary.value_cache is value_cache
     assert source.primary.token_indices is plan.primary_exact_token_indices
     assert source.primary.token_mask is plan.primary_exact_token_mask
     assert source.page_token_counts is page_counts
-    assert len(source.page_sources) == 2
+    assert source.resident_pages is not None
+    assert source.staging_pages is not None
 
-    resident_source, staging_source = source.page_sources
+    resident_source = source.resident_pages
+    staging_source = source.staging_pages
     assert resident_source.page_ids is resident_page_ids
     assert resident_source.key_pages is resident_keys
     assert resident_source.value_pages is resident_values

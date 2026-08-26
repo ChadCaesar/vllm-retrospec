@@ -4,510 +4,365 @@
 import pytest
 import torch
 
-from vllm.v1.spec_decode.retrospec.cluster_store import (
-    RetroSpecClusterPageStore,
-)
 from vllm.v1.spec_decode.retrospec.execution import (
-    RetroSpecExactExecutionBuffer,
+    EXACT_ATTENTION_PARTITION_SIZE,
+    RetroSpecExactAttentionWorkspace,
     RetroSpecExactKVSource,
     RetroSpecExactPageKVSource,
     RetroSpecExactPrimaryKVSource,
 )
 
 
-def test_execution_buffer_rejects_invalid_page_size():
-    with pytest.raises(ValueError, match="positive"):
-        RetroSpecExactExecutionBuffer(page_size=0)
+def test_exact_attention_workspace_rejects_invalid_capacity():
+    with pytest.raises(ValueError, match="page_size must be positive"):
+        RetroSpecExactAttentionWorkspace(page_size=0, max_num_queries=1)
+    with pytest.raises(ValueError, match="max_num_queries must be positive"):
+        RetroSpecExactAttentionWorkspace(page_size=16, max_num_queries=0)
 
 
-def _make_primary_cache(
-    num_blocks: int,
-    page_size: int,
-    num_kv_heads: int,
-    head_size: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    block_ids = torch.arange(num_blocks, device=device)[:, None, None, None]
-    offsets = torch.arange(page_size, device=device)[None, :, None, None]
-    head_ids = torch.arange(num_kv_heads, device=device)[None, None, :, None]
-    dimensions = torch.arange(head_size, device=device)[None, None, None, :]
-    keys = (block_ids * 1000 + offsets * 100 + head_ids * 10 + dimensions).to(
-        torch.bfloat16
-    )
-    return keys, keys + 5
-
-
-def _make_cluster_pages(
-    num_pages: int,
-    page_size: int,
-    head_size: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    page_ids = torch.arange(num_pages, device=device)[:, None, None]
-    offsets = torch.arange(page_size, device=device)[None, :, None]
-    dimensions = torch.arange(head_size, device=device)[None, None, :]
-    keys = (10000 + page_ids * 1000 + offsets * 100 + dimensions).to(torch.bfloat16)
-    return keys, keys + 7
-
-
-def _make_exact_source(
+def _make_source(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_table: torch.Tensor,
-    primary_token_indices: torch.Tensor,
-    primary_token_mask: torch.Tensor,
+    token_indices: torch.Tensor,
+    token_mask: torch.Tensor,
     page_token_counts: torch.Tensor,
-    page_sources: tuple[RetroSpecExactPageKVSource, ...] = (),
-    primary_ready_event: torch.cuda.Event | None = None,
+    resident_pages: RetroSpecExactPageKVSource | None = None,
+    staging_pages: RetroSpecExactPageKVSource | None = None,
+    ready_event: torch.cuda.Event | None = None,
 ) -> RetroSpecExactKVSource:
     return RetroSpecExactKVSource(
         primary=RetroSpecExactPrimaryKVSource(
             key_cache=key_cache,
             value_cache=value_cache,
             block_table=block_table,
-            token_indices=primary_token_indices,
-            token_mask=primary_token_mask,
-            ready_event=primary_ready_event,
+            token_indices=token_indices,
+            token_mask=token_mask,
+            ready_event=ready_event,
         ),
         page_token_counts=page_token_counts,
-        page_sources=page_sources,
+        resident_pages=resident_pages,
+        staging_pages=staging_pages,
     )
 
 
-def _reference_packed_tokens(
-    primary_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    primary_token_indices: torch.Tensor,
-    primary_token_mask: torch.Tensor,
-    page_ids: torch.Tensor,
-    page_token_counts: torch.Tensor,
-    cluster_pages: torch.Tensor,
-    page_size: int,
-) -> torch.Tensor:
-    batch_size, num_kv_heads = primary_token_indices.shape[:2]
-    sequences = []
+def _materialize_head(
+    source: RetroSpecExactKVSource,
+    request_idx: int,
+    kv_head_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    primary = source.primary
+    keys = []
+    values = []
+    for logical_idx, selected in zip(
+        primary.token_indices[request_idx, kv_head_idx].tolist(),
+        primary.token_mask[request_idx, kv_head_idx].tolist(),
+    ):
+        if not selected:
+            continue
+        logical_block, block_offset = divmod(logical_idx, primary.key_cache.shape[1])
+        physical_block = int(primary.block_table[request_idx, logical_block])
+        keys.append(primary.key_cache[physical_block, block_offset, kv_head_idx])
+        values.append(primary.value_cache[physical_block, block_offset, kv_head_idx])
 
-    for batch_idx in range(batch_size):
-        for head_idx in range(num_kv_heads):
-            tokens = []
-            for logical_idx, selected in zip(
-                primary_token_indices[batch_idx, head_idx].tolist(),
-                primary_token_mask[batch_idx, head_idx].tolist(),
-            ):
-                if selected:
-                    logical_block = logical_idx // page_size
-                    block_offset = logical_idx % page_size
-                    physical_block = int(block_table[batch_idx, logical_block])
-                    tokens.append(primary_cache[physical_block, block_offset, head_idx])
+    page_counts = source.page_token_counts[request_idx, kv_head_idx].reshape(-1)
+    for page_slot, token_count in enumerate(page_counts.tolist()):
+        page_source = None
+        page_id = -1
+        if source.resident_pages is not None:
+            candidate = int(
+                source.resident_pages.page_ids[request_idx, kv_head_idx].reshape(-1)[
+                    page_slot
+                ]
+            )
+            if candidate >= 0:
+                page_source = source.resident_pages
+                page_id = candidate
+        if page_source is None and source.staging_pages is not None:
+            candidate = int(
+                source.staging_pages.page_ids[request_idx, kv_head_idx].reshape(-1)[
+                    page_slot
+                ]
+            )
+            if candidate >= 0:
+                page_source = source.staging_pages
+                page_id = candidate
+        if page_source is not None:
+            keys.extend(page_source.key_pages[page_id, :token_count])
+            values.extend(page_source.value_pages[page_id, :token_count])
 
-            for page_id, token_count in zip(
-                page_ids[batch_idx, head_idx].reshape(-1).tolist(),
-                page_token_counts[batch_idx, head_idx].reshape(-1).tolist(),
-            ):
-                if page_id >= 0:
-                    tokens.extend(cluster_pages[page_id, :token_count])
+    head_size = primary.key_cache.shape[-1]
+    if not keys:
+        empty = primary.key_cache.new_empty(0, head_size)
+        return empty, empty
+    return torch.stack(keys), torch.stack(values)
 
-            sequences.extend(tokens)
 
-    return torch.stack(sequences).view(-1, 1, primary_cache.shape[-1])
+def _reference_attention(
+    source: RetroSpecExactKVSource,
+    query: torch.Tensor,
+    scale: float,
+    request_indices: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_queries, num_query_heads, _ = query.shape
+    num_kv_heads = source.primary.key_cache.shape[2]
+    queries_per_kv_head = num_query_heads // num_kv_heads
+    output = torch.zeros_like(query)
+    lse = torch.full(
+        (num_query_heads, num_queries),
+        float("-inf"),
+        dtype=torch.float32,
+        device=query.device,
+    )
+    for query_idx in range(num_queries):
+        request_idx = (
+            query_idx if request_indices is None else int(request_indices[query_idx])
+        )
+        for query_head_idx in range(num_query_heads):
+            kv_head_idx = query_head_idx // queries_per_kv_head
+            keys, values = _materialize_head(source, request_idx, kv_head_idx)
+            if not keys.numel():
+                continue
+            logits = torch.mv(keys.float(), query[query_idx, query_head_idx].float())
+            logits *= scale
+            weights = torch.softmax(logits, dim=0)
+            output[query_idx, query_head_idx] = torch.mv(
+                values.float().t(), weights
+            ).to(query.dtype)
+            lse[query_head_idx, query_idx] = torch.logsumexp(logits, dim=0)
+    return output, lse
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_execution_buffer_packs_primary_and_cluster_tokens_on_cuda():
+def test_multi_source_exact_attention_matches_reference_on_cuda():
     device = torch.device("cuda")
-    page_size = 2
+    torch.manual_seed(0)
+    page_size = 4
+    batch_size = 2
     num_kv_heads = 2
+    num_query_heads = 4
     head_size = 64
-    keys, values = _make_primary_cache(6, page_size, num_kv_heads, head_size, device)
-    cluster_keys, cluster_values = _make_cluster_pages(6, page_size, head_size, device)
-    block_table = torch.tensor([[2, 0, 1], [3, 4, 5]], dtype=torch.int32, device=device)
-    primary_indices = torch.tensor(
+    key_cache = torch.randn(
+        8, page_size, num_kv_heads, head_size, dtype=torch.float16, device=device
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.tensor(
+        [[2, 0, 1, 3], [4, 6, 5, 7]], dtype=torch.int32, device=device
+    )
+    token_indices = torch.tensor(
         [
-            [[0, 3, 4], [1, 2, 5]],
-            [[0, 1, 3], [2, 4, 5]],
+            [[0, 3, 7, 10], [1, 4, 8, 11]],
+            [[0, 2, 5, 9], [1, 3, 6, 10]],
         ],
         dtype=torch.int64,
         device=device,
     )
-    primary_mask = torch.tensor(
+    token_mask = torch.tensor(
         [
-            [[True, False, True], [True, True, False]],
-            [[False, True, True], [True, False, True]],
+            [[True, False, True, True], [True, True, False, True]],
+            [[True, True, False, True], [False, True, True, True]],
         ],
-        device=device,
-    )
-    page_ids = torch.tensor(
-        [
-            [[[0, 1], [-1, -1]], [[2, -1], [-1, -1]]],
-            [[[3, 4], [-1, -1]], [[5, -1], [-1, -1]]],
-        ],
-        dtype=torch.int64,
         device=device,
     )
     page_counts = torch.tensor(
         [
-            [[[2, 1], [0, 0]], [[1, 0], [0, 0]]],
-            [[[2, 2], [0, 0]], [[1, 0], [0, 0]]],
+            [[[4, 2]], [[3, 0]]],
+            [[[1, 4]], [[2, 3]]],
         ],
         dtype=torch.int32,
         device=device,
     )
-
-    buffer = RetroSpecExactExecutionBuffer(page_size)
-    execution = buffer.pack(
-        _make_exact_source(
-            keys,
-            values,
-            block_table,
-            primary_indices,
-            primary_mask,
-            page_counts,
-            page_sources=(
-                RetroSpecExactPageKVSource(
-                    key_pages=cluster_keys,
-                    value_pages=cluster_values,
-                    page_ids=page_ids,
-                ),
-            ),
-        )
+    resident_keys = torch.randn(
+        4, page_size, head_size, dtype=torch.float16, device=device
     )
+    resident_values = torch.randn_like(resident_keys)
+    staging_keys = torch.randn_like(resident_keys)
+    staging_values = torch.randn_like(resident_keys)
+    resident_ids = torch.tensor(
+        [[[[0, -1]], [[1, -1]]], [[[2, -1]], [[3, -1]]]],
+        dtype=torch.int64,
+        device=device,
+    )
+    staging_ids = torch.tensor(
+        [[[[-1, 0]], [[-1, -1]]], [[[-1, 1]], [[-1, 2]]]],
+        dtype=torch.int64,
+        device=device,
+    )
+    source = _make_source(
+        key_cache,
+        value_cache,
+        block_table,
+        token_indices,
+        token_mask,
+        page_counts,
+        resident_pages=RetroSpecExactPageKVSource(
+            resident_keys, resident_values, resident_ids
+        ),
+        staging_pages=RetroSpecExactPageKVSource(
+            staging_keys, staging_values, staging_ids
+        ),
+    )
+    query = torch.randn(
+        batch_size,
+        num_query_heads,
+        head_size,
+        dtype=torch.float16,
+        device=device,
+    )
+    workspace = RetroSpecExactAttentionWorkspace(page_size, batch_size)
+
+    output, lse = workspace.run(source, query, scale=0.125)
+    expected_output, expected_lse = _reference_attention(source, query, 0.125)
     torch.cuda.synchronize()
 
-    expected_keys = _reference_packed_tokens(
-        keys,
-        block_table,
-        primary_indices,
-        primary_mask,
-        page_ids,
-        page_counts,
-        cluster_keys,
-        page_size,
-    )
-    expected_values = _reference_packed_tokens(
-        values,
-        block_table,
-        primary_indices,
-        primary_mask,
-        page_ids,
-        page_counts,
-        cluster_values,
-        page_size,
-    )
-    actual_tokens = int(execution.cu_seqlens_k[-1])
-
-    assert execution.exact_seq_lens.tolist() == [5, 3, 6, 3]
-    assert execution.cu_seqlens_q.tolist() == [0, 1, 2, 3, 4]
-    assert execution.cu_seqlens_k.tolist() == [0, 5, 8, 14, 17]
-    assert execution.max_exact_seq_len == 11
-    torch.testing.assert_close(execution.keys[:actual_tokens], expected_keys)
-    torch.testing.assert_close(execution.values[:actual_tokens], expected_values)
+    torch.testing.assert_close(output, expected_output, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_execution_buffer_preserves_order_across_resident_and_staging_pages():
+def test_exact_attention_maps_multiple_queries_to_their_requests():
     device = torch.device("cuda")
-    page_size = 2
+    page_size = 4
     head_size = 64
-    keys, values = _make_primary_cache(1, page_size, 1, head_size, device)
-    cluster_keys, cluster_values = _make_cluster_pages(4, page_size, head_size, device)
-    logical_page_ids = torch.tensor(
-        [[[[0, 1], [2, 3]]]], dtype=torch.int64, device=device
+    key_cache = torch.randn(
+        4, page_size, 1, head_size, dtype=torch.bfloat16, device=device
     )
-    resident_page_ids = torch.tensor(
-        [[[[0, -1], [1, -1]]]], dtype=torch.int64, device=device
+    value_cache = torch.randn_like(key_cache)
+    source = _make_source(
+        key_cache,
+        value_cache,
+        torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device),
+        torch.tensor([[[0, 1, 2]], [[0, 2, 5]]], device=device),
+        torch.ones(2, 1, 3, dtype=torch.bool, device=device),
+        torch.empty(2, 1, 0, 0, dtype=torch.int32, device=device),
     )
-    staging_page_ids = torch.tensor(
-        [[[[-1, 0], [-1, 1]]]], dtype=torch.int64, device=device
-    )
-    page_counts = torch.tensor([[[[2, 1], [2, 1]]]], dtype=torch.int32, device=device)
-    resident_keys = cluster_keys.index_select(0, torch.tensor([0, 2], device=device))
-    resident_values = cluster_values.index_select(
-        0, torch.tensor([0, 2], device=device)
-    )
-    staging_keys = cluster_keys.index_select(0, torch.tensor([1, 3], device=device))
-    staging_values = cluster_values.index_select(0, torch.tensor([1, 3], device=device))
+    query = torch.randn(3, 2, head_size, dtype=torch.bfloat16, device=device)
+    request_indices = torch.tensor([0, 0, 1], dtype=torch.int64, device=device)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, 3)
 
-    execution = RetroSpecExactExecutionBuffer(page_size).pack(
-        _make_exact_source(
-            keys,
-            values,
-            torch.tensor([[0]], dtype=torch.int32, device=device),
-            torch.empty(1, 1, 0, dtype=torch.int64, device=device),
-            torch.empty(1, 1, 0, dtype=torch.bool, device=device),
-            page_counts,
-            page_sources=(
-                RetroSpecExactPageKVSource(
-                    key_pages=resident_keys,
-                    value_pages=resident_values,
-                    page_ids=resident_page_ids,
-                ),
-                RetroSpecExactPageKVSource(
-                    key_pages=staging_keys,
-                    value_pages=staging_values,
-                    page_ids=staging_page_ids,
-                ),
-            ),
-        )
-    )
-    torch.cuda.synchronize()
+    output, lse = workspace.run(source, query, 0.125, request_indices)
+    expected = _reference_attention(source, query, 0.125, request_indices)
 
-    expected_keys = _reference_packed_tokens(
-        keys,
-        torch.tensor([[0]], dtype=torch.int32, device=device),
-        torch.empty(1, 1, 0, dtype=torch.int64, device=device),
-        torch.empty(1, 1, 0, dtype=torch.bool, device=device),
-        logical_page_ids,
-        page_counts,
-        cluster_keys,
-        page_size,
-    )
-    expected_values = _reference_packed_tokens(
-        values,
-        torch.tensor([[0]], dtype=torch.int32, device=device),
-        torch.empty(1, 1, 0, dtype=torch.int64, device=device),
-        torch.empty(1, 1, 0, dtype=torch.bool, device=device),
-        logical_page_ids,
-        page_counts,
-        cluster_values,
-        page_size,
-    )
-
-    assert execution.exact_seq_lens.tolist() == [6]
-    torch.testing.assert_close(execution.keys[:6], expected_keys)
-    torch.testing.assert_close(execution.values[:6], expected_values)
+    torch.testing.assert_close(output, expected[0], atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, expected[1], atol=3e-3, rtol=3e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_execution_buffer_waits_for_page_source_copy_event():
+def test_exact_attention_reduces_multiple_partitions_and_reuses_workspace():
     device = torch.device("cuda")
-    page_size = 2
+    page_size = 16
     head_size = 64
-    primary_keys, primary_values = _make_primary_cache(
-        1, page_size, 1, head_size, device
+    num_tokens = EXACT_ATTENTION_PARTITION_SIZE + 37
+    num_blocks = (num_tokens + page_size - 1) // page_size
+    key_cache = torch.randn(
+        num_blocks, page_size, 1, head_size, dtype=torch.float16, device=device
     )
-    source_keys, source_values = _make_cluster_pages(1, page_size, head_size, device)
-    resident_keys = torch.zeros_like(source_keys)
-    resident_values = torch.zeros_like(source_values)
+    value_cache = torch.randn_like(key_cache)
+    source = _make_source(
+        key_cache,
+        value_cache,
+        torch.arange(num_blocks, dtype=torch.int32, device=device).view(1, -1),
+        torch.arange(num_tokens, dtype=torch.int64, device=device).view(1, 1, -1),
+        torch.ones(1, 1, num_tokens, dtype=torch.bool, device=device),
+        torch.empty(1, 1, 0, 0, dtype=torch.int32, device=device),
+    )
+    query = torch.randn(1, 2, head_size, dtype=torch.float16, device=device)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, 2)
 
-    current_stream = torch.cuda.current_stream(device)
-    copy_stream = torch.cuda.Stream(device=device)
-    copy_stream.wait_stream(current_stream)
-    ready_event = torch.cuda.Event()
+    output, lse = workspace.run(source, query, 0.125)
+    partial_pointer = workspace._partial_output.data_ptr()
+    second_output, _ = workspace.run(source, query, 0.125)
+    expected = _reference_attention(source, query, 0.125)
 
-    with torch.cuda.stream(copy_stream):
-        # Keep the producer behind the consumer long enough that omitting the
-        # event dependency would deterministically pack the zero-filled pages.
-        torch.cuda._sleep(20_000_000)
-        resident_keys.copy_(source_keys)
-        resident_values.copy_(source_values)
-        ready_event.record()
-
-    page_counts = torch.full((1, 1, 1, 1), page_size, dtype=torch.int32, device=device)
-    page_source = RetroSpecExactPageKVSource(
-        key_pages=resident_keys,
-        value_pages=resident_values,
-        page_ids=torch.zeros(1, 1, 1, 1, dtype=torch.int64, device=device),
-        ready_event=ready_event,
-    )
-    execution = RetroSpecExactExecutionBuffer(page_size).pack(
-        _make_exact_source(
-            primary_keys,
-            primary_values,
-            torch.tensor([[0]], dtype=torch.int32, device=device),
-            torch.empty(1, 1, 0, dtype=torch.int64, device=device),
-            torch.empty(1, 1, 0, dtype=torch.bool, device=device),
-            page_counts,
-            page_sources=(page_source,),
-        )
-    )
-    current_stream.synchronize()
-
-    torch.testing.assert_close(
-        execution.keys[:page_size], source_keys[0].view(page_size, 1, head_size)
-    )
-    torch.testing.assert_close(
-        execution.values[:page_size], source_values[0].view(page_size, 1, head_size)
-    )
+    torch.testing.assert_close(output, expected[0], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, expected[1], atol=3e-3, rtol=3e-3)
+    assert workspace._partial_output.data_ptr() == partial_pointer
+    assert second_output.data_ptr() == output.data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_execution_buffer_waits_for_primary_copy_event():
+def test_exact_attention_handles_empty_sources():
     device = torch.device("cuda")
-    page_size = 2
+    key_cache = torch.empty(1, 4, 1, 64, dtype=torch.float16, device=device)
+    source = _make_source(
+        key_cache,
+        key_cache.clone(),
+        torch.zeros(2, 1, dtype=torch.int32, device=device),
+        torch.empty(2, 1, 0, dtype=torch.int64, device=device),
+        torch.empty(2, 1, 0, dtype=torch.bool, device=device),
+        torch.empty(2, 1, 0, 0, dtype=torch.int32, device=device),
+    )
+    query = torch.ones(2, 2, 64, dtype=torch.float16, device=device)
+
+    output, lse = RetroSpecExactAttentionWorkspace(4, 2).run(source, query, 1.0)
+
+    assert not output.any()
+    assert torch.isneginf(lse).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_exact_attention_waits_for_page_ready_event():
+    device = torch.device("cuda")
+    page_size = 4
     head_size = 64
-    source_keys, source_values = _make_primary_cache(1, page_size, 1, head_size, device)
+    key_cache = torch.empty(
+        1, page_size, 1, head_size, dtype=torch.float16, device=device
+    )
+    source_keys = torch.randn(
+        1, page_size, head_size, dtype=torch.float16, device=device
+    )
+    source_values = torch.randn_like(source_keys)
     staged_keys = torch.zeros_like(source_keys)
     staged_values = torch.zeros_like(source_values)
-
-    current_stream = torch.cuda.current_stream(device)
     copy_stream = torch.cuda.Stream(device=device)
-    copy_stream.wait_stream(current_stream)
+    copy_stream.wait_stream(torch.cuda.current_stream(device))
     ready_event = torch.cuda.Event()
-
     with torch.cuda.stream(copy_stream):
         torch.cuda._sleep(20_000_000)
         staged_keys.copy_(source_keys)
         staged_values.copy_(source_values)
         ready_event.record()
 
-    source = _make_exact_source(
-        staged_keys,
-        staged_values,
-        torch.tensor([[0]], dtype=torch.int32, device=device),
-        torch.tensor([[[0, 1]]], dtype=torch.int64, device=device),
-        torch.tensor([[[True, True]]], device=device),
-        torch.empty(1, 1, 0, 0, dtype=torch.int32, device=device),
-        primary_ready_event=ready_event,
-    )
-    execution = RetroSpecExactExecutionBuffer(page_size).pack(source)
-    current_stream.synchronize()
-
-    torch.testing.assert_close(
-        execution.keys[:page_size], source_keys[0].view(page_size, 1, head_size)
-    )
-    torch.testing.assert_close(
-        execution.values[:page_size], source_values[0].view(page_size, 1, head_size)
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_execution_buffer_requires_a_source_for_nonempty_page_metadata():
-    device = torch.device("cuda")
-    page_size = 2
-    head_size = 64
-    keys, values = _make_primary_cache(1, page_size, 1, head_size, device)
-    source = _make_exact_source(
-        keys,
-        values,
-        torch.tensor([[0]], dtype=torch.int32, device=device),
+    page_ids = torch.zeros(1, 1, 1, 1, dtype=torch.int64, device=device)
+    source = _make_source(
+        key_cache,
+        key_cache.clone(),
+        torch.zeros(1, 1, dtype=torch.int32, device=device),
         torch.empty(1, 1, 0, dtype=torch.int64, device=device),
         torch.empty(1, 1, 0, dtype=torch.bool, device=device),
         torch.full((1, 1, 1, 1), page_size, dtype=torch.int32, device=device),
+        staging_pages=RetroSpecExactPageKVSource(
+            staged_keys, staged_values, page_ids, ready_event
+        ),
     )
+    query = torch.randn(1, 1, head_size, dtype=torch.float16, device=device)
 
-    with pytest.raises(RuntimeError, match="at least one page source"):
-        RetroSpecExactExecutionBuffer(page_size).pack(source)
+    output, lse = RetroSpecExactAttentionWorkspace(page_size, 1).run(
+        source, query, 0.125
+    )
+    expected = _reference_attention(source, query, 0.125)
+    torch.cuda.current_stream(device).synchronize()
 
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_execution_buffer_packs_resolved_cpu_backing_pages():
-    device = torch.device("cuda")
-    page_size = 2
-    head_size = 64
-    token_keys = (
-        torch.arange(6 * head_size, dtype=torch.float32, device=device)
-        .to(torch.bfloat16)
-        .view(1, 6, head_size)
-    )
-    token_values = token_keys + 10
-    assignments = torch.tensor([[0, 0, 1, 1, 2, 2]], dtype=torch.int64, device=device)
-    cluster_counts = torch.tensor([[2, 2, 2]], dtype=torch.int32, device=device)
-    token_offsets = torch.tensor(
-        [[0, 1, 0, 1, 0, 1]],
-        dtype=torch.int32,
-        device=device,
-    )
-    store = RetroSpecClusterPageStore(
-        page_size=page_size,
-        cache_ratio=0.5,
-    )
-    table = store.store_clusters(
-        layer_name="layer",
-        request_id="request",
-        cluster_start=0,
-        token_keys=token_keys,
-        token_values=token_values,
-        assignments=assignments,
-        cluster_token_counts=cluster_counts,
-        token_offsets_in_cluster=token_offsets,
-    )
-    cluster_ids = table.cluster_ids.to(device=device).unsqueeze(0)
-    metadata = store.get_cluster_block_metadata("layer", cluster_ids, device=device)
-    logical_page_ids = metadata.page_ids
-    page_counts = metadata.page_token_counts
-    resolved = store.resolve_cluster_blocks("layer", cluster_ids, logical_page_ids)
-
-    primary_keys, primary_values = _make_primary_cache(
-        1, page_size, 1, head_size, device
-    )
-    execution = RetroSpecExactExecutionBuffer(page_size).pack(
-        _make_exact_source(
-            primary_keys,
-            primary_values,
-            torch.tensor([[0]], dtype=torch.int32, device=device),
-            torch.empty(1, 1, 0, dtype=torch.int64, device=device),
-            torch.empty(1, 1, 0, dtype=torch.bool, device=device),
-            page_counts,
-            page_sources=(
-                RetroSpecExactPageKVSource(
-                    key_pages=resolved.resident_key_pages,
-                    value_pages=resolved.resident_value_pages,
-                    page_ids=resolved.resident_page_ids,
-                    ready_event=resolved.resident_ready_event,
-                ),
-                RetroSpecExactPageKVSource(
-                    key_pages=resolved.staging_key_pages,
-                    value_pages=resolved.staging_value_pages,
-                    page_ids=resolved.staging_page_ids,
-                ),
-            ),
-        )
-    )
-    torch.cuda.synchronize()
-
-    assert not (resolved.resident_page_ids >= 0).any()
-    assert (resolved.staging_page_ids >= 0).sum().item() == 3
-    assert execution.exact_seq_lens.tolist() == [6]
-    torch.testing.assert_close(execution.keys[:6], token_keys[0].view(6, 1, head_size))
-    torch.testing.assert_close(
-        execution.values[:6], token_values[0].view(6, 1, head_size)
-    )
+    torch.testing.assert_close(output, expected[0], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, expected[1], atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_execution_buffer_handles_empty_batch_and_reuses_storage_on_cuda():
+def test_exact_attention_rejects_query_over_workspace_capacity():
     device = torch.device("cuda")
-    page_size = 2
-    head_size = 64
-    keys, values = _make_primary_cache(2, page_size, 1, head_size, device)
-    buffer = RetroSpecExactExecutionBuffer(page_size)
-
-    first = buffer.pack(
-        _make_exact_source(
-            keys,
-            values,
-            torch.tensor([[0, 1]], dtype=torch.int32, device=device),
-            torch.tensor([[[0, 1]]], dtype=torch.int64, device=device),
-            torch.tensor([[[True, True]]], device=device),
-            torch.empty(1, 1, 0, 0, dtype=torch.int32, device=device),
-        )
+    key_cache = torch.zeros(1, 4, 1, 64, dtype=torch.float16, device=device)
+    source = _make_source(
+        key_cache,
+        key_cache.clone(),
+        torch.zeros(2, 1, dtype=torch.int32, device=device),
+        torch.zeros(2, 1, 1, dtype=torch.int64, device=device),
+        torch.ones(2, 1, 1, dtype=torch.bool, device=device),
+        torch.empty(2, 1, 0, 0, dtype=torch.int32, device=device),
     )
-    first_pointer = first.keys.data_ptr()
 
-    second = buffer.pack(
-        _make_exact_source(
-            keys,
-            values,
-            torch.tensor([[0, 1]], dtype=torch.int32, device=device),
-            torch.tensor([[[1]]], dtype=torch.int64, device=device),
-            torch.tensor([[[True]]], device=device),
-            torch.empty(1, 1, 0, 0, dtype=torch.int32, device=device),
+    with pytest.raises(ValueError, match="workspace capacity"):
+        RetroSpecExactAttentionWorkspace(4, 1).run(
+            source,
+            torch.zeros(2, 1, 64, dtype=torch.float16, device=device),
+            1.0,
         )
-    )
-    empty = buffer.pack(
-        _make_exact_source(
-            keys,
-            values,
-            torch.empty(0, 0, dtype=torch.int32, device=device),
-            torch.empty(0, 1, 2, dtype=torch.int64, device=device),
-            torch.empty(0, 1, 2, dtype=torch.bool, device=device),
-            torch.empty(0, 1, 0, 0, dtype=torch.int32, device=device),
-        )
-    )
-    torch.cuda.synchronize()
-
-    assert second.keys.data_ptr() == first_pointer
-    torch.testing.assert_close(second.keys[0], keys[0, 1, 0].view(1, head_size))
-    assert empty.keys.shape == (0, 1, head_size)
-    assert empty.exact_seq_lens.numel() == 0
-    assert empty.cu_seqlens_k.tolist() == [0]

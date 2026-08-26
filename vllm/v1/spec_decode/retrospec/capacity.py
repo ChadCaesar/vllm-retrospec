@@ -7,7 +7,10 @@ from math import ceil
 
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+
+_EXACT_ATTENTION_PARTITION_SIZE = 1024
 
 
 @dataclass(frozen=True)
@@ -218,31 +221,44 @@ def build_retrospec_long_context_capacity(
         indexed_tokens,
         max_segment_size + max_prefill_chunk,
     )
+    num_query_heads = vllm_config.model_config.get_num_attention_heads(
+        vllm_config.parallel_config
+    )
+    head_size = attention_specs[0].head_size
+    query_dtype_bytes = get_dtype_size(attention_specs[0].dtype)
+    max_parallel_queries = max(
+        max_resident_requests * config.num_speculative_tokens,
+        scheduler_config.max_num_batched_tokens,
+    )
+    max_exact_partitions = _next_power_of_two(
+        ceil(max_model_len / _EXACT_ATTENTION_PARTITION_SIZE)
+    )
+    exact_attention_workspace_bytes = (
+        max_parallel_queries
+        * num_query_heads
+        * (
+            max_exact_partitions * head_size * query_dtype_bytes
+            + max_exact_partitions * 8
+            + head_size * query_dtype_bytes
+            + 4
+        )
+    )
 
     for spec in attention_specs:
         num_kv_heads = spec.num_kv_heads
         per_head_page_bytes = spec.real_page_size_bytes // num_kv_heads
-        per_head_token_bytes = per_head_page_bytes // block_size
 
-        # Full-verification pages and the continuous exact-attention input each
-        # use one layer-shared growable power-of-two arena.
+        # Full-verification transfer pages and partitioned exact-attention
+        # state are reused by all model layers.
         transfer_pages = _next_power_of_two(
             max(64, num_kv_heads * cluster_pages_per_head)
         )
         transfer_buffer_bytes = transfer_pages * per_head_page_bytes
 
-        execution_tokens = _next_power_of_two(
-            max(
-                1024,
-                max_resident_requests * num_kv_heads * max_model_len,
-            )
-        )
-        execution_buffer_bytes = execution_tokens * per_head_token_bytes
-
         max_full_verify_workspace = max(
             max_full_verify_workspace,
             transfer_buffer_bytes
-            + execution_buffer_bytes
+            + exact_attention_workspace_bytes
             + cluster_pages_per_head * num_kv_heads * 12,
         )
 
@@ -254,9 +270,6 @@ def build_retrospec_long_context_capacity(
             4 * cluster_build_tokens * layer_token_bytes,
         )
 
-    num_query_heads = vllm_config.model_config.get_num_attention_heads(
-        vllm_config.parallel_config
-    )
     max_kv_heads = max(spec.num_kv_heads for spec in attention_specs)
 
     # Float logits/scores plus top-k values and indices, shared across layers.
