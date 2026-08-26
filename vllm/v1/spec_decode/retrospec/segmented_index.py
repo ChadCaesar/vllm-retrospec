@@ -26,6 +26,10 @@ from .index_residency import (
     RetroSpecStagedClusterSummary,
 )
 from .performance import RetroSpecPerformanceStats
+from .selection_kernels import (
+    gather_resident_estimation,
+    gather_resident_exact_pages,
+)
 
 
 @dataclass(frozen=True)
@@ -151,6 +155,148 @@ class _ClusterSelectionWorkspace:
     topk_indices: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _SelectionOutputWorkspace:
+    sparse_exact_cluster_ids: torch.Tensor
+    sparse_exact_page_ids: torch.Tensor
+    sparse_exact_page_token_counts: torch.Tensor
+    expanded_exact_cluster_ids: torch.Tensor
+    expanded_exact_page_ids: torch.Tensor
+    expanded_exact_page_token_counts: torch.Tensor
+    draft_exact_page_token_counts: torch.Tensor
+
+    draft_estimation_keys: torch.Tensor
+    draft_estimation_values: torch.Tensor
+    draft_estimation_token_counts: torch.Tensor
+    expanded_estimation_keys: torch.Tensor
+    expanded_estimation_values: torch.Tensor
+    expanded_estimation_token_counts: torch.Tensor
+
+    sparse_estimation_width: int
+    sparse_retrieval_width: int
+
+    @classmethod
+    def allocate(
+        cls,
+        batch_size: int,
+        num_kv_heads: int,
+        sparse_retrieval_width: int,
+        expanded_retrieval_width: int,
+        sparse_estimation_width: int,
+        max_pages_per_cluster: int,
+        head_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> "_SelectionOutputWorkspace":
+        sparse_cluster_shape = (
+            batch_size,
+            num_kv_heads,
+            sparse_retrieval_width,
+        )
+        expanded_cluster_shape = (
+            batch_size,
+            num_kv_heads,
+            expanded_retrieval_width,
+        )
+        sparse_page_shape = (*sparse_cluster_shape, max_pages_per_cluster)
+        expanded_page_shape = (*expanded_cluster_shape, max_pages_per_cluster)
+        draft_estimation_width = sparse_estimation_width + sparse_retrieval_width
+        draft_estimation_shape = (
+            batch_size,
+            num_kv_heads,
+            draft_estimation_width,
+            head_size,
+        )
+        expanded_estimation_shape = (
+            batch_size,
+            num_kv_heads,
+            sparse_estimation_width,
+            head_size,
+        )
+
+        return cls(
+            sparse_exact_cluster_ids=torch.empty(
+                sparse_cluster_shape, dtype=torch.int64, device=device
+            ),
+            sparse_exact_page_ids=torch.empty(
+                sparse_page_shape, dtype=torch.int64, device=device
+            ),
+            sparse_exact_page_token_counts=torch.empty(
+                sparse_page_shape, dtype=torch.int32, device=device
+            ),
+            expanded_exact_cluster_ids=torch.empty(
+                expanded_cluster_shape, dtype=torch.int64, device=device
+            ),
+            expanded_exact_page_ids=torch.empty(
+                expanded_page_shape, dtype=torch.int64, device=device
+            ),
+            expanded_exact_page_token_counts=torch.empty(
+                expanded_page_shape, dtype=torch.int32, device=device
+            ),
+            draft_exact_page_token_counts=torch.empty(
+                sparse_page_shape, dtype=torch.int32, device=device
+            ),
+            draft_estimation_keys=torch.empty(
+                draft_estimation_shape, dtype=dtype, device=device
+            ),
+            draft_estimation_values=torch.empty(
+                draft_estimation_shape, dtype=dtype, device=device
+            ),
+            draft_estimation_token_counts=torch.empty(
+                draft_estimation_shape[:-1], dtype=torch.int32, device=device
+            ),
+            expanded_estimation_keys=torch.empty(
+                expanded_estimation_shape, dtype=dtype, device=device
+            ),
+            expanded_estimation_values=torch.empty(
+                expanded_estimation_shape, dtype=dtype, device=device
+            ),
+            expanded_estimation_token_counts=torch.empty(
+                expanded_estimation_shape[:-1],
+                dtype=torch.int32,
+                device=device,
+            ),
+            sparse_estimation_width=sparse_estimation_width,
+            sparse_retrieval_width=sparse_retrieval_width,
+        )
+
+    def matches(
+        self,
+        batch_size: int,
+        num_kv_heads: int,
+        sparse_retrieval_width: int,
+        expanded_retrieval_width: int,
+        sparse_estimation_width: int,
+        max_pages_per_cluster: int,
+        head_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> bool:
+        return (
+            self.sparse_exact_cluster_ids.shape
+            == (batch_size, num_kv_heads, sparse_retrieval_width)
+            and self.expanded_exact_cluster_ids.shape
+            == (batch_size, num_kv_heads, expanded_retrieval_width)
+            and self.sparse_exact_page_ids.shape[-1] == max_pages_per_cluster
+            and self.draft_estimation_keys.shape
+            == (
+                batch_size,
+                num_kv_heads,
+                sparse_estimation_width + sparse_retrieval_width,
+                head_size,
+            )
+            and self.expanded_estimation_keys.shape
+            == (
+                batch_size,
+                num_kv_heads,
+                sparse_estimation_width,
+                head_size,
+            )
+            and self.draft_estimation_keys.dtype == dtype
+            and self.draft_estimation_keys.device == device
+        )
+
+
 class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     """Token-level segmented index backed by private cluster KV pages."""
 
@@ -218,6 +364,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         self.prefill_segment_size_tokens = prefill_segment_size_tokens
         self.generation_update_interval = generation_update_interval
+        self.num_speculative_tokens = num_speculative_tokens
         self.tokens_per_cluster = tokens_per_cluster
         self.num_kmeans_iterations = num_kmeans_iterations
         self.max_pending_cluster_builds = max_pending_cluster_builds
@@ -273,6 +420,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         # Shared across model layers. Selection results are copied into each
         # plan before the workspace is reused.
         self._cluster_selection_workspace: _ClusterSelectionWorkspace | None = None
+
+        # One output slot is retained for each layer and speculative step.
+        # Plans stay live until parallel verification finishes, so slots may
+        # be reused across proposals but not across steps in one proposal.
+        self._selection_output_workspaces: dict[
+            str, list[_SelectionOutputWorkspace]
+        ] = {}
+        self._selection_output_workspace_cursors: dict[str, int] = {}
 
         # CPU-offload construction is staged during layer execution and
         # committed after the complete prefill attention context.
@@ -491,6 +646,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             )
 
         self._gpu_index_residency.activate(request_ids)
+        self._selection_output_workspace_cursors.clear()
         self._proposal_active = True
         self._proposal_request_ids = request_ids
 
@@ -1820,34 +1976,131 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         )
         return selected_scores.sum(dim=2)
 
+    def _get_selection_output_workspace(
+        self,
+        layer_name: str,
+        view: RetroSpecResidentBatchView,
+        batch_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> _SelectionOutputWorkspace:
+        if device.type != "cuda":
+            raise ValueError("Selection output workspace requires CUDA")
+
+        sparse_retrieval_width, sparse_estimation_width, expanded_retrieval_width = (
+            self._maximum_zone_widths(view.max_num_clusters)
+        )
+        cursor = self._selection_output_workspace_cursors.get(layer_name, 0)
+        if cursor >= self.num_speculative_tokens:
+            raise RuntimeError(
+                f"Layer {layer_name!r} exceeded the speculative selection capacity"
+            )
+
+        layer_workspaces = self._selection_output_workspaces.setdefault(layer_name, [])
+        if cursor == len(layer_workspaces):
+            layer_workspaces.append(
+                _SelectionOutputWorkspace.allocate(
+                    batch_size=batch_size,
+                    num_kv_heads=num_kv_heads,
+                    sparse_retrieval_width=sparse_retrieval_width,
+                    expanded_retrieval_width=expanded_retrieval_width,
+                    sparse_estimation_width=sparse_estimation_width,
+                    max_pages_per_cluster=view.max_pages_per_cluster,
+                    head_size=head_size,
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+
+        workspace = layer_workspaces[cursor]
+        if not workspace.matches(
+            batch_size=batch_size,
+            num_kv_heads=num_kv_heads,
+            sparse_retrieval_width=sparse_retrieval_width,
+            expanded_retrieval_width=expanded_retrieval_width,
+            sparse_estimation_width=sparse_estimation_width,
+            max_pages_per_cluster=view.max_pages_per_cluster,
+            head_size=head_size,
+            dtype=dtype,
+            device=device,
+        ):
+            workspace = _SelectionOutputWorkspace.allocate(
+                batch_size=batch_size,
+                num_kv_heads=num_kv_heads,
+                sparse_retrieval_width=sparse_retrieval_width,
+                expanded_retrieval_width=expanded_retrieval_width,
+                sparse_estimation_width=sparse_estimation_width,
+                max_pages_per_cluster=view.max_pages_per_cluster,
+                head_size=head_size,
+                dtype=dtype,
+                device=device,
+            )
+            layer_workspaces[cursor] = workspace
+
+        self._selection_output_workspace_cursors[layer_name] = cursor + 1
+        return workspace
+
     @staticmethod
     def _build_resident_exact_cluster_selection(
         view: RetroSpecResidentBatchView,
         packed_cluster_indices: torch.Tensor,
         packed_cluster_mask: torch.Tensor,
+        selected_cluster_ids: torch.Tensor | None = None,
+        selected_page_ids: torch.Tensor | None = None,
+        selected_page_token_counts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, num_kv_heads, max_selected = packed_cluster_indices.shape
         max_pages = view.max_pages_per_cluster
         device = packed_cluster_indices.device
-        selected_cluster_ids = torch.full(
-            (batch_size, num_kv_heads, max_selected),
-            -1,
-            dtype=torch.int64,
-            device=device,
+        output_tensors = (
+            selected_cluster_ids,
+            selected_page_ids,
+            selected_page_token_counts,
         )
-        selected_page_ids = torch.full(
-            (batch_size, num_kv_heads, max_selected, max_pages),
-            -1,
-            dtype=torch.int64,
-            device=device,
-        )
-        selected_page_token_counts = torch.zeros_like(
-            selected_page_ids, dtype=torch.int32
-        )
+        if any(output is None for output in output_tensors):
+            if not all(output is None for output in output_tensors):
+                raise ValueError("Exact selection outputs must be supplied together")
+            selected_cluster_ids = torch.empty(
+                (batch_size, num_kv_heads, max_selected),
+                dtype=torch.int64,
+                device=device,
+            )
+            selected_page_ids = torch.empty(
+                (batch_size, num_kv_heads, max_selected, max_pages),
+                dtype=torch.int64,
+                device=device,
+            )
+            selected_page_token_counts = torch.empty(
+                selected_page_ids.shape, dtype=torch.int32, device=device
+            )
+
+        assert selected_cluster_ids is not None
+        assert selected_page_ids is not None
+        assert selected_page_token_counts is not None
         if view.arena is None or max_selected == 0 or max_pages == 0:
+            selected_cluster_ids.fill_(-1)
+            selected_page_ids.fill_(-1)
+            selected_page_token_counts.zero_()
             return selected_cluster_ids, selected_page_ids, selected_page_token_counts
 
         arena = view.arena
+        if device.type == "cuda":
+            gather_resident_exact_pages(
+                cluster_ids=arena.cluster_ids,
+                cluster_page_offsets=arena.cluster_page_offsets,
+                page_ids=arena.page_ids,
+                page_token_counts=arena.page_token_counts,
+                request_slot_ids=view.request_slot_ids,
+                selected_indices=packed_cluster_indices,
+                selected_mask=packed_cluster_mask,
+                output_cluster_ids=selected_cluster_ids,
+                output_page_ids=selected_page_ids,
+                output_page_token_counts=selected_page_token_counts,
+            )
+            return selected_cluster_ids, selected_page_ids, selected_page_token_counts
+
         slots = view.request_slot_ids.clamp_min(0)
         slot_indices = slots[:, None, None].expand_as(packed_cluster_indices)
         head_indices = torch.arange(num_kv_heads, dtype=torch.int64, device=device)[
@@ -1856,10 +2109,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         valid_clusters = packed_cluster_mask & (
             view.request_slot_ids[:, None, None] >= 0
         )
-        selected_cluster_ids = arena.cluster_ids[
+        gathered_cluster_ids = arena.cluster_ids[
             slot_indices, head_indices, packed_cluster_indices
         ]
-        valid_clusters &= selected_cluster_ids >= 0
+        valid_clusters &= gathered_cluster_ids >= 0
+        selected_cluster_ids.copy_(gathered_cluster_ids)
         selected_cluster_ids.masked_fill_(~valid_clusters, -1)
 
         page_starts = arena.cluster_page_offsets[
@@ -1876,18 +2130,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         flat_page_indices.clamp_(min=0, max=arena.page_ids.shape[2] - 1)
         page_slots = slot_indices.unsqueeze(-1).expand_as(flat_page_indices)
         page_heads = head_indices.unsqueeze(-1).expand_as(flat_page_indices)
-        selected_page_ids = arena.page_ids[page_slots, page_heads, flat_page_indices]
-        selected_page_token_counts = arena.page_token_counts[
-            page_slots, page_heads, flat_page_indices
-        ]
+        selected_page_ids.copy_(
+            arena.page_ids[page_slots, page_heads, flat_page_indices]
+        )
+        selected_page_token_counts.copy_(
+            arena.page_token_counts[page_slots, page_heads, flat_page_indices]
+        )
         selected_page_ids.masked_fill_(~valid_pages, -1)
         selected_page_token_counts.masked_fill_(~valid_pages, 0)
 
-        return (
-            selected_cluster_ids.contiguous(),
-            selected_page_ids.contiguous(),
-            selected_page_token_counts.contiguous(),
-        )
+        return selected_cluster_ids, selected_page_ids, selected_page_token_counts
 
     @staticmethod
     def _gather_prefill_warm_cluster_ids(
@@ -1929,6 +2181,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         packed_mask: torch.Tensor,
         head_size: int,
         dtype: torch.dtype,
+        keys: torch.Tensor | None = None,
+        values: torch.Tensor | None = None,
+        counts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, num_kv_heads, max_selected_clusters = packed_indices.shape
         output_shape = (
@@ -1937,37 +2192,56 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             max_selected_clusters,
             head_size,
         )
-        if view.arena is None or max_selected_clusters == 0:
-            keys = torch.zeros(output_shape, dtype=dtype, device=packed_indices.device)
-            values = torch.zeros_like(keys)
-            counts = torch.zeros(
+        output_tensors = (keys, values, counts)
+        if any(output is None for output in output_tensors):
+            if not all(output is None for output in output_tensors):
+                raise ValueError("Estimation outputs must be supplied together")
+            keys = torch.empty(output_shape, dtype=dtype, device=packed_indices.device)
+            values = torch.empty_like(keys)
+            counts = torch.empty(
                 output_shape[:-1], dtype=torch.int32, device=packed_indices.device
             )
+
+        assert keys is not None
+        assert values is not None
+        assert counts is not None
+        if view.arena is None or max_selected_clusters == 0:
+            keys.zero_()
+            values.zero_()
+            counts.zero_()
             return keys, values, counts
 
         arena = view.arena
+        if packed_indices.device.type == "cuda":
+            gather_resident_estimation(
+                cluster_keys=arena.cluster_keys,
+                cluster_values=arena.cluster_values,
+                cluster_token_counts=arena.cluster_token_counts,
+                request_slot_ids=view.request_slot_ids,
+                selected_indices=packed_indices,
+                selected_mask=packed_mask,
+                output_keys=keys,
+                output_values=values,
+                output_token_counts=counts,
+            )
+            return keys, values, counts
+
         slots = view.request_slot_ids.clamp_min(0)
         slot_indices = slots[:, None, None].expand_as(packed_indices)
         head_indices = torch.arange(
             num_kv_heads, dtype=torch.int64, device=packed_indices.device
         )[None, :, None].expand_as(packed_indices)
         valid = packed_mask & (view.request_slot_ids[:, None, None] >= 0)
-        estimation_keys = arena.cluster_keys[slot_indices, head_indices, packed_indices]
-        estimation_values = arena.cluster_values[
-            slot_indices, head_indices, packed_indices
-        ]
-        estimation_token_counts = arena.cluster_token_counts[
-            slot_indices, head_indices, packed_indices
-        ]
-        estimation_keys.masked_fill_(~valid.unsqueeze(-1), 0.0)
-        estimation_values.masked_fill_(~valid.unsqueeze(-1), 0.0)
-        estimation_token_counts.masked_fill_(~valid, 0)
-
-        return (
-            estimation_keys.contiguous(),
-            estimation_values.contiguous(),
-            estimation_token_counts.to(torch.int32).contiguous(),
+        keys.copy_(arena.cluster_keys[slot_indices, head_indices, packed_indices])
+        values.copy_(arena.cluster_values[slot_indices, head_indices, packed_indices])
+        counts.copy_(
+            arena.cluster_token_counts[slot_indices, head_indices, packed_indices]
         )
+        keys.masked_fill_(~valid.unsqueeze(-1), 0.0)
+        values.masked_fill_(~valid.unsqueeze(-1), 0.0)
+        counts.masked_fill_(~valid, 0)
+
+        return keys, values, counts
 
     def _make_plan(
         self,
@@ -1980,7 +2254,19 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         num_kv_heads: int,
         head_size: int,
         dtype: torch.dtype,
-    ) -> RetroSpecTokenSelectionPlan:
+    ) -> tuple[RetroSpecTokenSelectionPlan, _SelectionOutputWorkspace | None]:
+        output_workspace = None
+        if forced_exact_mask.device.type == "cuda":
+            output_workspace = self._get_selection_output_workspace(
+                layer_name=layer_name,
+                view=view,
+                batch_size=forced_exact_mask.shape[0],
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=dtype,
+                device=forced_exact_mask.device,
+            )
+
         per_head_forced_exact = forced_exact_mask.unsqueeze(1).expand(
             -1,
             num_kv_heads,
@@ -2017,6 +2303,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             view,
             cluster_zones.sparse_retrieval_indices,
             cluster_zones.sparse_retrieval_mask,
+            None
+            if output_workspace is None
+            else output_workspace.sparse_exact_cluster_ids,
+            None
+            if output_workspace is None
+            else output_workspace.sparse_exact_page_ids,
+            None
+            if output_workspace is None
+            else output_workspace.sparse_exact_page_token_counts,
         )
 
         (
@@ -2027,7 +2322,31 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             view,
             cluster_zones.expanded_retrieval_indices,
             cluster_zones.expanded_retrieval_mask,
+            None
+            if output_workspace is None
+            else output_workspace.expanded_exact_cluster_ids,
+            None
+            if output_workspace is None
+            else output_workspace.expanded_exact_page_ids,
+            None
+            if output_workspace is None
+            else output_workspace.expanded_exact_page_token_counts,
         )
+
+        sparse_estimation_keys = None
+        sparse_estimation_values = None
+        sparse_estimation_token_counts = None
+        if output_workspace is not None:
+            sparse_width = output_workspace.sparse_estimation_width
+            sparse_estimation_keys = output_workspace.draft_estimation_keys[
+                :, :, :sparse_width
+            ]
+            sparse_estimation_values = output_workspace.draft_estimation_values[
+                :, :, :sparse_width
+            ]
+            sparse_estimation_token_counts = (
+                output_workspace.draft_estimation_token_counts[:, :, :sparse_width]
+            )
 
         (
             sparse_estimation_keys,
@@ -2039,6 +2358,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             cluster_zones.sparse_estimation_mask,
             head_size,
             dtype,
+            sparse_estimation_keys,
+            sparse_estimation_values,
+            sparse_estimation_token_counts,
         )
         (
             expanded_estimation_keys,
@@ -2050,26 +2372,38 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             cluster_zones.expanded_estimation_mask,
             head_size,
             dtype,
+            None
+            if output_workspace is None
+            else output_workspace.expanded_estimation_keys,
+            None
+            if output_workspace is None
+            else output_workspace.expanded_estimation_values,
+            None
+            if output_workspace is None
+            else output_workspace.expanded_estimation_token_counts,
         )
 
-        return RetroSpecTokenSelectionPlan(
-            layer_name=layer_name,
-            primary_exact_token_indices=primary_exact_token_indices,
-            primary_exact_token_mask=primary_exact_token_mask,
-            sparse_exact_cluster_ids=sparse_exact_cluster_ids,
-            sparse_exact_page_ids=sparse_exact_page_ids,
-            sparse_exact_page_token_counts=sparse_exact_page_token_counts,
-            sparse_estimation_keys=sparse_estimation_keys,
-            sparse_estimation_values=sparse_estimation_values,
-            sparse_estimation_token_counts=sparse_estimation_token_counts,
-            expanded_exact_cluster_ids=expanded_exact_cluster_ids,
-            expanded_exact_page_ids=expanded_exact_page_ids,
-            expanded_exact_page_token_counts=expanded_exact_page_token_counts,
-            expanded_estimation_keys=expanded_estimation_keys,
-            expanded_estimation_values=expanded_estimation_values,
-            expanded_estimation_token_counts=expanded_estimation_token_counts,
-            sparse_attn=sparse_attn,
-            expanded_attn=expanded_attn,
+        return (
+            RetroSpecTokenSelectionPlan(
+                layer_name=layer_name,
+                primary_exact_token_indices=primary_exact_token_indices,
+                primary_exact_token_mask=primary_exact_token_mask,
+                sparse_exact_cluster_ids=sparse_exact_cluster_ids,
+                sparse_exact_page_ids=sparse_exact_page_ids,
+                sparse_exact_page_token_counts=sparse_exact_page_token_counts,
+                sparse_estimation_keys=sparse_estimation_keys,
+                sparse_estimation_values=sparse_estimation_values,
+                sparse_estimation_token_counts=sparse_estimation_token_counts,
+                expanded_exact_cluster_ids=expanded_exact_cluster_ids,
+                expanded_exact_page_ids=expanded_exact_page_ids,
+                expanded_exact_page_token_counts=expanded_exact_page_token_counts,
+                expanded_estimation_keys=expanded_estimation_keys,
+                expanded_estimation_values=expanded_estimation_values,
+                expanded_estimation_token_counts=expanded_estimation_token_counts,
+                sparse_attn=sparse_attn,
+                expanded_attn=expanded_attn,
+            ),
+            output_workspace,
         )
 
     def _gather_selected_tokens(
@@ -2119,6 +2453,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     def _materialize_draft_selection(
         self,
         plan: RetroSpecTokenSelectionPlan,
+        output_workspace: _SelectionOutputWorkspace | None,
         view: RetroSpecResidentBatchView,
         cluster_zones: _PackedClusterZones,
         cluster_scores: torch.Tensor,
@@ -2136,6 +2471,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 plan,
                 RetroSpecAttentionLevel.SPARSE,
             )
+        if output_workspace is None:
+            raise RuntimeError("CUDA draft selection requires an output workspace")
 
         resolved_pages = self.cluster_store.resolve_cluster_blocks(
             layer_name=plan.layer_name,
@@ -2151,45 +2488,30 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             cluster_zones.sparse_retrieval_mask & resolved_pages.miss_cluster_mask
         )
 
-        draft_exact_page_token_counts = plan.sparse_exact_page_token_counts.clone()
+        draft_exact_page_token_counts = output_workspace.draft_exact_page_token_counts
+        draft_exact_page_token_counts.copy_(plan.sparse_exact_page_token_counts)
         draft_exact_page_token_counts.masked_fill_(
             ~hit_cluster_mask.unsqueeze(-1),
             0,
         )
 
-        (
-            miss_estimation_keys,
-            miss_estimation_values,
-            miss_estimation_token_counts,
-        ) = self._build_resident_estimation_selection(
+        sparse_width = output_workspace.sparse_estimation_width
+        retrieval_width = output_workspace.sparse_retrieval_width
+        estimation_keys = output_workspace.draft_estimation_keys
+        estimation_values = output_workspace.draft_estimation_values
+        estimation_token_counts = output_workspace.draft_estimation_token_counts
+        self._build_resident_estimation_selection(
             view,
             cluster_zones.sparse_retrieval_indices,
             miss_cluster_mask,
             head_size,
             dtype,
+            estimation_keys[:, :, sparse_width : sparse_width + retrieval_width],
+            estimation_values[:, :, sparse_width : sparse_width + retrieval_width],
+            estimation_token_counts[
+                :, :, sparse_width : sparse_width + retrieval_width
+            ],
         )
-
-        estimation_keys = torch.cat(
-            (
-                plan.sparse_estimation_keys,
-                miss_estimation_keys,
-            ),
-            dim=2,
-        ).contiguous()
-        estimation_values = torch.cat(
-            (
-                plan.sparse_estimation_values,
-                miss_estimation_values,
-            ),
-            dim=2,
-        ).contiguous()
-        estimation_token_counts = torch.cat(
-            (
-                plan.sparse_estimation_token_counts,
-                miss_estimation_token_counts,
-            ),
-            dim=2,
-        ).contiguous()
 
         hit_attn_by_head = self._sum_selected_scores(
             cluster_scores,
@@ -2857,7 +3179,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             torch.ones_like(expanded_attn),
         )
 
-        plan = self._make_plan(
+        plan, output_workspace = self._make_plan(
             layer_name=layer_name,
             forced_exact_mask=forced_exact_mask,
             cluster_zones=cluster_zones,
@@ -2871,6 +3193,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         return self._materialize_draft_selection(
             plan=plan,
+            output_workspace=output_workspace,
             view=view,
             cluster_zones=cluster_zones,
             cluster_scores=cluster_scores,
