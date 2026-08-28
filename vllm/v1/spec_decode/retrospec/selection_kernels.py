@@ -11,6 +11,7 @@ def _gather_resident_estimation_kernel(
     cluster_keys,
     cluster_values,
     cluster_token_counts,
+    cluster_offsets,
     request_slot_ids,
     selected_indices,
     selected_mask,
@@ -20,14 +21,12 @@ def _gather_resident_estimation_kernel(
     key_stride_0,
     key_stride_1,
     key_stride_2,
-    key_stride_3,
     value_stride_0,
     value_stride_1,
     value_stride_2,
-    value_stride_3,
     count_stride_0,
     count_stride_1,
-    count_stride_2,
+    cluster_offset_stride_0,
     request_slot_stride_0,
     selected_stride_0,
     selected_stride_1,
@@ -70,28 +69,27 @@ def _gather_resident_estimation_kernel(
     )
 
     safe_slot = tl.maximum(request_slot, 0).to(tl.int64)
-    safe_cluster = tl.maximum(cluster_idx, 0).to(tl.int64)
-    count_offset = (
-        safe_slot * count_stride_0
-        + kv_head_idx * count_stride_1
-        + safe_cluster * count_stride_2
-    )
+    request_cluster_offset = tl.load(
+        cluster_offsets + safe_slot * cluster_offset_stride_0,
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    safe_cluster = request_cluster_offset + tl.maximum(cluster_idx, 0).to(tl.int64)
+    count_offset = kv_head_idx * count_stride_0 + safe_cluster * count_stride_1
     token_count = tl.load(cluster_token_counts + count_offset, mask=valid, other=0)
     valid &= token_count > 0
 
     head_offsets = tl.arange(0, BLOCK_D)
     head_mask = head_offsets < HEAD_SIZE
     source_key_offsets = (
-        safe_slot * key_stride_0
-        + kv_head_idx * key_stride_1
-        + safe_cluster * key_stride_2
-        + head_offsets * key_stride_3
+        kv_head_idx * key_stride_0
+        + safe_cluster * key_stride_1
+        + head_offsets * key_stride_2
     )
     source_value_offsets = (
-        safe_slot * value_stride_0
-        + kv_head_idx * value_stride_1
-        + safe_cluster * value_stride_2
-        + head_offsets * value_stride_3
+        kv_head_idx * value_stride_0
+        + safe_cluster * value_stride_1
+        + head_offsets * value_stride_2
     )
     output_key_offsets = (
         batch_idx * output_key_stride_0
@@ -123,9 +121,12 @@ def _gather_resident_estimation_kernel(
 @triton.jit
 def _gather_resident_exact_pages_kernel(
     cluster_ids,
-    cluster_page_offsets,
+    cluster_page_starts,
+    cluster_page_counts,
     page_ids,
     page_token_counts,
+    cluster_offsets,
+    page_offsets,
     request_slot_ids,
     selected_indices,
     selected_mask,
@@ -134,16 +135,16 @@ def _gather_resident_exact_pages_kernel(
     output_page_token_counts,
     cluster_stride_0,
     cluster_stride_1,
-    cluster_stride_2,
-    offset_stride_0,
-    offset_stride_1,
-    offset_stride_2,
+    page_start_stride_0,
+    page_start_stride_1,
+    cluster_page_count_stride_0,
+    cluster_page_count_stride_1,
     page_stride_0,
     page_stride_1,
-    page_stride_2,
     page_count_stride_0,
     page_count_stride_1,
-    page_count_stride_2,
+    cluster_offset_stride_0,
+    page_offset_stride_0,
     request_slot_stride_0,
     selected_stride_0,
     selected_stride_1,
@@ -185,11 +186,20 @@ def _gather_resident_exact_pages_kernel(
     )
     safe_slot = tl.maximum(request_slot, 0).to(tl.int64)
     safe_cluster = tl.maximum(cluster_idx, 0).to(tl.int64)
+    request_cluster_offset = tl.load(
+        cluster_offsets + safe_slot * cluster_offset_stride_0,
+        mask=valid_cluster,
+        other=0,
+    ).to(tl.int64)
+    request_page_offset = tl.load(
+        page_offsets + safe_slot * page_offset_stride_0,
+        mask=valid_cluster,
+        other=0,
+    ).to(tl.int64)
+    absolute_cluster = request_cluster_offset + safe_cluster
 
     cluster_offset = (
-        safe_slot * cluster_stride_0
-        + kv_head_idx * cluster_stride_1
-        + safe_cluster * cluster_stride_2
+        kv_head_idx * cluster_stride_0 + absolute_cluster * cluster_stride_1
     )
     cluster_id = tl.load(cluster_ids + cluster_offset, mask=valid_cluster, other=-1)
     valid_cluster &= cluster_id >= 0
@@ -203,35 +213,32 @@ def _gather_resident_exact_pages_kernel(
         tl.where(valid_cluster, cluster_id, -1),
     )
 
-    page_start_offset = (
-        safe_slot * offset_stride_0
-        + kv_head_idx * offset_stride_1
-        + safe_cluster * offset_stride_2
-    )
     page_start = tl.load(
-        cluster_page_offsets + page_start_offset, mask=valid_cluster, other=0
+        cluster_page_starts
+        + kv_head_idx * page_start_stride_0
+        + absolute_cluster * page_start_stride_1,
+        mask=valid_cluster,
+        other=0,
     )
-    page_end = tl.load(
-        cluster_page_offsets + page_start_offset + offset_stride_2,
+    cluster_num_pages = tl.load(
+        cluster_page_counts
+        + kv_head_idx * cluster_page_count_stride_0
+        + absolute_cluster * cluster_page_count_stride_1,
         mask=valid_cluster,
         other=0,
     )
 
     for page_offset in tl.static_range(0, MAX_PAGES):
-        source_page_idx = page_start + page_offset
-        valid_page = valid_cluster & (source_page_idx < page_end)
+        source_page_idx = request_page_offset + page_start + page_offset
+        valid_page = valid_cluster & (page_offset < cluster_num_pages)
         source_page_offset = (
-            safe_slot * page_stride_0
-            + kv_head_idx * page_stride_1
-            + source_page_idx * page_stride_2
+            kv_head_idx * page_stride_0 + source_page_idx * page_stride_1
         )
         source_page_count_offset = (
-            safe_slot * page_count_stride_0
-            + kv_head_idx * page_count_stride_1
-            + source_page_idx * page_count_stride_2
+            kv_head_idx * page_count_stride_0 + source_page_idx * page_count_stride_1
         )
         page_id = tl.load(page_ids + source_page_offset, mask=valid_page, other=-1)
-        page_count = tl.load(
+        page_token_count = tl.load(
             page_token_counts + source_page_count_offset, mask=valid_page, other=0
         )
         output_page_offset = (
@@ -247,13 +254,14 @@ def _gather_resident_exact_pages_kernel(
             + page_offset * output_page_count_stride_3
         )
         tl.store(output_page_ids + output_page_offset, page_id)
-        tl.store(output_page_token_counts + output_page_count_offset, page_count)
+        tl.store(output_page_token_counts + output_page_count_offset, page_token_count)
 
 
 def gather_resident_estimation(
     cluster_keys: torch.Tensor,
     cluster_values: torch.Tensor,
     cluster_token_counts: torch.Tensor,
+    cluster_offsets: torch.Tensor,
     request_slot_ids: torch.Tensor,
     selected_indices: torch.Tensor,
     selected_mask: torch.Tensor,
@@ -263,7 +271,7 @@ def gather_resident_estimation(
 ) -> None:
     """Gather resident cluster summaries into caller-owned CUDA storage."""
     batch_size, num_kv_heads, max_selected = selected_indices.shape
-    head_size = cluster_keys.shape[3]
+    head_size = cluster_keys.shape[2]
     expected_output_shape = (batch_size, num_kv_heads, max_selected, head_size)
     if output_keys.shape != expected_output_shape or output_values.shape != (
         expected_output_shape
@@ -279,6 +287,7 @@ def gather_resident_estimation(
         cluster_keys,
         cluster_values,
         cluster_token_counts,
+        cluster_offsets,
         request_slot_ids,
         selected_indices,
         selected_mask,
@@ -288,6 +297,7 @@ def gather_resident_estimation(
         *cluster_keys.stride(),
         *cluster_values.stride(),
         *cluster_token_counts.stride(),
+        cluster_offsets.stride(0),
         request_slot_ids.stride(0),
         *selected_indices.stride(),
         *selected_mask.stride(),
@@ -301,9 +311,12 @@ def gather_resident_estimation(
 
 def gather_resident_exact_pages(
     cluster_ids: torch.Tensor,
-    cluster_page_offsets: torch.Tensor,
+    cluster_page_starts: torch.Tensor,
+    cluster_page_counts: torch.Tensor,
     page_ids: torch.Tensor,
     page_token_counts: torch.Tensor,
+    cluster_offsets: torch.Tensor,
+    page_offsets: torch.Tensor,
     request_slot_ids: torch.Tensor,
     selected_indices: torch.Tensor,
     selected_mask: torch.Tensor,
@@ -333,9 +346,12 @@ def gather_resident_exact_pages(
 
     _gather_resident_exact_pages_kernel[(batch_size, num_kv_heads, max_selected)](
         cluster_ids,
-        cluster_page_offsets,
+        cluster_page_starts,
+        cluster_page_counts,
         page_ids,
         page_token_counts,
+        cluster_offsets,
+        page_offsets,
         request_slot_ids,
         selected_indices,
         selected_mask,
@@ -343,9 +359,12 @@ def gather_resident_exact_pages(
         output_page_ids,
         output_page_token_counts,
         *cluster_ids.stride(),
-        *cluster_page_offsets.stride(),
+        *cluster_page_starts.stride(),
+        *cluster_page_counts.stride(),
         *page_ids.stride(),
         *page_token_counts.stride(),
+        cluster_offsets.stride(0),
+        page_offsets.stride(0),
         request_slot_ids.stride(0),
         *selected_indices.stride(),
         *selected_mask.stride(),

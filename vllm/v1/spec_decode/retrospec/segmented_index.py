@@ -337,6 +337,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         first_draft_warmup_multiplier: int = 4,
         cpu_page_slab_bytes: int = 1 << 20,
         max_pinned_memory_bytes: int = 64 << 20,
+        max_gpu_index_memory_bytes: int = 4 << 30,
         performance_stats: RetroSpecPerformanceStats | None = None,
     ) -> None:
         super().__init__(
@@ -366,6 +367,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             raise ValueError("cpu_page_slab_bytes must be positive")
         if max_pinned_memory_bytes <= 0:
             raise ValueError("max_pinned_memory_bytes must be positive")
+        if max_gpu_index_memory_bytes <= 0:
+            raise ValueError("max_gpu_index_memory_bytes must be positive")
         if max_model_len <= 0:
             raise ValueError("max_model_len must be positive")
 
@@ -408,22 +411,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             performance_stats=performance_stats,
         )
 
-        full_block_count = max_model_len // block_size
-        stable_end_block = max(full_block_count - self.num_recent_blocks, 1)
-        max_indexed_tokens = max((stable_end_block - 1) * block_size, 0)
-        max_clusters_per_request = max(
-            ceil(max_indexed_tokens / tokens_per_cluster),
-            1,
-        )
-        max_pages_per_head_per_request = max(
-            ceil(max_indexed_tokens / block_size) + max_clusters_per_request,
-            1,
-        )
         self._gpu_index_residency = RetroSpecGPUIndexResidencyManager(
             pin_memory=pin_memory,
             max_resident_requests=max_resident_requests,
-            max_clusters_per_request=max_clusters_per_request,
-            max_pages_per_head_per_request=max_pages_per_head_per_request,
+            max_gpu_index_memory_bytes=max_gpu_index_memory_bytes,
         )
 
         # layer_name -> request_id -> token-level index
@@ -1379,9 +1370,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 raise RuntimeError(
                     "Resident RetroSpec arena and attention KV use different dtypes"
                 )
-            if arena.cluster_keys.shape[1] != key_cache.shape[2]:
+            if arena.cluster_keys.shape[0] != key_cache.shape[2]:
                 raise RuntimeError("Resident RetroSpec arena changed KV-head count")
-            if arena.cluster_keys.shape[3] != key_cache.shape[3]:
+            if arena.cluster_keys.shape[2] != key_cache.shape[3]:
                 raise RuntimeError("Resident RetroSpec arena changed head size")
         return view
 
@@ -1805,15 +1796,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 candidate_counts = workspace.candidate_counts.zero_()
             return scores, ranking_scores, candidate_counts, workspace
 
-        cluster_keys = arena.cluster_keys[:, :, : view.max_num_clusters]
-        cluster_ids = arena.cluster_ids[:, :, : view.max_num_clusters]
-        token_counts = arena.cluster_token_counts[:, :, : view.max_num_clusters]
         if workspace is not None:
             scores = score_resident_clusters(
                 query=query,
-                cluster_keys=cluster_keys,
-                cluster_ids=cluster_ids,
-                cluster_token_counts=token_counts,
+                cluster_keys=arena.cluster_keys,
+                cluster_ids=arena.cluster_ids,
+                cluster_token_counts=arena.cluster_token_counts,
+                cluster_offsets=arena.cluster_offsets,
                 num_clusters=arena.num_clusters,
                 request_slot_ids=view.request_slot_ids,
                 scale=scale,
@@ -1831,16 +1820,30 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             )
 
         safe_slots = view.request_slot_ids.clamp_min(0)
-        packed_keys = cluster_keys.index_select(0, safe_slots)
-        packed_ids = cluster_ids.index_select(0, safe_slots)
-        packed_counts = token_counts.index_select(0, safe_slots)
         request_num_clusters = arena.num_clusters.index_select(0, safe_slots)
-        cluster_offsets = torch.arange(
+        request_cluster_offsets = arena.cluster_offsets.index_select(0, safe_slots)
+        local_cluster_indices = torch.arange(
             view.max_num_clusters, dtype=torch.int64, device=query.device
         )
+        absolute_cluster_indices = (
+            request_cluster_offsets[:, None, None]
+            + local_cluster_indices[None, None, :]
+        )
+        absolute_cluster_indices.clamp_(min=0, max=arena.cluster_ids.shape[1] - 1)
+        head_indices = torch.arange(
+            num_kv_heads, dtype=torch.int64, device=query.device
+        )[None, :, None]
+        packed_keys = arena.cluster_keys[head_indices, absolute_cluster_indices]
+        packed_ids = arena.cluster_ids[head_indices, absolute_cluster_indices]
+        packed_counts = arena.cluster_token_counts[
+            head_indices, absolute_cluster_indices
+        ]
         cluster_mask = (
             (view.request_slot_ids >= 0)[:, None, None]
-            & (cluster_offsets[None, None, :] < request_num_clusters[:, None, None])
+            & (
+                local_cluster_indices[None, None, :]
+                < request_num_clusters[:, None, None]
+            )
             & (packed_ids >= 0)
             & (packed_counts > 0)
         )
@@ -2065,10 +2068,29 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             else:
                 arena = view.arena
                 safe_slots = view.request_slot_ids.clamp_min(0)
-                cluster_page_counts = (
-                    arena.cluster_page_offsets[:, :, 1 : view.max_num_clusters + 1]
-                    - arena.cluster_page_offsets[:, :, : view.max_num_clusters]
-                ).index_select(0, safe_slots)
+                request_cluster_offsets = arena.cluster_offsets.index_select(
+                    0, safe_slots
+                )
+                local_cluster_indices = torch.arange(
+                    view.max_num_clusters,
+                    dtype=torch.int64,
+                    device=view.request_slot_ids.device,
+                )
+                absolute_cluster_indices = (
+                    request_cluster_offsets[:, None, None]
+                    + local_cluster_indices[None, None, :]
+                )
+                absolute_cluster_indices.clamp_(
+                    min=0, max=arena.cluster_page_counts.shape[1] - 1
+                )
+                head_indices = torch.arange(
+                    arena.cluster_page_counts.shape[0],
+                    dtype=torch.int64,
+                    device=view.request_slot_ids.device,
+                )[None, :, None]
+                cluster_page_counts = arena.cluster_page_counts[
+                    head_indices, absolute_cluster_indices
+                ]
                 ranked_page_counts = cluster_page_counts.gather(
                     2,
                     first_draft_warmup_indices,
@@ -2302,9 +2324,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         if device.type == "cuda":
             gather_resident_exact_pages(
                 cluster_ids=arena.cluster_ids,
-                cluster_page_offsets=arena.cluster_page_offsets,
+                cluster_page_starts=arena.cluster_page_starts,
+                cluster_page_counts=arena.cluster_page_counts,
                 page_ids=arena.page_ids,
                 page_token_counts=arena.page_token_counts,
+                cluster_offsets=arena.cluster_offsets,
+                page_offsets=arena.page_offsets,
                 request_slot_ids=view.request_slot_ids,
                 selected_indices=packed_cluster_indices,
                 selected_mask=packed_cluster_mask,
@@ -2315,39 +2340,39 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             return selected_cluster_ids, selected_page_ids, selected_page_token_counts
 
         slots = view.request_slot_ids.clamp_min(0)
-        slot_indices = slots[:, None, None].expand_as(packed_cluster_indices)
         head_indices = torch.arange(num_kv_heads, dtype=torch.int64, device=device)[
             None, :, None
         ].expand_as(packed_cluster_indices)
         valid_clusters = packed_cluster_mask & (
             view.request_slot_ids[:, None, None] >= 0
         )
-        gathered_cluster_ids = arena.cluster_ids[
-            slot_indices, head_indices, packed_cluster_indices
-        ]
+        request_cluster_offsets = arena.cluster_offsets.index_select(0, slots)
+        absolute_cluster_indices = (
+            request_cluster_offsets[:, None, None] + packed_cluster_indices
+        )
+        absolute_cluster_indices.clamp_(min=0, max=arena.cluster_ids.shape[1] - 1)
+        gathered_cluster_ids = arena.cluster_ids[head_indices, absolute_cluster_indices]
         valid_clusters &= gathered_cluster_ids >= 0
         selected_cluster_ids.copy_(gathered_cluster_ids)
         selected_cluster_ids.masked_fill_(~valid_clusters, -1)
 
-        page_starts = arena.cluster_page_offsets[
-            slot_indices, head_indices, packed_cluster_indices
-        ]
-        page_ends = arena.cluster_page_offsets[
-            slot_indices, head_indices, packed_cluster_indices + 1
-        ]
+        page_starts = arena.cluster_page_starts[head_indices, absolute_cluster_indices]
+        page_counts = arena.cluster_page_counts[head_indices, absolute_cluster_indices]
         page_offsets = torch.arange(max_pages, dtype=torch.int64, device=device)
-        flat_page_indices = page_starts.unsqueeze(-1) + page_offsets
+        request_page_offsets = arena.page_offsets.index_select(0, slots)
+        flat_page_indices = (
+            request_page_offsets[:, None, None, None]
+            + page_starts.unsqueeze(-1)
+            + page_offsets
+        )
         valid_pages = valid_clusters.unsqueeze(-1) & (
-            flat_page_indices < page_ends.unsqueeze(-1)
+            page_offsets < page_counts.unsqueeze(-1)
         )
-        flat_page_indices.clamp_(min=0, max=arena.page_ids.shape[2] - 1)
-        page_slots = slot_indices.unsqueeze(-1).expand_as(flat_page_indices)
+        flat_page_indices.clamp_(min=0, max=arena.page_ids.shape[1] - 1)
         page_heads = head_indices.unsqueeze(-1).expand_as(flat_page_indices)
-        selected_page_ids.copy_(
-            arena.page_ids[page_slots, page_heads, flat_page_indices]
-        )
+        selected_page_ids.copy_(arena.page_ids[page_heads, flat_page_indices])
         selected_page_token_counts.copy_(
-            arena.page_token_counts[page_slots, page_heads, flat_page_indices]
+            arena.page_token_counts[page_heads, flat_page_indices]
         )
         selected_page_ids.masked_fill_(~valid_pages, -1)
         selected_page_token_counts.masked_fill_(~valid_pages, 0)
@@ -2397,6 +2422,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 cluster_keys=arena.cluster_keys,
                 cluster_values=arena.cluster_values,
                 cluster_token_counts=arena.cluster_token_counts,
+                cluster_offsets=arena.cluster_offsets,
                 request_slot_ids=view.request_slot_ids,
                 selected_indices=packed_indices,
                 selected_mask=packed_mask,
@@ -2407,16 +2433,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             return keys, values, counts
 
         slots = view.request_slot_ids.clamp_min(0)
-        slot_indices = slots[:, None, None].expand_as(packed_indices)
         head_indices = torch.arange(
             num_kv_heads, dtype=torch.int64, device=packed_indices.device
         )[None, :, None].expand_as(packed_indices)
         valid = packed_mask & (view.request_slot_ids[:, None, None] >= 0)
-        keys.copy_(arena.cluster_keys[slot_indices, head_indices, packed_indices])
-        values.copy_(arena.cluster_values[slot_indices, head_indices, packed_indices])
-        counts.copy_(
-            arena.cluster_token_counts[slot_indices, head_indices, packed_indices]
-        )
+        request_cluster_offsets = arena.cluster_offsets.index_select(0, slots)
+        absolute_indices = request_cluster_offsets[:, None, None] + packed_indices
+        absolute_indices.clamp_(min=0, max=arena.cluster_ids.shape[1] - 1)
+        keys.copy_(arena.cluster_keys[head_indices, absolute_indices])
+        values.copy_(arena.cluster_values[head_indices, absolute_indices])
+        counts.copy_(arena.cluster_token_counts[head_indices, absolute_indices])
         keys.masked_fill_(~valid.unsqueeze(-1), 0.0)
         values.masked_fill_(~valid.unsqueeze(-1), 0.0)
         counts.masked_fill_(~valid, 0)
@@ -2925,31 +2951,24 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         arena = view.arena
         slots = view.request_slot_ids.clamp_min(0)
-        slot_indices = slots[:, None, None].expand(
-            batch_size, num_kv_heads, view.max_num_pages
-        )
         head_indices = torch.arange(num_kv_heads, dtype=torch.int64, device=device)[
             None, :, None
-        ].expand_as(slot_indices)
-        page_indices = torch.arange(
-            view.max_num_pages, dtype=torch.int64, device=device
-        )[None, None, :].expand_as(slot_indices)
-        request_num_clusters = arena.num_clusters.index_select(0, slots)
-        request_heads = torch.arange(num_kv_heads, dtype=torch.int64, device=device)[
-            None, :
-        ].expand(batch_size, num_kv_heads)
-        request_slots = slots[:, None].expand_as(request_heads)
-        page_ends = arena.cluster_page_offsets[
-            request_slots, request_heads, request_num_clusters[:, None]
         ]
+        local_page_indices = torch.arange(
+            view.max_num_pages, dtype=torch.int64, device=device
+        )[None, None, :]
+        request_page_offsets = arena.page_offsets.index_select(0, slots)
+        request_page_counts = arena.num_pages.index_select(0, slots)
+        absolute_page_indices = request_page_offsets[:, None, None] + local_page_indices
+        absolute_page_indices.clamp_(max=arena.page_ids.shape[1] - 1)
         valid = (view.request_slot_ids[:, None, None] >= 0) & (
-            page_indices < page_ends.unsqueeze(-1)
+            local_page_indices < request_page_counts.unsqueeze(-1)
         )
         page_ids[:, :, 0] = arena.page_ids[
-            slot_indices, head_indices, page_indices
+            head_indices, absolute_page_indices
         ].masked_fill(~valid, -1)
         page_token_counts[:, :, 0] = arena.page_token_counts[
-            slot_indices, head_indices, page_indices
+            head_indices, absolute_page_indices
         ].masked_fill(~valid, 0)
         return page_ids, page_token_counts
 

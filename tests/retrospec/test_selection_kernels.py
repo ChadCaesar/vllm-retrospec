@@ -23,19 +23,33 @@ def test_gather_resident_estimation_matches_request_slot_reference():
     num_kv_heads, num_clusters, head_size = 2, 4, 7
     max_selected = 3
 
-    cluster_keys = torch.arange(
+    slot_cluster_keys = torch.arange(
         num_slots * num_kv_heads * num_clusters * head_size,
         dtype=torch.float32,
         device=device,
     ).view(num_slots, num_kv_heads, num_clusters, head_size)
-    cluster_values = cluster_keys + 1000
-    cluster_token_counts = torch.arange(
+    slot_cluster_values = slot_cluster_keys + 1000
+    slot_cluster_token_counts = torch.arange(
         1,
         num_slots * num_kv_heads * num_clusters + 1,
         dtype=torch.int32,
         device=device,
     ).view(num_slots, num_kv_heads, num_clusters)
-    cluster_token_counts[0, 1, 2] = 0
+    slot_cluster_token_counts[0, 1, 2] = 0
+    cluster_offsets = torch.tensor([2, 9, 16], dtype=torch.int64, device=device)
+    arena_capacity = 22
+    cluster_keys = torch.zeros(
+        num_kv_heads, arena_capacity, head_size, dtype=torch.float32, device=device
+    )
+    cluster_values = torch.zeros_like(cluster_keys)
+    cluster_token_counts = torch.zeros(
+        num_kv_heads, arena_capacity, dtype=torch.int32, device=device
+    )
+    for slot, cluster_offset in enumerate(cluster_offsets.tolist()):
+        cluster_slice = slice(cluster_offset, cluster_offset + num_clusters)
+        cluster_keys[:, cluster_slice].copy_(slot_cluster_keys[slot])
+        cluster_values[:, cluster_slice].copy_(slot_cluster_values[slot])
+        cluster_token_counts[:, cluster_slice].copy_(slot_cluster_token_counts[slot])
 
     request_slot_ids = torch.tensor([2, 0, -1], dtype=torch.int64, device=device)
     selected_indices = torch.tensor(
@@ -81,6 +95,7 @@ def test_gather_resident_estimation_matches_request_slot_reference():
         cluster_keys,
         cluster_values,
         cluster_token_counts,
+        cluster_offsets,
         request_slot_ids,
         selected_indices,
         selected_mask,
@@ -100,18 +115,19 @@ def test_gather_resident_estimation_matches_request_slot_reference():
                 cluster_idx = int(selected_indices[batch_idx, head_idx, selected_idx])
                 valid = bool(selected_mask[batch_idx, head_idx, selected_idx])
                 valid &= (
-                    int(cluster_token_counts[request_slot, head_idx, cluster_idx]) > 0
+                    int(slot_cluster_token_counts[request_slot, head_idx, cluster_idx])
+                    > 0
                 )
                 if not valid:
                     continue
                 expected_keys[batch_idx, head_idx, selected_idx].copy_(
-                    cluster_keys[request_slot, head_idx, cluster_idx]
+                    slot_cluster_keys[request_slot, head_idx, cluster_idx]
                 )
                 expected_values[batch_idx, head_idx, selected_idx].copy_(
-                    cluster_values[request_slot, head_idx, cluster_idx]
+                    slot_cluster_values[request_slot, head_idx, cluster_idx]
                 )
                 expected_counts[batch_idx, head_idx, selected_idx] = (
-                    cluster_token_counts[request_slot, head_idx, cluster_idx]
+                    slot_cluster_token_counts[request_slot, head_idx, cluster_idx]
                 )
 
     torch.cuda.synchronize()
@@ -128,30 +144,32 @@ def test_gather_resident_exact_pages_matches_request_slot_reference():
     max_selected, max_pages = 2, 2
     num_pages = num_clusters * max_pages
 
-    cluster_ids = torch.arange(
+    slot_cluster_ids = torch.arange(
         num_slots * num_kv_heads * num_clusters,
         dtype=torch.int64,
         device=device,
     ).view(num_slots, num_kv_heads, num_clusters)
-    cluster_ids[1, 0, 2] = -1
-    cluster_page_offsets = (
-        torch.arange(
-            0,
-            num_pages + 1,
-            max_pages,
-            dtype=torch.int64,
-            device=device,
-        )
-        .view(1, 1, num_clusters + 1)
+    slot_cluster_ids[1, 0, 2] = -1
+    cluster_offsets = torch.tensor([2, 9], dtype=torch.int64, device=device)
+    cluster_capacity = 14
+    cluster_ids = torch.full(
+        (num_kv_heads, cluster_capacity), -1, dtype=torch.int64, device=device
+    )
+    cluster_page_starts = (
+        torch.arange(0, num_pages, max_pages, dtype=torch.int64, device=device)
+        .view(1, 1, num_clusters)
         .expand(num_slots, num_kv_heads, -1)
         .contiguous()
     )
-    page_ids = torch.arange(
+    slot_cluster_page_counts = torch.full_like(cluster_page_starts, max_pages)
+    packed_cluster_page_starts = torch.zeros_like(cluster_ids)
+    cluster_page_counts = torch.zeros_like(cluster_ids, dtype=torch.int32)
+    slot_page_ids = torch.arange(
         num_slots * num_kv_heads * num_pages,
         dtype=torch.int64,
         device=device,
     ).view(num_slots, num_kv_heads, num_pages)
-    page_token_counts = (
+    slot_page_token_counts = (
         torch.tensor(
             [2, 1] * num_clusters,
             dtype=torch.int32,
@@ -161,6 +179,24 @@ def test_gather_resident_exact_pages_matches_request_slot_reference():
         .expand(num_slots, num_kv_heads, -1)
         .contiguous()
     )
+    page_offsets = torch.tensor([3, 14], dtype=torch.int64, device=device)
+    page_capacity = 22
+    page_ids = torch.full(
+        (num_kv_heads, page_capacity), -1, dtype=torch.int64, device=device
+    )
+    page_token_counts = torch.zeros(
+        num_kv_heads, page_capacity, dtype=torch.int32, device=device
+    )
+    for slot, (cluster_offset, page_offset) in enumerate(
+        zip(cluster_offsets.tolist(), page_offsets.tolist())
+    ):
+        cluster_slice = slice(cluster_offset, cluster_offset + num_clusters)
+        page_slice = slice(page_offset, page_offset + num_pages)
+        cluster_ids[:, cluster_slice].copy_(slot_cluster_ids[slot])
+        packed_cluster_page_starts[:, cluster_slice].copy_(cluster_page_starts[slot])
+        cluster_page_counts[:, cluster_slice].copy_(slot_cluster_page_counts[slot])
+        page_ids[:, page_slice].copy_(slot_page_ids[slot])
+        page_token_counts[:, page_slice].copy_(slot_page_token_counts[slot])
 
     request_slot_ids = torch.tensor([1, 0, -1], dtype=torch.int64, device=device)
     selected_indices = torch.tensor(
@@ -200,9 +236,12 @@ def test_gather_resident_exact_pages_matches_request_slot_reference():
 
     gather_resident_exact_pages(
         cluster_ids,
-        cluster_page_offsets,
+        packed_cluster_page_starts,
+        cluster_page_counts,
         page_ids,
         page_token_counts,
+        cluster_offsets,
+        page_offsets,
         request_slot_ids,
         selected_indices,
         selected_mask,
@@ -221,23 +260,21 @@ def test_gather_resident_exact_pages_matches_request_slot_reference():
             for selected_idx in range(max_selected):
                 cluster_idx = int(selected_indices[batch_idx, head_idx, selected_idx])
                 valid = bool(selected_mask[batch_idx, head_idx, selected_idx])
-                cluster_id = int(cluster_ids[request_slot, head_idx, cluster_idx])
+                cluster_id = int(slot_cluster_ids[request_slot, head_idx, cluster_idx])
                 if not valid or cluster_id < 0:
                     continue
                 expected_cluster_ids[batch_idx, head_idx, selected_idx] = cluster_id
-                page_start = int(
-                    cluster_page_offsets[request_slot, head_idx, cluster_idx]
-                )
-                page_end = int(
-                    cluster_page_offsets[request_slot, head_idx, cluster_idx + 1]
-                )
-                num_cluster_pages = page_end - page_start
+                page_start = cluster_idx * max_pages
+                page_end = page_start + max_pages
+                num_cluster_pages = max_pages
                 expected_page_ids[
                     batch_idx, head_idx, selected_idx, :num_cluster_pages
-                ].copy_(page_ids[request_slot, head_idx, page_start:page_end])
+                ].copy_(slot_page_ids[request_slot, head_idx, page_start:page_end])
                 expected_page_counts[
                     batch_idx, head_idx, selected_idx, :num_cluster_pages
-                ].copy_(page_token_counts[request_slot, head_idx, page_start:page_end])
+                ].copy_(
+                    slot_page_token_counts[request_slot, head_idx, page_start:page_end]
+                )
 
     torch.cuda.synchronize()
     torch.testing.assert_close(output_cluster_ids, expected_cluster_ids)

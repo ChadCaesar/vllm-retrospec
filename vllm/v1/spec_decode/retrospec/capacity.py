@@ -11,6 +11,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 
 _EXACT_ATTENTION_PARTITION_SIZE = 1024
+_GIB_BYTES = 1 << 30
 
 
 @dataclass(frozen=True)
@@ -192,18 +193,26 @@ def build_retrospec_long_context_capacity(
 
     max_model_len = vllm_config.model_config.max_model_len
 
-    # The persistent arena stores an int64 ID, an int32 token count and an
-    # int64 page offset per cluster. Each request/head also owns one trailing
-    # page offset. Page IDs and page token counts use 12 bytes per page, while
-    # request-level cluster counts and indexed ranges use another 20 bytes.
+    # Packed cluster descriptors use an int64 ID, an int32 token count, an
+    # int64 relative page start and an int32 page count. Page descriptors use
+    # 12 bytes per page. Request descriptors add cluster/page offsets, counts,
+    # a generation and the indexed token range.
     persistent_cluster_metadata_bytes = sum(
-        total_resident_clusters * spec.num_kv_heads * 20
-        + max_resident_requests * spec.num_kv_heads * 8
+        total_resident_clusters * spec.num_kv_heads * 24
         + cluster_pages_per_head * spec.num_kv_heads * 12
-        + max_resident_requests * 20
+        + max_resident_requests * (40 + 4 * spec.num_kv_heads)
         for spec in attention_specs
     )
-    persistent_index_bytes = cluster_summary_bytes + persistent_cluster_metadata_bytes
+    theoretical_persistent_index_bytes = (
+        cluster_summary_bytes + persistent_cluster_metadata_bytes
+    )
+    configured_gpu_index_budget = int(
+        getattr(config, "retrospec_max_gpu_index_memory", 4.0) * _GIB_BYTES
+    )
+    persistent_index_bytes = min(
+        theoretical_persistent_index_bytes,
+        configured_gpu_index_budget,
+    )
 
     max_full_verify_workspace = 0
     max_cluster_build_workspace = 0

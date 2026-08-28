@@ -594,9 +594,11 @@ def test_segmented_index_excludes_empty_clusters_from_selection():
         view = index._get_resident_view("layer", ["request"], keys)
         assert view.arena is not None
         slot = view.request_slot_ids.item()
-        assert view.arena.cluster_token_counts[slot, 0, :2].tolist() == [8, 0]
-        assert view.arena.cluster_ids[slot, 0, 0].item() >= 0
-        assert view.arena.cluster_ids[slot, 0, 1].item() == -1
+        cluster_offset = view.arena.cluster_offsets[slot].item()
+        cluster_slice = slice(cluster_offset, cluster_offset + 2)
+        assert view.arena.cluster_token_counts[0, cluster_slice].tolist() == [8, 0]
+        assert view.arena.cluster_ids[0, cluster_offset].item() >= 0
+        assert view.arena.cluster_ids[0, cluster_offset + 1].item() == -1
 
 
 @pytest.mark.parametrize(
@@ -1349,16 +1351,16 @@ def test_cpu_offload_keeps_request_indices_after_batch_deactivation():
             segment = index._indices["layer"][request_id].segments[0]
             slot = int(view.request_slot_ids[row].item())
             num_clusters = segment.cluster_token_counts.shape[1]
+            cluster_offset = int(view.arena.cluster_offsets[slot].item())
+            cluster_slice = slice(cluster_offset, cluster_offset + num_clusters)
             assert torch.equal(
-                view.arena.cluster_keys[slot, :, :num_clusters],
-                segment.cluster_keys,
+                view.arena.cluster_keys[:, cluster_slice], segment.cluster_keys
             )
             assert torch.equal(
-                view.arena.cluster_values[slot, :, :num_clusters],
-                segment.cluster_values,
+                view.arena.cluster_values[:, cluster_slice], segment.cluster_values
             )
             assert torch.equal(
-                view.arena.cluster_token_counts[slot, :, :num_clusters],
+                view.arena.cluster_token_counts[:, cluster_slice],
                 segment.cluster_token_counts,
             )
     finally:

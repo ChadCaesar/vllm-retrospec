@@ -38,6 +38,7 @@ def make_controller(
     max_pending_cluster_builds: int = 2,
     cpu_page_slab_size_mib: int = 1,
     max_pinned_memory: float = 0.0625,
+    max_gpu_index_memory: float = 0.125,
     stats_interval_seconds: float = 0.0,
 ) -> RetroSpecSparseAttention:
     config = cast(
@@ -55,6 +56,7 @@ def make_controller(
                 retrospec_max_pending_cluster_builds=max_pending_cluster_builds,
                 retrospec_cpu_page_slab_size_mib=cpu_page_slab_size_mib,
                 retrospec_max_pinned_memory=max_pinned_memory,
+                retrospec_max_gpu_index_memory=max_gpu_index_memory,
                 retrospec_cache_ratio=cache_ratio,
                 retrospec_stats_interval_seconds=stats_interval_seconds,
             ),
@@ -110,6 +112,7 @@ def test_segmented_attention_configures_cluster_backing_store(
     assert controller.index.max_pending_cluster_builds == 2
     assert controller.index.cluster_store.cpu_page_slab_bytes == 1 << 20
     assert controller.index.cluster_store.max_pinned_memory_bytes == 64 << 20
+    assert controller.index._gpu_index_residency.max_gpu_index_memory_bytes == 128 << 20
 
 
 def test_segmented_attention_configures_pending_cluster_build_limit():

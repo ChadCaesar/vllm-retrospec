@@ -65,7 +65,7 @@ def test_resident_cluster_scores_match_request_slot_reference():
     query = torch.randn(
         batch_size, num_query_heads, head_size, dtype=torch.float16, device="cuda"
     )
-    cluster_keys = torch.randn(
+    slot_cluster_keys = torch.randn(
         num_slots,
         num_kv_heads,
         num_clusters,
@@ -73,12 +73,12 @@ def test_resident_cluster_scores_match_request_slot_reference():
         dtype=torch.float16,
         device="cuda",
     )
-    cluster_ids = torch.arange(
+    slot_cluster_ids = torch.arange(
         num_slots * num_kv_heads * num_clusters,
         dtype=torch.int64,
         device="cuda",
     ).view(num_slots, num_kv_heads, num_clusters)
-    token_counts = torch.randint(
+    slot_token_counts = torch.randint(
         1,
         17,
         (num_slots, num_kv_heads, num_clusters),
@@ -88,10 +88,30 @@ def test_resident_cluster_scores_match_request_slot_reference():
     num_valid = torch.tensor([7, 4, 9], dtype=torch.int32, device="cuda")
     request_slots = torch.tensor([2, 0, -1], dtype=torch.int64, device="cuda")
 
-    cluster_offsets = torch.arange(num_clusters, device="cuda")
-    valid_arena = cluster_offsets[None, None, :] < num_valid[:, None, None]
-    cluster_ids.masked_fill_(~valid_arena, -1)
-    token_counts.masked_fill_(~valid_arena, 0)
+    local_cluster_indices = torch.arange(num_clusters, device="cuda")
+    valid_arena = local_cluster_indices[None, None, :] < num_valid[:, None, None]
+    slot_cluster_ids.masked_fill_(~valid_arena, -1)
+    slot_token_counts.masked_fill_(~valid_arena, 0)
+    request_cluster_offsets = torch.tensor(
+        [2, 14, 29], dtype=torch.int64, device="cuda"
+    )
+    arena_capacity = 40
+    cluster_keys = torch.randn(
+        num_kv_heads,
+        arena_capacity,
+        head_size,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    cluster_ids = torch.full(
+        (num_kv_heads, arena_capacity), -1, dtype=torch.int64, device="cuda"
+    )
+    token_counts = torch.zeros_like(cluster_ids, dtype=torch.int32)
+    for slot, cluster_offset in enumerate(request_cluster_offsets.tolist()):
+        cluster_slice = slice(cluster_offset, cluster_offset + num_clusters)
+        cluster_keys[:, cluster_slice].copy_(slot_cluster_keys[slot])
+        cluster_ids[:, cluster_slice].copy_(slot_cluster_ids[slot])
+        token_counts[:, cluster_slice].copy_(slot_token_counts[slot])
 
     logits = torch.empty(
         batch_size,
@@ -120,6 +140,7 @@ def test_resident_cluster_scores_match_request_slot_reference():
         cluster_keys,
         cluster_ids,
         token_counts,
+        request_cluster_offsets,
         num_valid,
         request_slots,
         0.125,
@@ -131,13 +152,13 @@ def test_resident_cluster_scores_match_request_slot_reference():
     )
 
     safe_slots = request_slots.clamp_min(0)
-    packed_keys = cluster_keys.index_select(0, safe_slots)
-    packed_ids = cluster_ids.index_select(0, safe_slots)
-    packed_counts = token_counts.index_select(0, safe_slots)
+    packed_keys = slot_cluster_keys.index_select(0, safe_slots)
+    packed_ids = slot_cluster_ids.index_select(0, safe_slots)
+    packed_counts = slot_token_counts.index_select(0, safe_slots)
     packed_num_valid = num_valid.index_select(0, safe_slots)
     packed_mask = (
         (request_slots >= 0)[:, None, None]
-        & (cluster_offsets[None, None, :] < packed_num_valid[:, None, None])
+        & (local_cluster_indices[None, None, :] < packed_num_valid[:, None, None])
         & (packed_ids >= 0)
         & (packed_counts > 0)
     )

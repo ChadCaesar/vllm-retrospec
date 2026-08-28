@@ -161,6 +161,9 @@ class RetroSpecSparseAttention:
             max_pinned_memory_bytes=int(
                 getattr(config, "retrospec_max_pinned_memory", 1.0) * GiB_bytes
             ),
+            max_gpu_index_memory_bytes=int(
+                getattr(config, "retrospec_max_gpu_index_memory", 4.0) * GiB_bytes
+            ),
             performance_stats=(
                 self.performance_stats if self.performance_stats.enabled else None
             ),

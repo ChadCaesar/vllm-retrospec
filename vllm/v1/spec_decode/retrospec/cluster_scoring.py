@@ -262,6 +262,7 @@ def _resident_cluster_logits_kernel(
     cluster_keys,
     cluster_ids,
     cluster_token_counts,
+    cluster_offsets,
     num_clusters,
     request_slot_ids,
     logits,
@@ -272,13 +273,11 @@ def _resident_cluster_logits_kernel(
     key_stride_0,
     key_stride_1,
     key_stride_2,
-    key_stride_3,
     id_stride_0,
     id_stride_1,
-    id_stride_2,
     count_stride_0,
     count_stride_1,
-    count_stride_2,
+    cluster_offset_stride_0,
     logits_stride_0,
     logits_stride_1,
     logits_stride_2,
@@ -300,22 +299,27 @@ def _resident_cluster_logits_kernel(
         mask=valid_request,
         other=0,
     )
+    request_cluster_offset = tl.load(
+        cluster_offsets + safe_slot * cluster_offset_stride_0,
+        mask=valid_request,
+        other=0,
+    ).to(tl.int64)
+    absolute_cluster = request_cluster_offset + cluster_idx
 
     cluster_in_bounds = cluster_idx < max_num_clusters
+    valid_storage = (
+        valid_request & cluster_in_bounds & (cluster_idx < request_num_clusters)
+    )
     cluster_id = tl.load(
-        cluster_ids
-        + safe_slot * id_stride_0
-        + kv_head_idx * id_stride_1
-        + cluster_idx * id_stride_2,
-        mask=valid_request & cluster_in_bounds,
+        cluster_ids + kv_head_idx * id_stride_0 + absolute_cluster * id_stride_1,
+        mask=valid_storage,
         other=-1,
     )
     token_count = tl.load(
         cluster_token_counts
-        + safe_slot * count_stride_0
-        + kv_head_idx * count_stride_1
-        + cluster_idx * count_stride_2,
-        mask=valid_request & cluster_in_bounds,
+        + kv_head_idx * count_stride_0
+        + absolute_cluster * count_stride_1,
+        mask=valid_storage,
         other=0,
     )
     valid_cluster = (
@@ -342,10 +346,9 @@ def _resident_cluster_logits_kernel(
     ).to(tl.float32)
     cluster_key = tl.load(
         cluster_keys
-        + safe_slot * key_stride_0
-        + kv_head_idx * key_stride_1
-        + cluster_idx * key_stride_2
-        + head_offsets * key_stride_3,
+        + kv_head_idx * key_stride_0
+        + absolute_cluster * key_stride_1
+        + head_offsets * key_stride_2,
         mask=valid_cluster & valid_head,
         other=0.0,
     ).to(tl.float32)
@@ -369,16 +372,16 @@ def _resident_cluster_logits_kernel(
 def _resident_candidate_count_kernel(
     cluster_ids,
     cluster_token_counts,
+    cluster_offsets,
     num_clusters,
     request_slot_ids,
     output,
     max_num_clusters,
     id_stride_0,
     id_stride_1,
-    id_stride_2,
     count_stride_0,
     count_stride_1,
-    count_stride_2,
+    cluster_offset_stride_0,
     output_stride_0,
     output_stride_1,
     BLOCK_C: tl.constexpr,
@@ -394,31 +397,37 @@ def _resident_candidate_count_kernel(
         mask=valid_request,
         other=0,
     )
+    request_cluster_offset = tl.load(
+        cluster_offsets + safe_slot * cluster_offset_stride_0,
+        mask=valid_request,
+        other=0,
+    ).to(tl.int64)
 
     candidate_count = 0
     for cluster_start in tl.range(0, max_num_clusters, BLOCK_C):
-        cluster_offsets = cluster_start + tl.arange(0, BLOCK_C)
-        in_bounds = cluster_offsets < max_num_clusters
+        local_cluster_offsets = cluster_start + tl.arange(0, BLOCK_C)
+        absolute_clusters = request_cluster_offset + local_cluster_offsets
+        in_bounds = local_cluster_offsets < max_num_clusters
         cluster_id = tl.load(
-            cluster_ids
-            + safe_slot * id_stride_0
-            + kv_head_idx * id_stride_1
-            + cluster_offsets * id_stride_2,
-            mask=valid_request & in_bounds,
+            cluster_ids + kv_head_idx * id_stride_0 + absolute_clusters * id_stride_1,
+            mask=valid_request
+            & in_bounds
+            & (local_cluster_offsets < request_num_clusters),
             other=-1,
         )
         token_count = tl.load(
             cluster_token_counts
-            + safe_slot * count_stride_0
-            + kv_head_idx * count_stride_1
-            + cluster_offsets * count_stride_2,
-            mask=valid_request & in_bounds,
+            + kv_head_idx * count_stride_0
+            + absolute_clusters * count_stride_1,
+            mask=valid_request
+            & in_bounds
+            & (local_cluster_offsets < request_num_clusters),
             other=0,
         )
         valid = (
             valid_request
             & in_bounds
-            & (cluster_offsets < request_num_clusters)
+            & (local_cluster_offsets < request_num_clusters)
             & (cluster_id >= 0)
             & (token_count > 0)
         )
@@ -435,6 +444,7 @@ def _resident_cluster_softmax_lse_kernel(
     logits,
     cluster_ids,
     cluster_token_counts,
+    cluster_offsets,
     num_clusters,
     request_slot_ids,
     softmax_lse,
@@ -446,10 +456,9 @@ def _resident_cluster_softmax_lse_kernel(
     logits_stride_3,
     id_stride_0,
     id_stride_1,
-    id_stride_2,
     count_stride_0,
     count_stride_1,
-    count_stride_2,
+    cluster_offset_stride_0,
     lse_stride_0,
     lse_stride_1,
     lse_stride_2,
@@ -467,32 +476,38 @@ def _resident_cluster_softmax_lse_kernel(
         mask=valid_request,
         other=0,
     )
+    request_cluster_offset = tl.load(
+        cluster_offsets + safe_slot * cluster_offset_stride_0,
+        mask=valid_request,
+        other=0,
+    ).to(tl.int64)
 
     running_max = float("-inf")
     running_sum = 0.0
     for cluster_start in tl.range(0, max_num_clusters, BLOCK_C):
-        cluster_offsets = cluster_start + tl.arange(0, BLOCK_C)
-        in_bounds = cluster_offsets < max_num_clusters
+        local_cluster_offsets = cluster_start + tl.arange(0, BLOCK_C)
+        absolute_clusters = request_cluster_offset + local_cluster_offsets
+        in_bounds = local_cluster_offsets < max_num_clusters
         cluster_id = tl.load(
-            cluster_ids
-            + safe_slot * id_stride_0
-            + kv_head_idx * id_stride_1
-            + cluster_offsets * id_stride_2,
-            mask=valid_request & in_bounds,
+            cluster_ids + kv_head_idx * id_stride_0 + absolute_clusters * id_stride_1,
+            mask=valid_request
+            & in_bounds
+            & (local_cluster_offsets < request_num_clusters),
             other=-1,
         )
         token_counts = tl.load(
             cluster_token_counts
-            + safe_slot * count_stride_0
-            + kv_head_idx * count_stride_1
-            + cluster_offsets * count_stride_2,
-            mask=valid_request & in_bounds,
+            + kv_head_idx * count_stride_0
+            + absolute_clusters * count_stride_1,
+            mask=valid_request
+            & in_bounds
+            & (local_cluster_offsets < request_num_clusters),
             other=0,
         )
         valid_clusters = (
             valid_request
             & in_bounds
-            & (cluster_offsets < request_num_clusters)
+            & (local_cluster_offsets < request_num_clusters)
             & (cluster_id >= 0)
             & (token_counts > 0)
         )
@@ -501,7 +516,7 @@ def _resident_cluster_softmax_lse_kernel(
             + batch_idx * logits_stride_0
             + kv_head_idx * logits_stride_1
             + query_group_idx * logits_stride_2
-            + cluster_offsets * logits_stride_3,
+            + local_cluster_offsets * logits_stride_3,
             mask=valid_clusters,
             other=0.0,
         ).to(tl.float32)
@@ -551,6 +566,7 @@ def _resident_reduce_cluster_scores_kernel(
     logits,
     cluster_ids,
     cluster_token_counts,
+    cluster_offsets,
     num_clusters,
     request_slot_ids,
     softmax_lse,
@@ -564,10 +580,9 @@ def _resident_reduce_cluster_scores_kernel(
     logits_stride_3,
     id_stride_0,
     id_stride_1,
-    id_stride_2,
     count_stride_0,
     count_stride_1,
-    count_stride_2,
+    cluster_offset_stride_0,
     lse_stride_0,
     lse_stride_1,
     lse_stride_2,
@@ -584,8 +599,8 @@ def _resident_reduce_cluster_scores_kernel(
     kv_head_idx = tl.program_id(1)
     cluster_block_idx = tl.program_id(2)
 
-    cluster_offsets = cluster_block_idx * BLOCK_C + tl.arange(0, BLOCK_C)
-    in_bounds = cluster_offsets < max_num_clusters
+    local_cluster_offsets = cluster_block_idx * BLOCK_C + tl.arange(0, BLOCK_C)
+    in_bounds = local_cluster_offsets < max_num_clusters
     request_slot = tl.load(request_slot_ids + batch_idx)
     valid_request = request_slot >= 0
     safe_slot = tl.maximum(request_slot, 0)
@@ -594,27 +609,29 @@ def _resident_reduce_cluster_scores_kernel(
         mask=valid_request,
         other=0,
     )
+    request_cluster_offset = tl.load(
+        cluster_offsets + safe_slot * cluster_offset_stride_0,
+        mask=valid_request,
+        other=0,
+    ).to(tl.int64)
+    absolute_clusters = request_cluster_offset + local_cluster_offsets
 
     cluster_id = tl.load(
-        cluster_ids
-        + safe_slot * id_stride_0
-        + kv_head_idx * id_stride_1
-        + cluster_offsets * id_stride_2,
-        mask=valid_request & in_bounds,
+        cluster_ids + kv_head_idx * id_stride_0 + absolute_clusters * id_stride_1,
+        mask=valid_request & in_bounds & (local_cluster_offsets < request_num_clusters),
         other=-1,
     )
     token_counts = tl.load(
         cluster_token_counts
-        + safe_slot * count_stride_0
-        + kv_head_idx * count_stride_1
-        + cluster_offsets * count_stride_2,
-        mask=valid_request & in_bounds,
+        + kv_head_idx * count_stride_0
+        + absolute_clusters * count_stride_1,
+        mask=valid_request & in_bounds & (local_cluster_offsets < request_num_clusters),
         other=0,
     )
     valid_clusters = (
         valid_request
         & in_bounds
-        & (cluster_offsets < request_num_clusters)
+        & (local_cluster_offsets < request_num_clusters)
         & (cluster_id >= 0)
         & (token_counts > 0)
     )
@@ -627,7 +644,7 @@ def _resident_reduce_cluster_scores_kernel(
             + batch_idx * logits_stride_0
             + kv_head_idx * logits_stride_1
             + query_group_idx * logits_stride_2
-            + cluster_offsets * logits_stride_3,
+            + local_cluster_offsets * logits_stride_3,
             mask=valid_clusters,
             other=0.0,
         ).to(tl.float32)
@@ -647,12 +664,12 @@ def _resident_reduce_cluster_scores_kernel(
     output_offsets = (
         batch_idx * output_stride_0
         + kv_head_idx * output_stride_1
-        + cluster_offsets * output_stride_2
+        + local_cluster_offsets * output_stride_2
     )
     ranking_offsets = (
         batch_idx * ranking_stride_0
         + kv_head_idx * ranking_stride_1
-        + cluster_offsets * ranking_stride_2
+        + local_cluster_offsets * ranking_stride_2
     )
     tl.store(
         output + output_offsets,
@@ -695,6 +712,7 @@ def score_resident_clusters(
     cluster_keys: torch.Tensor,
     cluster_ids: torch.Tensor,
     cluster_token_counts: torch.Tensor,
+    cluster_offsets: torch.Tensor,
     num_clusters: torch.Tensor,
     request_slot_ids: torch.Tensor,
     scale: float,
@@ -707,25 +725,28 @@ def score_resident_clusters(
     """Score request-slot cluster summaries without repacking the arena."""
     if query.device.type != "cuda":
         raise ValueError("Resident cluster scoring requires CUDA tensors")
-    if query.ndim != 3 or cluster_keys.ndim != 4:
+    if query.ndim != 3 or cluster_keys.ndim != 3:
         raise ValueError("Resident query or cluster-key shape is invalid")
 
     batch_size, num_query_heads, head_size = query.shape
-    _, num_kv_heads, max_num_clusters, key_head_size = cluster_keys.shape
+    num_kv_heads, _, key_head_size = cluster_keys.shape
+    max_num_clusters = logits.shape[3]
     if head_size != key_head_size:
         raise ValueError("Resident query and cluster head sizes do not match")
     if num_kv_heads <= 0 or num_query_heads % num_kv_heads != 0:
         raise ValueError("Resident query heads are incompatible with KV heads")
     if max_num_clusters <= 0:
-        raise ValueError("Resident cluster arena must contain a cluster slot")
+        raise ValueError("Resident scoring workspace must contain a cluster slot")
 
-    cluster_shape = cluster_keys.shape[:3]
+    cluster_shape = cluster_keys.shape[:2]
     if cluster_ids.shape != cluster_shape:
         raise ValueError("Resident cluster IDs do not match cluster keys")
     if cluster_token_counts.shape != cluster_shape:
         raise ValueError("Resident cluster counts do not match cluster keys")
-    if num_clusters.shape != (cluster_keys.shape[0],):
+    if num_clusters.ndim != 1:
         raise ValueError("Resident request cluster counts have an invalid shape")
+    if cluster_offsets.shape != num_clusters.shape:
+        raise ValueError("Resident request cluster offsets have an invalid shape")
     if request_slot_ids.shape != (batch_size,):
         raise ValueError("Resident request slots do not match the query batch")
 
@@ -751,6 +772,7 @@ def score_resident_clusters(
         cluster_keys,
         cluster_ids,
         cluster_token_counts,
+        cluster_offsets,
         num_clusters,
         request_slot_ids,
         logits,
@@ -767,6 +789,8 @@ def score_resident_clusters(
         raise ValueError("Resident cluster counts must use an integral dtype")
     if num_clusters.dtype not in (torch.int32, torch.int64):
         raise ValueError("Resident request cluster counts must be integral")
+    if cluster_offsets.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Resident request cluster offsets must be integral")
     if request_slot_ids.dtype not in (torch.int32, torch.int64):
         raise ValueError("Resident request slots must be integral")
     if batch_size == 0:
@@ -780,6 +804,7 @@ def score_resident_clusters(
         cluster_keys,
         cluster_ids,
         cluster_token_counts,
+        cluster_offsets,
         num_clusters,
         request_slot_ids,
         logits,
@@ -787,16 +812,10 @@ def score_resident_clusters(
         query.stride(0),
         query.stride(1),
         query.stride(2),
-        cluster_keys.stride(0),
-        cluster_keys.stride(1),
-        cluster_keys.stride(2),
-        cluster_keys.stride(3),
-        cluster_ids.stride(0),
-        cluster_ids.stride(1),
-        cluster_ids.stride(2),
-        cluster_token_counts.stride(0),
-        cluster_token_counts.stride(1),
-        cluster_token_counts.stride(2),
+        *cluster_keys.stride(),
+        *cluster_ids.stride(),
+        *cluster_token_counts.stride(),
+        cluster_offsets.stride(0),
         logits.stride(0),
         logits.stride(1),
         logits.stride(2),
@@ -810,16 +829,14 @@ def score_resident_clusters(
     _resident_candidate_count_kernel[(batch_size, num_kv_heads)](
         cluster_ids,
         cluster_token_counts,
+        cluster_offsets,
         num_clusters,
         request_slot_ids,
         candidate_counts,
         max_num_clusters,
-        cluster_ids.stride(0),
-        cluster_ids.stride(1),
-        cluster_ids.stride(2),
-        cluster_token_counts.stride(0),
-        cluster_token_counts.stride(1),
-        cluster_token_counts.stride(2),
+        *cluster_ids.stride(),
+        *cluster_token_counts.stride(),
+        cluster_offsets.stride(0),
         candidate_counts.stride(0),
         candidate_counts.stride(1),
         BLOCK_C=block_c,
@@ -829,6 +846,7 @@ def score_resident_clusters(
         logits,
         cluster_ids,
         cluster_token_counts,
+        cluster_offsets,
         num_clusters,
         request_slot_ids,
         softmax_lse,
@@ -838,12 +856,9 @@ def score_resident_clusters(
         logits.stride(1),
         logits.stride(2),
         logits.stride(3),
-        cluster_ids.stride(0),
-        cluster_ids.stride(1),
-        cluster_ids.stride(2),
-        cluster_token_counts.stride(0),
-        cluster_token_counts.stride(1),
-        cluster_token_counts.stride(2),
+        *cluster_ids.stride(),
+        *cluster_token_counts.stride(),
+        cluster_offsets.stride(0),
         softmax_lse.stride(0),
         softmax_lse.stride(1),
         softmax_lse.stride(2),
@@ -856,6 +871,7 @@ def score_resident_clusters(
         logits,
         cluster_ids,
         cluster_token_counts,
+        cluster_offsets,
         num_clusters,
         request_slot_ids,
         softmax_lse,
@@ -867,12 +883,9 @@ def score_resident_clusters(
         logits.stride(1),
         logits.stride(2),
         logits.stride(3),
-        cluster_ids.stride(0),
-        cluster_ids.stride(1),
-        cluster_ids.stride(2),
-        cluster_token_counts.stride(0),
-        cluster_token_counts.stride(1),
-        cluster_token_counts.stride(2),
+        *cluster_ids.stride(),
+        *cluster_token_counts.stride(),
+        cluster_offsets.stride(0),
         softmax_lse.stride(0),
         softmax_lse.stride(1),
         softmax_lse.stride(2),

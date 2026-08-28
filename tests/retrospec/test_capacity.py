@@ -180,6 +180,18 @@ def test_capacity_reserves_indices_and_pages_for_all_resident_requests():
     assert multiple.auxiliary_memory_bytes > single.auxiliary_memory_bytes
 
 
+def test_capacity_caps_persistent_index_reservation_at_gpu_index_budget():
+    default_budget = build_retrospec_long_context_capacity(
+        make_capacity_config(), make_kv_cache_specs()
+    )
+    limited_budget = build_retrospec_long_context_capacity(
+        make_capacity_config(retrospec_max_gpu_index_memory=1e-6),
+        make_kv_cache_specs(),
+    )
+
+    assert limited_budget.auxiliary_memory_bytes < default_budget.auxiliary_memory_bytes
+
+
 def test_capacity_rejects_unaligned_segment_size():
     config = make_capacity_config(retrospec_index_segment_size=1000)
 
