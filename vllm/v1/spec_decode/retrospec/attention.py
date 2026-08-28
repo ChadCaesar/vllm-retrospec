@@ -135,6 +135,14 @@ class RetroSpecSparseAttention:
                 0.0,
             ),
         )
+        cpu_page_slab_size_mib = getattr(
+            config, "retrospec_cpu_page_slab_size_mib", 256
+        )
+        cpu_page_initial_slab_size_mib = getattr(
+            config,
+            "retrospec_cpu_page_initial_slab_size_mib",
+            min(8, cpu_page_slab_size_mib),
+        )
 
         self.index = RetroSpecSegmentedTokenIndex(
             block_size=block_size,
@@ -155,9 +163,8 @@ class RetroSpecSparseAttention:
                 "retrospec_first_draft_warmup_multiplier",
                 4,
             ),
-            cpu_page_slab_bytes=(
-                getattr(config, "retrospec_cpu_page_slab_size_mib", 256) * MiB_bytes
-            ),
+            cpu_page_initial_slab_bytes=(cpu_page_initial_slab_size_mib * MiB_bytes),
+            cpu_page_slab_bytes=cpu_page_slab_size_mib * MiB_bytes,
             max_pinned_memory_bytes=int(
                 getattr(config, "retrospec_max_pinned_memory", 1.0) * GiB_bytes
             ),
@@ -430,7 +437,7 @@ class RetroSpecSparseAttention:
 
         self.original_forwards.clear()
         self.forward_wrappers.clear()
-        self.index.cluster_store.close()
+        self.index.close()
 
     @contextmanager
     def full_verification_context(

@@ -17,6 +17,7 @@ from .cluster_identity import (
     RetroSpecClusterIdentity,
 )
 from .performance import RetroSpecPerformanceStats
+from .pinned_memory import RetroSpecPinnedMemoryManager
 from .resident_cache import (
     RetroSpecResidentClusterCache,
     RetroSpecResidentPageAccess,
@@ -35,6 +36,7 @@ class _PinnedStagingSlot:
 
     source_device: torch.device
     max_bytes: int
+    pinned_memory: RetroSpecPinnedMemoryManager
 
     token_key_storage: torch.Tensor | None = None
     token_value_storage: torch.Tensor | None = None
@@ -76,11 +78,11 @@ class _PinnedStagingSlot:
                     "slot budget; reduce the clustering segment size or increase "
                     "retrospec_max_pinned_memory"
                 )
-            storage = torch.empty(
-                required_numel,
-                dtype=source.dtype,
-                device="cpu",
-                pin_memory=True,
+            storage = self.pinned_memory.replace(
+                storage,
+                (required_numel,),
+                source.dtype,
+                "cluster-build-staging",
             )
 
         view = storage[:required_numel].view(source.shape)
@@ -131,11 +133,24 @@ class _PinnedStagingSlot:
             staged_token_offsets,
         )
 
+    def release_storage(self) -> None:
+        self.pinned_memory.release(self.token_key_storage)
+        self.pinned_memory.release(self.token_value_storage)
+        self.pinned_memory.release(self.assignment_storage)
+        self.pinned_memory.release(self.cluster_count_storage)
+        self.pinned_memory.release(self.token_offset_storage)
+        self.token_key_storage = None
+        self.token_value_storage = None
+        self.assignment_storage = None
+        self.cluster_count_storage = None
+        self.token_offset_storage = None
+
 
 @dataclass
 class _PinnedSelectionSlot:
     """Reusable pinned cluster-ID buffer for one asynchronous prefetch."""
 
+    pinned_memory: RetroSpecPinnedMemoryManager
     cluster_id_storage: torch.Tensor | None = None
     in_use: bool = False
 
@@ -148,14 +163,18 @@ class _PinnedSelectionSlot:
             self.cluster_id_storage is None
             or self.cluster_id_storage.numel() < required_numel
         ):
-            self.cluster_id_storage = torch.empty(
-                required_numel,
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=True,
+            self.cluster_id_storage = self.pinned_memory.replace(
+                self.cluster_id_storage,
+                (required_numel,),
+                torch.int64,
+                "resident-prefetch-cluster-ids",
             )
 
         return self.cluster_id_storage[:required_numel].view(source.shape)
+
+    def release_storage(self) -> None:
+        self.pinned_memory.release(self.cluster_id_storage)
+        self.cluster_id_storage = None
 
 
 @dataclass(frozen=True)
@@ -315,7 +334,7 @@ class _PinnedPageTransferSlot:
 
 
 class _LayerClusterPagePool:
-    """Append-only pageable CPU slabs for one layer's cluster pages."""
+    """Geometrically growing pageable CPU slabs for one layer."""
 
     _PAGE_OFFSET_BITS = 32
     _PAGE_OFFSET_MASK = (1 << _PAGE_OFFSET_BITS) - 1
@@ -327,12 +346,9 @@ class _LayerClusterPagePool:
         dtype: torch.dtype,
         storage_device: torch.device,
         metadata_device: torch.device,
-        pin_memory: bool,
-        slab_size_bytes: int,
+        initial_slab_size_bytes: int,
+        max_slab_size_bytes: int,
     ) -> None:
-        if pin_memory and storage_device.type != "cpu":
-            raise ValueError("Only CPU cluster storage can use pinned memory")
-
         self.page_size = page_size
         self.head_size = head_size
         self.dtype = dtype
@@ -340,16 +356,25 @@ class _LayerClusterPagePool:
         self.metadata_device = metadata_device
         if storage_device.type != "cpu":
             raise ValueError("Cluster-page slabs must use CPU storage")
-        if slab_size_bytes <= 0:
-            raise ValueError("slab_size_bytes must be positive")
+        if initial_slab_size_bytes <= 0:
+            raise ValueError("initial_slab_size_bytes must be positive")
+        if max_slab_size_bytes < initial_slab_size_bytes:
+            raise ValueError(
+                "max_slab_size_bytes must not be smaller than initial_slab_size_bytes"
+            )
 
         self.pin_memory = False
         page_pair_bytes = 2 * page_size * head_size * dtype.itemsize
-        self.pages_per_slab = max(slab_size_bytes // page_pair_bytes, 1)
-        if self.pages_per_slab > self._PAGE_OFFSET_MASK + 1:
+        self.initial_pages_per_slab = max(initial_slab_size_bytes // page_pair_bytes, 1)
+        self.max_pages_per_slab = max(
+            max_slab_size_bytes // page_pair_bytes,
+            self.initial_pages_per_slab,
+        )
+        if self.max_pages_per_slab > self._PAGE_OFFSET_MASK + 1:
             raise ValueError("Cluster-page slab contains too many pages")
 
         self._slabs: list[_CPUPageSlab] = []
+        self._slab_allocated_page_counts: list[int] = []
 
         # Allocation state remains on the CPU because page allocation and
         # request release are control-plane operations.
@@ -370,23 +395,38 @@ class _LayerClusterPagePool:
             raise ValueError("Cluster page ID must be non-negative")
         return page_id >> cls._PAGE_OFFSET_BITS, page_id & cls._PAGE_OFFSET_MASK
 
+    @property
+    def pages_per_slab(self) -> int:
+        """Maximum slab capacity retained for compatibility and diagnostics."""
+        return self.max_pages_per_slab
+
+    def _next_slab_page_capacity(self) -> int:
+        if not self._slabs:
+            return self.initial_pages_per_slab
+        return min(
+            self._slabs[-1].key_pages.shape[0] * 2,
+            self.max_pages_per_slab,
+        )
+
     def _append_slab(self) -> None:
         slab_id = len(self._slabs)
-        shape = (self.pages_per_slab, self.page_size, self.head_size)
+        slab_capacity = self._next_slab_page_capacity()
+        shape = (slab_capacity, self.page_size, self.head_size)
         self._slabs.append(
             _CPUPageSlab(
                 key_pages=torch.empty(shape, dtype=self.dtype, device="cpu"),
                 value_pages=torch.empty(shape, dtype=self.dtype, device="cpu"),
             )
         )
+        self._slab_allocated_page_counts.append(0)
         self._free_page_ids.extend(
             self.encode_page_id(slab_id, page_offset)
-            for page_offset in range(self.pages_per_slab - 1, -1, -1)
+            for page_offset in range(slab_capacity - 1, -1, -1)
         )
 
     @property
     def capacity(self) -> int:
-        return len(self._slabs) * self.pages_per_slab
+        return sum(slab.key_pages.shape[0] for slab in self._slabs)
 
     @property
     def num_slabs(self) -> int:
@@ -423,7 +463,9 @@ class _LayerClusterPagePool:
                 raise RuntimeError(
                     f"RetroSpec cluster page {page_id} is already allocated"
                 )
+            slab_id, _ = self.decode_page_id(page_id)
             self._allocated_page_ids.add(page_id)
+            self._slab_allocated_page_counts[slab_id] += 1
 
         return torch.tensor(
             page_ids,
@@ -447,12 +489,24 @@ class _LayerClusterPagePool:
             if page_id not in self._allocated_page_ids:
                 raise RuntimeError(f"RetroSpec cluster page {page_id} is not allocated")
 
-        for page_id in sorted(
-            unique_page_ids,
-            reverse=True,
-        ):
+        for page_id in sorted(unique_page_ids, reverse=True):
+            slab_id, _ = self.decode_page_id(page_id)
             self._allocated_page_ids.remove(page_id)
+            self._slab_allocated_page_counts[slab_id] -= 1
             self._free_page_ids.append(page_id)
+
+        self._trim_empty_tail_slabs()
+
+    def _trim_empty_tail_slabs(self) -> None:
+        while self._slabs and self._slab_allocated_page_counts[-1] == 0:
+            removed_slab_id = len(self._slabs) - 1
+            self._free_page_ids = [
+                page_id
+                for page_id in self._free_page_ids
+                if self.decode_page_id(page_id)[0] != removed_slab_id
+            ]
+            self._slabs.pop()
+            self._slab_allocated_page_counts.pop()
 
     def write(
         self,
@@ -595,7 +649,7 @@ class _FullVerificationTransferBuffer:
         page_size: int,
         device: torch.device,
         max_pinned_memory_bytes: int,
-        pin_memory: bool,
+        pinned_memory: RetroSpecPinnedMemoryManager,
         performance_stats: RetroSpecPerformanceStats | None = None,
     ) -> None:
         if page_size <= 0:
@@ -612,7 +666,8 @@ class _FullVerificationTransferBuffer:
         self.device = device
         self.performance_stats = performance_stats
         self.max_pinned_memory_bytes = max_pinned_memory_bytes
-        self.pin_memory = pin_memory
+        self._pinned_memory = pinned_memory
+        self.pin_memory = pinned_memory.enabled
 
         self._gpu_arenas = [
             _FullVerificationGPUArena(),
@@ -686,6 +741,8 @@ class _FullVerificationTransferBuffer:
             for slot in self._cpu_slots:
                 if slot.reuse_ready_event is not None:
                     slot.reuse_ready_event.synchronize()
+                self._pinned_memory.release(slot.key_pages)
+                self._pinned_memory.release(slot.value_pages)
 
         page_pair_bytes = 2 * self.page_size * pool.head_size * pool.dtype.itemsize
         h2d_budget = self.max_pinned_memory_bytes // 2
@@ -697,19 +754,47 @@ class _FullVerificationTransferBuffer:
                 "retrospec_max_pinned_memory cannot hold one H2D page per ring slot"
             )
         shape = (self._cpu_slot_capacity, self.page_size, pool.head_size)
-        self._cpu_slots = [
-            _PinnedPageTransferSlot(
-                key_pages=torch.empty(
-                    shape, dtype=pool.dtype, device="cpu", pin_memory=self.pin_memory
-                ),
-                value_pages=torch.empty(
-                    shape, dtype=pool.dtype, device="cpu", pin_memory=self.pin_memory
-                ),
-            )
-            for _ in range(self._RESIDENT_PREFETCH_RING_SIZE)
-        ]
+        self._cpu_slots = []
+        try:
+            for _ in range(self._RESIDENT_PREFETCH_RING_SIZE):
+                key_pages = self._pinned_memory.empty(
+                    shape, pool.dtype, "full-verification-h2d-keys"
+                )
+                try:
+                    value_pages = self._pinned_memory.empty(
+                        shape, pool.dtype, "full-verification-h2d-values"
+                    )
+                except BaseException:
+                    self._pinned_memory.release(key_pages)
+                    raise
+                self._cpu_slots.append(
+                    _PinnedPageTransferSlot(
+                        key_pages=key_pages,
+                        value_pages=value_pages,
+                    )
+                )
+        except BaseException:
+            for slot in self._cpu_slots:
+                self._pinned_memory.release(slot.key_pages)
+                self._pinned_memory.release(slot.value_pages)
+            self._cpu_slots.clear()
+            raise
         self._cpu_slot_layout = layout
         self._cpu_slot_cursor = 0
+
+    def close(self) -> None:
+        for slot in self._cpu_slots:
+            if slot.in_use:
+                raise RuntimeError(
+                    "Cannot close an active full-verification H2D staging slot"
+                )
+            if slot.reuse_ready_event is not None:
+                slot.reuse_ready_event.synchronize()
+            self._pinned_memory.release(slot.key_pages)
+            self._pinned_memory.release(slot.value_pages)
+        self._cpu_slots.clear()
+        self._cpu_slot_layout = None
+        self._cpu_slot_capacity = 0
 
     def stage_cpu_pages(
         self,
@@ -896,10 +981,12 @@ class RetroSpecClusterPageStore:
         page_size: int,
         pin_memory: bool = False,
         cache_ratio: float = 0.0,
+        cpu_page_initial_slab_bytes: int | None = None,
         cpu_page_slab_bytes: int = 1 << 20,
         max_pinned_memory_bytes: int = 64 << 20,
         max_pending_cluster_builds: int = 2,
         performance_stats: RetroSpecPerformanceStats | None = None,
+        pinned_memory: RetroSpecPinnedMemoryManager | None = None,
     ) -> None:
         if page_size <= 0:
             raise ValueError("page_size must be positive")
@@ -907,16 +994,34 @@ class RetroSpecClusterPageStore:
             raise ValueError("cache_ratio must be between zero and one")
         if cpu_page_slab_bytes <= 0:
             raise ValueError("cpu_page_slab_bytes must be positive")
+        if cpu_page_initial_slab_bytes is None:
+            cpu_page_initial_slab_bytes = min(8 << 20, cpu_page_slab_bytes)
+        if cpu_page_initial_slab_bytes <= 0:
+            raise ValueError("cpu_page_initial_slab_bytes must be positive")
+        if cpu_page_initial_slab_bytes > cpu_page_slab_bytes:
+            raise ValueError(
+                "cpu_page_initial_slab_bytes must not exceed cpu_page_slab_bytes"
+            )
         if max_pinned_memory_bytes <= 0:
             raise ValueError("max_pinned_memory_bytes must be positive")
         if max_pending_cluster_builds <= 0:
             raise ValueError("max_pending_cluster_builds must be positive")
 
+        if pinned_memory is None:
+            pinned_memory = RetroSpecPinnedMemoryManager(
+                enabled=pin_memory,
+                max_bytes=max_pinned_memory_bytes,
+            )
+        elif pin_memory and not pinned_memory.enabled:
+            raise ValueError("pin_memory conflicts with the shared pinned manager")
+
         self.page_size = page_size
-        self.pin_memory = pin_memory
+        self._pinned_memory = pinned_memory
+        self.pin_memory = pinned_memory.enabled
         self.cache_ratio = cache_ratio
+        self.cpu_page_initial_slab_bytes = cpu_page_initial_slab_bytes
         self.cpu_page_slab_bytes = cpu_page_slab_bytes
-        self.max_pinned_memory_bytes = max_pinned_memory_bytes
+        self.max_pinned_memory_bytes = pinned_memory.max_bytes
         self.max_pending_cluster_builds = max_pending_cluster_builds
         self.performance_stats = performance_stats
 
@@ -955,7 +1060,7 @@ class RetroSpecClusterPageStore:
 
         self._resident_prefetch_streams: dict[torch.device, torch.cuda.Stream] = {}
         self._resident_prefetch_slots: dict[
-            tuple[torch.device, str], list[_PinnedSelectionSlot]
+            torch.device, list[_PinnedSelectionSlot]
         ] = {}
         self._resident_prefetch_futures: dict[str, deque[Future[None]]] = {}
         self._resident_prefetch_lock = Lock()
@@ -1016,7 +1121,6 @@ class RetroSpecClusterPageStore:
             -1,
             dtype=torch.int64,
             device="cpu",
-            pin_memory=self.pin_memory,
         )
 
         # Stable handles remain unique and monotonic within one layer. They are
@@ -1348,13 +1452,11 @@ class RetroSpecClusterPageStore:
             -1,
             dtype=torch.int64,
             device="cpu",
-            pin_memory=self.pin_memory,
         )
         page_token_counts_cpu = torch.zeros(
             output_shape,
             dtype=torch.int32,
             device="cpu",
-            pin_memory=self.pin_memory,
         )
 
         flat_cluster_ids = cluster_ids_cpu.reshape(-1).tolist()
@@ -1414,8 +1516,8 @@ class RetroSpecClusterPageStore:
                 dtype=vectors.dtype,
                 storage_device=storage_device,
                 metadata_device=metadata_device,
-                pin_memory=self.pin_memory,
-                slab_size_bytes=self.cpu_page_slab_bytes,
+                initial_slab_size_bytes=self.cpu_page_initial_slab_bytes,
+                max_slab_size_bytes=self.cpu_page_slab_bytes,
             )
             self._layer_pools[layer_name] = pool
             return pool
@@ -1728,6 +1830,7 @@ class RetroSpecClusterPageStore:
                 max_bytes=(
                     self.max_pinned_memory_bytes // 2 // self.max_pending_cluster_builds
                 ),
+                pinned_memory=self._pinned_memory,
                 in_use=True,
             )
             slots.append(slot)
@@ -2193,13 +2296,11 @@ class RetroSpecClusterPageStore:
             -1,
             dtype=torch.int64,
             device="cpu",
-            pin_memory=self.pin_memory,
         )
         page_token_counts = torch.zeros(
             metadata_shape,
             dtype=torch.int32,
             device="cpu",
-            pin_memory=self.pin_memory,
         )
 
         if max_pages_per_cluster == 0:
@@ -2498,7 +2599,7 @@ class RetroSpecClusterPageStore:
                 page_size=self.page_size,
                 device=device,
                 max_pinned_memory_bytes=self.max_pinned_memory_bytes,
-                pin_memory=self.pin_memory,
+                pinned_memory=self._pinned_memory,
                 performance_stats=self.performance_stats,
             )
             self._full_verification_buffers[device] = buffer
@@ -2715,17 +2816,15 @@ class RetroSpecClusterPageStore:
 
     def _acquire_resident_prefetch_slot(
         self,
-        layer_name: str,
         device: torch.device,
     ) -> _PinnedSelectionSlot | None:
         device = self._canonical_cuda_device(device)
-        key = (device, layer_name)
 
         with self._resident_prefetch_lock:
             slots = self._resident_prefetch_slots.setdefault(
-                key,
+                device,
                 [
-                    _PinnedSelectionSlot()
+                    _PinnedSelectionSlot(pinned_memory=self._pinned_memory)
                     for _ in range(self._RESIDENT_PREFETCH_RING_SIZE)
                 ],
             )
@@ -2862,10 +2961,7 @@ class RetroSpecClusterPageStore:
         if cluster_ids.dtype not in (torch.int32, torch.int64):
             raise ValueError("Cluster IDs must use an integral dtype")
 
-        slot = self._acquire_resident_prefetch_slot(
-            layer_name,
-            cluster_ids.device,
-        )
+        slot = self._acquire_resident_prefetch_slot(cluster_ids.device)
         if slot is None:
             if self.performance_stats is not None:
                 self.performance_stats.add_counter("prefetch_dropped")
@@ -2946,6 +3042,28 @@ class RetroSpecClusterPageStore:
             self.wait_for_resident_prefetches()
         finally:
             self._resident_prefetch_executor.shutdown(wait=True)
+
+        for buffer in self._full_verification_buffers.values():
+            buffer.close()
+        self._full_verification_buffers.clear()
+
+        for slots in self._pinned_staging_slots.values():
+            for slot in slots:
+                if slot.in_use:
+                    raise RuntimeError(
+                        "Cannot close an active cluster-build staging slot"
+                    )
+                slot.release_storage()
+        self._pinned_staging_slots.clear()
+
+        for slots in self._resident_prefetch_slots.values():
+            for slot in slots:
+                if slot.in_use:
+                    raise RuntimeError(
+                        "Cannot close an active resident-prefetch staging slot"
+                    )
+                slot.release_storage()
+        self._resident_prefetch_slots.clear()
 
     def resolve_cluster_blocks(
         self,

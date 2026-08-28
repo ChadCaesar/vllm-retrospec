@@ -761,7 +761,11 @@ def test_cpu_backing_store_preserves_page_layout_and_reuses_pages():
 
 
 def test_cpu_backing_store_appends_pageable_slabs_without_migration():
-    store = RetroSpecClusterPageStore(page_size=2, cpu_page_slab_bytes=32)
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        cpu_page_initial_slab_bytes=32,
+        cpu_page_slab_bytes=64,
+    )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
 
     first = store_cluster_data(
@@ -770,15 +774,16 @@ def test_cpu_backing_store_appends_pageable_slabs_without_migration():
     first_metadata = get_block_metadata(store, first)
     pool = store._layer_pools["layer"]
 
-    assert pool.pages_per_slab == 2
-    assert pool.num_slabs == 3
+    assert pool.initial_pages_per_slab == 2
+    assert pool.max_pages_per_slab == 4
+    assert [slab.key_pages.shape[0] for slab in pool._slabs] == [2, 4]
     assert first_metadata.page_ids[first_metadata.page_ids >= 0].tolist() == [
         0,
         1,
         1 << 32,
         (1 << 32) + 1,
-        2 << 32,
-        (2 << 32) + 1,
+        (1 << 32) + 2,
+        (1 << 32) + 3,
     ]
     slab_pointers = [slab.key_pages.data_ptr() for slab in pool._slabs]
     assert all(not slab.key_pages.is_pinned() for slab in pool._slabs)
@@ -787,8 +792,8 @@ def test_cpu_backing_store_appends_pageable_slabs_without_migration():
     second = store_cluster_data(
         store, "layer", keys, values, assignments, cluster_token_counts
     )
-    assert pool.num_slabs == 6
-    assert [slab.key_pages.data_ptr() for slab in pool._slabs[:3]] == slab_pointers
+    assert [slab.key_pages.shape[0] for slab in pool._slabs] == [2, 4, 4, 4]
+    assert [slab.key_pages.data_ptr() for slab in pool._slabs[:2]] == slab_pointers
 
     gathered_keys, gathered_values, token_mask = store.gather_pages(
         "layer",
@@ -811,6 +816,8 @@ def test_cpu_backing_store_appends_pageable_slabs_without_migration():
     torch.testing.assert_close(reused_metadata.page_ids, first_metadata.page_ids)
     store.free("layer", second)
     store.free("layer", reused)
+    assert pool.num_slabs == 0
+    assert pool.capacity == 0
 
 
 def test_cpu_backing_store_growth_preserves_existing_logical_pages():
@@ -872,7 +879,7 @@ def test_cpu_backing_store_growth_preserves_existing_logical_pages():
     not torch.cuda.is_available() or not is_pin_memory_available(),
     reason="CUDA with pinned host memory is required",
 )
-def test_cpu_backing_store_keeps_block_metadata_on_pinned_cpu():
+def test_cpu_backing_store_keeps_long_lived_metadata_on_pageable_cpu():
     store = RetroSpecClusterPageStore(
         page_size=2,
         pin_memory=True,
@@ -889,11 +896,11 @@ def test_cpu_backing_store_keeps_block_metadata_on_pinned_cpu():
     )
     metadata = get_block_metadata(store, table)
     assert table.cluster_ids.device.type == "cpu"
-    assert table.cluster_ids.is_pinned()
+    assert not table.cluster_ids.is_pinned()
     assert metadata.page_ids.device.type == "cpu"
-    assert metadata.page_ids.is_pinned()
+    assert not metadata.page_ids.is_pinned()
     assert metadata.page_token_counts.device.type == "cpu"
-    assert metadata.page_token_counts.is_pinned()
+    assert not metadata.page_token_counts.is_pinned()
     pool = store._layer_pools["layer"]
     assert all(not slab.key_pages.is_pinned() for slab in pool._slabs)
     assert all(not slab.value_pages.is_pinned() for slab in pool._slabs)

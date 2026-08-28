@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import Lock
 
 import torch
+
+from .pinned_memory import RetroSpecPinnedMemoryManager
 
 
 @dataclass(frozen=True)
@@ -14,6 +17,64 @@ class RetroSpecClusterSummary:
     cluster_token_counts: torch.Tensor
 
 
+@dataclass
+class _PinnedSummarySlot:
+    pinned_memory: RetroSpecPinnedMemoryManager
+
+    key_storage: torch.Tensor | None = None
+    value_storage: torch.Tensor | None = None
+    count_storage: torch.Tensor | None = None
+    in_use: bool = False
+
+    def _reserve(
+        self,
+        storage: torch.Tensor | None,
+        source: torch.Tensor,
+        label: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        required_numel = source.numel()
+        if (
+            storage is None
+            or storage.dtype != source.dtype
+            or storage.numel() < required_numel
+        ):
+            storage = self.pinned_memory.replace(
+                storage,
+                (required_numel,),
+                source.dtype,
+                label,
+            )
+        return storage, storage[:required_numel].view(source.shape)
+
+    def reserve(
+        self,
+        cluster_keys: torch.Tensor,
+        cluster_values: torch.Tensor,
+        cluster_token_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.in_use:
+            raise RuntimeError("Pinned summary slot must be acquired before use")
+
+        self.key_storage, host_keys = self._reserve(
+            self.key_storage, cluster_keys, "cluster-summary-keys"
+        )
+        self.value_storage, host_values = self._reserve(
+            self.value_storage, cluster_values, "cluster-summary-values"
+        )
+        self.count_storage, host_counts = self._reserve(
+            self.count_storage, cluster_token_counts, "cluster-summary-counts"
+        )
+        return host_keys, host_values, host_counts
+
+    def release_storage(self) -> None:
+        self.pinned_memory.release(self.key_storage)
+        self.pinned_memory.release(self.value_storage)
+        self.pinned_memory.release(self.count_storage)
+        self.key_storage = None
+        self.value_storage = None
+        self.count_storage = None
+
+
 @dataclass(frozen=True)
 class RetroSpecStagedClusterSummary:
     cluster_keys: torch.Tensor
@@ -21,6 +82,11 @@ class RetroSpecStagedClusterSummary:
     cluster_token_counts: torch.Tensor
     resident_summary: RetroSpecClusterSummary
     ready_event: torch.cuda.Event | None
+    staging_slot: _PinnedSummarySlot | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -170,16 +236,30 @@ class RetroSpecGPUIndexResidencyManager:
 
     def __init__(
         self,
-        pin_memory: bool,
-        max_resident_requests: int,
-        max_gpu_index_memory_bytes: int,
+        pin_memory: bool = False,
+        max_resident_requests: int = 1,
+        max_gpu_index_memory_bytes: int = 4 << 30,
+        pinned_memory: RetroSpecPinnedMemoryManager | None = None,
+        max_summary_slots: int = 2,
     ) -> None:
+        if max_summary_slots <= 0:
+            raise ValueError("max_summary_slots must be positive")
         if max_resident_requests <= 0:
             raise ValueError("max_resident_requests must be positive")
         if max_gpu_index_memory_bytes <= 0:
             raise ValueError("max_gpu_index_memory_bytes must be positive")
 
-        self.pin_memory = pin_memory
+        if pinned_memory is None:
+            pinned_memory = RetroSpecPinnedMemoryManager(
+                enabled=pin_memory,
+                max_bytes=64 << 20,
+            )
+        elif pin_memory and not pinned_memory.enabled:
+            raise ValueError("pin_memory conflicts with the shared pinned manager")
+
+        self._pinned_memory = pinned_memory
+        self.pin_memory = pinned_memory.enabled
+        self.max_summary_slots = max_summary_slots
         self.max_resident_requests = max_resident_requests
         self.max_gpu_index_memory_bytes = max_gpu_index_memory_bytes
         self._allocated_gpu_index_bytes = 0
@@ -197,6 +277,8 @@ class RetroSpecGPUIndexResidencyManager:
             dict[str, _ResidentRequestState],
         ] = {}
         self._offload_streams: dict[torch.device, torch.cuda.Stream] = {}
+        self._summary_slots: dict[torch.device, list[_PinnedSummarySlot]] = {}
+        self._summary_slot_lock = Lock()
 
     @property
     def active_request_ids(self) -> tuple[str, ...]:
@@ -611,7 +693,8 @@ class RetroSpecGPUIndexResidencyManager:
         indexed_start: int,
         indexed_end: int,
         cluster_start: int,
-        staged_summary: RetroSpecStagedClusterSummary,
+        resident_summary: RetroSpecClusterSummary,
+        cluster_token_counts_cpu: torch.Tensor,
         cluster_ids: torch.Tensor,
         cluster_page_ids: torch.Tensor,
         cluster_page_token_counts: torch.Tensor,
@@ -621,7 +704,7 @@ class RetroSpecGPUIndexResidencyManager:
         if cluster_start < 0:
             raise ValueError("Resident segment cluster offset must be non-negative")
 
-        summary = staged_summary.resident_summary
+        summary = resident_summary
         device = summary.cluster_keys.device
 
         if summary.cluster_keys.shape != summary.cluster_values.shape:
@@ -647,9 +730,9 @@ class RetroSpecGPUIndexResidencyManager:
             device="cpu", dtype=torch.int32
         ).contiguous()
         cluster_ids_cpu = cluster_ids.to(device="cpu", dtype=torch.int64)
-        cluster_token_counts_cpu = staged_summary.cluster_token_counts.to(
+        cluster_token_counts_cpu = cluster_token_counts_cpu.to(
             device="cpu", dtype=torch.int32
-        )
+        ).contiguous()
         valid_clusters = cluster_ids_cpu >= 0
         positive_clusters = cluster_token_counts_cpu > 0
         valid_pages = cluster_page_ids_cpu >= 0
@@ -1133,6 +1216,42 @@ class RetroSpecGPUIndexResidencyManager:
 
         return stream
 
+    def _acquire_summary_slot(
+        self,
+        device: torch.device,
+    ) -> _PinnedSummarySlot:
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+
+        with self._summary_slot_lock:
+            slots = self._summary_slots.setdefault(device, [])
+            for slot in slots:
+                if not slot.in_use:
+                    slot.in_use = True
+                    return slot
+
+            if len(slots) >= self.max_summary_slots:
+                raise RuntimeError("RetroSpec pinned summary ring is exhausted")
+
+            slot = _PinnedSummarySlot(
+                pinned_memory=self._pinned_memory,
+                in_use=True,
+            )
+            slots.append(slot)
+            return slot
+
+    def _release_summary_slot(
+        self,
+        slot: _PinnedSummarySlot | None,
+    ) -> None:
+        if slot is None:
+            return
+
+        with self._summary_slot_lock:
+            if not slot.in_use:
+                raise RuntimeError("Pinned summary slot was already released")
+            slot.in_use = False
+
     def stage_cluster_summary(
         self,
         cluster_keys: torch.Tensor,
@@ -1155,29 +1274,14 @@ class RetroSpecGPUIndexResidencyManager:
             cluster_token_counts=cluster_token_counts,
         )
 
-        host_keys = torch.empty_like(
-            cluster_keys, device="cpu", pin_memory=self.pin_memory
-        )
-        host_values = torch.empty_like(
-            cluster_values, device="cpu", pin_memory=self.pin_memory
-        )
-        host_counts = torch.empty_like(
-            cluster_token_counts, device="cpu", pin_memory=self.pin_memory
-        )
-
-        if cluster_keys.device.type != "cuda":
-            host_keys.copy_(cluster_keys)
-            host_values.copy_(cluster_values)
-            host_counts.copy_(cluster_token_counts)
-            return RetroSpecStagedClusterSummary(
-                cluster_keys=host_keys,
-                cluster_values=host_values,
-                cluster_token_counts=host_counts,
-                resident_summary=resident_summary,
-                ready_event=None,
+        if cluster_keys.device.type != "cuda" or not self.pin_memory:
+            host_keys = torch.empty_like(cluster_keys, device="cpu", pin_memory=False)
+            host_values = torch.empty_like(
+                cluster_values, device="cpu", pin_memory=False
             )
-
-        if not self.pin_memory:
+            host_counts = torch.empty_like(
+                cluster_token_counts, device="cpu", pin_memory=False
+            )
             host_keys.copy_(cluster_keys, non_blocking=False)
             host_values.copy_(cluster_values, non_blocking=False)
             host_counts.copy_(cluster_token_counts, non_blocking=False)
@@ -1189,17 +1293,28 @@ class RetroSpecGPUIndexResidencyManager:
                 ready_event=None,
             )
 
-        device = cluster_keys.device
-        transfer_stream = self._get_offload_stream(device)
-        current_stream = torch.cuda.current_stream(device)
-        transfer_stream.wait_stream(current_stream)
+        slot = self._acquire_summary_slot(cluster_keys.device)
+        try:
+            host_keys, host_values, host_counts = slot.reserve(
+                cluster_keys,
+                cluster_values,
+                cluster_token_counts,
+            )
+            device = cluster_keys.device
+            transfer_stream = self._get_offload_stream(device)
+            current_stream = torch.cuda.current_stream(device)
+            transfer_stream.wait_stream(current_stream)
 
-        with torch.cuda.stream(transfer_stream):
-            host_keys.copy_(cluster_keys, non_blocking=True)
-            host_values.copy_(cluster_values, non_blocking=True)
-            host_counts.copy_(cluster_token_counts, non_blocking=True)
-            ready_event = torch.cuda.Event()
-            ready_event.record(transfer_stream)
+            with torch.cuda.stream(transfer_stream):
+                host_keys.copy_(cluster_keys, non_blocking=True)
+                host_values.copy_(cluster_values, non_blocking=True)
+                host_counts.copy_(cluster_token_counts, non_blocking=True)
+                ready_event = torch.cuda.Event()
+                ready_event.record(transfer_stream)
+        except BaseException:
+            slot.release_storage()
+            self._release_summary_slot(slot)
+            raise
 
         return RetroSpecStagedClusterSummary(
             cluster_keys=host_keys,
@@ -1207,22 +1322,59 @@ class RetroSpecGPUIndexResidencyManager:
             cluster_token_counts=host_counts,
             resident_summary=resident_summary,
             ready_event=ready_event,
+            staging_slot=slot,
         )
 
-    @staticmethod
     def finish_cluster_summary(
+        self,
         staged: RetroSpecStagedClusterSummary,
     ) -> RetroSpecClusterSummary:
-        if staged.ready_event is not None:
-            staged.ready_event.synchronize()
+        try:
+            if staged.ready_event is not None:
+                staged.ready_event.synchronize()
 
-        return RetroSpecClusterSummary(
-            cluster_keys=staged.cluster_keys,
-            cluster_values=staged.cluster_values,
-            cluster_token_counts=staged.cluster_token_counts,
-        )
+            if staged.staging_slot is None:
+                return RetroSpecClusterSummary(
+                    cluster_keys=staged.cluster_keys,
+                    cluster_values=staged.cluster_values,
+                    cluster_token_counts=staged.cluster_token_counts,
+                )
 
-    @staticmethod
-    def discard_cluster_summary(staged: RetroSpecStagedClusterSummary) -> None:
-        if staged.ready_event is not None:
-            staged.ready_event.synchronize()
+            cluster_keys = torch.empty_like(
+                staged.cluster_keys, device="cpu", pin_memory=False
+            )
+            cluster_values = torch.empty_like(
+                staged.cluster_values, device="cpu", pin_memory=False
+            )
+            cluster_token_counts = torch.empty_like(
+                staged.cluster_token_counts, device="cpu", pin_memory=False
+            )
+            cluster_keys.copy_(staged.cluster_keys)
+            cluster_values.copy_(staged.cluster_values)
+            cluster_token_counts.copy_(staged.cluster_token_counts)
+            return RetroSpecClusterSummary(
+                cluster_keys=cluster_keys,
+                cluster_values=cluster_values,
+                cluster_token_counts=cluster_token_counts,
+            )
+        finally:
+            self._release_summary_slot(staged.staging_slot)
+
+    def discard_cluster_summary(self, staged: RetroSpecStagedClusterSummary) -> None:
+        try:
+            if staged.ready_event is not None:
+                staged.ready_event.synchronize()
+        finally:
+            self._release_summary_slot(staged.staging_slot)
+
+    def close(self) -> None:
+        with self._summary_slot_lock:
+            for slots in self._summary_slots.values():
+                for slot in slots:
+                    if slot.in_use:
+                        raise RuntimeError(
+                            "Cannot close GPU index residency with an active "
+                            "summary transfer"
+                        )
+                    slot.release_storage()
+            self._summary_slots.clear()

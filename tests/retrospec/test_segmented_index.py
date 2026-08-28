@@ -77,6 +77,16 @@ def make_empty_resident_view(
     )
 
 
+def test_index_shares_one_pinned_memory_budget_across_components():
+    index = make_index()
+
+    assert index.cluster_store._pinned_memory is index._pinned_memory
+    assert index._gpu_index_residency._pinned_memory is index._pinned_memory
+
+    index.close()
+    assert index._pinned_memory.allocated_bytes == 0
+
+
 @contextmanager
 def active_residency(
     index: RetroSpecSegmentedTokenIndex,

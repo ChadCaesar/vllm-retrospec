@@ -26,6 +26,7 @@ from .index_residency import (
     RetroSpecStagedClusterSummary,
 )
 from .performance import RetroSpecPerformanceStats
+from .pinned_memory import RetroSpecPinnedMemoryManager
 from .selection_kernels import (
     gather_resident_estimation,
     gather_resident_exact_pages,
@@ -111,6 +112,12 @@ class _RequestLayerSegment:
 
 
 @dataclass(frozen=True)
+class _CompletedRequestLayerSegment:
+    cluster_summary: RetroSpecClusterSummary
+    cluster_blocks: RetroSpecClusterBlockTable
+
+
+@dataclass(frozen=True)
 class _StagedRequestLayerSegment:
     layer_name: str
     request_id: str
@@ -119,8 +126,8 @@ class _StagedRequestLayerSegment:
     indexed_end: int
     cluster_start: int
 
-    cluster_summary: RetroSpecStagedClusterSummary
-    build_future: Future[RetroSpecClusterBlockTable]
+    resident_summary: RetroSpecClusterSummary
+    build_future: Future[_CompletedRequestLayerSegment]
 
 
 @dataclass
@@ -335,6 +342,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         pin_memory: bool = False,
         max_resident_requests: int = 1,
         first_draft_warmup_multiplier: int = 4,
+        cpu_page_initial_slab_bytes: int | None = None,
         cpu_page_slab_bytes: int = 1 << 20,
         max_pinned_memory_bytes: int = 64 << 20,
         max_gpu_index_memory_bytes: int = 4 << 30,
@@ -365,6 +373,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             raise ValueError("first_draft_warmup_multiplier must be positive")
         if cpu_page_slab_bytes <= 0:
             raise ValueError("cpu_page_slab_bytes must be positive")
+        if cpu_page_initial_slab_bytes is None:
+            cpu_page_initial_slab_bytes = min(8 << 20, cpu_page_slab_bytes)
+        if cpu_page_initial_slab_bytes <= 0:
+            raise ValueError("cpu_page_initial_slab_bytes must be positive")
+        if cpu_page_initial_slab_bytes > cpu_page_slab_bytes:
+            raise ValueError(
+                "cpu_page_initial_slab_bytes must not exceed cpu_page_slab_bytes"
+            )
         if max_pinned_memory_bytes <= 0:
             raise ValueError("max_pinned_memory_bytes must be positive")
         if max_gpu_index_memory_bytes <= 0:
@@ -401,20 +417,25 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 1.0,
             )
 
+        self._pinned_memory = RetroSpecPinnedMemoryManager(
+            enabled=pin_memory,
+            max_bytes=max_pinned_memory_bytes,
+        )
         self.cluster_store = RetroSpecClusterPageStore(
             page_size=block_size,
-            pin_memory=pin_memory,
             cache_ratio=effective_cache_ratio,
+            cpu_page_initial_slab_bytes=cpu_page_initial_slab_bytes,
             cpu_page_slab_bytes=cpu_page_slab_bytes,
-            max_pinned_memory_bytes=max_pinned_memory_bytes,
             max_pending_cluster_builds=max_pending_cluster_builds,
             performance_stats=performance_stats,
+            pinned_memory=self._pinned_memory,
         )
 
         self._gpu_index_residency = RetroSpecGPUIndexResidencyManager(
-            pin_memory=pin_memory,
             max_resident_requests=max_resident_requests,
             max_gpu_index_memory_bytes=max_gpu_index_memory_bytes,
+            pinned_memory=self._pinned_memory,
+            max_summary_slots=max_pending_cluster_builds,
         )
 
         # layer_name -> request_id -> token-level index
@@ -448,7 +469,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         # worker. The executor lives for one staged index transaction and is
         # closed by flush_staged_updates() or discard_staged_updates().
         self._cluster_build_executor: ThreadPoolExecutor | None = None
-        self._pending_cluster_builds: deque[Future[RetroSpecClusterBlockTable]] = (
+        self._pending_cluster_builds: deque[Future[_CompletedRequestLayerSegment]] = (
             deque()
         )
 
@@ -786,6 +807,18 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     def has_staged_updates(self) -> bool:
         return bool(self._staged_segments)
 
+    def close(self) -> None:
+        try:
+            if self.has_staged_updates:
+                self.discard_staged_updates()
+        finally:
+            try:
+                self.cluster_store.close()
+            finally:
+                self._gpu_index_residency.close()
+
+        self._pinned_memory.assert_empty()
+
     def _get_cluster_build_executor(self) -> ThreadPoolExecutor:
         if self._cluster_build_executor is None:
             self._cluster_build_executor = ThreadPoolExecutor(
@@ -795,20 +828,49 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         return self._cluster_build_executor
 
+    def _finish_cluster_build(
+        self,
+        layer_name: str,
+        request_id: str,
+        cluster_start: int,
+        staged_summary: RetroSpecStagedClusterSummary,
+        staged_clusters: RetroSpecStagedClusterInput,
+    ) -> _CompletedRequestLayerSegment:
+        try:
+            cluster_summary = self._gpu_index_residency.finish_cluster_summary(
+                staged_summary
+            )
+        except BaseException:
+            self.cluster_store.discard_staged_clusters(staged_clusters)
+            raise
+
+        cluster_blocks = self.cluster_store.store_staged_clusters(
+            layer_name=layer_name,
+            request_id=request_id,
+            cluster_start=cluster_start,
+            staged=staged_clusters,
+        )
+        return _CompletedRequestLayerSegment(
+            cluster_summary=cluster_summary,
+            cluster_blocks=cluster_blocks,
+        )
+
     def _submit_cluster_build(
         self,
         layer_name: str,
         request_id: str,
         cluster_start: int,
+        staged_summary: RetroSpecStagedClusterSummary,
         staged_clusters: RetroSpecStagedClusterInput,
-    ) -> Future[RetroSpecClusterBlockTable]:
+    ) -> Future[_CompletedRequestLayerSegment]:
         executor = self._get_cluster_build_executor()
         build_future = executor.submit(
-            self.cluster_store.store_staged_clusters,
-            layer_name=layer_name,
-            request_id=request_id,
-            cluster_start=cluster_start,
-            staged=staged_clusters,
+            self._finish_cluster_build,
+            layer_name,
+            request_id,
+            cluster_start,
+            staged_summary,
+            staged_clusters,
         )
         self._pending_cluster_builds.append(build_future)
         if self.performance_stats is not None:
@@ -894,6 +956,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 layer_name=layer_name,
                 request_id=request_id,
                 cluster_start=cluster_start,
+                staged_summary=staged_summary,
                 staged_clusters=staged_clusters,
             )
         except BaseException:
@@ -909,7 +972,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 indexed_start=indexed_start,
                 indexed_end=indexed_end,
                 cluster_start=cluster_start,
-                cluster_summary=staged_summary,
+                resident_summary=staged_summary.resident_summary,
                 build_future=build_future,
             )
         )
@@ -1026,7 +1089,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     indexed_start=staged_segment.indexed_start,
                     indexed_end=staged_segment.indexed_end,
                     cluster_start=staged_segment.cluster_start,
-                    staged_summary=staged_segment.cluster_summary,
+                    resident_summary=staged_segment.resident_summary,
+                    cluster_token_counts_cpu=summary.cluster_token_counts,
                     cluster_ids=cluster_blocks.cluster_ids,
                     cluster_page_ids=block_metadata.page_ids,
                     cluster_page_token_counts=block_metadata.page_token_counts,
@@ -1101,34 +1165,20 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         try:
             for staged_segment in staged_segments:
-                summary: RetroSpecClusterSummary | None = None
-                cluster_blocks: RetroSpecClusterBlockTable | None = None
-
                 try:
-                    summary = self._gpu_index_residency.finish_cluster_summary(
-                        staged_segment.cluster_summary
+                    completed = staged_segment.build_future.result()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    continue
+
+                built_segments.append(
+                    (
+                        staged_segment,
+                        completed.cluster_summary,
+                        completed.cluster_blocks,
                     )
-                except BaseException as exc:
-                    if first_error is None:
-                        first_error = exc
-
-                try:
-                    cluster_blocks = staged_segment.build_future.result()
-                except BaseException as exc:
-                    if first_error is None:
-                        first_error = exc
-
-                if summary is not None and cluster_blocks is not None:
-                    built_segments.append((staged_segment, summary, cluster_blocks))
-                elif cluster_blocks is not None:
-                    try:
-                        self.cluster_store.free(
-                            staged_segment.layer_name,
-                            cluster_blocks,
-                        )
-                    except BaseException as exc:
-                        if first_error is None:
-                            first_error = exc
+                )
 
             if first_error is not None:
                 self._release_built_segments(built_segments)
@@ -1157,15 +1207,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         try:
             for staged_segment in staged_segments:
                 try:
-                    self._gpu_index_residency.discard_cluster_summary(
-                        staged_segment.cluster_summary
-                    )
-                except BaseException as exc:
-                    if cleanup_error is None:
-                        cleanup_error = exc
-
-                try:
-                    cluster_blocks = staged_segment.build_future.result()
+                    completed = staged_segment.build_future.result()
                 except BaseException:
                     # A failed store_clusters() call releases allocations made
                     # before it raises. The original prefill error takes priority.
@@ -1174,7 +1216,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 try:
                     self.cluster_store.free(
                         staged_segment.layer_name,
-                        cluster_blocks,
+                        completed.cluster_blocks,
                     )
                 except BaseException as exc:
                     if cleanup_error is None:

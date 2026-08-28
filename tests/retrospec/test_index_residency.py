@@ -37,7 +37,7 @@ def make_resident_segment(
     values = keys + 10
     counts = torch.full((1, num_clusters), 2, dtype=torch.int32)
     staged = manager.stage_cluster_summary(keys, values, counts)
-    manager.finish_cluster_summary(staged)
+    summary = manager.finish_cluster_summary(staged)
     cluster_ids = torch.arange(
         cluster_start, cluster_start + num_clusters, dtype=torch.int64
     ).view(1, num_clusters)
@@ -48,7 +48,8 @@ def make_resident_segment(
         indexed_start=indexed_start,
         indexed_end=indexed_start + 2 * num_clusters,
         cluster_start=cluster_start,
-        staged_summary=staged,
+        resident_summary=staged.resident_summary,
+        cluster_token_counts_cpu=summary.cluster_token_counts,
         cluster_ids=cluster_ids,
         cluster_page_ids=cluster_ids.unsqueeze(-1),
         cluster_page_token_counts=torch.full(
@@ -210,6 +211,7 @@ def test_resident_segment_rejects_inconsistent_cpu_page_descriptors():
         keys,
         torch.tensor([[2]], dtype=torch.int32),
     )
+    summary = manager.finish_cluster_summary(staged)
 
     with pytest.raises(ValueError, match="do not match page descriptors"):
         manager.build_resident_segment(
@@ -218,7 +220,8 @@ def test_resident_segment_rejects_inconsistent_cpu_page_descriptors():
             indexed_start=2,
             indexed_end=4,
             cluster_start=0,
-            staged_summary=staged,
+            resident_summary=staged.resident_summary,
+            cluster_token_counts_cpu=summary.cluster_token_counts,
             cluster_ids=torch.tensor([[0]]),
             cluster_page_ids=torch.tensor([[[0]]]),
             cluster_page_token_counts=torch.tensor([[[1]]], dtype=torch.int32),
@@ -236,13 +239,15 @@ def test_resident_arena_uses_request_slots_and_ragged_page_offsets():
     values = keys + 10
     counts = torch.tensor([[3, 1, 0], [1, 3, 1]], dtype=torch.int32)
     staged = manager.stage_cluster_summary(keys, values, counts)
+    summary = manager.finish_cluster_summary(staged)
     segment = manager.build_resident_segment(
         layer_name="layer",
         request_id="request",
         indexed_start=2,
         indexed_end=8,
         cluster_start=0,
-        staged_summary=staged,
+        resident_summary=staged.resident_summary,
+        cluster_token_counts_cpu=summary.cluster_token_counts,
         cluster_ids=torch.tensor([[10, 11, -1], [12, 13, 14]]),
         cluster_page_ids=torch.tensor(
             [
@@ -458,17 +463,25 @@ def test_cluster_summary_offloads_asynchronously_to_pinned_cpu_storage():
 
     staged = manager.stage_cluster_summary(keys, values, counts)
     assert staged.ready_event is not None
+    assert staged.cluster_keys.is_pinned()
+    assert staged.cluster_values.is_pinned()
+    assert staged.cluster_token_counts.is_pinned()
     assert staged.resident_summary.cluster_keys is keys
     assert staged.resident_summary.cluster_values is values
     assert staged.resident_summary.cluster_token_counts is counts
 
     summary = manager.finish_cluster_summary(staged)
 
-    assert summary.cluster_keys.is_pinned()
-    assert summary.cluster_values.is_pinned()
-    assert summary.cluster_token_counts.is_pinned()
+    assert not summary.cluster_keys.is_pinned()
+    assert not summary.cluster_values.is_pinned()
+    assert not summary.cluster_token_counts.is_pinned()
     assert summary.cluster_keys.flatten().tolist() == pytest.approx(list(range(8)))
     assert summary.cluster_values.flatten().tolist() == pytest.approx(
         list(range(10, 18))
     )
     assert summary.cluster_token_counts.tolist() == [[3, 4]]
+    assert staged.staging_slot is not None
+    assert not staged.staging_slot.in_use
+    assert manager._pinned_memory.allocated_bytes > 0
+    manager.close()
+    assert manager._pinned_memory.allocated_bytes == 0

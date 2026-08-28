@@ -184,12 +184,15 @@ class SpeculativeConfig:
     retrospec_max_pending_cluster_builds: int = Field(default=2, gt=0)
     """Maximum number of in-flight CPU cluster-page builds, including the active
     build. Prefill waits before staging more token KV when this limit is reached."""
+    retrospec_cpu_page_initial_slab_size_mib: int = Field(default=8, gt=0)
+    """Initial pageable CPU cluster-page slab size in MiB for each layer.
+    Later slabs grow geometrically up to retrospec_cpu_page_slab_size_mib."""
     retrospec_cpu_page_slab_size_mib: int = Field(default=256, gt=0)
-    """Size in MiB of each pageable CPU cluster-page slab. New slabs are
-    appended without reallocating or copying previously stored cluster KV."""
+    """Maximum pageable CPU cluster-page slab size in MiB. Slabs grow
+    geometrically without migrating previously stored cluster KV."""
     retrospec_max_pinned_memory: float = Field(default=1.0, gt=0)
-    """Maximum pinned-memory budget in GiB for RetroSpec D2H/H2D KV staging.
-    Long-lived CPU cluster KV is stored in pageable slabs."""
+    """Maximum total pinned-memory budget in GiB shared by all RetroSpec
+    D2H/H2D staging rings. Long-lived CPU data is stored in pageable memory."""
     retrospec_max_gpu_index_memory: float = Field(default=4.0, gt=0)
     """Maximum GPU-memory budget in GiB for persistent RetroSpec cluster
     summaries and page descriptors. The budget is shared by all attention
@@ -795,6 +798,15 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
+        if (
+            self.retrospec_cpu_page_initial_slab_size_mib
+            > self.retrospec_cpu_page_slab_size_mib
+        ):
+            raise ValueError(
+                "retrospec_cpu_page_initial_slab_size_mib must not exceed "
+                "retrospec_cpu_page_slab_size_mib"
+            )
+
         if self.tensor_parallel_size is not None:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "
