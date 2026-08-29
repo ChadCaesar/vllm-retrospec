@@ -21,6 +21,7 @@ from .pinned_memory import RetroSpecPinnedMemoryManager
 from .resident_cache import (
     RetroSpecResidentClusterCache,
     RetroSpecResidentPageAccess,
+    RetroSpecResidentReadLease,
 )
 
 RetroSpecClusterResolveMode = Literal[
@@ -148,17 +149,16 @@ class _PinnedStagingSlot:
 
 @dataclass
 class _PinnedSelectionSlot:
-    """Reusable pinned cluster-ID buffer for one asynchronous prefetch."""
+    """Reusable pinned ring slot for one asynchronous resident access batch."""
 
     pinned_memory: RetroSpecPinnedMemoryManager
     cluster_id_storage: torch.Tensor | None = None
+    access_kind_storage: torch.Tensor | None = None
     in_use: bool = False
 
-    def reserve(self, source: torch.Tensor) -> torch.Tensor:
-        if not self.in_use:
-            raise RuntimeError("Pinned selection slot must be acquired before use")
-
-        required_numel = source.numel()
+    def reserve_capacity(self, required_numel: int) -> None:
+        if required_numel <= 0:
+            return
         if (
             self.cluster_id_storage is None
             or self.cluster_id_storage.numel() < required_numel
@@ -169,22 +169,49 @@ class _PinnedSelectionSlot:
                 torch.int64,
                 "resident-prefetch-cluster-ids",
             )
+            self.access_kind_storage = self.pinned_memory.replace(
+                self.access_kind_storage,
+                (required_numel,),
+                torch.uint8,
+                "resident-prefetch-access-kinds",
+            )
 
-        return self.cluster_id_storage[:required_numel].view(source.shape)
+    def reserve(
+        self,
+        cluster_ids: torch.Tensor,
+        access_kinds: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.in_use:
+            raise RuntimeError("Pinned selection slot must be acquired before use")
+        if access_kinds.shape != cluster_ids.shape:
+            raise ValueError("Resident access kinds must match cluster IDs")
+
+        required_numel = cluster_ids.numel()
+        self.reserve_capacity(required_numel)
+
+        if self.access_kind_storage is None:
+            raise RuntimeError("Resident access-kind storage is unavailable")
+        return (
+            self.cluster_id_storage[:required_numel].view(cluster_ids.shape),
+            self.access_kind_storage[:required_numel].view(access_kinds.shape),
+        )
 
     def release_storage(self) -> None:
         self.pinned_memory.release(self.cluster_id_storage)
+        self.pinned_memory.release(self.access_kind_storage)
         self.cluster_id_storage = None
+        self.access_kind_storage = None
 
 
 @dataclass(frozen=True)
 class _StagedResidentPrefetch:
-    """Cluster IDs staged for background descriptor parsing and admission."""
+    """GPU-produced resident access records staged for background handling."""
 
     layer_name: str
     cluster_ids_cpu: torch.Tensor
+    access_kinds_cpu: torch.Tensor
     metadata_ready_event: torch.cuda.Event
-    reuse_ready_event: torch.cuda.Event
+    execution_stream: torch.cuda.Stream
     slot: _PinnedSelectionSlot = field(repr=False, compare=False)
 
 
@@ -317,6 +344,8 @@ class RetroSpecResolvedClusterPages:
     hit_gate_ready_mask: torch.Tensor
     resident_ready_event: torch.cuda.Event | None
     staging_ready_event: torch.cuda.Event | None = None
+    access_kinds: torch.Tensor | None = None
+    read_lease: RetroSpecResidentReadLease | None = None
 
 
 @dataclass(frozen=True)
@@ -1062,6 +1091,7 @@ class RetroSpecClusterPageStore:
         self._resident_prefetch_slots: dict[
             torch.device, list[_PinnedSelectionSlot]
         ] = {}
+        self._resident_access_ring_capacity = 0
         self._resident_prefetch_futures: dict[str, deque[Future[None]]] = {}
         self._resident_prefetch_lock = Lock()
         self._resident_prefetch_executor = ThreadPoolExecutor(
@@ -2488,7 +2518,8 @@ class RetroSpecClusterPageStore:
 
             resident_cache = self._resident_caches.get(layer_name)
             if resident_cache is not None:
-                resident_cache.invalidate(block_table.cluster_ids)
+                with resident_cache.mutation_guard():
+                    resident_cache.invalidate(block_table.cluster_ids)
 
             pool.free(block_metadata.page_ids)
             self._free_cluster_ids(layer_name, block_table.cluster_ids)
@@ -2814,6 +2845,32 @@ class RetroSpecClusterPageStore:
             self._resident_prefetch_streams[device] = stream
         return stream
 
+    def reserve_resident_access_ring(
+        self,
+        device: torch.device,
+        capacity: int,
+    ) -> None:
+        """Reserve fixed pinned access slots outside the draft hot path."""
+        if not self.pin_memory or capacity <= 0:
+            return
+        device = self._canonical_cuda_device(device)
+
+        with self._resident_prefetch_lock:
+            self._resident_access_ring_capacity = max(
+                self._resident_access_ring_capacity,
+                capacity,
+            )
+            slots = self._resident_prefetch_slots.setdefault(
+                device,
+                [
+                    _PinnedSelectionSlot(pinned_memory=self._pinned_memory)
+                    for _ in range(self._RESIDENT_PREFETCH_RING_SIZE)
+                ],
+            )
+            for slot in slots:
+                if not slot.in_use:
+                    slot.reserve_capacity(self._resident_access_ring_capacity)
+
     def _acquire_resident_prefetch_slot(
         self,
         device: torch.device,
@@ -2830,6 +2887,7 @@ class RetroSpecClusterPageStore:
             )
             for slot in slots:
                 if not slot.in_use:
+                    slot.reserve_capacity(self._resident_access_ring_capacity)
                     slot.in_use = True
                     return slot
 
@@ -2843,6 +2901,7 @@ class RetroSpecClusterPageStore:
             if not slot.in_use:
                 raise RuntimeError("Resident prefetch slot was already released")
             slot.in_use = False
+            slot.reserve_capacity(self._resident_access_ring_capacity)
 
     @torch.inference_mode()
     def _finish_resident_prefetch(
@@ -2852,64 +2911,87 @@ class RetroSpecClusterPageStore:
         try:
             staged.metadata_ready_event.synchronize()
 
+            hit_cluster_ids = staged.cluster_ids_cpu.masked_fill(
+                staged.access_kinds_cpu != 1, -1
+            )
+            miss_cluster_ids = staged.cluster_ids_cpu.masked_fill(
+                staged.access_kinds_cpu != 2, -1
+            )
+
             if self.performance_stats is not None:
-                num_clusters = int((staged.cluster_ids_cpu >= 0).sum().item())
                 self.performance_stats.add_counter(
                     "prefetch_candidate_clusters",
-                    num_clusters,
+                    int((staged.access_kinds_cpu > 0).sum().item()),
+                )
+                self.performance_stats.add_counter(
+                    "resident_cluster_hits",
+                    int((staged.access_kinds_cpu == 1).sum().item()),
+                )
+                self.performance_stats.add_counter(
+                    "resident_cluster_misses",
+                    int((staged.access_kinds_cpu == 2).sum().item()),
                 )
 
             with self._resident_state_lock:
-                metadata = self._materialize_cluster_block_metadata_cpu(
-                    staged.layer_name,
-                    staged.cluster_ids_cpu,
-                )
                 pool, resident_cache = self._get_or_create_resident_cache(
                     staged.layer_name
                 )
+                resident_cache.touch_cpu(hit_cluster_ids)
+
+                if not torch.any(miss_cluster_ids >= 0).item():
+                    return
+
+                metadata = self._materialize_cluster_block_metadata_cpu(
+                    staged.layer_name,
+                    miss_cluster_ids,
+                )
                 selected_cluster_ids, selected_page_ids = (
                     self._select_resident_staging_prefix(
-                        pool, staged.cluster_ids_cpu, metadata.page_ids
+                        pool, miss_cluster_ids, metadata.page_ids
                     )
                 )
                 cluster_groups = self._get_cluster_groups(
                     staged.layer_name,
                     selected_cluster_ids,
                 )
-                (
-                    source_page_ids,
-                    source_key_pages,
-                    source_value_pages,
-                    transfer_buffer,
-                    transfer_slot,
-                ) = self._stage_resident_pages(pool, selected_page_ids)
 
-                with torch.cuda.device(pool.metadata_device):
-                    try:
-                        access = resident_cache.admit_staged(
-                            cluster_ids=selected_cluster_ids,
-                            page_ids=selected_page_ids,
-                            cluster_groups=cluster_groups,
-                            allocated_cluster_ids=self._get_allocated_cluster_ids(
-                                staged.layer_name
-                            ),
-                            allocated_page_ids=pool.allocated_page_ids,
-                            staging_page_ids=source_page_ids,
-                            staging_key_pages=source_key_pages,
-                            staging_value_pages=source_value_pages,
-                            cluster_ids_cpu=selected_cluster_ids,
-                            page_ids_cpu=selected_page_ids,
-                            reuse_ready_event=staged.reuse_ready_event,
-                        )
-                    except BaseException:
-                        resident_cache.synchronize_pending_copies()
-                        if transfer_slot is not None:
-                            transfer_buffer.release_cpu_slot(transfer_slot, None)
-                        raise
+            (
+                source_page_ids,
+                source_key_pages,
+                source_value_pages,
+                transfer_buffer,
+                transfer_slot,
+            ) = self._stage_resident_pages(pool, selected_page_ids)
+
+            with (
+                self._resident_state_lock,
+                resident_cache.mutation_guard(),
+                torch.cuda.device(pool.metadata_device),
+            ):
+                try:
+                    access = resident_cache.admit_staged(
+                        cluster_ids=selected_cluster_ids,
+                        page_ids=selected_page_ids,
+                        cluster_groups=cluster_groups,
+                        allocated_cluster_ids=self._get_allocated_cluster_ids(
+                            staged.layer_name
+                        ),
+                        allocated_page_ids=pool.allocated_page_ids,
+                        staging_page_ids=source_page_ids,
+                        staging_key_pages=source_key_pages,
+                        staging_value_pages=source_value_pages,
+                        cluster_ids_cpu=selected_cluster_ids,
+                        page_ids_cpu=selected_page_ids,
+                        mutation_stream=staged.execution_stream,
+                        lookup_after_admit=False,
+                    )
+                except BaseException:
+                    resident_cache.synchronize_pending_copies()
                     if transfer_slot is not None:
-                        transfer_buffer.release_cpu_slot(
-                            transfer_slot, access.ready_event
-                        )
+                        transfer_buffer.release_cpu_slot(transfer_slot, None)
+                    raise
+            if transfer_slot is not None:
+                transfer_buffer.release_cpu_slot(transfer_slot, access.ready_event)
         finally:
             self._release_resident_prefetch_slot(staged.slot)
 
@@ -2948,8 +3030,9 @@ class RetroSpecClusterPageStore:
         self,
         layer_name: str,
         cluster_ids: torch.Tensor,
+        access_kinds: torch.Tensor,
     ) -> bool:
-        """Queue descriptor parsing and resident admission without host waits."""
+        """Queue GPU-produced access records without synchronizing the caller."""
         if self._closed:
             raise RuntimeError("RetroSpec cluster page store is closed")
         self._reap_resident_prefetches((layer_name,), wait=False)
@@ -2960,6 +3043,12 @@ class RetroSpecClusterPageStore:
             raise ValueError("Asynchronous resident prefetch requires CUDA cluster IDs")
         if cluster_ids.dtype not in (torch.int32, torch.int64):
             raise ValueError("Cluster IDs must use an integral dtype")
+        if access_kinds.shape != cluster_ids.shape:
+            raise ValueError("Resident access kinds must match cluster IDs")
+        if access_kinds.dtype != torch.uint8:
+            raise ValueError("Resident access kinds must use uint8")
+        if access_kinds.device != cluster_ids.device:
+            raise ValueError("Resident access records must use one device")
 
         slot = self._acquire_resident_prefetch_slot(cluster_ids.device)
         if slot is None:
@@ -2971,23 +3060,24 @@ class RetroSpecClusterPageStore:
         current_stream = torch.cuda.current_stream(cluster_ids.device)
 
         try:
-            cluster_ids_cpu = slot.reserve(cluster_ids)
+            cluster_ids_cpu, access_kinds_cpu = slot.reserve(cluster_ids, access_kinds)
             stream.wait_stream(current_stream)
 
             with torch.cuda.stream(stream):
                 cluster_ids_cpu.copy_(cluster_ids, non_blocking=True)
+                access_kinds_cpu.copy_(access_kinds, non_blocking=True)
                 metadata_ready_event = torch.cuda.Event()
                 metadata_ready_event.record(stream)
 
-            reuse_ready_event = torch.cuda.Event()
-            reuse_ready_event.record(current_stream)
             cluster_ids.record_stream(stream)
+            access_kinds.record_stream(stream)
 
             staged = _StagedResidentPrefetch(
                 layer_name=layer_name,
                 cluster_ids_cpu=cluster_ids_cpu,
+                access_kinds_cpu=access_kinds_cpu,
                 metadata_ready_event=metadata_ready_event,
-                reuse_ready_event=reuse_ready_event,
+                execution_stream=current_stream,
                 slot=slot,
             )
             future = self._resident_prefetch_executor.submit(
@@ -3065,6 +3155,55 @@ class RetroSpecClusterPageStore:
                 slot.release_storage()
         self._resident_prefetch_slots.clear()
 
+    def resolve_draft_cluster_blocks(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+        logical_page_ids: torch.Tensor,
+        active_mask: torch.Tensor,
+        cache_page_ids: torch.Tensor,
+        hit_cluster_mask: torch.Tensor,
+        miss_cluster_mask: torch.Tensor,
+        hit_gate_ready_mask: torch.Tensor,
+        access_kinds: torch.Tensor,
+    ) -> RetroSpecResolvedClusterPages:
+        """Resolve draft cluster handles entirely on the model device."""
+        if cluster_ids.device.type != "cuda":
+            raise ValueError("Draft resident lookup requires CUDA")
+        if logical_page_ids.shape[:-1] != cluster_ids.shape:
+            raise ValueError("Logical pages do not match cluster IDs")
+        if active_mask.shape != (cluster_ids.shape[0],):
+            raise ValueError("active_mask does not match the draft batch")
+
+        with self._resident_state_lock:
+            _, resident_cache = self._get_or_create_resident_cache(layer_name)
+
+        access = resident_cache.lookup_gpu(
+            cluster_ids=cluster_ids,
+            page_ids=logical_page_ids,
+            active_mask=active_mask,
+            cache_page_ids=cache_page_ids,
+            hit_cluster_mask=hit_cluster_mask,
+            miss_cluster_mask=miss_cluster_mask,
+            hit_gate_ready_mask=hit_gate_ready_mask,
+            access_kinds=access_kinds,
+        )
+        return RetroSpecResolvedClusterPages(
+            resident_page_ids=access.cache_page_ids,
+            staging_page_ids=torch.full_like(logical_page_ids, -1),
+            resident_key_pages=resident_cache.key_pages,
+            resident_value_pages=resident_cache.value_pages,
+            staging_key_pages=resident_cache.key_pages[:0],
+            staging_value_pages=resident_cache.value_pages[:0],
+            hit_cluster_mask=access.hit_cluster_mask,
+            miss_cluster_mask=access.miss_cluster_mask,
+            hit_gate_ready_mask=access.hit_gate_ready_mask,
+            resident_ready_event=None,
+            staging_ready_event=None,
+            access_kinds=access.access_kinds,
+            read_lease=access.read_lease,
+        )
+
     def resolve_cluster_blocks(
         self,
         layer_name: str,
@@ -3137,7 +3276,7 @@ class RetroSpecClusterPageStore:
             page_ids_cpu=logical_page_ids_cpu,
         )
 
-        if self.performance_stats is not None:
+        if self.performance_stats is not None and not verification:
             valid_clusters_cpu = cluster_ids_cpu >= 0
             miss_clusters_cpu = (
                 valid_clusters_cpu & resident_access.miss_cluster_mask_cpu
@@ -3291,21 +3430,24 @@ class RetroSpecClusterPageStore:
             ) = self._stage_resident_pages(pool, selected_page_ids)
 
             try:
-                access = resident_cache.admit_staged(
-                    cluster_ids=selected_cluster_ids,
-                    page_ids=selected_page_ids,
-                    cluster_groups=self._get_cluster_groups(
-                        layer_name,
-                        selected_cluster_ids,
-                    ),
-                    allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
-                    allocated_page_ids=pool.allocated_page_ids,
-                    staging_page_ids=source_page_ids,
-                    staging_key_pages=source_key_pages,
-                    staging_value_pages=source_value_pages,
-                    cluster_ids_cpu=selected_cluster_ids,
-                    page_ids_cpu=selected_page_ids,
-                )
+                with resident_cache.mutation_guard():
+                    access = resident_cache.admit_staged(
+                        cluster_ids=selected_cluster_ids,
+                        page_ids=selected_page_ids,
+                        cluster_groups=self._get_cluster_groups(
+                            layer_name,
+                            selected_cluster_ids,
+                        ),
+                        allocated_cluster_ids=self._get_allocated_cluster_ids(
+                            layer_name
+                        ),
+                        allocated_page_ids=pool.allocated_page_ids,
+                        staging_page_ids=source_page_ids,
+                        staging_key_pages=source_key_pages,
+                        staging_value_pages=source_value_pages,
+                        cluster_ids_cpu=selected_cluster_ids,
+                        page_ids_cpu=selected_page_ids,
+                    )
             except BaseException:
                 resident_cache.synchronize_pending_copies()
                 if transfer_slot is not None:
@@ -3341,21 +3483,22 @@ class RetroSpecClusterPageStore:
             )
             pool, resident_cache = self._get_or_create_resident_cache(layer_name)
 
-            return resident_cache.admit_staged(
-                cluster_ids=cluster_ids,
-                page_ids=logical_page_ids,
-                cluster_groups=self._get_cluster_groups(
-                    layer_name,
-                    cluster_ids_cpu,
-                ),
-                allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
-                allocated_page_ids=pool.allocated_page_ids,
-                staging_page_ids=staging_page_ids,
-                staging_key_pages=staging_key_pages,
-                staging_value_pages=staging_value_pages,
-                cluster_ids_cpu=cluster_ids_cpu,
-                page_ids_cpu=page_ids_cpu,
-            )
+            with resident_cache.mutation_guard():
+                return resident_cache.admit_staged(
+                    cluster_ids=cluster_ids,
+                    page_ids=logical_page_ids,
+                    cluster_groups=self._get_cluster_groups(
+                        layer_name,
+                        cluster_ids_cpu,
+                    ),
+                    allocated_cluster_ids=self._get_allocated_cluster_ids(layer_name),
+                    allocated_page_ids=pool.allocated_page_ids,
+                    staging_page_ids=staging_page_ids,
+                    staging_key_pages=staging_key_pages,
+                    staging_value_pages=staging_value_pages,
+                    cluster_ids_cpu=cluster_ids_cpu,
+                    page_ids_cpu=page_ids_cpu,
+                )
 
     def get_resident_page_storage(
         self,

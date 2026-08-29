@@ -1021,8 +1021,10 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
         store.resolve_cluster_blocks(
             "layer", cluster_ids, metadata.page_ids, mode="resident_only"
         )
+    stats._cpu_counters.clear()
 
-    assert store.prefetch_resident_clusters("layer", cluster_ids)
+    access_kinds = torch.full_like(cluster_ids, 2, dtype=torch.uint8)
+    assert store.prefetch_resident_clusters("layer", cluster_ids, access_kinds)
     store.wait_for_resident_prefetches(("layer",))
     assert stats._cpu_counters["prefetch_submitted"] == 1
     assert stats._cpu_counters["prefetch_candidate_clusters"] == 4
@@ -2037,7 +2039,39 @@ def test_cluster_store_close_is_idempotent_and_rejects_new_prefetches():
     store.close()
 
     with pytest.raises(RuntimeError, match="closed"):
-        store.prefetch_resident_clusters("layer", torch.tensor([0]))
+        store.prefetch_resident_clusters(
+            "layer",
+            torch.tensor([0]),
+            torch.tensor([2], dtype=torch.uint8),
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA pinned memory is required for the resident access ring",
+)
+def test_resident_access_ring_grows_outside_an_in_use_slot():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(page_size=2, pin_memory=True)
+    store.reserve_resident_access_ring(device, 5)
+
+    slot = store._acquire_resident_prefetch_slot(device)
+    assert slot is not None
+    assert slot.cluster_id_storage is not None
+    assert slot.cluster_id_storage.numel() >= 5
+
+    store.reserve_resident_access_ring(device, 17)
+    free_slot = next(
+        candidate
+        for candidate in store._resident_prefetch_slots[device]
+        if candidate is not slot
+    )
+    assert free_slot.cluster_id_storage is not None
+    assert free_slot.cluster_id_storage.numel() >= 17
+
+    store._release_resident_prefetch_slot(slot)
+    assert slot.cluster_id_storage.numel() >= 17
+    store.close()
 
 
 def test_cluster_store_rejects_released_cluster_id_after_page_reuse():

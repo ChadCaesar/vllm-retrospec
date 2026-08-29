@@ -1079,3 +1079,58 @@ def test_resident_cache_rejects_cluster_id_descriptor_conflicts():
             allocated_cluster_ids={3},
             allocated_page_ids={0},
         )
+
+
+def test_gpu_handle_table_tracks_resident_admission_and_invalidation():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=2, group_targets={group: 2})
+    backing_keys, backing_values = make_backing_pages()
+    cluster_ids = torch.tensor([[[7]]], dtype=torch.int64, device="cuda")
+    logical_page_ids = torch.tensor([[[[0, 1]]]], dtype=torch.int64, device="cuda")
+    active_mask = torch.tensor([True], device="cuda")
+
+    def lookup_gpu():
+        access = cache.lookup_gpu(
+            cluster_ids=cluster_ids,
+            page_ids=logical_page_ids,
+            active_mask=active_mask,
+            cache_page_ids=torch.empty_like(logical_page_ids),
+            hit_cluster_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+            miss_cluster_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+            hit_gate_ready_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+            access_kinds=torch.empty_like(cluster_ids, dtype=torch.uint8),
+        )
+        assert access.read_lease is not None
+        access.read_lease.release()
+        return access
+
+    cold = lookup_gpu()
+    assert cold.miss_cluster_mask.item()
+    assert cold.access_kinds is not None
+    assert cold.access_kinds.item() == 2
+
+    with cache.mutation_guard():
+        RetroSpecResidentClusterCache.admit(
+            cache,
+            cluster_ids=cluster_ids.cpu().reshape(1),
+            page_ids=logical_page_ids.cpu().reshape(1, 2),
+            cluster_groups={7: group},
+            allocated_cluster_ids={7},
+            allocated_page_ids={0, 1},
+            backing_key_pages=backing_keys,
+            backing_value_pages=backing_values,
+        )
+    cache.synchronize_pending_copies()
+
+    resident = lookup_gpu()
+    assert resident.cache_page_ids.cpu().tolist() == [[[[0, 1]]]]
+    assert resident.hit_cluster_mask.item()
+    assert resident.hit_gate_ready_mask.item()
+    assert resident.access_kinds is not None
+    assert resident.access_kinds.item() == 1
+
+    with cache.mutation_guard():
+        cache.invalidate(torch.tensor([7]))
+    invalidated = lookup_gpu()
+    assert invalidated.miss_cluster_mask.item()
+    assert invalidated.cache_page_ids.cpu().tolist() == [[[[-1, -1]]]]

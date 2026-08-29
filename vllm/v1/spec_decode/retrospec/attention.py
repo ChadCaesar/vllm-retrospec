@@ -1186,7 +1186,11 @@ class RetroSpecSparseAttention:
             value_cache=value_cache,
             block_table=attn_metadata.block_table,
         )
-        exact_output = self.exact_attention_workspace.run(source, query, impl.scale)
+        try:
+            exact_output = self.exact_attention_workspace.run(source, query, impl.scale)
+        finally:
+            if resolved_pages is not None and resolved_pages.read_lease is not None:
+                resolved_pages.read_lease.release()
 
         if (
             self.mode
@@ -1358,7 +1362,7 @@ class RetroSpecSparseAttention:
 
         if self.mode == RetroSpecAttentionMode.DRAFT:
             self.index.prefetch_sparse_verification(
-                plan=selection.plan,
+                selection=selection,
                 active_mask=self.active_mask,
             )
 

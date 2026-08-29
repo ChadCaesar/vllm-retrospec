@@ -27,6 +27,7 @@ from .index_residency import (
 )
 from .performance import RetroSpecPerformanceStats
 from .pinned_memory import RetroSpecPinnedMemoryManager
+from .resident_cache import RetroSpecResidentReadLease
 from .selection_kernels import (
     gather_resident_estimation,
     gather_resident_exact_pages,
@@ -72,6 +73,8 @@ class RetroSpecTokenAttentionSelection:
     attention_mass: torch.Tensor
     plan: RetroSpecTokenSelectionPlan
     resolved_pages: RetroSpecResolvedClusterPages | None
+    prefetch_cluster_ids: torch.Tensor | None = None
+    prefetch_access_kinds: torch.Tensor | None = None
 
     @property
     def hit_attn(self) -> torch.Tensor:
@@ -190,6 +193,11 @@ class _SelectionOutputWorkspace:
     expanded_exact_page_ids: torch.Tensor
     expanded_exact_page_token_counts: torch.Tensor
     draft_exact_page_token_counts: torch.Tensor
+    draft_resident_page_ids: torch.Tensor
+    draft_resident_hit_mask: torch.Tensor
+    draft_resident_miss_mask: torch.Tensor
+    draft_resident_hit_gate_ready_mask: torch.Tensor
+    draft_resident_access_kinds: torch.Tensor
 
     draft_estimation_keys: torch.Tensor
     draft_estimation_values: torch.Tensor
@@ -261,6 +269,21 @@ class _SelectionOutputWorkspace:
             ),
             draft_exact_page_token_counts=torch.empty(
                 sparse_page_shape, dtype=torch.int32, device=device
+            ),
+            draft_resident_page_ids=torch.empty(
+                sparse_page_shape, dtype=torch.int64, device=device
+            ),
+            draft_resident_hit_mask=torch.empty(
+                sparse_cluster_shape, dtype=torch.bool, device=device
+            ),
+            draft_resident_miss_mask=torch.empty(
+                sparse_cluster_shape, dtype=torch.bool, device=device
+            ),
+            draft_resident_hit_gate_ready_mask=torch.empty(
+                sparse_cluster_shape, dtype=torch.bool, device=device
+            ),
+            draft_resident_access_kinds=torch.empty(
+                sparse_cluster_shape, dtype=torch.uint8, device=device
             ),
             draft_estimation_keys=torch.empty(
                 draft_estimation_shape, dtype=dtype, device=device
@@ -443,6 +466,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         self._proposal_active = False
         self._proposal_request_ids: tuple[str, ...] = ()
+        self._proposal_read_leases: list[RetroSpecResidentReadLease] = []
 
         # request_id -> layers that still need one query-guided resident
         # admission after the first real draft ranking.
@@ -752,6 +776,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         request_ids = tuple(request_ids)
         self._gpu_index_residency.activate(request_ids)
         self._selection_output_workspace_cursors.clear()
+        self._proposal_read_leases.clear()
         self._proposal_active = True
         self._proposal_request_ids = request_ids
 
@@ -762,6 +787,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         try:
             self._gpu_index_residency.deactivate()
         finally:
+            for lease in self._proposal_read_leases:
+                lease.release()
+            self._proposal_read_leases.clear()
             self._proposal_active = False
             self._proposal_request_ids = ()
 
@@ -2269,6 +2297,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         sparse_retrieval_width, sparse_estimation_width, expanded_retrieval_width = (
             self._maximum_zone_widths(view.max_num_clusters)
         )
+        max_access_width = max(
+            sparse_retrieval_width,
+            self._maximum_first_draft_warmup_width(view.max_num_clusters),
+        )
+        self.cluster_store.reserve_resident_access_ring(
+            device,
+            batch_size * num_kv_heads * max_access_width,
+        )
         next_cursor = self._selection_output_workspace_cursors.get(layer_name, 0)
         # A proposal may contain several sparse-verification rounds. Only the
         # current round's plans remain live, so recycle the fixed speculative
@@ -2709,7 +2745,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         head_size: int,
         dtype: torch.dtype,
         active_mask: torch.Tensor,
-        include_pending_resident: bool,
+        prefetch_cluster_ids: torch.Tensor | None = None,
+        prefetch_access_kinds: torch.Tensor | None = None,
     ) -> RetroSpecTokenAttentionSelection:
         """Use resident retrieval clusters and estimate selected cache misses."""
         if (
@@ -2723,15 +2760,19 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         if output_workspace is None:
             raise RuntimeError("CUDA draft selection requires an output workspace")
 
-        resolve_mode = (
-            "resident_pending" if include_pending_resident else "resident_only"
-        )
-        resolved_pages = self.cluster_store.resolve_cluster_blocks(
+        resolved_pages = self.cluster_store.resolve_draft_cluster_blocks(
             layer_name=plan.layer_name,
             cluster_ids=plan.sparse_exact_cluster_ids,
             logical_page_ids=plan.sparse_exact_page_ids,
-            mode=resolve_mode,
+            active_mask=active_mask,
+            cache_page_ids=output_workspace.draft_resident_page_ids,
+            hit_cluster_mask=output_workspace.draft_resident_hit_mask,
+            miss_cluster_mask=output_workspace.draft_resident_miss_mask,
+            hit_gate_ready_mask=(output_workspace.draft_resident_hit_gate_ready_mask),
+            access_kinds=output_workspace.draft_resident_access_kinds,
         )
+        if resolved_pages.read_lease is not None:
+            self._proposal_read_leases.append(resolved_pages.read_lease)
 
         hit_cluster_mask = (
             cluster_zones.sparse_retrieval_mask & resolved_pages.hit_cluster_mask
@@ -2811,34 +2852,47 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             attention_mass=hit_attn,
             plan=plan,
             resolved_pages=resolved_pages,
+            prefetch_cluster_ids=(
+                plan.sparse_exact_cluster_ids
+                if prefetch_cluster_ids is None
+                else prefetch_cluster_ids
+            ),
+            prefetch_access_kinds=(
+                resolved_pages.access_kinds
+                if prefetch_access_kinds is None
+                else prefetch_access_kinds
+            ),
         )
 
     def prefetch_sparse_verification(
         self,
-        plan: RetroSpecTokenSelectionPlan,
+        selection: RetroSpecTokenAttentionSelection,
         active_mask: torch.Tensor,
     ) -> None:
-        """Asynchronously admit a draft plan's sparse pages into the GPU cache."""
+        """Submit GPU-produced resident accesses to the background ring."""
         if not self.cluster_store.pin_memory:
             return
 
-        cluster_ids = plan.sparse_exact_cluster_ids
+        cluster_ids = selection.prefetch_cluster_ids
+        access_kinds = selection.prefetch_access_kinds
+        if cluster_ids is None or access_kinds is None:
+            return
 
         if active_mask.ndim != 1 or active_mask.dtype != torch.bool:
             raise ValueError("active_mask must be a one-dimensional boolean tensor")
         if active_mask.shape != (cluster_ids.shape[0],):
             raise ValueError("active_mask does not match the selection batch size")
         if active_mask.device != cluster_ids.device:
-            raise ValueError("active_mask and selection plan must use one device")
-        if cluster_ids.numel() == 0 or plan.sparse_exact_page_ids.numel() == 0:
+            raise ValueError("active_mask and selection must use one device")
+        if cluster_ids.numel() == 0:
             return
 
-        active_cluster_mask = active_mask[:, None, None]
-        prefetch_cluster_ids = cluster_ids.masked_fill(~active_cluster_mask, -1)
+        access_kinds.masked_fill_(~active_mask[:, None, None], 0)
 
         self.cluster_store.prefetch_resident_clusters(
-            layer_name=plan.layer_name,
-            cluster_ids=prefetch_cluster_ids,
+            layer_name=selection.plan.layer_name,
+            cluster_ids=cluster_ids,
+            access_kinds=access_kinds,
         )
 
     def _materialize_token_selection(
@@ -3438,7 +3492,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             dtype=key_cache.dtype,
         )
 
-        include_pending_resident = False
+        prefetch_cluster_ids = None
+        prefetch_access_kinds = None
         if first_draft_warmup_mask is not None:
             warmup_cluster_ids, warmup_page_ids, _ = (
                 self._build_resident_exact_cluster_selection(
@@ -3447,12 +3502,25 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     cluster_zones.first_draft_warmup_mask,
                 )
             )
-            self.cluster_store.admit_resident_clusters(
+            warmup_access = self.cluster_store.resolve_draft_cluster_blocks(
                 layer_name=layer_name,
                 cluster_ids=warmup_cluster_ids,
-                page_ids=warmup_page_ids,
+                logical_page_ids=warmup_page_ids,
+                active_mask=active_mask,
+                cache_page_ids=torch.empty_like(warmup_page_ids),
+                hit_cluster_mask=torch.empty_like(warmup_cluster_ids, dtype=torch.bool),
+                miss_cluster_mask=torch.empty_like(
+                    warmup_cluster_ids, dtype=torch.bool
+                ),
+                hit_gate_ready_mask=torch.empty_like(
+                    warmup_cluster_ids, dtype=torch.bool
+                ),
+                access_kinds=torch.empty_like(warmup_cluster_ids, dtype=torch.uint8),
             )
-            include_pending_resident = True
+            if warmup_access.read_lease is not None:
+                warmup_access.read_lease.release()
+            prefetch_cluster_ids = warmup_cluster_ids
+            prefetch_access_kinds = warmup_access.access_kinds
         return self._materialize_draft_selection(
             plan=plan,
             output_workspace=output_workspace,
@@ -3463,7 +3531,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             head_size=key_cache.shape[3],
             dtype=key_cache.dtype,
             active_mask=active_mask,
-            include_pending_resident=include_pending_resident,
+            prefetch_cluster_ids=prefetch_cluster_ids,
+            prefetch_access_kinds=prefetch_access_kinds,
         )
 
     def materialize(

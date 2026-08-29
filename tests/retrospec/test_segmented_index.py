@@ -117,48 +117,50 @@ def test_segmented_index_configures_resident_cache_ratio(
 
 def test_sparse_verification_prefetch_masks_inactive_draft_rows():
     index = make_index(cache_ratio=0.5, pin_memory=True)
-    plan = Mock(
-        layer_name="layer",
-        sparse_exact_cluster_ids=torch.tensor([[[0, 1]], [[2, 3]]], dtype=torch.int64),
-        sparse_exact_page_ids=torch.tensor(
-            [[[[0], [1]]], [[[2], [3]]]], dtype=torch.int64
-        ),
+    cluster_ids = torch.tensor([[[0, 1]], [[2, 3]]], dtype=torch.int64)
+    access_kinds = torch.ones_like(cluster_ids, dtype=torch.uint8)
+    selection = Mock(
+        plan=Mock(layer_name="layer"),
+        prefetch_cluster_ids=cluster_ids,
+        prefetch_access_kinds=access_kinds,
     )
     index.cluster_store.prefetch_resident_clusters = Mock()
 
     index.prefetch_sparse_verification(
-        plan,
+        selection,
         active_mask=torch.tensor([True, False]),
     )
 
     call_kwargs = index.cluster_store.prefetch_resident_clusters.call_args.kwargs
     assert call_kwargs["layer_name"] == "layer"
-    assert call_kwargs["cluster_ids"].tolist() == [[[0, 1]], [[-1, -1]]]
+    assert call_kwargs["cluster_ids"].tolist() == [[[0, 1]], [[2, 3]]]
+    assert call_kwargs["access_kinds"].tolist() == [[[1, 1]], [[0, 0]]]
 
 
-def test_sparse_verification_prefetch_skips_empty_page_table():
+def test_sparse_verification_prefetch_skips_empty_access_record():
     index = make_index(cache_ratio=0.5, pin_memory=True)
-    plan = Mock(
-        sparse_exact_cluster_ids=torch.full((1, 1, 1), -1, dtype=torch.int64),
-        sparse_exact_page_ids=torch.empty((1, 1, 1, 0), dtype=torch.int64),
+    selection = Mock(
+        plan=Mock(layer_name="layer"),
+        prefetch_cluster_ids=torch.empty((1, 1, 0), dtype=torch.int64),
+        prefetch_access_kinds=torch.empty((1, 1, 0), dtype=torch.uint8),
     )
     index.cluster_store.prefetch_resident_clusters = Mock()
 
-    index.prefetch_sparse_verification(plan, active_mask=torch.tensor([True]))
+    index.prefetch_sparse_verification(selection, active_mask=torch.tensor([True]))
 
     index.cluster_store.prefetch_resident_clusters.assert_not_called()
 
 
 def test_sparse_verification_prefetch_requires_pinned_cpu_backing():
     index = make_index(pin_memory=False)
-    plan = Mock(
-        sparse_exact_cluster_ids=torch.tensor([[[0]]]),
-        sparse_exact_page_ids=torch.tensor([[[[0]]]]),
+    selection = Mock(
+        prefetch_cluster_ids=torch.tensor([[[0]]]),
+        prefetch_access_kinds=torch.tensor([[[2]]], dtype=torch.uint8),
     )
     index.cluster_store.prefetch_resident_clusters = Mock()
 
     index.prefetch_sparse_verification(
-        plan,
+        selection,
         active_mask=torch.tensor([True]),
     )
 
@@ -208,7 +210,7 @@ def test_first_draft_warmup_waits_for_each_requests_first_active_draft():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_first_draft_selection_admits_ranked_cluster_before_attention():
+def test_first_draft_selection_queues_ranked_miss_after_attention():
     device = torch.device("cuda")
     index = make_index(
         retrieval_ratio=0.5,
@@ -240,15 +242,24 @@ def test_first_draft_selection_admits_ranked_cluster_before_attention():
             scale=1.0,
             warm_first_draft=True,
         )
+        assert index.cluster_store.num_resident_pages("layer") == 0
+        assert selection.resolved_pages is not None
+        assert selection.resolved_pages.miss_cluster_mask.all()
+        assert selection.resolved_pages.resident_ready_event is None
+        assert selection.resolved_pages.read_lease is not None
+        selection.resolved_pages.read_lease.release()
+
+        index.prefetch_sparse_verification(
+            selection,
+            active_mask=torch.tensor([True], device=device),
+        )
+        index.cluster_store.synchronize_resident_prefetches(("layer",))
     finally:
         index.end_proposal()
 
     assert index.cluster_store.num_resident_pages("layer") == 1
     score_resident_view.assert_called_once()
-    assert selection.resolved_pages is not None
-    assert selection.resolved_pages.hit_cluster_mask.all()
-    assert selection.resolved_pages.resident_ready_event is not None
-    assert selection.exact_token_counts.tolist() == [[8]]
+    assert selection.exact_token_counts.tolist() == [[6]]
     # The first draft occupies at most half the request/head target, so the hit
     # gate stays cold-protected until later drafts fill the remaining capacity.
     assert not selection.resolved_pages.hit_gate_ready_mask.any()

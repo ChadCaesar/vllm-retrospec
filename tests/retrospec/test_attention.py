@@ -1290,7 +1290,7 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
 
     assert call_order == ["exact", "estimation", "prefetch"]
     controller.index.prefetch_sparse_verification.assert_called_once_with(
-        plan=plan,
+        selection=selection,
         active_mask=active_mask,
     )
     assert controller.index.select_segmented.call_args.kwargs["warm_first_draft"]
