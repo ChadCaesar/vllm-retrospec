@@ -10,7 +10,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 
-_EXACT_ATTENTION_PARTITION_SIZE = 1024
+from .workspace import (
+    exact_attention_partition_capacity,
+    exact_attention_workspace_size_bytes,
+)
+
 _GIB_BYTES = 1 << 30
 
 
@@ -120,6 +124,43 @@ def _get_indexed_token_capacity(
     return (stable_end_block - 1) * block_size
 
 
+def get_retrospec_exact_attention_source_token_capacity(
+    vllm_config: VllmConfig,
+    block_size: int,
+) -> int:
+    """Return the maximum physical source-token slots per request."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+
+    config = vllm_config.speculative_config
+    if config is None or config.method != "retrospec":
+        raise ValueError("RetroSpec capacity requires a RetroSpec configuration")
+
+    indexed_tokens = _get_indexed_token_capacity(vllm_config, block_size)
+    tokens_per_cluster = config.retrospec_blocks_per_cluster * block_size
+    num_clusters = cdiv(indexed_tokens, tokens_per_cluster)
+
+    # Every cluster may leave one partially occupied page. The first term
+    # covers the indexed tokens and the second bounds cluster tail pages.
+    max_cluster_pages = cdiv(indexed_tokens, block_size) + num_clusters
+    max_cluster_token_slots = max_cluster_pages * block_size
+
+    # At maximum index coverage, the remaining logical context is native KV.
+    max_model_len = vllm_config.model_config.max_model_len
+    max_primary_tokens = max_model_len - indexed_tokens
+    return max(max_primary_tokens + max_cluster_token_slots, 1)
+
+
+def get_retrospec_exact_attention_partition_capacity(
+    vllm_config: VllmConfig,
+    block_size: int,
+) -> int:
+    max_num_source_tokens = get_retrospec_exact_attention_source_token_capacity(
+        vllm_config, block_size
+    )
+    return exact_attention_partition_capacity(max_num_source_tokens)
+
+
 def build_retrospec_long_context_capacity(
     vllm_config: VllmConfig,
     kv_cache_specs: Mapping[str, KVCacheSpec],
@@ -191,8 +232,6 @@ def build_retrospec_long_context_capacity(
         resident_pages_per_head * spec.real_page_size_bytes for spec in attention_specs
     )
 
-    max_model_len = vllm_config.model_config.max_model_len
-
     # Packed cluster descriptors use an int64 ID, an int32 token count, an
     # int64 relative page start and an int32 page count. Page descriptors use
     # 12 bytes per page. Request descriptors add cluster/page offsets, counts,
@@ -239,18 +278,15 @@ def build_retrospec_long_context_capacity(
         max_resident_requests * config.num_speculative_tokens,
         scheduler_config.max_num_batched_tokens,
     )
-    max_exact_partitions = _next_power_of_two(
-        ceil(max_model_len / _EXACT_ATTENTION_PARTITION_SIZE)
+    max_exact_partitions = get_retrospec_exact_attention_partition_capacity(
+        vllm_config, block_size
     )
-    exact_attention_workspace_bytes = (
-        max_parallel_queries
-        * num_query_heads
-        * (
-            max_exact_partitions * head_size * query_dtype_bytes
-            + max_exact_partitions * 8
-            + head_size * query_dtype_bytes
-            + 4
-        )
+    exact_attention_workspace_bytes = exact_attention_workspace_size_bytes(
+        max_num_queries=max_parallel_queries,
+        num_query_heads=num_query_heads,
+        head_size=head_size,
+        dtype_size=query_dtype_bytes,
+        partition_capacity=max_exact_partitions,
     )
 
     for spec in attention_specs:

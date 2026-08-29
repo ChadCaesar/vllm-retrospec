@@ -7,7 +7,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-EXACT_ATTENTION_PARTITION_SIZE = 1024
+from .workspace import EXACT_ATTENTION_PARTITION_SIZE
+
 _EXACT_ATTENTION_BLOCK_TOKENS = 64
 
 
@@ -367,42 +368,50 @@ def _reduce_exact_partitions_kernel(
 class RetroSpecExactAttentionWorkspace:
     """Reusable workspace for partitioned attention over three KV sources."""
 
-    def __init__(self, page_size: int, max_num_queries: int) -> None:
+    def __init__(
+        self,
+        page_size: int,
+        max_num_queries: int,
+        partition_capacity: int,
+    ) -> None:
         if page_size <= 0:
             raise ValueError("page_size must be positive")
         if max_num_queries <= 0:
             raise ValueError("max_num_queries must be positive")
+        if partition_capacity <= 0:
+            raise ValueError("partition_capacity must be positive")
+        if partition_capacity & (partition_capacity - 1):
+            raise ValueError("partition_capacity must be a power of two")
 
         self.page_size = page_size
         self.max_num_queries = max_num_queries
+        self._partition_capacity = partition_capacity
         self._configuration: tuple[torch.dtype, torch.device, int, int] | None = None
-        self._partition_capacity = 0
         self._partial_output: torch.Tensor | None = None
         self._partial_max: torch.Tensor | None = None
         self._partial_sum: torch.Tensor | None = None
         self._output: torch.Tensor | None = None
         self._output_lse: torch.Tensor | None = None
 
-    @staticmethod
-    def _next_power_of_two(value: int) -> int:
-        return 1 << (max(value, 1) - 1).bit_length()
-
     def _ensure_workspace(
         self,
         query: torch.Tensor,
         required_partitions: int,
     ) -> None:
+        if required_partitions > self._partition_capacity:
+            raise RuntimeError(
+                "Exact-attention source exceeds the planned workspace capacity: "
+                f"required {required_partitions} partitions, but the capacity "
+                f"planner reserved {self._partition_capacity}"
+            )
+
         _, num_query_heads, head_size = query.shape
         configuration = (query.dtype, query.device, num_query_heads, head_size)
         if self._configuration is not None and self._configuration != configuration:
             raise ValueError("Exact-attention workspace configuration changed")
-
-        if self._configuration is None:
-            self._configuration = configuration
-        if self._partition_capacity >= required_partitions:
+        if self._configuration is not None:
             return
 
-        self._partition_capacity = self._next_power_of_two(required_partitions)
         partial_shape = (
             self.max_num_queries,
             num_query_heads,
@@ -410,26 +419,31 @@ class RetroSpecExactAttentionWorkspace:
             head_size,
         )
         stats_shape = partial_shape[:-1]
-        self._partial_output = torch.empty(
+        partial_output = torch.empty(
             partial_shape, dtype=query.dtype, device=query.device
         )
-        self._partial_max = torch.empty(
-            stats_shape, dtype=torch.float32, device=query.device
-        )
-        self._partial_sum = torch.empty_like(self._partial_max)
-        self._output = torch.empty(
+        partial_max = torch.empty(stats_shape, dtype=torch.float32, device=query.device)
+        partial_sum = torch.empty_like(partial_max)
+        output = torch.empty(
             self.max_num_queries,
             num_query_heads,
             head_size,
             dtype=query.dtype,
             device=query.device,
         )
-        self._output_lse = torch.empty(
+        output_lse = torch.empty(
             num_query_heads,
             self.max_num_queries,
             dtype=torch.float32,
             device=query.device,
         )
+
+        self._partial_output = partial_output
+        self._partial_max = partial_max
+        self._partial_sum = partial_sum
+        self._output = output
+        self._output_lse = output_lse
+        self._configuration = configuration
 
     def _validate_source(
         self,

@@ -19,6 +19,7 @@ from vllm.v1.attention.backends.flash_attn import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
+from .capacity import get_retrospec_exact_attention_partition_capacity
 from .cluster_store import RetroSpecResolvedClusterPages
 from .execution import (
     RetroSpecExactAttentionWorkspace,
@@ -176,9 +177,13 @@ class RetroSpecSparseAttention:
             ),
         )
 
+        exact_partition_capacity = get_retrospec_exact_attention_partition_capacity(
+            vllm_config, block_size
+        )
         self.exact_attention_workspace = RetroSpecExactAttentionWorkspace(
             page_size=block_size,
             max_num_queries=self.max_verification_tokens,
+            partition_capacity=exact_partition_capacity,
         )
 
         self.proposal_request_ids: tuple[str, ...] = ()

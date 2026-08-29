@@ -20,8 +20,14 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.spec_decode.retrospec.capacity import (
     RetroSpecLongContextCapacity,
     build_retrospec_long_context_capacity,
+    get_retrospec_exact_attention_partition_capacity,
+    get_retrospec_exact_attention_source_token_capacity,
     get_retrospec_native_working_set_tokens,
     is_retrospec_long_context_enabled,
+)
+from vllm.v1.spec_decode.retrospec.workspace import (
+    exact_attention_partition_capacity,
+    exact_attention_workspace_size_bytes,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -151,6 +157,51 @@ def test_native_working_set_scales_request_state_but_shares_prefill_chunk():
 def test_native_working_set_is_capped_by_max_model_len():
     config = make_capacity_config(max_model_len=4096)
     assert get_retrospec_native_working_set_tokens(config, 16) == 4096
+
+
+def test_exact_attention_capacity_includes_cluster_page_fragmentation():
+    config = make_capacity_config(max_model_len=65536)
+
+    assert get_retrospec_exact_attention_source_token_capacity(config, 16) == 130976
+    assert get_retrospec_exact_attention_partition_capacity(config, 16) == 128
+
+
+def test_exact_attention_capacity_covers_32k_to_64k_boundary():
+    capacity_32k = get_retrospec_exact_attention_partition_capacity(
+        make_capacity_config(max_model_len=32768), 16
+    )
+    capacity_64k = get_retrospec_exact_attention_partition_capacity(
+        make_capacity_config(max_model_len=65536), 16
+    )
+
+    assert capacity_32k == 64
+    assert capacity_64k == 128
+
+
+def test_exact_attention_workspace_size_matches_tensor_layout():
+    workspace_bytes = exact_attention_workspace_size_bytes(
+        max_num_queries=1024,
+        num_query_heads=8,
+        head_size=64,
+        dtype_size=2,
+        partition_capacity=128,
+    )
+    expected_bytes = (
+        1024 * 8 * 128 * 64 * 2
+        + 1024 * 8 * 128 * 2 * 4
+        + 1024 * 8 * 64 * 2
+        + 1024 * 8 * 4
+    )
+
+    assert workspace_bytes == expected_bytes
+
+
+@pytest.mark.parametrize("max_num_source_tokens", [0, -1])
+def test_exact_attention_partition_capacity_rejects_invalid_source_capacity(
+    max_num_source_tokens: int,
+):
+    with pytest.raises(ValueError, match="max_num_source_tokens must be positive"):
+        exact_attention_partition_capacity(max_num_source_tokens)
 
 
 def test_capacity_reserves_null_block_and_auxiliary_buffers():

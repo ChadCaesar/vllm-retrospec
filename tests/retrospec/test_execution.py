@@ -15,9 +15,21 @@ from vllm.v1.spec_decode.retrospec.execution import (
 
 def test_exact_attention_workspace_rejects_invalid_capacity():
     with pytest.raises(ValueError, match="page_size must be positive"):
-        RetroSpecExactAttentionWorkspace(page_size=0, max_num_queries=1)
+        RetroSpecExactAttentionWorkspace(
+            page_size=0, max_num_queries=1, partition_capacity=1
+        )
     with pytest.raises(ValueError, match="max_num_queries must be positive"):
-        RetroSpecExactAttentionWorkspace(page_size=16, max_num_queries=0)
+        RetroSpecExactAttentionWorkspace(
+            page_size=16, max_num_queries=0, partition_capacity=1
+        )
+    with pytest.raises(ValueError, match="partition_capacity must be positive"):
+        RetroSpecExactAttentionWorkspace(
+            page_size=16, max_num_queries=1, partition_capacity=0
+        )
+    with pytest.raises(ValueError, match="power of two"):
+        RetroSpecExactAttentionWorkspace(
+            page_size=16, max_num_queries=1, partition_capacity=3
+        )
 
 
 def _make_source(
@@ -209,7 +221,7 @@ def test_multi_source_exact_attention_matches_reference_on_cuda():
         dtype=torch.float16,
         device=device,
     )
-    workspace = RetroSpecExactAttentionWorkspace(page_size, batch_size)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, batch_size, 1)
 
     output, lse = workspace.run(source, query, scale=0.125)
     expected_output, expected_lse = _reference_attention(source, query, 0.125)
@@ -238,7 +250,7 @@ def test_exact_attention_maps_multiple_queries_to_their_requests():
     )
     query = torch.randn(3, 2, head_size, dtype=torch.bfloat16, device=device)
     request_indices = torch.tensor([0, 0, 1], dtype=torch.int64, device=device)
-    workspace = RetroSpecExactAttentionWorkspace(page_size, 3)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, 3, 1)
 
     output, lse = workspace.run(source, query, 0.125, request_indices)
     expected = _reference_attention(source, query, 0.125, request_indices)
@@ -267,7 +279,7 @@ def test_exact_attention_reduces_multiple_partitions_and_reuses_workspace():
         torch.empty(1, 1, 0, 0, dtype=torch.int32, device=device),
     )
     query = torch.randn(1, 2, head_size, dtype=torch.float16, device=device)
-    workspace = RetroSpecExactAttentionWorkspace(page_size, 2)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, 2, 4)
 
     output, lse = workspace.run(source, query, 0.125)
     partial_pointer = workspace._partial_output.data_ptr()
@@ -276,8 +288,14 @@ def test_exact_attention_reduces_multiple_partitions_and_reuses_workspace():
 
     torch.testing.assert_close(output, expected[0], atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(lse, expected[1], atol=3e-3, rtol=3e-3)
+    assert workspace._partial_output.shape[2] == 4
     assert workspace._partial_output.data_ptr() == partial_pointer
     assert second_output.data_ptr() == output.data_ptr()
+
+    undersized_workspace = RetroSpecExactAttentionWorkspace(page_size, 2, 1)
+    with pytest.raises(RuntimeError, match="planned workspace capacity"):
+        undersized_workspace.run(source, query, 0.125)
+    assert undersized_workspace._partial_output is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -294,7 +312,7 @@ def test_exact_attention_handles_empty_sources():
     )
     query = torch.ones(2, 2, 64, dtype=torch.float16, device=device)
 
-    output, lse = RetroSpecExactAttentionWorkspace(4, 2).run(source, query, 1.0)
+    output, lse = RetroSpecExactAttentionWorkspace(4, 2, 1).run(source, query, 1.0)
 
     assert not output.any()
     assert torch.isneginf(lse).all()
@@ -337,7 +355,7 @@ def test_exact_attention_waits_for_page_ready_event():
     )
     query = torch.randn(1, 1, head_size, dtype=torch.float16, device=device)
 
-    output, lse = RetroSpecExactAttentionWorkspace(page_size, 1).run(
+    output, lse = RetroSpecExactAttentionWorkspace(page_size, 1, 1).run(
         source, query, 0.125
     )
     expected = _reference_attention(source, query, 0.125)
@@ -361,7 +379,7 @@ def test_exact_attention_rejects_query_over_workspace_capacity():
     )
 
     with pytest.raises(ValueError, match="workspace capacity"):
-        RetroSpecExactAttentionWorkspace(4, 1).run(
+        RetroSpecExactAttentionWorkspace(4, 1, 1).run(
             source,
             torch.zeros(2, 1, 64, dtype=torch.float16, device=device),
             1.0,
