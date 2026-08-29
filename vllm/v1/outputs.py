@@ -164,6 +164,14 @@ class KVCacheRetirement:
     end_block: int
 
 
+@dataclass(frozen=True)
+class RetroSpecLayerMajorPrefillCompletion:
+    """Actual prompt position completed by a layer-major prefill execution."""
+
+    request_id: str
+    num_completed_prompt_tokens: int
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -207,6 +215,11 @@ class ModelRunnerOutput:
 
     # Native GPU KV blocks replaced by CPU-backed clustered storage.
     kv_cache_retirements: list[KVCacheRetirement] = field(default_factory=list)
+
+    # Actual completion returned by an isolated layer-major prefill execution.
+    retrospec_layer_major_prefill_completion: (
+        RetroSpecLayerMajorPrefillCompletion | None
+    ) = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

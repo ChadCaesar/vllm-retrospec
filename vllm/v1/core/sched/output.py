@@ -180,6 +180,31 @@ class CachedRequestData:
 
 
 @bc_linter_include
+@dataclass(frozen=True)
+class RetroSpecLayerMajorPrefillDescriptor:
+    """Describe one isolated RetroSpec target-prefill execution."""
+
+    request_id: str
+    prompt_num_tokens: int
+    scheduled_start: int
+    scheduled_end: int
+
+    def __post_init__(self) -> None:
+        if self.prompt_num_tokens <= 0:
+            raise ValueError("prompt_num_tokens must be positive")
+        if self.scheduled_start < 0:
+            raise ValueError("scheduled_start must be non-negative")
+        if self.scheduled_end <= self.scheduled_start:
+            raise ValueError("scheduled_end must be greater than scheduled_start")
+        if self.scheduled_end > self.prompt_num_tokens:
+            raise ValueError("scheduled_end cannot exceed prompt_num_tokens")
+
+    @property
+    def num_scheduled_tokens(self) -> int:
+        return self.scheduled_end - self.scheduled_start
+
+
+@bc_linter_include
 @dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
@@ -237,6 +262,9 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
+
+    # Exclusive RetroSpec target-prefill execution for one request.
+    retrospec_layer_major_prefill: RetroSpecLayerMajorPrefillDescriptor | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

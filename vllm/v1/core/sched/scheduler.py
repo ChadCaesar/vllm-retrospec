@@ -43,6 +43,7 @@ from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
     NewRequestData,
+    RetroSpecLayerMajorPrefillDescriptor,
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
@@ -56,6 +57,7 @@ from vllm.v1.outputs import (
     KVCacheRetirement,
     KVConnectorOutput,
     ModelRunnerOutput,
+    RetroSpecLayerMajorPrefillCompletion,
 )
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -243,6 +245,15 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        self.enable_retrospec_layer_major_prefill = (
+            speculative_config is not None
+            and speculative_config.method == "retrospec"
+            and not self.is_encoder_decoder
+            and not self.use_pp
+            and self.connector is None
+            and self.ec_connector is None
+        )
+        self._retrospec_layer_major_prefill_req_id: str | None = None
 
         def has_mamba_layers(kv_cache_config: KVCacheConfig) -> bool:
             return any(
@@ -325,6 +336,54 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _is_retrospec_layer_major_prefill_candidate(self, request: Request) -> bool:
+        if not self.enable_retrospec_layer_major_prefill:
+            return False
+
+        if request.status not in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+            RequestStatus.RUNNING,
+        ):
+            return False
+
+        sampling_params = request.sampling_params
+        return (
+            request.pooling_params is None
+            and request.prompt_token_ids is not None
+            and request.prompt_embeds is None
+            and not request.has_encoder_inputs
+            and request.lora_request is None
+            and request.num_output_tokens == 0
+            and request.num_computed_tokens < request.num_prompt_tokens
+            and not request.spec_token_ids
+            and (sampling_params is None or sampling_params.prompt_logprobs is None)
+        )
+
+    def _select_retrospec_layer_major_prefill_request(self) -> str | None:
+        request_id = self._retrospec_layer_major_prefill_req_id
+        if request_id is not None:
+            request = self.requests.get(request_id)
+            if request is not None and self._is_retrospec_layer_major_prefill_candidate(
+                request
+            ):
+                return request_id
+            self._retrospec_layer_major_prefill_req_id = None
+
+        # Commit 66 does not reserve or offload the complete prompt working
+        # set. Start an exclusive prefill only after older requests finish, so
+        # an allocation failure cannot permanently block decode progress.
+        if self.running or not self.waiting:
+            return None
+
+        request = self.waiting.peek_request()
+        if not self._is_retrospec_layer_major_prefill_candidate(request):
+            return None
+
+        request_id = request.request_id
+        self._retrospec_layer_major_prefill_req_id = request_id
+        return request_id
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -353,11 +412,21 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        layer_major_prefill_req_id = (
+            self._select_retrospec_layer_major_prefill_request()
+        )
 
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if (
+                layer_major_prefill_req_id is not None
+                and request.request_id != layer_major_prefill_req_id
+            ):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -544,6 +613,20 @@ class Scheduler(SchedulerInterface):
 
                 request = self.waiting.peek_request()
                 request_id = request.request_id
+
+                if (
+                    layer_major_prefill_req_id is None
+                    and self._is_retrospec_layer_major_prefill_candidate(request)
+                ):
+                    # Never silently fall back to a regular mixed prefill batch.
+                    # Leave the request waiting until it can run exclusively.
+                    break
+
+                if (
+                    layer_major_prefill_req_id is not None
+                    and request_id != layer_major_prefill_req_id
+                ):
+                    break
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -804,9 +887,29 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+
+                if request_id == layer_major_prefill_req_id:
+                    break
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+
+        layer_major_prefill_descriptor = None
+        if (
+            layer_major_prefill_req_id is not None
+            and layer_major_prefill_req_id in num_scheduled_tokens
+        ):
+            request = self.requests[layer_major_prefill_req_id]
+            scheduled_start = request.num_computed_tokens
+            scheduled_end = (
+                scheduled_start + num_scheduled_tokens[layer_major_prefill_req_id]
+            )
+            layer_major_prefill_descriptor = RetroSpecLayerMajorPrefillDescriptor(
+                request_id=layer_major_prefill_req_id,
+                prompt_num_tokens=request.num_prompt_tokens,
+                scheduled_start=scheduled_start,
+                scheduled_end=scheduled_end,
+            )
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -879,6 +982,7 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            retrospec_layer_major_prefill=layer_major_prefill_descriptor,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1266,6 +1370,49 @@ class Scheduler(SchedulerInterface):
                 end_block=retirement.end_block,
             )
 
+    def _update_retrospec_layer_major_prefill_completion(
+        self,
+        scheduler_output: SchedulerOutput,
+        completion: RetroSpecLayerMajorPrefillCompletion | None,
+    ) -> None:
+        descriptor = scheduler_output.retrospec_layer_major_prefill
+        if descriptor is None:
+            if completion is not None:
+                raise RuntimeError(
+                    "Received a layer-major prefill completion without a descriptor"
+                )
+            return
+
+        if completion is None:
+            raise RuntimeError(
+                "RetroSpec layer-major prefill did not return a completion"
+            )
+
+        if completion.request_id != descriptor.request_id:
+            raise RuntimeError(
+                "RetroSpec layer-major prefill completion request ID mismatch: "
+                f"expected={descriptor.request_id}, got={completion.request_id}"
+            )
+
+        completed = completion.num_completed_prompt_tokens
+        if not descriptor.scheduled_start < completed <= descriptor.scheduled_end:
+            raise RuntimeError(
+                "RetroSpec layer-major prefill completed outside its reserved "
+                f"range: reserved=({descriptor.scheduled_start}, "
+                f"{descriptor.scheduled_end}], completed={completed}"
+            )
+
+        request = self.requests.get(descriptor.request_id)
+        if request is None or request.is_finished():
+            return
+
+        # _update_after_schedule() already advanced this request optimistically
+        # to scheduled_end. Replace that value with the worker's actual result.
+        request.num_computed_tokens = completed
+        request.is_prefill_chunk = completed < (
+            request.num_tokens + request.num_output_placeholders
+        )
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1279,6 +1426,10 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        self._update_retrospec_layer_major_prefill_completion(
+            scheduler_output,
+            model_runner_output.retrospec_layer_major_prefill_completion,
+        )
         self._apply_kv_cache_retirements(
             scheduler_output,
             model_runner_output.kv_cache_retirements,

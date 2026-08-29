@@ -160,6 +160,9 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.retrospec import RetroSpecProposer
+from vllm.v1.spec_decode.retrospec.prefill import (
+    RetroSpecLayerMajorPrefillProtocol,
+)
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -3374,6 +3377,8 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        RetroSpecLayerMajorPrefillProtocol.validate_scheduler_output(scheduler_output)
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -3393,6 +3398,18 @@ class GPUModelRunner(
         ):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+
+            descriptor = scheduler_output.retrospec_layer_major_prefill
+            if descriptor is not None:
+                request = self.requests.get(descriptor.request_id)
+                if request is None:
+                    raise RuntimeError(
+                        "RetroSpec layer-major prefill request is missing from the "
+                        "worker cache"
+                    )
+                RetroSpecLayerMajorPrefillProtocol.validate_cached_prompt(
+                    descriptor, request.num_prompt_tokens
+                )
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -3942,6 +3959,11 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 kv_cache_retirements=kv_cache_retirements,
+                retrospec_layer_major_prefill_completion=(
+                    RetroSpecLayerMajorPrefillProtocol.complete_scheduled_range(
+                        scheduler_output
+                    )
+                ),
             )
 
         if not self.use_async_scheduling:
