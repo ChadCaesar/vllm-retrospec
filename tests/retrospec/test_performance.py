@@ -68,7 +68,7 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
         device=torch.device("cpu"),
         log_interval_seconds=5.0,
     )
-    stats.add_counter("proposal_requests", 2)
+    stats.add_gpu_counter("proposal_requests", torch.tensor([1, 1]))
     stats.add_counter("sparse_verify_tokens", 8)
     stats.add_counter("expanded_verify_tokens", 2)
     stats.add_counter("full_verify_requests", 1)

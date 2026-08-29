@@ -1153,6 +1153,7 @@ class RetroSpecProposer:
         next_token_ids: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         common_attn_metadata: CommonAttentionMetadata,
+        proposal_active_mask: torch.Tensor,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> list[list[int]]:
         if not sampling_metadata.all_greedy:
@@ -1169,11 +1170,14 @@ class RetroSpecProposer:
         if len(committed_positions) != batch_size:
             raise ValueError("committed_positions must match the proposal batch size")
 
-        self.performance_stats.add_counter("proposal_calls")
-        self.performance_stats.add_counter("proposal_requests", batch_size)
-
-        self.state.begin_batch(batch_size)
+        self.state.begin_batch(batch_size, proposal_active_mask)
         self.index_update_state.begin_batch(request_ids, committed_positions)
+
+        self.performance_stats.add_counter("proposal_calls")
+        self.performance_stats.add_gpu_counter(
+            "proposal_requests",
+            proposal_active_mask,
+        )
 
         self._draft_token_ids[:batch_size].fill_(-1)
         self.input_ids[:batch_size].copy_(next_token_ids)

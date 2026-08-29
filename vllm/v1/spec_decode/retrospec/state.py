@@ -176,9 +176,23 @@ class RetroSpecBatchState:
     def active_mask(self) -> torch.Tensor:
         return self._active_mask[: self.batch_size]
 
-    def begin_batch(self, batch_size: int) -> None:
+    def begin_batch(
+        self,
+        batch_size: int,
+        proposal_active_mask: torch.Tensor | None = None,
+    ) -> None:
         if not 0 <= batch_size <= self.max_batch_size:
             raise ValueError(f"batch_size must be in [0, {self.max_batch_size}]")
+
+        if proposal_active_mask is not None:
+            if proposal_active_mask.shape != (batch_size,):
+                raise ValueError(
+                    f"proposal_active_mask must have shape ({batch_size},)"
+                )
+            if proposal_active_mask.device != self.device:
+                raise ValueError("proposal_active_mask must be on the state device")
+            if proposal_active_mask.dtype != torch.bool:
+                raise ValueError("proposal_active_mask must have dtype torch.bool")
 
         self.batch_size = batch_size
 
@@ -190,8 +204,15 @@ class RetroSpecBatchState:
         if batch_size == 0:
             return
 
-        self._stage[:batch_size].fill_(int(RetroSpecStage.DRAFT))
-        self._active_mask[:batch_size].fill_(True)
+        if proposal_active_mask is None:
+            self._active_mask[:batch_size].fill_(True)
+        else:
+            self._active_mask[:batch_size].copy_(proposal_active_mask)
+
+        self._stage[:batch_size].masked_fill_(
+            self._active_mask[:batch_size],
+            int(RetroSpecStage.DRAFT),
+        )
 
     def _validate_mask(self, mask: torch.Tensor) -> None:
         if mask.shape != (self.batch_size,):

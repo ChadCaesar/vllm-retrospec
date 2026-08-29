@@ -4,11 +4,90 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import torch
 
 from vllm.v1.outputs import KVCacheRetirement
+from vllm.v1.spec_decode.retrospec import RetroSpecProposer
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+
+def make_retrospec_proposal_runner(
+    partial_prefill_mask: list[bool],
+) -> tuple[GPUModelRunner, RetroSpecProposer]:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    drafter = RetroSpecProposer.__new__(RetroSpecProposer)
+    drafter.prepare_next_token_ids_padded = Mock(
+        return_value=(
+            torch.tensor([10, 11], dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+        )
+    )
+    drafter.propose = Mock(return_value=[[], [12]])
+
+    runner.speculative_config = SimpleNamespace(
+        method="retrospec",
+        disable_padded_drafter_batch=False,
+    )
+    runner.drafter = drafter
+    runner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        req_ids=["prefill", "decode"],
+    )
+    runner.requests = {
+        "prefill": SimpleNamespace(num_computed_tokens=8),
+        "decode": SimpleNamespace(num_computed_tokens=4),
+    }
+    runner.discard_request_mask = SimpleNamespace(
+        np=np.array(partial_prefill_mask, dtype=np.bool_),
+        gpu=torch.tensor(partial_prefill_mask, dtype=torch.bool),
+    )
+    runner._copy_valid_sampled_token_count = Mock()
+    return runner, drafter
+
+
+def call_retrospec_proposal(runner: GPUModelRunner) -> list[list[int]]:
+    return runner.propose_draft_token_ids(
+        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=2),
+        sampled_token_ids=torch.tensor([[10], [11]], dtype=torch.int32),
+        sampling_metadata=SimpleNamespace(),
+        hidden_states=torch.empty(0),
+        sample_hidden_states=torch.empty(0),
+        aux_hidden_states=None,
+        spec_decode_metadata=None,
+        common_attn_metadata=SimpleNamespace(),
+        slot_mappings=None,
+    )
+
+
+def test_all_partial_prefill_rows_skip_retrospec_proposal():
+    runner, drafter = make_retrospec_proposal_runner([True, True])
+
+    result = call_retrospec_proposal(runner)
+
+    assert result == [[], []]
+    drafter.prepare_next_token_ids_padded.assert_not_called()
+    drafter.propose.assert_not_called()
+
+
+def test_mixed_batch_only_activates_decode_rows_for_retrospec():
+    runner, drafter = make_retrospec_proposal_runner([True, False])
+
+    result = call_retrospec_proposal(runner)
+
+    assert result == [[], [12]]
+    proposal_active_mask = drafter.propose.call_args.args[-2]
+    assert proposal_active_mask.tolist() == [False, True]
+
+
+def test_completed_prefill_rows_can_start_retrospec_proposal():
+    runner, drafter = make_retrospec_proposal_runner([False, False])
+
+    call_retrospec_proposal(runner)
+
+    proposal_active_mask = drafter.propose.call_args.args[-2]
+    assert proposal_active_mask.tolist() == [True, True]
 
 
 def test_list_draft_tokens_keep_proposal_request_order():

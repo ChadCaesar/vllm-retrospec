@@ -4127,6 +4127,16 @@ class GPUModelRunner(
             assert not spec_config.disable_padded_drafter_batch
             assert isinstance(sampled_token_ids, torch.Tensor)
 
+            num_reqs = self.input_batch.num_reqs
+            partial_prefill_mask = self.discard_request_mask.np[:num_reqs]
+
+            # Target prefill and index construction have already completed. If
+            # every request is still in partial prefill, do not enter RetroSpec.
+            if bool(partial_prefill_mask.all()):
+                return [[] for _ in range(num_reqs)]
+
+            proposal_active_mask = ~self.discard_request_mask.gpu[:num_reqs]
+
             next_token_ids, valid_sampled_tokens_count = (
                 self.drafter.prepare_next_token_ids_padded(
                     common_attn_metadata,
@@ -4164,6 +4174,7 @@ class GPUModelRunner(
                 next_token_ids,
                 sampling_metadata,
                 common_attn_metadata,
+                proposal_active_mask,
                 num_rejected_tokens_gpu,
             )
         elif spec_config.method == "medusa":

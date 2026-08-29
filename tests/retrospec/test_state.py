@@ -176,6 +176,38 @@ def test_begin_batch_initializes_active_requests():
     assert state.active_mask.tolist() == [True, True, True]
 
 
+def test_begin_batch_keeps_inactive_proposal_rows_idle():
+    state = make_state()
+
+    state.begin_batch(3, torch.tensor([False, True, False]))
+
+    assert state.stage.tolist() == [
+        int(RetroSpecStage.IDLE),
+        int(RetroSpecStage.DRAFT),
+        int(RetroSpecStage.IDLE),
+    ]
+    assert state.draft_counts.tolist() == [0, 0, 0]
+    assert state.pending_counts.tolist() == [0, 0, 0]
+    assert state.active_mask.tolist() == [False, True, False]
+
+
+@pytest.mark.parametrize(
+    ("proposal_active_mask", "message"),
+    [
+        (torch.tensor([True]), "shape"),
+        (torch.tensor([1, 0], dtype=torch.int32), "dtype"),
+    ],
+)
+def test_begin_batch_rejects_invalid_proposal_active_mask(
+    proposal_active_mask: torch.Tensor,
+    message: str,
+):
+    state = make_state()
+
+    with pytest.raises(ValueError, match=message):
+        state.begin_batch(2, proposal_active_mask)
+
+
 def test_begin_empty_batch():
     state = make_state()
 

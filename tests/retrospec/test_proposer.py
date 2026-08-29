@@ -94,12 +94,15 @@ def run_proposal(
     num_rejected_tokens_gpu: torch.Tensor | None = None,
     request_ids: list[str] | None = None,
     committed_positions: list[int] | None = None,
+    proposal_active_mask: torch.Tensor | None = None,
 ) -> list[list[int]]:
     batch_size = common_attn_metadata.batch_size()
     if request_ids is None:
         request_ids = [f"request-{index}" for index in range(batch_size)]
     if committed_positions is None:
         committed_positions = common_attn_metadata.seq_lens.tolist()
+    if proposal_active_mask is None:
+        proposal_active_mask = torch.ones(batch_size, dtype=torch.bool)
 
     return proposer.propose(
         request_ids=request_ids,
@@ -107,6 +110,7 @@ def run_proposal(
         next_token_ids=next_token_ids,
         sampling_metadata=sampling_metadata,
         common_attn_metadata=common_attn_metadata,
+        proposal_active_mask=proposal_active_mask,
         num_rejected_tokens_gpu=num_rejected_tokens_gpu,
     )
 
@@ -312,6 +316,54 @@ def test_propose_rejects_random_sampling():
             make_sampling_metadata(all_greedy=False),
             make_common_metadata([1]),
         )
+
+
+def test_propose_keeps_partial_prefill_rows_idle(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(
+            retrospec_max_draft_tokens=1,
+            retrospec_stats_interval_seconds=3600.0,
+        ),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    observed_masks: list[list[bool]] = []
+
+    def fake_run_draft_step(
+        batch_size,
+        draft_index,
+        common_attn_metadata,
+        active_mask,
+        sampling_metadata,
+    ):
+        observed_masks.append(active_mask.tolist())
+        return (
+            torch.tensor([10, 11], dtype=torch.int32),
+            None,
+            torch.ones(batch_size),
+        )
+
+    monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    mock_proposal_execution(proposer, monkeypatch)
+
+    result = run_proposal(
+        proposer,
+        torch.tensor([1, 2], dtype=torch.int32),
+        make_sampling_metadata(all_greedy=True),
+        make_common_metadata([8, 4]),
+        proposal_active_mask=torch.tensor([False, True]),
+    )
+
+    assert observed_masks == [[False, True]]
+    assert result == [[], [11]]
+    assert proposer.state.stage.tolist() == [
+        int(RetroSpecStage.IDLE),
+        int(RetroSpecStage.FULL_VERIFY),
+    ]
+    assert proposer.state.active_mask.tolist() == [False, True]
+    stats = proposer.performance_stats
+    proposal_requests_index = stats._gpu_counter_indices["proposal_requests"]
+    assert stats._gpu_counters[proposal_requests_index].item() == 1
 
 
 def test_propose_stops_requests_independently_on_draft_margin(monkeypatch):
@@ -1198,8 +1250,8 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
         for name, index in stats._gpu_counter_indices.items()
     }
     assert stats._cpu_counters["proposal_calls"] == 1
-    assert stats._cpu_counters["proposal_requests"] == 1
     assert gpu_counters == {
+        "proposal_requests": 1,
         "draft_round_requests": 2,
         "draft_tokens": 4,
         "verified_tokens": 4,

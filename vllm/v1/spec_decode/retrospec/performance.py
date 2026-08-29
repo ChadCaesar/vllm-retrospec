@@ -35,6 +35,7 @@ class RetroSpecPerformanceStats:
     """
 
     _GPU_COUNTER_NAMES = (
+        "proposal_requests",
         "draft_round_requests",
         "draft_tokens",
         "verified_tokens",
