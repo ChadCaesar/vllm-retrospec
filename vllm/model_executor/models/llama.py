@@ -25,7 +25,6 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 from collections.abc import Iterable
-from itertools import islice
 
 import torch
 from torch import nn
@@ -398,6 +397,24 @@ class LlamaModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def forward_layer(
+        self,
+        layer_index: int,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        **extra_layer_kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Execute one decoder layer owned by the current pipeline rank."""
+        if not self.start_layer <= layer_index < self.end_layer:
+            raise ValueError(
+                f"Layer {layer_index} is not owned by this pipeline rank; "
+                f"local range is [{self.start_layer}, {self.end_layer})"
+            )
+
+        layer = self.layers[layer_index]
+        return layer(positions, hidden_states, residual, **extra_layer_kwargs)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -418,13 +435,17 @@ class LlamaModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
+        for local_index, layer_index in enumerate(
+            range(self.start_layer, self.end_layer)
         ):
-            if idx in self.aux_hidden_state_layers:
+            if local_index in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
-            hidden_states, residual = layer(
-                positions, hidden_states, residual, **extra_layer_kwargs
+            hidden_states, residual = self.forward_layer(
+                layer_index,
+                positions,
+                hidden_states,
+                residual,
+                **extra_layer_kwargs,
             )
 
         if not get_pp_group().is_last_rank:

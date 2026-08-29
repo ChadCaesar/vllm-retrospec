@@ -1,11 +1,47 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any, Protocol, runtime_checkable
+
+import torch
+
 from vllm.v1.core.sched.output import (
     RetroSpecLayerMajorPrefillDescriptor,
     SchedulerOutput,
 )
 from vllm.v1.outputs import RetroSpecLayerMajorPrefillCompletion
+
+
+@runtime_checkable
+class RetroSpecLayerModel(Protocol):
+    """Decoder model interface required by layer-major prefill."""
+
+    start_layer: int
+    end_layer: int
+
+    def forward_layer(
+        self,
+        layer_index: int,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        **extra_layer_kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+def resolve_retrospec_layer_model(model: torch.nn.Module) -> RetroSpecLayerModel:
+    """Resolve the decoder model implementing the layer execution interface."""
+    if isinstance(model, RetroSpecLayerModel):
+        return model
+
+    layer_model = getattr(model, "model", None)
+    if isinstance(layer_model, RetroSpecLayerModel):
+        return layer_model
+
+    raise TypeError(
+        "RetroSpec layer-major prefill requires a model exposing "
+        "start_layer, end_layer, and forward_layer()"
+    )
 
 
 class RetroSpecLayerMajorPrefillProtocol:
