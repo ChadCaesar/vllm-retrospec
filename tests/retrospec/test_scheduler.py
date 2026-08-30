@@ -8,6 +8,7 @@ import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.config import DeviceConfig, SpeculativeConfig
+from vllm.v1.core.kv_cache_utils import KV_CACHE_NULL_BLOCK_ID
 from vllm.v1.core.sched.output import (
     RetroSpecLayerMajorPrefillDescriptor,
     SchedulerOutput,
@@ -92,38 +93,41 @@ def test_scheduler_rejects_retirement_for_unscheduled_request():
 
 def make_layer_major_scheduler_output(
     *,
-    scheduled_start: int = 4,
-    scheduled_end: int = 8,
+    prompt_num_tokens: int = 16,
 ) -> SchedulerOutput:
     output = SchedulerOutput.make_empty()
-    output.num_scheduled_tokens = {
-        "request": scheduled_end - scheduled_start,
-    }
-    output.total_num_scheduled_tokens = scheduled_end - scheduled_start
+    output.num_scheduled_tokens = {"request": prompt_num_tokens}
+    output.total_num_scheduled_tokens = prompt_num_tokens
     output.retrospec_layer_major_prefill = RetroSpecLayerMajorPrefillDescriptor(
         request_id="request",
-        prompt_num_tokens=16,
-        scheduled_start=scheduled_start,
-        scheduled_end=scheduled_end,
+        prompt_num_tokens=prompt_num_tokens,
+        scheduled_start=0,
+        scheduled_end=prompt_num_tokens,
+        resident_start_block=1,
+        num_logical_blocks=2,
     )
     return output
 
 
 def test_layer_major_prefill_descriptor_validates_ranges():
-    with pytest.raises(ValueError, match="greater than scheduled_start"):
+    with pytest.raises(ValueError, match="start at token zero"):
         RetroSpecLayerMajorPrefillDescriptor(
             request_id="request",
             prompt_num_tokens=16,
             scheduled_start=4,
-            scheduled_end=4,
+            scheduled_end=16,
+            resident_start_block=1,
+            num_logical_blocks=2,
         )
 
-    with pytest.raises(ValueError, match="cannot exceed prompt_num_tokens"):
+    with pytest.raises(ValueError, match="complete prompt"):
         RetroSpecLayerMajorPrefillDescriptor(
             request_id="request",
             prompt_num_tokens=16,
-            scheduled_start=4,
-            scheduled_end=17,
+            scheduled_start=0,
+            scheduled_end=8,
+            resident_start_block=1,
+            num_logical_blocks=2,
         )
 
 
@@ -136,7 +140,7 @@ def test_layer_major_prefill_protocol_returns_completed_range():
 
     assert completion == RetroSpecLayerMajorPrefillCompletion(
         request_id="request",
-        num_completed_prompt_tokens=8,
+        num_completed_prompt_tokens=16,
     )
 
 
@@ -180,7 +184,7 @@ def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
 
     scheduler_output = scheduler.schedule()
 
-    assert scheduler_output.num_scheduled_tokens == {"prefill-0": 4}
+    assert scheduler_output.num_scheduled_tokens == {"prefill-0": 8}
     assert len(scheduler.running) == 1
     assert len(scheduler.waiting) == 1
     assert scheduler_output.retrospec_layer_major_prefill == (
@@ -188,7 +192,9 @@ def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
             request_id="prefill-0",
             prompt_num_tokens=8,
             scheduled_start=0,
-            scheduled_end=4,
+            scheduled_end=8,
+            resident_start_block=1,
+            num_logical_blocks=1,
         )
     )
 
@@ -204,10 +210,52 @@ def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
     assert len(scheduler.waiting) == 1
 
 
+def test_layer_major_prefill_allocates_only_sink_and_resident_suffix():
+    speculative_config = SpeculativeConfig(
+        method="retrospec",
+        num_speculative_tokens=4,
+        retrospec_max_draft_tokens=4,
+    )
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=8,
+        max_model_len=128,
+        speculative_config=speculative_config,
+        device_config=DeviceConfig(device="cpu"),
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["long-prefill"],
+    )[0]
+    scheduler.add_request(request)
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    initial_free_blocks = manager.block_pool.get_num_free_blocks()
+
+    scheduler_output = scheduler.schedule()
+
+    descriptor = scheduler_output.retrospec_layer_major_prefill
+    assert descriptor is not None
+    assert scheduler_output.num_scheduled_tokens == {"long-prefill": 64}
+    assert descriptor.resident_start_block == 2
+    assert descriptor.num_logical_blocks == 5
+
+    block_ids = scheduler.kv_cache_manager.get_block_ids("long-prefill")[0]
+    assert len(block_ids) == 5
+    assert block_ids[0] != KV_CACHE_NULL_BLOCK_ID
+    assert block_ids[1] == KV_CACHE_NULL_BLOCK_ID
+    assert all(block_id != KV_CACHE_NULL_BLOCK_ID for block_id in block_ids[2:])
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks - 4
+
+    scheduler.kv_cache_manager.free(request)
+
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
+
+
 def test_scheduler_applies_actual_layer_major_prefill_completion():
     scheduler = Scheduler.__new__(Scheduler)
     request = SimpleNamespace(
-        num_computed_tokens=8,
+        num_computed_tokens=16,
         num_tokens=16,
         num_output_placeholders=0,
         is_prefill_chunk=False,
@@ -217,15 +265,15 @@ def test_scheduler_applies_actual_layer_major_prefill_completion():
     scheduler_output = make_layer_major_scheduler_output()
     completion = RetroSpecLayerMajorPrefillCompletion(
         request_id="request",
-        num_completed_prompt_tokens=6,
+        num_completed_prompt_tokens=16,
     )
 
     scheduler._update_retrospec_layer_major_prefill_completion(
         scheduler_output, completion
     )
 
-    assert request.num_computed_tokens == 6
-    assert request.is_prefill_chunk
+    assert request.num_computed_tokens == 16
+    assert not request.is_prefill_chunk
 
 
 def test_scheduler_rejects_completion_outside_reserved_range():
@@ -238,10 +286,10 @@ def test_scheduler_rejects_completion_outside_reserved_range():
     scheduler_output = make_layer_major_scheduler_output()
     completion = RetroSpecLayerMajorPrefillCompletion(
         request_id="request",
-        num_completed_prompt_tokens=9,
+        num_completed_prompt_tokens=15,
     )
 
-    with pytest.raises(RuntimeError, match="outside its reserved range"):
+    with pytest.raises(RuntimeError, match="atomic prompt transaction"):
         scheduler._update_retrospec_layer_major_prefill_completion(
             scheduler_output, completion
         )

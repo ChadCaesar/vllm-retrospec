@@ -38,8 +38,10 @@ class AddLayer(nn.Module):
 
 class FinalNorm(nn.Module):
     def forward(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return hidden_states + 1
         return hidden_states + residual, residual
 
 
@@ -116,6 +118,17 @@ def test_regular_forward_uses_forward_layer_without_changing_output():
 
     torch.testing.assert_close(output, inputs_embeds * 2 + 3.0)
     assert model.executed_layer_indices == [0, 1]
+
+
+def test_finalize_hidden_states_accepts_materialized_residual():
+    model = make_llama_model()
+    hidden_states = torch.ones(2, 4)
+    pp_group = SimpleNamespace(is_last_rank=True)
+
+    with patch("vllm.model_executor.models.llama.get_pp_group", return_value=pp_group):
+        output = model.finalize_hidden_states(hidden_states, None)
+
+    torch.testing.assert_close(output, hidden_states + 1)
 
 
 def test_resolve_retrospec_layer_model_accepts_inner_and_wrapped_model():

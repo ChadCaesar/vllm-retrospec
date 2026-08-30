@@ -232,6 +232,41 @@ class SingleTypeKVCacheManager(ABC):
             req_blocks.extend(new_blocks)
             return new_blocks
 
+    def allocate_sparse_blocks(
+        self,
+        request_id: str,
+        num_logical_blocks: int,
+        resident_block_indices: Sequence[int],
+    ) -> list[KVCacheBlock] | None:
+        """Allocate physical blocks only for selected logical positions."""
+        if num_logical_blocks <= 0:
+            raise ValueError("num_logical_blocks must be positive")
+
+        resident_indices = tuple(sorted(set(resident_block_indices)))
+        if not resident_indices:
+            raise ValueError("At least one resident block is required")
+        if resident_indices[0] < 0 or resident_indices[-1] >= num_logical_blocks:
+            raise ValueError("Resident block index is outside the logical table")
+
+        req_blocks = self.req_to_blocks[request_id]
+        if req_blocks:
+            raise RuntimeError(f"Request {request_id!r} already owns KV blocks")
+        if len(resident_indices) > self.block_pool.get_num_free_blocks():
+            return None
+
+        allocated_blocks = self.block_pool.get_new_blocks(len(resident_indices))
+        logical_blocks = [self._null_block] * num_logical_blocks
+        for logical_index, block in zip(
+            resident_indices, allocated_blocks, strict=True
+        ):
+            logical_blocks[logical_index] = block
+
+        req_blocks.extend(logical_blocks)
+        # A sparse table cannot participate in ordinary prefix hashing because
+        # its retired middle entries intentionally contain null blocks.
+        self.num_cached_block[request_id] = num_logical_blocks
+        return req_blocks
+
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
         """
         Cache the blocks for the request.
@@ -247,9 +282,14 @@ class SingleTypeKVCacheManager(ABC):
         if num_cached_blocks >= num_full_blocks:
             return
 
+        blocks = self.req_to_blocks[request.request_id]
+        if any(block.is_null for block in blocks[:num_full_blocks]):
+            self.num_cached_block[request.request_id] = num_full_blocks
+            return
+
         self.block_pool.cache_full_blocks(
             request=request,
-            blocks=self.req_to_blocks[request.request_id],
+            blocks=blocks,
             num_cached_blocks=num_cached_blocks,
             num_full_blocks=num_full_blocks,
             block_size=self.block_size,
@@ -270,7 +310,7 @@ class SingleTypeKVCacheManager(ABC):
 
         # Free blocks in reverse order so that the tail blocks are
         # freed first.
-        ordered_blocks = reversed(req_blocks)
+        ordered_blocks = (block for block in reversed(req_blocks) if not block.is_null)
 
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)

@@ -175,6 +175,25 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def allocate_retrospec_prefill_blocks(
+        self,
+        request_id: str,
+        num_logical_blocks: int,
+        resident_block_indices: Sequence[int],
+    ) -> tuple[list[KVCacheBlock], ...] | None:
+        """Reserve one sparse logical block table for RetroSpec prefill."""
+        if len(self.single_type_managers) != 1:
+            raise NotImplementedError(
+                "RetroSpec layer-major prefill requires one KV-cache group"
+            )
+
+        blocks = self.single_type_managers[0].allocate_sparse_blocks(
+            request_id, num_logical_blocks, resident_block_indices
+        )
+        if blocks is None:
+            return None
+        return (blocks,)
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
         Cache the blocks for the request.

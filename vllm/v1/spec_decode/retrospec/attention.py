@@ -308,6 +308,52 @@ class RetroSpecSparseAttention:
             prefill_complete,
         )
 
+    def stage_layer_major_prefill_layer(
+        self,
+        layer_name: str,
+        request_id: str,
+        seq_len: int,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.cuda.Event | None:
+        """Stage one complete prompt layer without using forward hooks."""
+        if self.in_proposal:
+            raise RuntimeError("Cannot build a prefill index during a proposal")
+        if self.index_update_active:
+            raise RuntimeError(
+                "Layer-major prefill cannot overlap a normal index update"
+            )
+        if self.index.has_staged_request_layer(layer_name, request_id):
+            raise RuntimeError(
+                f"Layer {layer_name!r} is already staged for {request_id!r}"
+            )
+
+        return self.index.build_or_update(
+            layer_name=layer_name,
+            request_ids=(request_id,),
+            seq_lens=(seq_len,),
+            is_prefill=(True,),
+            rows=(0,),
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            defer_cpu_store=True,
+            prefill_complete=(True,),
+        )
+
+    def commit_layer_major_prefill(
+        self,
+        request_id: str,
+        layer_names: Sequence[str],
+    ) -> None:
+        """Publish every layer after the complete request succeeds."""
+        self.index.flush_staged_updates()
+        self.index.mark_first_draft_warmup((request_id,), tuple(layer_names))
+
+    def abort_layer_major_prefill(self) -> None:
+        self.index.discard_staged_updates()
+
     def has_retired_kv_blocks(self, request_ids: Sequence[str]) -> bool:
         if not self.uses_full_verification_offload:
             return False

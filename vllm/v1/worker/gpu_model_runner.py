@@ -162,6 +162,8 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.retrospec import RetroSpecProposer
 from vllm.v1.spec_decode.retrospec.prefill import (
     RetroSpecLayerMajorPrefillProtocol,
+    RetroSpecLayerPrefillWorkspace,
+    resolve_retrospec_layer_model,
 )
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
@@ -720,6 +722,9 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        self.retrospec_layer_prefill_workspace: (
+            RetroSpecLayerPrefillWorkspace | None
+        ) = None
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
 
@@ -3109,6 +3114,244 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _build_retrospec_prefill_tile_metadata(
+        self,
+        tile,
+        builder: AttentionMetadataBuilder,
+    ) -> AttentionMetadata:
+        query_start_loc_cpu = torch.tensor(
+            [0, tile.num_scheduled_tokens], dtype=torch.int32
+        )
+        query_start_loc = query_start_loc_cpu.to(device=self.device, non_blocking=True)
+        common_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=torch.tensor(
+                [tile.context_len], dtype=torch.int32, device=self.device
+            ),
+            num_reqs=1,
+            num_actual_tokens=tile.num_scheduled_tokens,
+            max_query_len=tile.num_scheduled_tokens,
+            max_seq_len=tile.context_len,
+            block_table_tensor=tile.block_table,
+            slot_mapping=tile.slot_mapping,
+            causal=True,
+        )
+        return builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_metadata,
+        )
+
+    @staticmethod
+    def _copy_retrospec_prefill_resident_blocks(
+        workspace: RetroSpecLayerPrefillWorkspace,
+        native_kv_cache: torch.Tensor,
+        source_block_ids: torch.Tensor,
+        destination_block_ids: torch.Tensor,
+    ) -> None:
+        source = workspace.kv_cache.index_select(1, source_block_ids)
+        native_kv_cache.index_copy_(1, destination_block_ids, source)
+
+    def _build_retrospec_post_prefill_metadata(
+        self,
+        block_table: torch.Tensor,
+        prompt_num_tokens: int,
+        last_prompt_slot: int,
+    ) -> CommonAttentionMetadata:
+        return CommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=self.device),
+            query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+            seq_lens=torch.tensor(
+                [prompt_num_tokens], dtype=torch.int32, device=self.device
+            ),
+            num_reqs=1,
+            num_actual_tokens=1,
+            max_query_len=1,
+            max_seq_len=prompt_num_tokens,
+            block_table_tensor=block_table,
+            slot_mapping=torch.tensor(
+                [last_prompt_slot], dtype=torch.int64, device=self.device
+            ),
+            causal=True,
+        )
+
+    def _execute_retrospec_layer_major_prefill(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        descriptor = scheduler_output.retrospec_layer_major_prefill
+        if descriptor is None:
+            raise RuntimeError("Missing layer-major prefill descriptor")
+
+        drafter = self.drafter
+        if not isinstance(drafter, RetroSpecProposer):
+            raise RuntimeError("Layer-major prefill requires RetroSpec")
+        workspace = self.retrospec_layer_prefill_workspace
+        if workspace is None:
+            raise RuntimeError("Layer-major prefill workspace is unavailable")
+
+        request = self.requests[descriptor.request_id]
+        if request.prompt_token_ids is None:
+            raise RuntimeError("Layer-major prefill requires prompt token IDs")
+
+        layer_model = resolve_retrospec_layer_model(self.model)
+        layer_names = drafter.attn_layer_names
+        layer_indices = tuple(range(layer_model.start_layer, layer_model.end_layer))
+        if len(layer_names) != len(layer_indices):
+            raise RuntimeError(
+                "Model layer count and registered attention layer count differ"
+            )
+
+        kv_cache_group_id = drafter.kv_cache_group_id
+        if kv_cache_group_id is None:
+            raise RuntimeError("RetroSpec KV-cache group is unavailable")
+
+        self.input_batch.block_table.commit_block_table(1)
+        native_block_table = self.input_batch.block_table[
+            kv_cache_group_id
+        ].get_device_tensor(1)
+
+        prompt_num_tokens = descriptor.prompt_num_tokens
+        workspace.prepare(prompt_num_tokens)
+        prompt_block_count = cdiv(prompt_num_tokens, workspace.block_size)
+        source_blocks = (
+            0,
+            *range(descriptor.resident_start_block, prompt_block_count),
+        )
+        request_block_ids = request.block_ids[kv_cache_group_id]
+        destination_blocks = tuple(
+            request_block_ids[logical_block] for logical_block in source_blocks
+        )
+        if any(block_id == KV_CACHE_NULL_BLOCK_ID for block_id in destination_blocks):
+            raise RuntimeError("A required resident prompt block is not allocated")
+
+        source_block_ids = torch.tensor(
+            source_blocks, dtype=torch.int64, device=self.device
+        )
+        destination_block_ids = torch.tensor(
+            destination_blocks, dtype=torch.int64, device=self.device
+        )
+        prompt_token_ids = torch.tensor(
+            request.prompt_token_ids, dtype=torch.int64, device=self.device
+        )
+        positions = torch.arange(
+            prompt_num_tokens, dtype=torch.int64, device=self.device
+        )
+        hidden_states = layer_model.embed_input_ids(prompt_token_ids)
+        builder = drafter.get_attention_metadata_builder()
+        tile_size = self.scheduler_config.max_num_batched_tokens
+
+        try:
+            for layer_index, layer_name in zip(layer_indices, layer_names, strict=True):
+                attention_layer = self.compilation_config.static_forward_context[
+                    layer_name
+                ]
+                if not isinstance(attention_layer, Attention):
+                    raise TypeError(
+                        f"Layer {layer_name!r} is not a vLLM Attention module"
+                    )
+
+                workspace.begin_layer(layer_name)
+                try:
+                    for tile_start in range(0, prompt_num_tokens, tile_size):
+                        tile_end = min(tile_start + tile_size, prompt_num_tokens)
+                        tile = workspace.tile(tile_start, tile_end)
+                        attn_metadata = self._build_retrospec_prefill_tile_metadata(
+                            tile, builder
+                        )
+                        per_layer_metadata = {layer_name: attn_metadata}
+                        per_layer_slot_mapping = {layer_name: tile.slot_mapping}
+
+                        with (
+                            workspace.bind_layer(layer_name, attention_layer),
+                            set_forward_context(
+                                per_layer_metadata,
+                                self.vllm_config,
+                                num_tokens=tile.num_scheduled_tokens,
+                                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                                slot_mapping=per_layer_slot_mapping,
+                            ),
+                        ):
+                            tile_hidden, tile_residual = layer_model.forward_layer(
+                                layer_index,
+                                positions[tile_start:tile_end],
+                                hidden_states[tile_start:tile_end],
+                                None,
+                            )
+
+                        if tile_residual is not None:
+                            tile_hidden = tile_hidden + tile_residual
+                        hidden_states[tile_start:tile_end].copy_(tile_hidden)
+
+                    key_cache, value_cache = workspace.kv_cache.unbind(0)
+                    full_prompt_tile = workspace.tile(0, prompt_num_tokens)
+                    reuse_ready_event = drafter.stage_layer_major_prefill_layer(
+                        layer_name=layer_name,
+                        request_id=descriptor.request_id,
+                        seq_len=prompt_num_tokens,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        block_table=full_prompt_tile.block_table,
+                    )
+                    native_kv_cache = attention_layer.kv_cache[0]
+                    self._copy_retrospec_prefill_resident_blocks(
+                        workspace,
+                        native_kv_cache,
+                        source_block_ids,
+                        destination_block_ids,
+                    )
+                    workspace.end_layer(reuse_ready_event)
+                except BaseException:
+                    workspace.abort_layer()
+                    raise
+
+            drafter.commit_layer_major_prefill(descriptor.request_id)
+        except BaseException:
+            drafter.abort_layer_major_prefill()
+            raise
+
+        last_hidden_state = layer_model.finalize_hidden_states(hidden_states[-1:], None)
+        del hidden_states
+        logits = self.model.compute_logits(last_hidden_state)
+        if logits is None:
+            raise RuntimeError("Layer-major prefill did not produce logits")
+
+        req_index = self.input_batch.req_id_to_index[descriptor.request_id]
+        request.num_computed_tokens = prompt_num_tokens
+        self.input_batch.num_computed_tokens_cpu[req_index] = prompt_num_tokens
+        self.discard_request_mask.np[:1] = False
+        self.discard_request_mask.copy_to_gpu(1)
+
+        last_prompt_position = prompt_num_tokens - 1
+        last_prompt_block = last_prompt_position // workspace.block_size
+        last_prompt_block_id = request_block_ids[last_prompt_block]
+        last_prompt_slot = (
+            last_prompt_block_id * workspace.block_size
+            + last_prompt_position % workspace.block_size
+        )
+        common_metadata = self._build_retrospec_post_prefill_metadata(
+            native_block_table,
+            prompt_num_tokens,
+            last_prompt_slot,
+        )
+        slot_mappings = {
+            layer_name: common_metadata.slot_mapping for layer_name in layer_names
+        }
+
+        self.execute_model_state = ExecuteModelState(
+            scheduler_output=scheduler_output,
+            logits=logits,
+            spec_decode_metadata=None,
+            spec_decode_common_attn_metadata=common_metadata,
+            hidden_states=last_hidden_state,
+            sample_hidden_states=last_hidden_state,
+            aux_hidden_states=None,
+            ec_connector_output=None,
+            cudagraph_stats=None,
+            slot_mappings=slot_mappings,
+        )
+        self.kv_connector_output = None
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -3410,6 +3653,8 @@ class GPUModelRunner(
                 RetroSpecLayerMajorPrefillProtocol.validate_cached_prompt(
                     descriptor, request.num_prompt_tokens
                 )
+                self._execute_retrospec_layer_major_prefill(scheduler_output)
+                return None
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -6317,6 +6562,35 @@ class GPUModelRunner(
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
+
+        if isinstance(getattr(self, "drafter", None), RetroSpecProposer):
+            kv_cache_group_id = self.drafter.kv_cache_group_id
+            if kv_cache_group_id is None:
+                raise RuntimeError("RetroSpec KV-cache group is unavailable")
+
+            attn_groups = self.attn_groups[kv_cache_group_id]
+            if len(attn_groups) != 1:
+                raise NotImplementedError(
+                    "Layer-major prefill requires one attention backend"
+                )
+            attn_group = attn_groups[0]
+            builder = attn_group.get_metadata_builder()
+            kv_cache_spec = builder.kv_cache_spec
+            if not isinstance(kv_cache_spec, AttentionSpec):
+                raise TypeError(
+                    "Layer-major prefill requires an AttentionSpec KV cache"
+                )
+            if kv_cache_spec.block_size != self.cache_config.block_size:
+                raise NotImplementedError(
+                    "Layer-major prefill does not support virtual block splitting"
+                )
+
+            self.retrospec_layer_prefill_workspace = RetroSpecLayerPrefillWorkspace(
+                device=self.device,
+                backend=attn_group.backend,
+                kv_cache_spec=kv_cache_spec,
+                cache_dtype=self.cache_config.cache_dtype,
+            )
 
         if has_kv_transfer_group():
             kv_transfer_group = get_kv_transfer_group()

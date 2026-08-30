@@ -173,14 +173,38 @@ def test_first_draft_warmup_is_marked_only_with_pinned_cpu_backing():
     assert pageable._first_draft_warm_layers_by_request == {}
 
     pinned = make_index(pin_memory=True)
+    first_record = pinned._empty_index()
+    first_record.num_clusters = 1
+    second_record = pinned._empty_index()
+    second_record.num_clusters = 1
+    pinned._indices = {
+        "first": {"request": first_record},
+        "second": {"request": second_record},
+    }
     pinned.mark_first_draft_warmup(["request"], ["first", "second"])
     assert pinned._first_draft_warm_layers_by_request == {
         "request": {"first", "second"}
     }
 
 
+def test_first_draft_warmup_skips_layers_without_cluster_pages():
+    index = make_index(pin_memory=True)
+    index._indices = {"empty": {"request": index._empty_index()}}
+
+    index.mark_first_draft_warmup(["request"], ["missing", "empty"])
+
+    assert index._first_draft_warm_layers_by_request == {}
+
+
 def test_first_draft_warmup_waits_for_each_requests_first_active_draft():
     index = make_index(pin_memory=True)
+    first_record = index._empty_index()
+    first_record.num_clusters = 1
+    second_record = index._empty_index()
+    second_record.num_clusters = 1
+    index._indices = {
+        "layer": {"first": first_record, "second": second_record},
+    }
     index.mark_first_draft_warmup(["first", "second"], ["layer"])
 
     first_mask = index._get_first_draft_warmup_mask(

@@ -165,3 +165,21 @@ def test_gpu_model_runner_applies_retirement_to_cached_and_batched_state():
         start_block=1,
         end_block=4,
     )
+
+
+def test_layer_major_prefill_copies_only_resident_workspace_blocks():
+    workspace_cache = torch.arange(2 * 5 * 2, dtype=torch.float32).view(2, 5, 2)
+    workspace = SimpleNamespace(kv_cache=workspace_cache)
+    native_cache = torch.full((2, 8, 2), -1.0)
+
+    GPUModelRunner._copy_retrospec_prefill_resident_blocks(
+        workspace,
+        native_cache,
+        torch.tensor([0, 3, 4]),
+        torch.tensor([2, 5, 7]),
+    )
+
+    torch.testing.assert_close(native_cache[:, 2], workspace_cache[:, 0])
+    torch.testing.assert_close(native_cache[:, 5], workspace_cache[:, 3])
+    torch.testing.assert_close(native_cache[:, 7], workspace_cache[:, 4])
+    assert torch.all(native_cache[:, [0, 1, 3, 4, 6]] == -1)

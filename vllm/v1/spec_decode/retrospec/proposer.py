@@ -290,6 +290,35 @@ class RetroSpecProposer:
             build_rows,
         )
 
+    def stage_layer_major_prefill_layer(
+        self,
+        layer_name: str,
+        request_id: str,
+        seq_len: int,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.cuda.Event | None:
+        return self.sparse_attention.stage_layer_major_prefill_layer(
+            layer_name,
+            request_id,
+            seq_len,
+            key_cache,
+            value_cache,
+            block_table,
+        )
+
+    def commit_layer_major_prefill(self, request_id: str) -> None:
+        self.sparse_attention.commit_layer_major_prefill(
+            request_id, self.attn_layer_names
+        )
+
+    def abort_layer_major_prefill(self) -> None:
+        self.sparse_attention.abort_layer_major_prefill()
+
+    def get_attention_metadata_builder(self) -> AttentionMetadataBuilder:
+        return self._get_attention_metadata_builder()
+
     def load_model(self, target_model: nn.Module) -> None:
         self.model = target_model
 

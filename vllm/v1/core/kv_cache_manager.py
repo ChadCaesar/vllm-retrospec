@@ -8,6 +8,7 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -398,6 +399,46 @@ class KVCacheManager:
             kv_cache_group_id,
             start_block,
             end_block,
+        )
+
+    def allocate_retrospec_prefill_slots(
+        self,
+        request: Request,
+        prompt_num_tokens: int,
+        num_recent_blocks: int,
+        num_lookahead_tokens: int,
+    ) -> tuple[KVCacheBlocks, int, int] | None:
+        """Allocate sink/recent/lookahead blocks around a null middle range."""
+        if request.num_computed_tokens != 0:
+            raise ValueError("Layer-major prefill requires an uncomputed prompt")
+        if num_recent_blocks < 1:
+            raise ValueError("num_recent_blocks must be positive")
+        if len(self.coordinator.single_type_managers) != 1:
+            raise NotImplementedError(
+                "RetroSpec layer-major prefill requires one KV-cache group"
+            )
+
+        manager = self.coordinator.single_type_managers[0]
+        total_tokens = min(prompt_num_tokens + num_lookahead_tokens, self.max_model_len)
+        num_logical_blocks = cdiv(total_tokens, manager.block_size)
+        full_prompt_blocks = prompt_num_tokens // manager.block_size
+        resident_start_block = max(full_prompt_blocks - num_recent_blocks, 1)
+        resident_block_indices = (
+            0,
+            *range(resident_start_block, num_logical_blocks),
+        )
+
+        blocks = self.coordinator.allocate_retrospec_prefill_blocks(
+            request.request_id,
+            num_logical_blocks,
+            resident_block_indices,
+        )
+        if blocks is None:
+            return None
+        return (
+            self.create_kv_cache_blocks(blocks),
+            resident_start_block,
+            num_logical_blocks,
         )
 
     def remove_skipped_blocks(

@@ -707,10 +707,18 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             return
 
         for request_id in request_ids:
-            self._first_draft_warm_layers_by_request.setdefault(
-                request_id,
-                set(),
-            ).update(layer_names)
+            indexed_layers = {
+                layer_name
+                for layer_name in layer_names
+                if (record := self._indices.get(layer_name, {}).get(request_id))
+                is not None
+                and record.num_clusters > 0
+            }
+            if indexed_layers:
+                self._first_draft_warm_layers_by_request.setdefault(
+                    request_id,
+                    set(),
+                ).update(indexed_layers)
 
     def _get_first_draft_warmup_mask(
         self,
@@ -927,7 +935,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         segment_size: int,
         token_keys: torch.Tensor,
         token_values: torch.Tensor,
-    ) -> int:
+    ) -> tuple[int, torch.cuda.Event | None]:
         """Overlap one bounded segment's D2H copy, k-means, and CPU build."""
         self._wait_for_cluster_build_slot()
         staged_token_kv = self.cluster_store.stage_token_kv(token_keys, token_values)
@@ -1004,7 +1012,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 build_future=build_future,
             )
         )
-        return phase_result.cluster_sizes.shape[1]
+        return phase_result.cluster_sizes.shape[1], staged_clusters.ready_event
+
+    def has_staged_request_layer(self, layer_name: str, request_id: str) -> bool:
+        return (layer_name, request_id) in self._staged_segment_keys
 
     def _release_built_segments(
         self,
@@ -1268,7 +1279,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         block_table: torch.Tensor,
         defer_cpu_store: bool = False,
         prefill_complete: Sequence[bool] | None = None,
-    ) -> None:
+    ) -> torch.cuda.Event | None:
         """Cluster stable tokens and stage or store private cluster pages."""
         if len(request_ids) != len(seq_lens):
             raise ValueError("request_ids and seq_lens must have equal length")
@@ -1292,6 +1303,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         layer_indices = self._indices.setdefault(layer_name, {})
         layer_changed = False
+        last_ready_event: torch.cuda.Event | None = None
 
         for row in rows:
             if not 0 <= row < len(request_ids):
@@ -1372,7 +1384,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     .contiguous()
                 )
 
-                num_phase_clusters = self._stage_clustering_phase(
+                num_phase_clusters, ready_event = self._stage_clustering_phase(
                     layer_name=layer_name,
                     request_id=request_id,
                     indexed_start=phase_start,
@@ -1381,6 +1393,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     token_keys=token_keys,
                     token_values=token_values,
                 )
+                if ready_event is not None:
+                    last_ready_event = ready_event
                 phase_start = phase_end
                 cluster_start += num_phase_clusters
 
@@ -1391,6 +1405,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         if layer_changed:
             self._gpu_index_residency.invalidate_active_view(layer_name)
+        return last_ready_event
 
     def _validate_resident_index(
         self,

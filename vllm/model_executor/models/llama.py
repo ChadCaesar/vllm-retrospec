@@ -415,6 +415,21 @@ class LlamaModel(nn.Module):
         layer = self.layers[layer_index]
         return layer(positions, hidden_states, residual, **extra_layer_kwargs)
 
+    def finalize_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply the final decoder norm after explicit layer execution."""
+        if not get_pp_group().is_last_rank:
+            raise RuntimeError(
+                "Layer-major prefill does not support pipeline parallelism"
+            )
+        output = self.norm(hidden_states, residual)
+        if isinstance(output, tuple):
+            return output[0]
+        return output
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -453,7 +468,7 @@ class LlamaModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.finalize_hidden_states(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states

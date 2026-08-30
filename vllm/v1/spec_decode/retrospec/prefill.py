@@ -25,6 +25,8 @@ class RetroSpecLayerModel(Protocol):
     start_layer: int
     end_layer: int
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor: ...
+
     def forward_layer(
         self,
         layer_index: int,
@@ -33,6 +35,12 @@ class RetroSpecLayerModel(Protocol):
         residual: torch.Tensor | None,
         **extra_layer_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def finalize_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor: ...
 
 
 def resolve_retrospec_layer_model(model: torch.nn.Module) -> RetroSpecLayerModel:
@@ -46,7 +54,7 @@ def resolve_retrospec_layer_model(model: torch.nn.Module) -> RetroSpecLayerModel
 
     raise TypeError(
         "RetroSpec layer-major prefill requires a model exposing "
-        "start_layer, end_layer, and forward_layer()"
+        "embedding, layer execution, and final normalization interfaces"
     )
 
 

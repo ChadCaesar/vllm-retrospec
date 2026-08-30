@@ -182,26 +182,38 @@ class CachedRequestData:
 @bc_linter_include
 @dataclass(frozen=True)
 class RetroSpecLayerMajorPrefillDescriptor:
-    """Describe one isolated RetroSpec target-prefill execution."""
+    """Describe one complete isolated RetroSpec target-prefill execution."""
 
     request_id: str
     prompt_num_tokens: int
     scheduled_start: int
     scheduled_end: int
+    resident_start_block: int
+    num_logical_blocks: int
 
     def __post_init__(self) -> None:
         if self.prompt_num_tokens <= 0:
             raise ValueError("prompt_num_tokens must be positive")
-        if self.scheduled_start < 0:
-            raise ValueError("scheduled_start must be non-negative")
-        if self.scheduled_end <= self.scheduled_start:
-            raise ValueError("scheduled_end must be greater than scheduled_start")
-        if self.scheduled_end > self.prompt_num_tokens:
-            raise ValueError("scheduled_end cannot exceed prompt_num_tokens")
+        if self.scheduled_start != 0:
+            raise ValueError("Layer-major prefill must start at token zero")
+        if self.scheduled_end != self.prompt_num_tokens:
+            raise ValueError("Layer-major prefill must cover the complete prompt")
+        if self.resident_start_block < 1:
+            raise ValueError("resident_start_block must preserve the sink block")
+        if self.num_logical_blocks < self.resident_start_block:
+            raise ValueError("resident_start_block exceeds the logical table")
 
     @property
     def num_scheduled_tokens(self) -> int:
-        return self.scheduled_end - self.scheduled_start
+        return self.prompt_num_tokens
+
+    @property
+    def retired_start_block(self) -> int:
+        return 1
+
+    @property
+    def retired_end_block(self) -> int:
+        return self.resident_start_block
 
 
 @bc_linter_include

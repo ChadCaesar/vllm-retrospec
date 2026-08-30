@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -355,7 +356,7 @@ class Scheduler(SchedulerInterface):
             and not request.has_encoder_inputs
             and request.lora_request is None
             and request.num_output_tokens == 0
-            and request.num_computed_tokens < request.num_prompt_tokens
+            and request.num_computed_tokens == 0
             and not request.spec_token_ids
             and (sampling_params is None or sampling_params.prompt_logprobs is None)
         )
@@ -415,6 +416,8 @@ class Scheduler(SchedulerInterface):
         layer_major_prefill_req_id = (
             self._select_retrospec_layer_major_prefill_request()
         )
+        layer_major_resident_start_block: int | None = None
+        layer_major_num_logical_blocks: int | None = None
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -683,9 +686,14 @@ class Scheduler(SchedulerInterface):
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
+                is_layer_major_prefill = request_id == layer_major_prefill_req_id
 
                 # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
+                if is_layer_major_prefill:
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_new_local_computed_tokens = 0
+                    num_computed_tokens = 0
+                elif request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
@@ -739,22 +747,25 @@ class Scheduler(SchedulerInterface):
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
-                    num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
+                    if is_layer_major_prefill:
+                        num_new_tokens = request.num_prompt_tokens
+                    else:
+                        num_new_tokens = request.num_tokens - num_computed_tokens
+                        threshold = self.scheduler_config.long_prefill_token_threshold
+                        if 0 < threshold < num_new_tokens:
+                            num_new_tokens = threshold
 
-                    # chunked prefill has to be enabled explicitly to allow
-                    # pooling requests to be chunked
-                    if (
-                        not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens > token_budget
-                    ):
-                        # If chunked_prefill is disabled,
-                        # we can stop the scheduling here.
-                        break
+                        # chunked prefill has to be enabled explicitly to allow
+                        # pooling requests to be chunked
+                        if (
+                            not self.scheduler_config.enable_chunked_prefill
+                            and num_new_tokens > token_budget
+                        ):
+                            # If chunked_prefill is disabled,
+                            # we can stop the scheduling here.
+                            break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                        num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -800,16 +811,33 @@ class Scheduler(SchedulerInterface):
                     else 0
                 )
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                )
+                if is_layer_major_prefill:
+                    num_recent_blocks = cdiv(self.num_spec_tokens, self.block_size) + 1
+                    allocation = self.kv_cache_manager.allocate_retrospec_prefill_slots(
+                        request,
+                        prompt_num_tokens=request.num_prompt_tokens,
+                        num_recent_blocks=num_recent_blocks,
+                        num_lookahead_tokens=self.num_lookahead_tokens,
+                    )
+                    if allocation is None:
+                        new_blocks = None
+                    else:
+                        (
+                            new_blocks,
+                            layer_major_resident_start_block,
+                            layer_major_num_logical_blocks,
+                        ) = allocation
+                else:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -868,7 +896,10 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
-                token_budget -= num_new_tokens
+                if is_layer_major_prefill:
+                    token_budget = 0
+                else:
+                    token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -900,20 +931,25 @@ class Scheduler(SchedulerInterface):
             and layer_major_prefill_req_id in num_scheduled_tokens
         ):
             request = self.requests[layer_major_prefill_req_id]
-            scheduled_start = request.num_computed_tokens
-            scheduled_end = (
-                scheduled_start + num_scheduled_tokens[layer_major_prefill_req_id]
-            )
+            assert layer_major_resident_start_block is not None
+            assert layer_major_num_logical_blocks is not None
             layer_major_prefill_descriptor = RetroSpecLayerMajorPrefillDescriptor(
                 request_id=layer_major_prefill_req_id,
                 prompt_num_tokens=request.num_prompt_tokens,
-                scheduled_start=scheduled_start,
-                scheduled_end=scheduled_end,
+                scheduled_start=0,
+                scheduled_end=request.num_prompt_tokens,
+                resident_start_block=layer_major_resident_start_block,
+                num_logical_blocks=layer_major_num_logical_blocks,
             )
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        if layer_major_prefill_descriptor is None:
+            assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        else:
+            assert total_num_scheduled_tokens == (
+                layer_major_prefill_descriptor.prompt_num_tokens
+            )
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
@@ -1395,11 +1431,11 @@ class Scheduler(SchedulerInterface):
             )
 
         completed = completion.num_completed_prompt_tokens
-        if not descriptor.scheduled_start < completed <= descriptor.scheduled_end:
+        if completed != descriptor.prompt_num_tokens:
             raise RuntimeError(
-                "RetroSpec layer-major prefill completed outside its reserved "
-                f"range: reserved=({descriptor.scheduled_start}, "
-                f"{descriptor.scheduled_end}], completed={completed}"
+                "RetroSpec layer-major prefill did not complete its atomic "
+                f"prompt transaction: expected={descriptor.prompt_num_tokens}, "
+                f"completed={completed}"
             )
 
         request = self.requests.get(descriptor.request_id)
