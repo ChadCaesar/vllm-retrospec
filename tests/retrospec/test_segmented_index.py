@@ -4,6 +4,7 @@
 import threading
 from concurrent.futures import Future
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -194,6 +195,48 @@ def test_first_draft_warmup_skips_layers_without_cluster_pages():
     index.mark_first_draft_warmup(["request"], ["missing", "empty"])
 
     assert index._first_draft_warm_layers_by_request == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_draft_materialization_skips_resident_lookup_without_arena():
+    device = torch.device("cuda")
+    index = make_index(pin_memory=True)
+    plan = SimpleNamespace(
+        layer_name="layer",
+        primary_exact_token_mask=torch.ones(1, 1, 2, dtype=torch.bool, device=device),
+        sparse_exact_cluster_ids=torch.full(
+            (1, 1, 1), -1, dtype=torch.int64, device=device
+        ),
+        sparse_exact_page_ids=torch.full(
+            (1, 1, 1, 1), -1, dtype=torch.int64, device=device
+        ),
+        sparse_exact_page_token_counts=torch.zeros(
+            1, 1, 1, 1, dtype=torch.int32, device=device
+        ),
+        sparse_estimation_keys=torch.empty(1, 1, 0, 1, device=device),
+        sparse_estimation_values=torch.empty(1, 1, 0, 1, device=device),
+        sparse_estimation_token_counts=torch.empty(
+            1, 1, 0, dtype=torch.int32, device=device
+        ),
+        sparse_attn=torch.ones(1, device=device),
+    )
+    index.cluster_store.resolve_draft_cluster_blocks = Mock()
+
+    selection = index._materialize_draft_selection(
+        plan=plan,
+        output_workspace=None,
+        view=make_empty_resident_view(1, 1, device),
+        cluster_zones=Mock(),
+        cluster_scores=torch.empty(1, 1, 1, device=device),
+        has_clusters=torch.zeros(1, 1, dtype=torch.bool, device=device),
+        head_size=1,
+        dtype=torch.float32,
+        active_mask=torch.ones(1, dtype=torch.bool, device=device),
+    )
+
+    assert selection.resolved_pages is None
+    assert selection.exact_token_counts.tolist() == [[2]]
+    index.cluster_store.resolve_draft_cluster_blocks.assert_not_called()
 
 
 def test_first_draft_warmup_waits_for_each_requests_first_active_draft():

@@ -406,13 +406,16 @@ class KVCacheManager:
         request: Request,
         prompt_num_tokens: int,
         num_recent_blocks: int,
+        blocks_per_cluster: int,
         num_lookahead_tokens: int,
     ) -> tuple[KVCacheBlocks, int, int] | None:
-        """Allocate sink/recent/lookahead blocks around a null middle range."""
+        """Allocate native blocks outside the cluster-backed prompt prefix."""
         if request.num_computed_tokens != 0:
             raise ValueError("Layer-major prefill requires an uncomputed prompt")
         if num_recent_blocks < 1:
             raise ValueError("num_recent_blocks must be positive")
+        if blocks_per_cluster < 1:
+            raise ValueError("blocks_per_cluster must be positive")
         if len(self.coordinator.single_type_managers) != 1:
             raise NotImplementedError(
                 "RetroSpec layer-major prefill requires one KV-cache group"
@@ -421,8 +424,15 @@ class KVCacheManager:
         manager = self.coordinator.single_type_managers[0]
         total_tokens = min(prompt_num_tokens + num_lookahead_tokens, self.max_model_len)
         num_logical_blocks = cdiv(total_tokens, manager.block_size)
+
         full_prompt_blocks = prompt_num_tokens // manager.block_size
-        resident_start_block = max(full_prompt_blocks - num_recent_blocks, 1)
+        stable_end_block = max(full_prompt_blocks - num_recent_blocks, 1)
+        num_stable_middle_blocks = stable_end_block - 1
+        num_clustered_blocks = (
+            num_stable_middle_blocks // blocks_per_cluster * blocks_per_cluster
+        )
+        resident_start_block = 1 + num_clustered_blocks
+
         resident_block_indices = (
             0,
             *range(resident_start_block, num_logical_blocks),

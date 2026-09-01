@@ -694,6 +694,19 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             if layer_changed:
                 self._gpu_index_residency.invalidate_active_view(layer_name)
 
+    def has_cluster_pages(
+        self,
+        layer_name: str,
+        request_ids: Sequence[str],
+    ) -> bool:
+        """Return whether any request owns committed clusters for one layer."""
+        layer_indices = self._indices.get(layer_name, {})
+        return any(
+            (record := layer_indices.get(request_id)) is not None
+            and record.num_clusters > 0
+            for request_id in request_ids
+        )
+
     def mark_first_draft_warmup(
         self,
         request_ids: Sequence[str],
@@ -710,15 +723,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             indexed_layers = {
                 layer_name
                 for layer_name in layer_names
-                if (record := self._indices.get(layer_name, {}).get(request_id))
-                is not None
-                and record.num_clusters > 0
+                if self.has_cluster_pages(layer_name, (request_id,))
             }
-            if indexed_layers:
-                self._first_draft_warm_layers_by_request.setdefault(
-                    request_id,
-                    set(),
-                ).update(indexed_layers)
+            if not indexed_layers:
+                continue
+
+            self._first_draft_warm_layers_by_request.setdefault(
+                request_id,
+                set(),
+            ).update(indexed_layers)
 
     def _get_first_draft_warmup_mask(
         self,
@@ -2765,7 +2778,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     ) -> RetroSpecTokenAttentionSelection:
         """Use resident retrieval clusters and estimate selected cache misses."""
         if (
-            plan.sparse_exact_page_ids.numel() == 0
+            view.arena is None
+            or plan.sparse_exact_page_ids.numel() == 0
             or plan.sparse_exact_page_ids.device.type != "cuda"
         ):
             return self._materialize_token_selection(

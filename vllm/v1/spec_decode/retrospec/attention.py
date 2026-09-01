@@ -885,7 +885,16 @@ class RetroSpecSparseAttention:
             raise RuntimeError("RetroSpec attention ran without an active step")
 
         return self._sparse_forward(
-            layer_name, impl, layer, query, kv_cache, attn_metadata, output
+            layer_name,
+            original_forward,
+            impl,
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
         )
 
     @staticmethod
@@ -1303,9 +1312,12 @@ class RetroSpecSparseAttention:
     def _sparse_forward(
         self,
         layer_name: str,
+        original_forward: LayerForward,
         impl: FlashAttentionImpl,
         layer: torch.nn.Module,
         query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
@@ -1321,6 +1333,22 @@ class RetroSpecSparseAttention:
             )
         if attn_metadata.max_query_len != 1:
             raise RuntimeError("RetroSpec attention requires max_query_len=1.")
+
+        if not self.index.has_cluster_pages(layer_name, self.proposal_request_ids):
+            result = original_forward(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                None,
+                None,
+            )
+            self.attention_mass_sum[: self.batch_size].add_(1.0)
+            self.attention_mass_layer_count += 1
+            return result
 
         query = query[:num_actual_tokens]
         key_cache, value_cache = kv_cache.unbind(0)

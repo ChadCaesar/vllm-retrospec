@@ -252,6 +252,80 @@ def test_layer_major_prefill_allocates_only_sink_and_resident_suffix():
     assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
 
 
+def test_layer_major_prefill_keeps_native_blocks_without_complete_cluster():
+    speculative_config = SpeculativeConfig(
+        method="retrospec",
+        num_speculative_tokens=4,
+        retrospec_blocks_per_cluster=4,
+        retrospec_max_draft_tokens=4,
+    )
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=8,
+        max_model_len=128,
+        speculative_config=speculative_config,
+        device_config=DeviceConfig(device="cpu"),
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["empty-cluster-prefill"],
+    )[0]
+    scheduler.add_request(request)
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    initial_free_blocks = manager.block_pool.get_num_free_blocks()
+
+    scheduler_output = scheduler.schedule()
+
+    descriptor = scheduler_output.retrospec_layer_major_prefill
+    assert descriptor is not None
+    assert descriptor.resident_start_block == 1
+    assert descriptor.retired_start_block == descriptor.retired_end_block
+
+    block_ids = scheduler.kv_cache_manager.get_block_ids("empty-cluster-prefill")[0]
+    assert len(block_ids) == 5
+    assert all(block_id != KV_CACHE_NULL_BLOCK_ID for block_id in block_ids)
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks - 5
+
+    scheduler.kv_cache_manager.free(request)
+
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
+
+
+def test_layer_major_prefill_keeps_cluster_remainder_blocks_native():
+    speculative_config = SpeculativeConfig(
+        method="retrospec",
+        num_speculative_tokens=4,
+        retrospec_blocks_per_cluster=4,
+        retrospec_max_draft_tokens=4,
+    )
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=8,
+        max_model_len=256,
+        speculative_config=speculative_config,
+        device_config=DeviceConfig(device="cpu"),
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=128,
+        req_ids=["cluster-remainder-prefill"],
+    )[0]
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+
+    descriptor = scheduler_output.retrospec_layer_major_prefill
+    assert descriptor is not None
+    assert descriptor.resident_start_block == 5
+    assert descriptor.num_logical_blocks == 9
+
+    block_ids = scheduler.kv_cache_manager.get_block_ids("cluster-remainder-prefill")[0]
+    assert block_ids[0] != KV_CACHE_NULL_BLOCK_ID
+    assert all(block_id == KV_CACHE_NULL_BLOCK_ID for block_id in block_ids[1:5])
+    assert all(block_id != KV_CACHE_NULL_BLOCK_ID for block_id in block_ids[5:])
+
+
 def test_scheduler_applies_actual_layer_major_prefill_completion():
     scheduler = Scheduler.__new__(Scheduler)
     request = SimpleNamespace(

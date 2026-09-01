@@ -221,6 +221,7 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
+        self.retrospec_blocks_per_cluster = 1
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             if speculative_config.use_eagle():
@@ -230,6 +231,9 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.method == "retrospec":
                 self.num_lookahead_tokens = self.num_spec_tokens
+                self.retrospec_blocks_per_cluster = (
+                    speculative_config.retrospec_blocks_per_cluster
+                )
 
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
@@ -817,6 +821,7 @@ class Scheduler(SchedulerInterface):
                         request,
                         prompt_num_tokens=request.num_prompt_tokens,
                         num_recent_blocks=num_recent_blocks,
+                        blocks_per_cluster=self.retrospec_blocks_per_cluster,
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
                     if allocation is None:

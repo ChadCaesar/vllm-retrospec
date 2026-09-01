@@ -1177,6 +1177,7 @@ def test_exact_attention_resolves_resident_and_staging_pages(
 def test_verification_reuses_draft_selection_plan_without_reranking():
     controller = make_controller()
     mark_installed(controller)
+    controller.index.has_cluster_pages = Mock(return_value=True)
     selection = make_selection(batch_size=1)
     controller.index.select_segmented = Mock(return_value=selection)
     controller.index.materialize = Mock(return_value=selection)
@@ -1198,6 +1199,7 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
         seq_lens=torch.ones(1, dtype=torch.int32),
     )
     output = torch.zeros(1, 1, 1)
+    original_forward = Mock()
 
     with (
         patch("vllm.v1.spec_decode.retrospec.attention.merge_attn_states"),
@@ -1205,7 +1207,16 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
     ):
         controller.begin_step(RetroSpecAttentionMode.DRAFT, 0, torch.tensor([True]))
         controller._sparse_forward(
-            "layer", impl, layer, query, kv_cache, metadata, output
+            "layer",
+            original_forward,
+            impl,
+            layer,
+            query,
+            query,
+            query,
+            kv_cache,
+            metadata,
+            output,
         )
         controller.end_step()
 
@@ -1215,7 +1226,16 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
             torch.tensor([True]),
         )
         controller._sparse_forward(
-            "layer", impl, layer, query, kv_cache, metadata, output
+            "layer",
+            original_forward,
+            impl,
+            layer,
+            query,
+            query,
+            query,
+            kv_cache,
+            metadata,
+            output,
         )
         controller.end_step()
 
@@ -1227,6 +1247,77 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
         assert torch.equal(materialize_args[2], kv_cache[0])
         assert torch.equal(materialize_args[3], kv_cache[1])
         assert materialize_args[4] is metadata.block_table
+
+
+def test_empty_cluster_index_uses_native_attention_without_selection_plan():
+    controller = make_controller()
+    mark_installed(controller)
+    controller.index.select_segmented = Mock()
+    controller.index.materialize = Mock()
+
+    impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
+    layer = cast(torch.nn.Module, SimpleNamespace())
+    query = torch.zeros(1, 1, 1)
+    key = torch.ones_like(query)
+    value = torch.full_like(query, 2)
+    kv_cache = torch.zeros(2, 1, 2, 1, 1)
+    metadata = SimpleNamespace(num_actual_tokens=1, max_query_len=1)
+    output = torch.zeros_like(query)
+    original_forward = Mock(return_value=output)
+
+    with controller.proposal_context(["request"]):
+        controller.begin_step(RetroSpecAttentionMode.DRAFT, 0, torch.tensor([True]))
+        draft_result = controller._sparse_forward(
+            "layer",
+            original_forward,
+            impl,
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            metadata,
+            output,
+        )
+        draft_attention_mass = controller.end_step()
+
+        controller.begin_step(
+            RetroSpecAttentionMode.SPARSE_VERIFY,
+            0,
+            torch.tensor([True]),
+        )
+        verify_result = controller._sparse_forward(
+            "layer",
+            original_forward,
+            impl,
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            metadata,
+            output,
+        )
+        verify_attention_mass = controller.end_step()
+
+    assert draft_result is output
+    assert verify_result is output
+    assert original_forward.call_count == 2
+    assert original_forward.call_args.args == (
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        metadata,
+        output,
+        None,
+        None,
+    )
+    assert draft_attention_mass.tolist() == [1.0]
+    assert verify_attention_mass.tolist() == [1.0]
+    controller.index.select_segmented.assert_not_called()
+    controller.index.materialize.assert_not_called()
 
 
 def test_segmented_draft_prefetches_sparse_plan_after_attention():
@@ -1250,6 +1341,7 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
         resolved_pages=None,
     )
     controller.index.select_segmented = Mock(return_value=selection)
+    controller.index.has_cluster_pages = Mock(return_value=True)
 
     call_order: list[str] = []
     controller._run_exact_attention = Mock(
@@ -1277,6 +1369,7 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
     )
     output = torch.zeros(2, 1, 1)
     active_mask = torch.tensor([True, False])
+    original_forward = Mock()
 
     with (
         patch("vllm.v1.spec_decode.retrospec.attention.merge_attn_states"),
@@ -1284,7 +1377,16 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
     ):
         controller.begin_step(RetroSpecAttentionMode.DRAFT, 0, active_mask)
         controller._sparse_forward(
-            "layer", impl, layer, query, kv_cache, metadata, output
+            "layer",
+            original_forward,
+            impl,
+            layer,
+            query,
+            query,
+            query,
+            kv_cache,
+            metadata,
+            output,
         )
         controller.end_step()
 
