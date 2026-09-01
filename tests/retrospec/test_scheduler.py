@@ -166,6 +166,7 @@ def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
         method="retrospec",
         num_speculative_tokens=4,
         retrospec_max_draft_tokens=4,
+        retrospec_index_segment_size=4,
     )
     scheduler = create_scheduler(
         max_num_seqs=2,
@@ -210,11 +211,35 @@ def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
     assert len(scheduler.waiting) == 1
 
 
+def test_short_prompt_uses_native_chunked_prefill():
+    speculative_config = SpeculativeConfig(
+        method="retrospec",
+        num_speculative_tokens=4,
+        retrospec_max_draft_tokens=4,
+        retrospec_index_segment_size=8,
+    )
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=8,
+        max_model_len=32,
+        speculative_config=speculative_config,
+        device_config=DeviceConfig(device="cpu"),
+    )
+    request = create_requests(num_requests=1, num_tokens=8)[0]
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+
+    assert scheduler_output.num_scheduled_tokens == {request.request_id: 8}
+    assert scheduler_output.retrospec_layer_major_prefill is None
+
+
 def test_layer_major_prefill_allocates_only_sink_and_resident_suffix():
     speculative_config = SpeculativeConfig(
         method="retrospec",
         num_speculative_tokens=4,
         retrospec_max_draft_tokens=4,
+        retrospec_index_segment_size=4,
     )
     scheduler = create_scheduler(
         max_num_seqs=1,
@@ -258,6 +283,7 @@ def test_layer_major_prefill_keeps_native_blocks_without_complete_cluster():
         num_speculative_tokens=4,
         retrospec_blocks_per_cluster=4,
         retrospec_max_draft_tokens=4,
+        retrospec_index_segment_size=4,
     )
     scheduler = create_scheduler(
         max_num_seqs=1,
@@ -298,6 +324,7 @@ def test_layer_major_prefill_keeps_cluster_remainder_blocks_native():
         num_speculative_tokens=4,
         retrospec_blocks_per_cluster=4,
         retrospec_max_draft_tokens=4,
+        retrospec_index_segment_size=4,
     )
     scheduler = create_scheduler(
         max_num_seqs=1,

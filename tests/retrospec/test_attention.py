@@ -40,6 +40,8 @@ def make_controller(
     max_pinned_memory: float = 0.0625,
     max_gpu_index_memory: float = 0.125,
     stats_interval_seconds: float = 0.0,
+    max_num_seqs: int = 4,
+    max_num_batched_tokens: int = 32,
 ) -> RetroSpecSparseAttention:
     config = cast(
         VllmConfig,
@@ -61,8 +63,8 @@ def make_controller(
                 retrospec_stats_interval_seconds=stats_interval_seconds,
             ),
             scheduler_config=SimpleNamespace(
-                max_num_seqs=4,
-                max_num_batched_tokens=32,
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
             ),
             cache_config=SimpleNamespace(block_size=2),
             model_config=SimpleNamespace(max_model_len=64),
@@ -130,6 +132,14 @@ def test_exact_attention_workspace_covers_mixed_verification_batch():
     assert controller.max_parallel_tokens == 8
     assert controller.max_verification_tokens == 32
     assert controller.exact_attention_workspace.max_num_queries == 32
+
+
+def test_exact_attention_workspace_uses_scheduler_token_budget():
+    controller = make_controller(max_num_seqs=8, max_num_batched_tokens=4)
+
+    assert controller.max_parallel_tokens == 16
+    assert controller.max_verification_tokens == 4
+    assert controller.exact_attention_workspace.max_num_queries == 4
 
 
 def test_segmented_attention_shares_enabled_performance_stats():

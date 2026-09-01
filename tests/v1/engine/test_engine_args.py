@@ -44,6 +44,7 @@ def test_retrospec_preserves_explicit_max_num_seqs():
     engine_args = EngineArgs(
         model="unused",
         speculative_config={"method": "retrospec", "num_speculative_tokens": 64},
+        enable_chunked_prefill=True,
         max_num_batched_tokens=128,
         max_num_seqs=3,
     )
@@ -55,6 +56,40 @@ def test_retrospec_preserves_explicit_max_num_seqs():
     )
 
     assert engine_args.max_num_seqs == 3
+
+
+def test_retrospec_uses_resource_constrained_default_max_num_batched_tokens():
+    engine_args = EngineArgs(
+        model="unused",
+        speculative_config={"method": "retrospec", "num_speculative_tokens": 64},
+        enable_chunked_prefill=True,
+    )
+    engine_args.get_batch_defaults = Mock(return_value=({None: 8192}, {None: 256}))
+
+    engine_args._set_default_max_num_seqs_and_batched_tokens_args(
+        None,
+        SimpleNamespace(max_model_len=65536),
+    )
+
+    assert engine_args.max_num_batched_tokens == 512
+    assert engine_args.max_num_seqs == 8
+
+
+def test_retrospec_preserves_explicit_max_num_batched_tokens():
+    engine_args = EngineArgs(
+        model="unused",
+        speculative_config={"method": "retrospec", "num_speculative_tokens": 64},
+        enable_chunked_prefill=True,
+        max_num_batched_tokens=1024,
+    )
+    engine_args.get_batch_defaults = Mock(return_value=({None: 8192}, {None: 256}))
+
+    engine_args._set_default_max_num_seqs_and_batched_tokens_args(
+        None,
+        SimpleNamespace(max_model_len=65536),
+    )
+
+    assert engine_args.max_num_batched_tokens == 1024
 
 
 def test_prefix_caching_from_cli():

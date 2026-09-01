@@ -124,6 +124,14 @@ def test_retrospec_long_context_mode_detection():
     config = make_capacity_config()
     assert is_retrospec_long_context_enabled(config)
 
+    config.model_config.max_model_len = (
+        config.speculative_config.retrospec_index_segment_size
+    )
+    assert not is_retrospec_long_context_enabled(config)
+
+    config.model_config.max_model_len += 1
+    assert is_retrospec_long_context_enabled(config)
+
     config.speculative_config.method = "ngram"
     assert not is_retrospec_long_context_enabled(config)
 
@@ -146,12 +154,10 @@ def test_native_working_set_uses_larger_generation_update_interval():
     assert get_retrospec_native_working_set_tokens(config, 16) == 20640
 
 
-def test_native_working_set_scales_request_state_but_shares_prefill_chunk():
+def test_native_working_set_does_not_preallocate_for_max_num_seqs():
     config = make_capacity_config(max_num_seqs=2)
 
-    # 2 * (sink 16 + segment 8192 + recent 80 + lookahead 64)
-    # + one batch-wide prefill chunk 4096.
-    assert get_retrospec_native_working_set_tokens(config, 16) == 20800
+    assert get_retrospec_native_working_set_tokens(config, 16) == 12448
 
 
 def test_native_working_set_is_capped_by_max_model_len():
@@ -218,7 +224,7 @@ def test_capacity_reserves_null_block_and_auxiliary_buffers():
     assert capacity.total_memory_bytes > capacity.native_memory_bytes
 
 
-def test_capacity_reserves_indices_and_pages_for_all_resident_requests():
+def test_capacity_does_not_preallocate_for_max_num_seqs():
     single = build_retrospec_long_context_capacity(
         make_capacity_config(max_num_seqs=1), make_kv_cache_specs()
     )
@@ -226,9 +232,7 @@ def test_capacity_reserves_indices_and_pages_for_all_resident_requests():
         make_capacity_config(max_num_seqs=2), make_kv_cache_specs()
     )
 
-    assert multiple.native_working_set_tokens == 20800
-    assert multiple.native_num_blocks > single.native_num_blocks
-    assert multiple.auxiliary_memory_bytes > single.auxiliary_memory_bytes
+    assert multiple == single
 
 
 def test_capacity_caps_persistent_index_reservation_at_gpu_index_budget():
@@ -257,7 +261,7 @@ def test_capacity_rejects_unaligned_generation_update_interval():
         build_retrospec_long_context_capacity(config, make_kv_cache_specs())
 
 
-def test_kv_config_uses_native_working_set_when_full_kv_does_not_fit(monkeypatch):
+def test_kv_config_uses_native_working_set_for_long_prompt_capacity(monkeypatch):
     config = make_engine_config()
     spec = next(iter(make_kv_cache_specs().values()))
     capacity = RetroSpecLongContextCapacity(
@@ -300,7 +304,7 @@ def test_kv_config_uses_estimated_long_context_capacity():
     )
 
 
-def test_kv_config_keeps_normal_capacity_when_full_kv_fits():
+def test_kv_config_keeps_normal_capacity_below_segment_threshold():
     config = make_engine_config(max_model_len=16, max_num_seqs=2)
     spec = next(iter(make_kv_cache_specs().values()))
     available_memory = 10 * spec.page_size_bytes
@@ -339,10 +343,7 @@ def test_long_context_capacity_rejects_disabled_chunked_prefill():
         get_kv_cache_configs(config, [{"layer.0": spec}], [spec.page_size_bytes])
 
 
-def test_long_context_capacity_accepts_multiple_resident_requests():
-    # The auxiliary request-level and packed indices make 64K full KV cheaper
-    # than long-context mode for this synthetic 32-layer model. Use a context
-    # where full KV still exceeds the complete RetroSpec working set.
+def test_long_context_capacity_accepts_multiple_scheduler_slots():
     config = make_engine_config(max_model_len=131072, max_num_seqs=2)
     specs = make_kv_cache_specs(num_layers=32)
     capacity = build_retrospec_long_context_capacity(config, specs)

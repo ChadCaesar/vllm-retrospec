@@ -119,13 +119,10 @@ class RetroSpecSparseAttention:
         self.block_size = block_size
         self.num_speculative_tokens = config.num_speculative_tokens
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
-        self.max_verification_tokens = max(
+        self.max_verification_tokens = getattr(
+            vllm_config.scheduler_config,
+            "max_num_batched_tokens",
             self.max_parallel_tokens,
-            getattr(
-                vllm_config.scheduler_config,
-                "max_num_batched_tokens",
-                self.max_parallel_tokens,
-            ),
         )
 
         self.performance_stats = RetroSpecPerformanceStats(

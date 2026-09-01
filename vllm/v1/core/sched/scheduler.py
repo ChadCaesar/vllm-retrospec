@@ -258,6 +258,11 @@ class Scheduler(SchedulerInterface):
             and self.connector is None
             and self.ec_connector is None
         )
+        self.retrospec_layer_major_prefill_threshold = (
+            speculative_config.retrospec_index_segment_size
+            if self.enable_retrospec_layer_major_prefill
+            else 0
+        )
         self._retrospec_layer_major_prefill_req_id: str | None = None
 
         def has_mamba_layers(kv_cache_config: KVCacheConfig) -> bool:
@@ -354,7 +359,8 @@ class Scheduler(SchedulerInterface):
 
         sampling_params = request.sampling_params
         return (
-            request.pooling_params is None
+            request.num_prompt_tokens > self.retrospec_layer_major_prefill_threshold
+            and request.pooling_params is None
             and request.prompt_token_ids is not None
             and request.prompt_embeds is None
             and not request.has_encoder_inputs

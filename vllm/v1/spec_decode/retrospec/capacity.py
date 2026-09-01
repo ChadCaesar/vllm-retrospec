@@ -32,7 +32,9 @@ class RetroSpecLongContextCapacity:
 
 def is_retrospec_long_context_enabled(vllm_config: VllmConfig) -> bool:
     config = vllm_config.speculative_config
-    return config is not None and config.method == "retrospec"
+    if config is None or config.method != "retrospec":
+        return False
+    return vllm_config.model_config.max_model_len > config.retrospec_index_segment_size
 
 
 def get_retrospec_native_working_set_tokens(
@@ -46,7 +48,6 @@ def get_retrospec_native_working_set_tokens(
         raise ValueError("RetroSpec requires num_speculative_tokens")
 
     scheduler_config = vllm_config.scheduler_config
-    max_num_seqs = scheduler_config.max_num_seqs
     max_model_len = vllm_config.model_config.max_model_len
 
     max_prefill_chunk = scheduler_config.max_num_batched_tokens
@@ -61,9 +62,9 @@ def get_retrospec_native_working_set_tokens(
         config.retrospec_index_update_interval,
     )
 
-    # Each active request independently retains its sink, incomplete segment,
-    # recent blocks and speculative lookahead. Newly scheduled prefill tokens
-    # are shared across the complete scheduler batch.
+    # Size the native KV allocation for one active request. The scheduler and
+    # request residency managers admit additional requests from the remaining
+    # runtime budget instead of reserving max_num_seqs copies at startup.
     per_request_steady_tokens = (
         block_size
         + max_unindexed_segment_tokens
@@ -72,14 +73,13 @@ def get_retrospec_native_working_set_tokens(
     )
     per_request_steady_tokens = min(per_request_steady_tokens, max_model_len)
 
-    maximum_total_tokens = max_num_seqs * max_model_len
     working_set_tokens = min(
-        max_num_seqs * per_request_steady_tokens + max_prefill_chunk,
-        maximum_total_tokens,
+        per_request_steady_tokens + max_prefill_chunk,
+        max_model_len,
     )
     working_set_tokens = cdiv(working_set_tokens, block_size) * block_size
 
-    maximum_rounded_tokens = max_num_seqs * cdiv(max_model_len, block_size) * block_size
+    maximum_rounded_tokens = cdiv(max_model_len, block_size) * block_size
     return min(working_set_tokens, maximum_rounded_tokens)
 
 
@@ -174,7 +174,7 @@ def build_retrospec_long_context_capacity(
 
     attention_specs = _get_attention_specs(kv_cache_specs)
     block_size = attention_specs[0].block_size
-    max_resident_requests = vllm_config.scheduler_config.max_num_seqs
+    planning_requests = 1
 
     prefill_segment_size = config.retrospec_index_segment_size
     generation_update_interval = config.retrospec_index_update_interval
@@ -206,7 +206,7 @@ def build_retrospec_long_context_capacity(
 
     indexed_tokens = _get_indexed_token_capacity(vllm_config, block_size)
     num_clusters_per_request = cdiv(indexed_tokens, tokens_per_cluster)
-    total_resident_clusters = max_resident_requests * num_clusters_per_request
+    total_resident_clusters = planning_requests * num_clusters_per_request
 
     all_layer_token_bytes = sum(
         spec.real_page_size_bytes // block_size for spec in attention_specs
@@ -221,7 +221,7 @@ def build_retrospec_long_context_capacity(
     cluster_pages_per_head_per_request = (
         cdiv(indexed_tokens, block_size) + num_clusters_per_request
     )
-    cluster_pages_per_head = max_resident_requests * cluster_pages_per_head_per_request
+    cluster_pages_per_head = planning_requests * cluster_pages_per_head_per_request
 
     effective_cache_ratio = config.retrospec_cache_ratio
     if effective_cache_ratio == 0.0:
@@ -239,7 +239,7 @@ def build_retrospec_long_context_capacity(
     persistent_cluster_metadata_bytes = sum(
         total_resident_clusters * spec.num_kv_heads * 24
         + cluster_pages_per_head * spec.num_kv_heads * 12
-        + max_resident_requests * (40 + 4 * spec.num_kv_heads)
+        + planning_requests * (40 + 4 * spec.num_kv_heads)
         for spec in attention_specs
     )
     theoretical_persistent_index_bytes = (
@@ -274,10 +274,7 @@ def build_retrospec_long_context_capacity(
     )
     head_size = attention_specs[0].head_size
     query_dtype_bytes = get_dtype_size(attention_specs[0].dtype)
-    max_parallel_queries = max(
-        max_resident_requests * config.num_speculative_tokens,
-        scheduler_config.max_num_batched_tokens,
-    )
+    max_parallel_queries = scheduler_config.max_num_batched_tokens
     max_exact_partitions = get_retrospec_exact_attention_partition_capacity(
         vllm_config, block_size
     )

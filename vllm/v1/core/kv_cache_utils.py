@@ -1340,11 +1340,11 @@ def _report_kv_cache_config(
             min_block_size,
         )
         logger.info_once(
-            "Maximum RetroSpec native working-set batches for up to %d "
-            "resident requests (%d total active tokens): %.2fx",
-            vllm_config.scheduler_config.max_num_seqs,
+            "Maximum concurrent RetroSpec native working sets (%d tokens "
+            "each): %.2fx; scheduler request limit is %d",
             working_set_tokens,
             max_concurrency,
+            vllm_config.scheduler_config.max_num_seqs,
             scope="local",
         )
     else:
@@ -1551,23 +1551,15 @@ def get_kv_cache_configs(
 
     kv_cache_memory = list(available_memory)
     if global_kv_cache_groups:
-        full_kv_memory = _max_memory_usage_bytes_from_groups(
-            vllm_config,
-            global_kv_cache_groups,
-        )
-
         from vllm.v1.spec_decode.retrospec.capacity import (
             build_retrospec_long_context_capacity,
             is_retrospec_long_context_enabled,
         )
 
-        use_retrospec_long_context = is_retrospec_long_context_enabled(
-            vllm_config
-        ) and full_kv_memory > min(available_memory)
+        use_retrospec_long_context = is_retrospec_long_context_enabled(vllm_config)
 
         if use_retrospec_long_context:
-            scheduler_config = vllm_config.scheduler_config
-            if not scheduler_config.enable_chunked_prefill:
+            if not vllm_config.scheduler_config.enable_chunked_prefill:
                 raise ValueError(
                     "RetroSpec long-context CPU offload requires "
                     "enable_chunked_prefill=True"
@@ -1601,10 +1593,9 @@ def get_kv_cache_configs(
             ]
 
             logger.info_once(
-                "RetroSpec long-context capacity for up to %d requests: "
-                "native KV working set %d tokens, native KV %s GiB, "
-                "auxiliary reserve %s GiB",
-                scheduler_config.max_num_seqs,
+                "RetroSpec long-context one-request baseline: native KV "
+                "working set %d tokens, native KV %s GiB, auxiliary reserve "
+                "%s GiB; runtime index storage grows with resident requests",
                 retrospec_capacities[0].native_working_set_tokens,
                 format_gib(retrospec_capacities[0].native_memory_bytes),
                 format_gib(retrospec_capacities[0].auxiliary_memory_bytes),

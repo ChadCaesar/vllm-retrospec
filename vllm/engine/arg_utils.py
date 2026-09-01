@@ -114,6 +114,7 @@ else:
 logger = init_logger(__name__)
 
 RETROSPEC_DEFAULT_MAX_NUM_SEQS = 8
+RETROSPEC_DEFAULT_MAX_NUM_BATCHED_TOKENS = 512
 
 # object is used to allow for special typing forms
 T = TypeVar("T")
@@ -2019,19 +2020,24 @@ class EngineArgs:
         orig_max_num_batched_tokens = self.max_num_batched_tokens
         orig_max_num_seqs = self.max_num_seqs
 
+        speculative_method = (
+            None
+            if self.speculative_config is None
+            else self.speculative_config.get("method")
+        )
+        is_retrospec = speculative_method == "retrospec"
+
         if self.max_num_batched_tokens is None:
-            self.max_num_batched_tokens = default_max_num_batched_tokens.get(
-                usage_context,
-                SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS,
-            )
+            if is_retrospec:
+                self.max_num_batched_tokens = RETROSPEC_DEFAULT_MAX_NUM_BATCHED_TOKENS
+            else:
+                self.max_num_batched_tokens = default_max_num_batched_tokens.get(
+                    usage_context,
+                    SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS,
+                )
 
         if self.max_num_seqs is None:
-            speculative_method = (
-                None
-                if self.speculative_config is None
-                else self.speculative_config.get("method")
-            )
-            if speculative_method == "retrospec":
+            if is_retrospec:
                 self.max_num_seqs = RETROSPEC_DEFAULT_MAX_NUM_SEQS
             else:
                 self.max_num_seqs = default_max_num_seqs.get(
