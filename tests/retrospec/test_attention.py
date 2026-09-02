@@ -42,6 +42,10 @@ def make_controller(
     stats_interval_seconds: float = 0.0,
     max_num_seqs: int = 4,
     max_num_batched_tokens: int = 32,
+    tensor_parallel_size: int = 1,
+    hit_attn_threshold: float | None = None,
+    retrieval_attn_threshold: float | None = None,
+    expanded_attn_threshold: float | None = None,
 ) -> RetroSpecSparseAttention:
     config = cast(
         VllmConfig,
@@ -61,6 +65,9 @@ def make_controller(
                 retrospec_max_gpu_index_memory=max_gpu_index_memory,
                 retrospec_cache_ratio=cache_ratio,
                 retrospec_stats_interval_seconds=stats_interval_seconds,
+                retrospec_hit_attn_threshold=hit_attn_threshold,
+                retrospec_retrieval_attn_threshold=retrieval_attn_threshold,
+                retrospec_expanded_attn_threshold=expanded_attn_threshold,
             ),
             scheduler_config=SimpleNamespace(
                 max_num_seqs=max_num_seqs,
@@ -68,6 +75,9 @@ def make_controller(
             ),
             cache_config=SimpleNamespace(block_size=2),
             model_config=SimpleNamespace(max_model_len=64),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=tensor_parallel_size,
+            ),
         ),
     )
     return RetroSpecSparseAttention(config, torch.device("cpu"))
@@ -266,6 +276,89 @@ def test_proposal_context_and_step_average_attention_mass():
 
     assert not controller.in_proposal
     assert controller.active_mask is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "thresholds"),
+    [
+        (RetroSpecAttentionMode.DRAFT, {"hit_attn_threshold": 0.5}),
+        (
+            RetroSpecAttentionMode.SPARSE_VERIFY,
+            {"retrieval_attn_threshold": 0.5},
+        ),
+        (
+            RetroSpecAttentionMode.EXPANDED_VERIFY,
+            {"expanded_attn_threshold": 0.5},
+        ),
+    ],
+)
+def test_end_step_averages_attention_mass_across_tensor_parallel_ranks(
+    mode: RetroSpecAttentionMode,
+    thresholds: dict[str, float],
+):
+    controller = make_controller(
+        tensor_parallel_size=2,
+        **thresholds,
+    )
+    mark_installed(controller)
+
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.attention.tensor_model_parallel_all_reduce",
+            return_value=torch.tensor([1.2]),
+        ) as all_reduce,
+        controller.proposal_context(["request"]),
+    ):
+        if mode == RetroSpecAttentionMode.DRAFT:
+            controller.begin_step(mode, 0, torch.tensor([True]))
+        else:
+            controller.begin_parallel_step(
+                mode,
+                request_indices=torch.tensor([0]),
+                token_indices=torch.tensor([0]),
+            )
+        controller.attention_mass_sum[0] = 0.4
+        controller.attention_mass_layer_count = 1
+
+        attention_mass = controller.end_step()
+
+    assert attention_mass.tolist() == pytest.approx([0.6])
+    assert all_reduce.call_count == 1
+    assert all_reduce.call_args.args[0].tolist() == pytest.approx([0.4])
+
+
+@pytest.mark.parametrize(
+    ("tensor_parallel_size", "hit_attn_threshold"),
+    [(1, 0.5), (2, None)],
+)
+def test_end_step_skips_unneeded_tensor_parallel_reduction(
+    tensor_parallel_size: int,
+    hit_attn_threshold: float | None,
+):
+    controller = make_controller(
+        tensor_parallel_size=tensor_parallel_size,
+        hit_attn_threshold=hit_attn_threshold,
+    )
+    mark_installed(controller)
+
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.attention.tensor_model_parallel_all_reduce"
+        ) as all_reduce,
+        controller.proposal_context(["request"]),
+    ):
+        controller.begin_step(
+            RetroSpecAttentionMode.DRAFT,
+            0,
+            torch.tensor([True]),
+        )
+        controller.attention_mass_sum[0] = 0.4
+        controller.attention_mass_layer_count = 1
+
+        attention_mass = controller.end_step()
+
+    assert attention_mass.tolist() == pytest.approx([0.4])
+    all_reduce.assert_not_called()
 
 
 def test_proposal_context_restores_state_and_plans_after_exception():

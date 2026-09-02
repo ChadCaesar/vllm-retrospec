@@ -9,6 +9,7 @@ from enum import IntEnum
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.attention import Attention
 from vllm.utils.mem_constants import GiB_bytes, MiB_bytes
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -115,6 +116,17 @@ class RetroSpecSparseAttention:
         assert block_size is not None
 
         self.device = device
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        self.tensor_parallel_size = getattr(parallel_config, "tensor_parallel_size", 1)
+        self.reduce_draft_attention_mass = (
+            config.retrospec_hit_attn_threshold is not None
+        )
+        self.reduce_sparse_attention_mass = (
+            config.retrospec_retrieval_attn_threshold is not None
+        )
+        self.reduce_expanded_attention_mass = (
+            config.retrospec_expanded_attn_threshold is not None
+        )
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.block_size = block_size
         self.num_speculative_tokens = config.num_speculative_tokens
@@ -700,6 +712,27 @@ class RetroSpecSparseAttention:
         self.attention_mass_layer_count = 0
         self.step_active = True
 
+    def _should_reduce_attention_mass(self) -> bool:
+        if self.tensor_parallel_size == 1:
+            return False
+        if self.mode == RetroSpecAttentionMode.DRAFT:
+            return self.reduce_draft_attention_mass
+        if self.mode == RetroSpecAttentionMode.SPARSE_VERIFY:
+            return self.reduce_sparse_attention_mass
+        if self.mode == RetroSpecAttentionMode.EXPANDED_VERIFY:
+            return self.reduce_expanded_attention_mass
+        return False
+
+    def _synchronize_attention_mass(
+        self,
+        attention_mass: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self._should_reduce_attention_mass():
+            return attention_mass
+
+        attention_mass = tensor_model_parallel_all_reduce(attention_mass)
+        return attention_mass / self.tensor_parallel_size
+
     def end_step(self) -> torch.Tensor:
         if not self.step_active:
             raise RuntimeError("No RetroSpec attention step is active.")
@@ -709,6 +742,7 @@ class RetroSpecSparseAttention:
         attention_mass = (
             self.attention_mass_sum[: self.batch_size] / self.attention_mass_layer_count
         )
+        attention_mass = self._synchronize_attention_mass(attention_mass)
 
         if self.mode == RetroSpecAttentionMode.DRAFT:
             assert self.active_mask is not None

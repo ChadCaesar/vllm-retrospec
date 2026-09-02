@@ -690,14 +690,20 @@ class SpeculativeConfig:
         self.enforce_eager = True
 
         parallel_config = self.target_parallel_config
-        if parallel_config is not None and (
-            parallel_config.tensor_parallel_size != 1
-            or parallel_config.pipeline_parallel_size != 1
-        ):
-            raise ValueError(
-                "RetroSpec currently supports only tensor_parallel_size=1 "
-                "and pipeline_parallel_size=1"
-            )
+        if parallel_config is not None:
+            if parallel_config.pipeline_parallel_size != 1:
+                raise ValueError(
+                    "RetroSpec tensor-parallel execution currently requires "
+                    "pipeline_parallel_size=1"
+                )
+            if (
+                parallel_config.decode_context_parallel_size != 1
+                or parallel_config.prefill_context_parallel_size != 1
+            ):
+                raise ValueError(
+                    "RetroSpec currently does not support decode or prefill "
+                    "context parallelism"
+                )
 
         self.prompt_lookup_min = 0
         self.prompt_lookup_max = 0

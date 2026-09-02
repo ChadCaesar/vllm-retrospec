@@ -142,17 +142,35 @@ def test_retrospec_rejects_out_of_range_values(field: str, value: Any):
         make_retrospec_config(**{field: value})
 
 
+def test_retrospec_accepts_tensor_parallel_execution():
+    parallel_config = ParallelConfig(tensor_parallel_size=2)
+
+    config = make_retrospec_config(target_parallel_config=parallel_config)
+
+    assert config.target_parallel_config is parallel_config
+
+
+def test_retrospec_rejects_pipeline_parallel_execution():
+    parallel_config = ParallelConfig(pipeline_parallel_size=2)
+
+    with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
+        make_retrospec_config(target_parallel_config=parallel_config)
+
+
 @pytest.mark.parametrize(
     "parallel_config",
     [
-        ParallelConfig(tensor_parallel_size=2),
-        ParallelConfig(pipeline_parallel_size=2),
+        ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+        ),
+        ParallelConfig(prefill_context_parallel_size=2),
     ],
 )
-def test_retrospec_rejects_parallel_execution(
+def test_retrospec_rejects_context_parallel_execution(
     parallel_config: ParallelConfig,
 ):
-    with pytest.raises(ValueError, match="supports only"):
+    with pytest.raises(ValueError, match="context parallelism"):
         make_retrospec_config(target_parallel_config=parallel_config)
 
 
