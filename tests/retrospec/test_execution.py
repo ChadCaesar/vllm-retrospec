@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.spec_decode.retrospec.execution import (
     EXACT_ATTENTION_PARTITION_SIZE,
     RetroSpecExactAttentionWorkspace,
@@ -296,6 +297,67 @@ def test_exact_attention_reduces_multiple_partitions_and_reuses_workspace():
     with pytest.raises(RuntimeError, match="planned workspace capacity"):
         undersized_workspace.run(source, query, 0.125)
     assert undersized_workspace._partial_output is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_exact_attention_returns_compact_lse_for_attention_merge():
+    device = torch.device("cuda")
+    torch.manual_seed(4)
+    page_size = 4
+    num_queries = 3
+    num_query_heads = 2
+    head_size = 64
+    key_cache = torch.randn(
+        2, page_size, 1, head_size, dtype=torch.float16, device=device
+    )
+    value_cache = torch.randn_like(key_cache)
+    source = _make_source(
+        key_cache,
+        value_cache,
+        torch.tensor([[0, 1]], dtype=torch.int32, device=device),
+        torch.arange(8, dtype=torch.int64, device=device).view(1, 1, -1),
+        torch.ones(1, 1, 8, dtype=torch.bool, device=device),
+        torch.empty(1, 1, 0, 0, dtype=torch.int32, device=device),
+    )
+    query = torch.randn(
+        num_queries,
+        num_query_heads,
+        head_size,
+        dtype=torch.float16,
+        device=device,
+    )
+    request_indices = torch.zeros(num_queries, dtype=torch.int64, device=device)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, 8, 1)
+
+    prefix_output, prefix_lse = workspace.run(source, query, 0.125, request_indices)
+    assert prefix_lse.shape == (num_query_heads, num_queries)
+    assert prefix_lse.stride() == (num_queries, 1)
+    assert prefix_lse.is_contiguous()
+
+    suffix_output = torch.randn_like(prefix_output)
+    suffix_lse = prefix_lse.detach().clone() + torch.tensor(
+        [-0.5, 0.0, 0.5], dtype=torch.float32, device=device
+    )
+    output = torch.empty_like(prefix_output)
+    merge_attn_states(
+        output,
+        prefix_output,
+        prefix_lse,
+        suffix_output,
+        suffix_lse,
+    )
+
+    max_lse = torch.maximum(prefix_lse, suffix_lse)
+    prefix_scale = torch.exp(prefix_lse - max_lse)
+    suffix_scale = torch.exp(suffix_lse - max_lse)
+    normalization = prefix_scale + suffix_scale
+    prefix_scale = (prefix_scale / normalization).transpose(0, 1).unsqueeze(2)
+    suffix_scale = (suffix_scale / normalization).transpose(0, 1).unsqueeze(2)
+    expected = (prefix_output * prefix_scale + suffix_output * suffix_scale).to(
+        output.dtype
+    )
+
+    torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -432,8 +432,7 @@ class RetroSpecExactAttentionWorkspace:
             device=query.device,
         )
         output_lse = torch.empty(
-            num_query_heads,
-            self.max_num_queries,
+            num_query_heads * self.max_num_queries,
             dtype=torch.float32,
             device=query.device,
         )
@@ -604,7 +603,10 @@ class RetroSpecExactAttentionWorkspace:
         assert self._output_lse is not None
 
         output = self._output[:num_queries]
-        output_lse = self._output_lse[:, :num_queries]
+        num_output_lse_elements = num_query_heads * num_queries
+        output_lse = self._output_lse[:num_output_lse_elements].view(
+            num_query_heads, num_queries
+        )
         if num_queries == 0:
             return output, output_lse
 
