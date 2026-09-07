@@ -186,6 +186,14 @@ void cutlass_mla_decode(torch::Tensor const& out, torch::Tensor const& q_nope,
 
 torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
 
+void retrospec_gather_compact_kv(const std::vector<torch::Tensor>& key_slabs,
+                                 const std::vector<torch::Tensor>& value_slabs,
+                                 const std::vector<torch::Tensor>& range_tables,
+                                 const torch::Tensor& token_offsets,
+                                 int64_t destination_token_start,
+                                 torch::Tensor& key_output,
+                                 torch::Tensor& value_output);
+
 #ifndef USE_ROCM
 
 torch::Tensor awq_gemm(torch::Tensor _in_feats, torch::Tensor _kernel,

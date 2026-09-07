@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.spec_decode.retrospec import cluster_store as cluster_store_module
 from vllm.v1.spec_decode.retrospec.cluster_identity import (
     RetroSpecClusterGroup,
     RetroSpecClusterIdentity,
 )
 from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecClusterPageStore,
+    RetroSpecCompactTokenRange,
+    RetroSpecFullVerificationDescriptor,
 )
 from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
 
@@ -92,6 +97,78 @@ def test_full_verification_descriptor_compacts_partial_pages():
         == 10
     )
     assert (metadata.page_ids >= 0).sum().item() * store.page_size == 12
+
+
+def test_full_verification_descriptor_packs_head_local_range_offsets():
+    descriptor = RetroSpecFullVerificationDescriptor(
+        head_ranges=(
+            (
+                RetroSpecCompactTokenRange(0, 2, 3),
+                RetroSpecCompactTokenRange(1, 0, 2),
+            ),
+            (RetroSpecCompactTokenRange(2, 4, 4),),
+        ),
+        head_token_counts=(5, 4),
+    )
+
+    torch.testing.assert_close(
+        descriptor.range_table,
+        torch.tensor(
+            [
+                [0, 0, 2, 3, 0],
+                [0, 1, 0, 2, 3],
+                [1, 2, 4, 4, 0],
+            ],
+            dtype=torch.int64,
+        ),
+    )
+
+
+def test_native_compact_gather_clips_multi_request_ranges_to_chunk():
+    key_slab = torch.arange(32, dtype=torch.float32).view(8, 2, 2)
+    value_slab = key_slab + 100
+    range_tables = (
+        torch.tensor(
+            [
+                [0, 0, 0, 2, 0],
+                [0, 0, 4, 1, 2],
+                [1, 0, 8, 2, 0],
+            ],
+            dtype=torch.int64,
+        ),
+        torch.tensor(
+            [
+                [0, 0, 10, 1, 0],
+                [1, 0, 12, 3, 0],
+            ],
+            dtype=torch.int64,
+        ),
+    )
+    token_offsets = torch.tensor([[0, 3], [5, 6]], dtype=torch.int64)
+    expected_keys = torch.cat(
+        (
+            key_slab.view(-1, 2)[0:2],
+            key_slab.view(-1, 2)[4:5],
+            key_slab.view(-1, 2)[8:10],
+            key_slab.view(-1, 2)[10:11],
+            key_slab.view(-1, 2)[12:15],
+        )
+    )
+    key_output = torch.empty(5, 2)
+    value_output = torch.empty_like(key_output)
+
+    ops.retrospec_gather_compact_kv(
+        (key_slab,),
+        (value_slab,),
+        range_tables,
+        token_offsets,
+        2,
+        key_output,
+        value_output,
+    )
+
+    torch.testing.assert_close(key_output, expected_keys[2:7])
+    torch.testing.assert_close(value_output, expected_keys[2:7] + 100)
 
 
 def store_cluster_data(
@@ -1401,6 +1478,64 @@ def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
     torch.cuda.synchronize(device)
     stats._drain_cuda_samples()
     assert stats._cuda_times["full_verify_h2d"][1] == 2
+    assert stats._cpu_times["full_verify_cpu_gather"][1] == 2
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for asynchronous full-verification staging",
+)
+def test_full_verification_submission_gathers_on_background_worker(monkeypatch):
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(page_size=2, cache_ratio=0.5)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    metadata = store.get_cluster_block_metadata(
+        "layer", table.cluster_ids, device=torch.device("cpu")
+    )
+    descriptor = store.build_full_verification_descriptor(
+        "layer", metadata.page_ids, metadata.page_token_counts
+    )
+
+    gather_started = threading.Event()
+    allow_gather = threading.Event()
+    original_gather = cluster_store_module.ops.retrospec_gather_compact_kv
+
+    def delayed_gather(*args):
+        gather_started.set()
+        if not allow_gather.wait(timeout=5):
+            raise TimeoutError("Timed out waiting to release native gather")
+        original_gather(*args)
+
+    monkeypatch.setattr(
+        cluster_store_module.ops,
+        "retrospec_gather_compact_kv",
+        delayed_gather,
+    )
+
+    try:
+        ticket = store.submit_full_verification_tokens("layer", (descriptor,))
+        assert gather_started.wait(timeout=5)
+        assert not ticket.future.done()
+
+        allow_gather.set()
+        staging = ticket.result()
+        assert staging.ready_event is not None
+        torch.cuda.current_stream(device).wait_event(staging.ready_event)
+        expected_keys = torch.cat((keys[0], keys[1, [1, 3, 0, 2, 4]]))
+        expected_values = torch.cat((values[0], values[1, [1, 3, 0, 2, 4]]))
+        torch.testing.assert_close(staging.key_tokens.cpu(), expected_keys)
+        torch.testing.assert_close(staging.value_tokens.cpu(), expected_values)
+    finally:
+        allow_gather.set()
+        store.close()
 
 
 @pytest.mark.skipif(

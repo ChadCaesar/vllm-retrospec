@@ -18,6 +18,27 @@ logger = init_logger(__name__)
 
 current_platform.import_kernels()
 
+
+def retrospec_gather_compact_kv(
+    key_slabs: tuple[torch.Tensor, ...],
+    value_slabs: tuple[torch.Tensor, ...],
+    range_tables: tuple[torch.Tensor, ...],
+    token_offsets: torch.Tensor,
+    destination_token_start: int,
+    key_output: torch.Tensor,
+    value_output: torch.Tensor,
+) -> None:
+    torch.ops._C.retrospec_gather_compact_kv(
+        key_slabs,
+        value_slabs,
+        range_tables,
+        token_offsets,
+        destination_token_start,
+        key_output,
+        value_output,
+    )
+
+
 if TYPE_CHECKING:
 
     def register_fake(fn):

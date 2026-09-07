@@ -34,6 +34,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
            &get_cuda_view_from_cpu_tensor);
 
+  ops.def(
+      "retrospec_gather_compact_kv("
+      "Tensor[] key_slabs, Tensor[] value_slabs, Tensor[] range_tables, "
+      "Tensor token_offsets, int destination_token_start, "
+      "Tensor! key_output, Tensor! value_output) -> ()");
+  ops.impl("retrospec_gather_compact_kv", torch::kCPU,
+           &retrospec_gather_compact_kv);
+
   // Attention ops
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.

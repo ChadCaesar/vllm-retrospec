@@ -975,6 +975,7 @@ def test_full_verification_pipeline_prefetches_next_layer():
             )
             assert index._full_verification_prefetched is not None
             assert index._full_verification_prefetched.layer_name == "layer.0"
+            assert index._full_verification_prefetched.ticket is not None
 
             first = index.build_full_verification_plan(
                 request_ids=["request"],
@@ -986,6 +987,7 @@ def test_full_verification_pipeline_prefetches_next_layer():
             assert first.clustered_kv is not None
             assert index._full_verification_prefetched is not None
             assert index._full_verification_prefetched.layer_name == "layer.1"
+            assert index._full_verification_prefetched.ticket is not None
 
             second = index.build_full_verification_plan(
                 request_ids=["request"],

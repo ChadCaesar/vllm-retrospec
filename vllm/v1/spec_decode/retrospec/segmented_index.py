@@ -15,6 +15,7 @@ from .cluster_store import (
     RetroSpecClusterPageStore,
     RetroSpecFullVerificationDescriptor,
     RetroSpecFullVerificationStaging,
+    RetroSpecFullVerificationTicket,
     RetroSpecResolvedClusterPages,
     RetroSpecStagedClusterInput,
 )
@@ -144,7 +145,7 @@ class _RequestLayerIndex:
 @dataclass(frozen=True)
 class _PrefetchedFullVerificationLayer:
     layer_name: str
-    clustered_kv: RetroSpecFullVerificationStaging | None
+    ticket: RetroSpecFullVerificationTicket | None
 
 
 @dataclass(frozen=True)
@@ -3066,15 +3067,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             request_ids,
             num_kv_heads,
         )
-        clustered_kv = None
+        ticket = None
         if any(descriptor.num_tokens for descriptor in descriptors):
-            clustered_kv = self.cluster_store.resolve_full_verification_tokens(
+            ticket = self.cluster_store.submit_full_verification_tokens(
                 layer_name=layer_name,
                 descriptors=descriptors,
             )
         return _PrefetchedFullVerificationLayer(
             layer_name=layer_name,
-            clustered_kv=clustered_kv,
+            ticket=ticket,
         )
 
     def begin_full_verification_pipeline(
@@ -3124,6 +3125,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 "Full-verification layer order differs from the installed model"
             )
 
+        clustered_kv = None if prefetched.ticket is None else prefetched.ticket.result()
         next_cursor = self._full_verification_layer_cursor + 1
         next_prefetched = None
         if next_cursor < len(self._full_verification_layers):
@@ -3131,9 +3133,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         self._full_verification_layer_cursor = next_cursor
         self._full_verification_prefetched = next_prefetched
-        return prefetched.clustered_kv
+        return clustered_kv
 
     def end_full_verification_pipeline(self) -> None:
+        prefetched = self._full_verification_prefetched
+        if prefetched is not None and prefetched.ticket is not None:
+            prefetched.ticket.cancel()
+
         self._full_verification_pipeline_active = False
         self._full_verification_request_ids = ()
         self._full_verification_layers = ()
