@@ -195,8 +195,8 @@ def test_exact_attention_workspace_size_matches_tensor_layout():
     expected_bytes = (
         1024 * 8 * 128 * 64 * 2
         + 1024 * 8 * 128 * 2 * 4
-        + 1024 * 8 * 64 * 2
-        + 1024 * 8 * 4
+        + 2 * 1024 * 8 * 64 * 2
+        + 2 * 1024 * 8 * 4
     )
 
     assert workspace_bytes == expected_bytes

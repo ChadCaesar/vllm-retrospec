@@ -23,15 +23,16 @@ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from .capacity import get_retrospec_exact_attention_partition_capacity
 from .cluster_store import RetroSpecResolvedClusterPages
 from .execution import (
+    RetroSpecCompactKVSource,
     RetroSpecExactAttentionWorkspace,
     RetroSpecExactKVSource,
     RetroSpecExactPageKVSource,
     RetroSpecExactPrimaryKVSource,
+    RetroSpecFullVerificationKVSource,
 )
 from .index import RetroSpecAttentionLevel
 from .performance import RetroSpecPerformanceStats
 from .segmented_index import (
-    RetroSpecFullVerificationPlan,
     RetroSpecSegmentedTokenIndex,
     RetroSpecTokenAttentionSelection,
     RetroSpecTokenSelectionPlan,
@@ -47,7 +48,6 @@ class _RetroSpecFullVerificationBatch:
     request_ids: tuple[str, ...]
     context_lens: tuple[int, ...]
     query_lens: tuple[int, ...]
-    request_indices: torch.Tensor
 
 
 LayerForward = Callable[..., torch.Tensor]
@@ -571,15 +571,10 @@ class RetroSpecSparseAttention:
                 "full_verify_requests",
                 len(request_ids),
             )
-            request_indices = torch.repeat_interleave(
-                torch.arange(len(request_ids), dtype=torch.int64, device=self.device),
-                torch.tensor(query_lens, dtype=torch.int64, device=self.device),
-            )
             self.full_verification_batch = _RetroSpecFullVerificationBatch(
                 request_ids=request_ids,
                 context_lens=context_lens,
                 query_lens=query_lens,
-                request_indices=request_indices,
             )
             self.mode = RetroSpecAttentionMode.FULL_VERIFY
             yield
@@ -1031,50 +1026,6 @@ class RetroSpecSparseAttention:
 
         return attention_output, output_lse
 
-    @staticmethod
-    def _run_full_local_attention(
-        impl: FlashAttentionImpl,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
-
-        num_tokens = query.shape[0]
-        num_query_heads = query.shape[1]
-
-        local_output, local_lse = flash_attn_varlen_func(
-            q=query,
-            k=key,
-            v=value,
-            out=None,
-            cu_seqlens_q=attn_metadata.query_start_loc,
-            cu_seqlens_k=attn_metadata.query_start_loc,
-            max_seqlen_q=attn_metadata.max_query_len,
-            max_seqlen_k=attn_metadata.max_query_len,
-            softmax_scale=impl.scale,
-            causal=True,
-            alibi_slopes=None,
-            window_size=[-1, -1],
-            block_table=None,
-            softcap=0.0,
-            return_softmax_lse=True,
-            scheduler_metadata=None,
-            fa_version=impl.vllm_flash_attn_version,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            num_splits=0,
-            s_aux=None,
-        )
-
-        local_lse = local_lse.as_strided(
-            (num_query_heads, num_tokens),
-            (num_tokens, 1),
-        )
-        return local_output, local_lse
-
     def _full_verification_forward(
         self,
         layer_name: str,
@@ -1121,89 +1072,78 @@ class RetroSpecSparseAttention:
             key_cache=key_cache,
             block_table=attn_metadata.block_table,
         )
-        source, _ = self._resolve_exact_kv_source(
-            selection=plan,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_table=attn_metadata.block_table,
-        )
-        if self.exact_attention_workspace.supports_parallel_full_prefix(source, query):
-            prefix_output, prefix_lse = (
-                self.exact_attention_workspace.run_parallel_full_prefix(
-                    source,
-                    query,
-                    impl.scale,
-                    attn_metadata.query_start_loc,
-                    attn_metadata.max_query_len,
-                    batch.request_indices,
-                )
+        clustered = plan.clustered_kv
+        if clustered is None and any(
+            descriptor.num_tokens for descriptor in plan.clustered_descriptors
+        ):
+            clustered = self.index.cluster_store.resolve_full_verification_tokens(
+                layer_name=layer_name,
+                descriptors=plan.clustered_descriptors,
             )
-        else:
-            prefix_output, prefix_lse = self.exact_attention_workspace.run(
+        clustered_source = None
+        if clustered is not None:
+            clustered_source = RetroSpecCompactKVSource(
+                key_tokens=clustered.key_tokens,
+                value_tokens=clustered.value_tokens,
+                token_offsets=clustered.token_offsets,
+                token_counts=clustered.token_counts,
+                max_tokens_per_head=clustered.max_tokens_per_head,
+                ready_event=clustered.ready_event,
+            )
+        source = RetroSpecFullVerificationKVSource(
+            primary=RetroSpecExactPrimaryKVSource(
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=attn_metadata.block_table,
+                token_indices=plan.primary_exact_token_indices,
+                token_mask=plan.primary_exact_token_mask,
+            ),
+            clustered=clustered_source,
+        )
+        cluster_output, cluster_lse, native_output, native_lse = (
+            self.exact_attention_workspace.run_parallel_full_verification(
                 source,
                 query,
+                key,
+                value,
                 impl.scale,
-                request_indices=batch.request_indices,
+                attn_metadata.query_start_loc,
+                attn_metadata.max_query_len,
             )
-        local_output, local_lse = self._run_full_local_attention(
-            impl,
-            query,
-            key,
-            value,
-            attn_metadata,
         )
 
         merge_attn_states(
             output[:num_actual_tokens],
-            prefix_output,
-            prefix_lse,
-            local_output,
-            local_lse,
+            cluster_output,
+            cluster_lse,
+            native_output,
+            native_lse,
         )
         self.performance_stats.stop_cuda_timer(full_timer)
         return output
 
     def _resolve_exact_kv_source(
         self,
-        selection: RetroSpecTokenAttentionSelection | RetroSpecFullVerificationPlan,
+        selection: RetroSpecTokenAttentionSelection,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
     ) -> tuple[RetroSpecExactKVSource, RetroSpecResolvedClusterPages | None]:
-        full_verification = isinstance(selection, RetroSpecFullVerificationPlan)
-
-        if full_verification:
-            layer_name = selection.layer_name
-            primary_token_indices = selection.primary_exact_token_indices
-            primary_token_mask = selection.primary_exact_token_mask
-            exact_page_ids = selection.exact_page_ids
-            exact_page_token_counts = selection.exact_page_token_counts
-            resolved_pages = selection.resolved_pages
-        else:
-            layer_name = selection.plan.layer_name
-            primary_token_indices = selection.plan.primary_exact_token_indices
-            primary_token_mask = selection.plan.primary_exact_token_mask
-            exact_cluster_ids = selection.exact_cluster_ids
-            exact_page_ids = selection.exact_page_ids
-            exact_page_token_counts = selection.exact_page_token_counts
-            resolved_pages = selection.resolved_pages
+        layer_name = selection.plan.layer_name
+        primary_token_indices = selection.plan.primary_exact_token_indices
+        primary_token_mask = selection.plan.primary_exact_token_mask
+        exact_cluster_ids = selection.exact_cluster_ids
+        exact_page_ids = selection.exact_page_ids
+        exact_page_token_counts = selection.exact_page_token_counts
+        resolved_pages = selection.resolved_pages
 
         if resolved_pages is None and exact_page_ids.numel():
-            if full_verification:
-                resolved_pages = (
-                    self.index.cluster_store.resolve_full_verification_blocks(
-                        layer_name=layer_name,
-                        logical_page_ids=exact_page_ids,
-                        logical_page_ids_cpu=selection.exact_page_ids_cpu,
-                    )
-                )
-            else:
-                resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
-                    layer_name=layer_name,
-                    cluster_ids=exact_cluster_ids,
-                    logical_page_ids=exact_page_ids,
-                    mode="verification",
-                )
+            resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
+                layer_name=layer_name,
+                cluster_ids=exact_cluster_ids,
+                logical_page_ids=exact_page_ids,
+                mode="verification",
+            )
 
         resident_pages = None
         staging_pages = None

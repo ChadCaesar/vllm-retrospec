@@ -19,6 +19,9 @@ from vllm.v1.spec_decode.retrospec.attention import (
     RetroSpecSparseAttention,
 )
 from vllm.v1.spec_decode.retrospec.cluster_store import (
+    RetroSpecCompactTokenRange,
+    RetroSpecFullVerificationDescriptor,
+    RetroSpecFullVerificationStaging,
     RetroSpecResolvedClusterPages,
 )
 from vllm.v1.spec_decode.retrospec.execution import (
@@ -940,118 +943,97 @@ def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
     assert call_order == ["materialize", "admit", "attention"]
 
 
-def test_full_verification_source_skips_resolution_without_cluster_pages():
+def test_full_verification_uses_specialized_cluster_and_native_sources():
     controller = make_controller()
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
 
+    descriptor = RetroSpecFullVerificationDescriptor(
+        head_ranges=((RetroSpecCompactTokenRange(0, 0, 2),),),
+        head_token_counts=(2,),
+    )
     plan = RetroSpecFullVerificationPlan(
         layer_name="layer",
-        primary_exact_token_indices=torch.tensor([[[0, 1, 2]]]),
-        primary_exact_token_mask=torch.ones(1, 1, 3, dtype=torch.bool),
-        exact_page_ids=torch.empty(1, 1, 1, 0, dtype=torch.int64),
-        exact_page_ids_cpu=torch.empty(1, 1, 1, 0, dtype=torch.int64),
-        exact_page_token_counts=torch.empty(1, 1, 1, 0, dtype=torch.int32),
+        primary_exact_token_indices=torch.tensor([[[0]]]),
+        primary_exact_token_mask=torch.ones(1, 1, 1, dtype=torch.bool),
+        clustered_descriptors=(descriptor,),
+        clustered_kv=None,
         exact_token_counts=torch.tensor([[3]], dtype=torch.int32),
     )
-    controller.index.cluster_store.resolve_full_verification_blocks = Mock()
+    clustered = RetroSpecFullVerificationStaging(
+        key_tokens=torch.ones(2, 1),
+        value_tokens=torch.full((2, 1), 2.0),
+        token_offsets=torch.zeros(1, 1, dtype=torch.int64),
+        token_counts=torch.full((1, 1), 2, dtype=torch.int32),
+        max_tokens_per_head=2,
+        ready_event=None,
+    )
+    controller.index.cluster_store.resolve_full_verification_tokens = Mock(
+        return_value=clustered
+    )
+    controller.index.build_full_verification_plan = Mock(return_value=plan)
+    controller.full_verification_batch = cast(
+        Any,
+        SimpleNamespace(
+            request_ids=("request",),
+            context_lens=(3,),
+            query_lens=(1,),
+            request_indices=torch.zeros(1, dtype=torch.int64),
+        ),
+    )
     key_cache = torch.zeros(2, 2, 1, 1)
     value_cache = key_cache.clone()
-    block_table = torch.tensor([[0, 1]], dtype=torch.int32)
-
-    source, resolved_pages = controller._resolve_exact_kv_source(
-        plan,
-        key_cache,
-        value_cache,
-        block_table,
+    kv_cache = torch.stack((key_cache, value_cache))
+    query = torch.ones(1, 1, 1)
+    local_key = torch.full_like(query, 3.0)
+    local_value = torch.full_like(query, 4.0)
+    cluster_output = torch.full_like(query, 5.0)
+    native_output = torch.full_like(query, 6.0)
+    cluster_lse = torch.zeros(1, 1)
+    native_lse = torch.zeros(1, 1)
+    controller.exact_attention_workspace.run_parallel_full_verification = Mock(
+        return_value=(cluster_output, cluster_lse, native_output, native_lse)
     )
+    output = torch.empty_like(query)
+    metadata = cast(
+        FlashAttentionMetadata,
+        SimpleNamespace(
+            causal=True,
+            num_actual_tokens=1,
+            seq_lens=torch.tensor([3]),
+            max_query_len=1,
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+        ),
+    )
+    with patch(
+        "vllm.v1.spec_decode.retrospec.attention.merge_attn_states",
+        side_effect=lambda result, first, _, second, __: result.copy_(
+            (first + second) / 2
+        ),
+    ):
+        result = controller._full_verification_forward(
+            "layer",
+            cast(FlashAttentionImpl, SimpleNamespace(scale=0.5)),
+            query,
+            local_key,
+            local_value,
+            kv_cache,
+            metadata,
+            output,
+        )
 
-    assert resolved_pages is None
-    resolve_full = controller.index.cluster_store.resolve_full_verification_blocks
-    resolve_full.assert_not_called()
-    assert source.primary.key_cache is key_cache
-    assert source.primary.value_cache is value_cache
-    assert source.primary.token_indices is plan.primary_exact_token_indices
-    assert source.primary.token_mask is plan.primary_exact_token_mask
-    assert source.page_token_counts is plan.exact_page_token_counts
-    assert source.resident_pages is None
-    assert source.staging_pages is None
-
-
-def test_full_verification_source_resolves_all_cluster_pages():
-    controller = make_controller()
-    assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
-
-    page_ids = torch.tensor([[[[2], [3]]]], dtype=torch.int64)
-    page_counts = torch.tensor([[[[2], [1]]]], dtype=torch.int32)
-    plan = RetroSpecFullVerificationPlan(
+    controller.index.cluster_store.resolve_full_verification_tokens.assert_called_once_with(
         layer_name="layer",
-        primary_exact_token_indices=torch.tensor([[[0, 4]]]),
-        primary_exact_token_mask=torch.ones(1, 1, 2, dtype=torch.bool),
-        exact_page_ids=page_ids,
-        exact_page_ids_cpu=page_ids.cpu(),
-        exact_page_token_counts=page_counts,
-        exact_token_counts=torch.tensor([[5]], dtype=torch.int32),
+        descriptors=(descriptor,),
     )
-    resident_page_ids = torch.tensor([[[[0], [-1]]]], dtype=torch.int64)
-    staging_page_ids = torch.tensor([[[[-1], [0]]]], dtype=torch.int64)
-    resident_keys = torch.zeros(1, 2, 1)
-    resident_values = resident_keys.clone()
-    staging_keys = torch.ones(1, 2, 1)
-    staging_values = staging_keys.clone()
-    staging_ready_event = Mock()
-    resolved = RetroSpecResolvedClusterPages(
-        resident_page_ids=resident_page_ids,
-        staging_page_ids=staging_page_ids,
-        resident_key_pages=resident_keys,
-        resident_value_pages=resident_values,
-        staging_key_pages=staging_keys,
-        staging_value_pages=staging_values,
-        hit_cluster_mask=torch.tensor([[[True, False]]]),
-        miss_cluster_mask=torch.tensor([[[False, True]]]),
-        hit_gate_ready_mask=torch.zeros(1, 1, 2, dtype=torch.bool),
-        resident_ready_event=None,
-        staging_ready_event=staging_ready_event,
-    )
-    controller.index.cluster_store.resolve_full_verification_blocks = Mock(
-        return_value=resolved
-    )
-    key_cache = torch.zeros(3, 2, 1, 1)
-    value_cache = key_cache.clone()
-    block_table = torch.tensor([[0, 1, 2]], dtype=torch.int32)
-
-    source, resolved_pages = controller._resolve_exact_kv_source(
-        plan,
-        key_cache,
-        value_cache,
-        block_table,
-    )
-
-    assert resolved_pages is resolved
-    resolve_full = controller.index.cluster_store.resolve_full_verification_blocks
-    resolve_full.assert_called_once_with(
-        layer_name="layer",
-        logical_page_ids=page_ids,
-        logical_page_ids_cpu=plan.exact_page_ids_cpu,
-    )
-    assert source.primary.token_indices is plan.primary_exact_token_indices
-    assert source.primary.token_mask is plan.primary_exact_token_mask
-    assert source.page_token_counts is page_counts
-    assert source.resident_pages is not None
-    assert source.staging_pages is not None
-    assert source.resident_pages.page_ids is resident_page_ids
-    assert source.staging_pages.page_ids is staging_page_ids
-    assert source.staging_pages.ready_event is staging_ready_event
-
-    controller.index.cluster_store.resolve_full_verification_blocks.reset_mock()
-    prefetched_plan = replace(plan, resolved_pages=resolved)
-    _, prefetched_pages = controller._resolve_exact_kv_source(
-        prefetched_plan,
-        key_cache,
-        value_cache,
-        block_table,
-    )
-    assert prefetched_pages is resolved
-    resolve_full.assert_not_called()
+    call = controller.exact_attention_workspace.run_parallel_full_verification.call_args
+    source = call.args[0]
+    assert source.primary.key_cache.data_ptr() == kv_cache[0].data_ptr()
+    assert source.primary.value_cache.data_ptr() == kv_cache[1].data_ptr()
+    assert source.clustered.key_tokens is clustered.key_tokens
+    assert call.args[2].data_ptr() == local_key.data_ptr()
+    assert call.args[3].data_ptr() == local_value.data_ptr()
+    torch.testing.assert_close(result, torch.full_like(result, 5.5))
 
 
 def test_token_estimation_attention_uses_per_head_cluster_sizes():

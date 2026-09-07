@@ -890,10 +890,8 @@ def test_full_verification_plan_covers_clustered_and_primary_tokens():
     assert plan.layer_name == "layer"
     assert plan.exact_token_counts.tolist() == [[10, 10], [3, 3]]
     assert plan.primary_exact_token_mask.sum(dim=2).tolist() == [[6, 6], [3, 3]]
-    assert plan.exact_page_token_counts.sum(dim=(2, 3)).tolist() == [
-        [4, 4],
-        [0, 0],
-    ]
+    assert plan.clustered_descriptors[0].head_token_counts == (4, 4)
+    assert plan.clustered_descriptors[1].head_token_counts == (0, 0)
     assert plan.primary_exact_token_indices[0, 0].tolist() == [0, 1, 6, 7, 8, 9]
     assert plan.primary_exact_token_mask[1, 0].tolist() == [
         True,
@@ -907,9 +905,7 @@ def test_full_verification_plan_covers_clustered_and_primary_tokens():
         plan.primary_exact_token_mask[1, 0]
     ]
     assert short_primary_indices.tolist() == [0, 1, 2]
-    assert (plan.exact_page_ids[0] >= 0).sum(dim=(1, 2)).tolist() == [2, 2]
-    assert not (plan.exact_page_ids[1] >= 0).any()
-    assert torch.equal(plan.exact_page_ids_cpu, plan.exact_page_ids.cpu())
+    assert plan.clustered_kv is None
 
 
 def test_full_verification_plan_reuses_persistent_cpu_page_descriptor():
@@ -918,7 +914,7 @@ def test_full_verification_plan_reuses_persistent_cpu_page_descriptor():
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 10, keys, values, block_table)
 
-    descriptor = index._indices["layer"]["request"].full_verification_page_ids_cpu
+    descriptor = index._indices["layer"]["request"].full_verification_descriptor
     assert descriptor is not None
 
     with patch.object(
@@ -938,7 +934,7 @@ def test_full_verification_plan_reuses_persistent_cpu_page_descriptor():
         finally:
             index.end_full_verification_residency()
 
-    assert torch.equal(plan.exact_page_ids_cpu[0, :, 0], descriptor)
+    assert plan.clustered_descriptors[0] is descriptor
 
 
 @pytest.mark.skipif(
@@ -987,7 +983,7 @@ def test_full_verification_pipeline_prefetches_next_layer():
                 key_cache=keys,
                 block_table=block_table,
             )
-            assert first.resolved_pages is not None
+            assert first.clustered_kv is not None
             assert index._full_verification_prefetched is not None
             assert index._full_verification_prefetched.layer_name == "layer.1"
 
@@ -998,20 +994,16 @@ def test_full_verification_pipeline_prefetches_next_layer():
                 key_cache=keys,
                 block_table=block_table,
             )
-            assert second.resolved_pages is not None
+            assert second.clustered_kv is not None
             assert index._full_verification_prefetched is None
     finally:
         index.end_full_verification_pipeline()
         index.end_full_verification_residency()
 
-    assert first.resolved_pages.staging_ready_event is not None
-    assert second.resolved_pages.staging_ready_event is not None
-    torch.cuda.current_stream(device).wait_event(
-        first.resolved_pages.staging_ready_event
-    )
-    torch.cuda.current_stream(device).wait_event(
-        second.resolved_pages.staging_ready_event
-    )
+    assert first.clustered_kv.ready_event is not None
+    assert second.clustered_kv.ready_event is not None
+    torch.cuda.current_stream(device).wait_event(first.clustered_kv.ready_event)
+    torch.cuda.current_stream(device).wait_event(second.clustered_kv.ready_event)
     torch.cuda.synchronize(device)
 
 
@@ -1036,10 +1028,8 @@ def test_full_verification_plan_handles_request_without_cluster_pages():
     assert plan.exact_token_counts.tolist() == [[3]]
     assert plan.primary_exact_token_indices.tolist() == [[[0, 1, 2]]]
     assert plan.primary_exact_token_mask.all()
-    assert plan.exact_page_ids.shape == (1, 1, 1, 0)
-    assert plan.exact_page_ids.numel() == 0
-    assert plan.exact_page_ids_cpu.shape == plan.exact_page_ids.shape
-    assert plan.exact_page_token_counts.numel() == 0
+    assert plan.clustered_descriptors[0].num_tokens == 0
+    assert plan.clustered_kv is None
 
 
 def test_cpu_offload_sparse_selection_handles_request_without_cluster_pages():
@@ -1186,7 +1176,8 @@ def test_full_verification_plan_accepts_an_empty_context():
     assert plan.exact_token_counts.tolist() == [[0]]
     assert plan.primary_exact_token_indices.shape == (1, 1, 0)
     assert plan.primary_exact_token_mask.shape == (1, 1, 0)
-    assert plan.exact_page_ids.numel() == 0
+    assert plan.clustered_descriptors[0].num_tokens == 0
+    assert plan.clustered_kv is None
 
 
 def test_full_verification_plan_rejects_unapplied_rollback():

@@ -40,8 +40,10 @@ def exact_attention_workspace_size_bytes(
     partial_statistics_bytes = (
         max_num_queries * num_query_heads * partition_capacity * 2 * 4
     )
-    output_bytes = max_num_queries * num_query_heads * head_size * dtype_size
-    output_lse_bytes = max_num_queries * num_query_heads * 4
+    # Cluster-prefix and native-suffix states coexist until their final LSE
+    # merge, while the larger split-K partial workspace is reused serially.
+    output_bytes = 2 * max_num_queries * num_query_heads * head_size * dtype_size
+    output_lse_bytes = 2 * max_num_queries * num_query_heads * 4
     return (
         partial_output_bytes
         + partial_statistics_bytes

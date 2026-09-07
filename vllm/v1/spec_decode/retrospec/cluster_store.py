@@ -308,6 +308,88 @@ class _ClusterBlockDescriptor:
 
 
 @dataclass(frozen=True)
+class RetroSpecCompactTokenRange:
+    """One valid-token range in a layer's pageable CPU slab storage."""
+
+    slab_id: int
+    token_offset: int
+    token_count: int
+
+
+@dataclass(frozen=True)
+class RetroSpecFullVerificationDescriptor:
+    """Persistent compact full-prefix layout for every KV head of a request."""
+
+    head_ranges: tuple[tuple[RetroSpecCompactTokenRange, ...], ...]
+    head_token_counts: tuple[int, ...]
+
+    @classmethod
+    def empty(cls, num_kv_heads: int) -> "RetroSpecFullVerificationDescriptor":
+        if num_kv_heads <= 0:
+            raise ValueError("num_kv_heads must be positive")
+        return cls(
+            head_ranges=tuple(() for _ in range(num_kv_heads)),
+            head_token_counts=(0,) * num_kv_heads,
+        )
+
+    @property
+    def num_kv_heads(self) -> int:
+        return len(self.head_ranges)
+
+    @property
+    def num_tokens(self) -> int:
+        return sum(self.head_token_counts)
+
+    def append(
+        self, other: "RetroSpecFullVerificationDescriptor"
+    ) -> "RetroSpecFullVerificationDescriptor":
+        if self.num_kv_heads != other.num_kv_heads:
+            raise ValueError("Full-verification descriptors changed KV-head count")
+
+        merged_heads: list[tuple[RetroSpecCompactTokenRange, ...]] = []
+        for current, appended in zip(self.head_ranges, other.head_ranges):
+            ranges = list(current)
+            for token_range in appended:
+                if ranges:
+                    previous = ranges[-1]
+                    previous_end = previous.token_offset + previous.token_count
+                    if (
+                        previous.slab_id == token_range.slab_id
+                        and previous_end == token_range.token_offset
+                    ):
+                        ranges[-1] = RetroSpecCompactTokenRange(
+                            slab_id=previous.slab_id,
+                            token_offset=previous.token_offset,
+                            token_count=previous.token_count + token_range.token_count,
+                        )
+                        continue
+                ranges.append(token_range)
+            merged_heads.append(tuple(ranges))
+
+        return RetroSpecFullVerificationDescriptor(
+            head_ranges=tuple(merged_heads),
+            head_token_counts=tuple(
+                current + appended
+                for current, appended in zip(
+                    self.head_token_counts, other.head_token_counts
+                )
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class RetroSpecFullVerificationStaging:
+    """Token-contiguous GPU staging used only by full verification."""
+
+    key_tokens: torch.Tensor
+    value_tokens: torch.Tensor
+    token_offsets: torch.Tensor
+    token_counts: torch.Tensor
+    max_tokens_per_head: int
+    ready_event: torch.cuda.Event | None
+
+
+@dataclass(frozen=True)
 class RetroSpecResolvedClusterPages:
     """Physical GPU sources for one logical cluster-page selection.
 
@@ -657,14 +739,110 @@ class _LayerClusterPagePool:
         self.read_into(storage_page_ids, key_pages, value_pages)
         return key_pages.view(output_shape), value_pages.view(output_shape)
 
+    def build_full_verification_descriptor(
+        self,
+        page_ids: torch.Tensor,
+        page_token_counts: torch.Tensor,
+    ) -> RetroSpecFullVerificationDescriptor:
+        """Convert cluster pages into immutable valid-token slab ranges."""
+        if page_ids.device.type != "cpu" or page_ids.dtype != torch.int64:
+            raise ValueError("Full-verification page IDs must be CPU int64")
+        if page_token_counts.device.type != "cpu":
+            raise ValueError("Full-verification token counts must reside on CPU")
+        if page_ids.shape != page_token_counts.shape or page_ids.ndim < 2:
+            raise ValueError("Full-verification page metadata has an invalid shape")
+
+        head_ranges: list[tuple[RetroSpecCompactTokenRange, ...]] = []
+        head_token_counts: list[int] = []
+        for head_index in range(page_ids.shape[0]):
+            ranges: list[RetroSpecCompactTokenRange] = []
+            flat_ids = page_ids[head_index].reshape(-1).tolist()
+            flat_counts = page_token_counts[head_index].reshape(-1).tolist()
+            for page_id, token_count in zip(flat_ids, flat_counts):
+                if page_id < 0:
+                    continue
+                if page_id not in self._allocated_page_ids:
+                    raise RuntimeError(
+                        f"RetroSpec cluster page {page_id} is not allocated"
+                    )
+                if not 0 < token_count <= self.page_size:
+                    raise ValueError("Cluster page token count is out of range")
+                slab_id, page_offset = self.decode_page_id(page_id)
+                token_range = RetroSpecCompactTokenRange(
+                    slab_id=slab_id,
+                    token_offset=page_offset * self.page_size,
+                    token_count=token_count,
+                )
+                if ranges:
+                    previous = ranges[-1]
+                    previous_end = previous.token_offset + previous.token_count
+                    if (
+                        previous.slab_id == slab_id
+                        and previous_end == token_range.token_offset
+                    ):
+                        ranges[-1] = RetroSpecCompactTokenRange(
+                            slab_id=slab_id,
+                            token_offset=previous.token_offset,
+                            token_count=previous.token_count + token_count,
+                        )
+                        continue
+                ranges.append(token_range)
+            head_ranges.append(tuple(ranges))
+            head_token_counts.append(
+                sum(token_range.token_count for token_range in ranges)
+            )
+
+        return RetroSpecFullVerificationDescriptor(
+            head_ranges=tuple(head_ranges),
+            head_token_counts=tuple(head_token_counts),
+        )
+
+    def read_compact_ranges_into(
+        self,
+        ranges: Sequence[RetroSpecCompactTokenRange],
+        key_tokens: torch.Tensor,
+        value_tokens: torch.Tensor,
+    ) -> None:
+        """Gather valid slab ranges into caller-owned token-contiguous CPU storage."""
+        num_tokens = sum(token_range.token_count for token_range in ranges)
+        expected_shape = (num_tokens, self.head_size)
+        if key_tokens.shape != expected_shape or value_tokens.shape != expected_shape:
+            raise ValueError("Compact destination storage has an invalid shape")
+        if key_tokens.device.type != "cpu" or value_tokens.device.type != "cpu":
+            raise ValueError("Compact destination storage must reside on CPU")
+        if key_tokens.dtype != self.dtype or value_tokens.dtype != self.dtype:
+            raise ValueError("Compact destination dtype does not match the pool")
+
+        destination_start = 0
+        for token_range in ranges:
+            if token_range.slab_id < 0 or token_range.slab_id >= len(self._slabs):
+                raise RuntimeError("Compact descriptor references an unknown slab")
+            slab = self._slabs[token_range.slab_id]
+            slab_keys = slab.key_pages.view(-1, self.head_size)
+            slab_values = slab.value_pages.view(-1, self.head_size)
+            source_end = token_range.token_offset + token_range.token_count
+            if token_range.token_offset < 0 or source_end > slab_keys.shape[0]:
+                raise RuntimeError("Compact descriptor exceeds its source slab")
+            destination_end = destination_start + token_range.token_count
+            key_tokens[destination_start:destination_end].copy_(
+                slab_keys[token_range.token_offset : source_end]
+            )
+            value_tokens[destination_start:destination_end].copy_(
+                slab_values[token_range.token_offset : source_end]
+            )
+            destination_start = destination_end
+
 
 @dataclass
 class _FullVerificationGPUArena:
     dtype: torch.dtype | None = None
     head_size: int | None = None
     capacity: int = 0
-    key_pages: torch.Tensor | None = None
-    value_pages: torch.Tensor | None = None
+    metadata_capacity: int = 0
+    key_tokens: torch.Tensor | None = None
+    value_tokens: torch.Tensor | None = None
+    token_offsets: torch.Tensor | None = None
+    token_counts: torch.Tensor | None = None
 
 
 class _FullVerificationTransferBuffer:
@@ -720,29 +898,40 @@ class _FullVerificationTransferBuffer:
         return max(arena.capacity for arena in self._gpu_arenas)
 
     def _release_old_storage(self, arena: _FullVerificationGPUArena) -> None:
-        if arena.key_pages is None or arena.value_pages is None:
+        if arena.key_tokens is None or arena.value_tokens is None:
             return
 
         # The transfer stream already waits for the execution stream before
         # this method is called. Recording the old tensors on the transfer
         # stream prevents the CUDA allocator from recycling them too early.
-        arena.key_pages.record_stream(self._transfer_stream)
-        arena.value_pages.record_stream(self._transfer_stream)
+        arena.key_tokens.record_stream(self._transfer_stream)
+        arena.value_tokens.record_stream(self._transfer_stream)
+        assert arena.token_offsets is not None
+        assert arena.token_counts is not None
+        arena.token_offsets.record_stream(self._transfer_stream)
+        arena.token_counts.record_stream(self._transfer_stream)
 
     def _ensure_capacity(
         self,
         arena: _FullVerificationGPUArena,
-        required_pages: int,
+        required_tokens: int,
+        required_metadata: int,
         dtype: torch.dtype,
         head_size: int,
     ) -> None:
-        if required_pages < 0:
-            raise ValueError("required_pages must be non-negative")
+        if required_tokens < 0:
+            raise ValueError("required_tokens must be non-negative")
         if head_size <= 0:
             raise ValueError("head_size must be positive")
 
         layout_changed = arena.dtype != dtype or arena.head_size != head_size
-        if not layout_changed and required_pages <= arena.capacity:
+        if required_metadata < 0:
+            raise ValueError("required_metadata must be non-negative")
+        if (
+            not layout_changed
+            and required_tokens <= arena.capacity
+            and required_metadata <= arena.metadata_capacity
+        ):
             return
 
         self._release_old_storage(arena)
@@ -751,16 +940,22 @@ class _FullVerificationTransferBuffer:
         arena.head_size = head_size
         arena.capacity = max(
             self._MIN_CAPACITY,
-            self._next_power_of_two(required_pages),
+            self._next_power_of_two(required_tokens),
+        )
+        arena.metadata_capacity = max(
+            self._MIN_CAPACITY,
+            self._next_power_of_two(required_metadata),
         )
 
-        shape = (
-            arena.capacity,
-            self.page_size,
-            head_size,
+        shape = (arena.capacity, head_size)
+        arena.key_tokens = torch.empty(shape, dtype=dtype, device=self.device)
+        arena.value_tokens = torch.empty_like(arena.key_tokens)
+        arena.token_offsets = torch.empty(
+            arena.metadata_capacity, dtype=torch.int64, device=self.device
         )
-        arena.key_pages = torch.empty(shape, dtype=dtype, device=self.device)
-        arena.value_pages = torch.empty_like(arena.key_pages)
+        arena.token_counts = torch.empty(
+            arena.metadata_capacity, dtype=torch.int32, device=self.device
+        )
 
     def _ensure_cpu_slots(self, pool: _LayerClusterPagePool) -> None:
         layout = (pool.dtype, pool.head_size)
@@ -859,6 +1054,36 @@ class _FullVerificationTransferBuffer:
         self._ensure_cpu_slots(pool)
         return self._cpu_slot_capacity
 
+    def stage_cpu_ranges(
+        self,
+        pool: _LayerClusterPagePool,
+        ranges: Sequence[RetroSpecCompactTokenRange],
+    ) -> tuple[torch.Tensor, torch.Tensor, _PinnedPageTransferSlot]:
+        """Gather bounded valid-token ranges into the shared pinned ring."""
+        self._ensure_cpu_slots(pool)
+        num_tokens = sum(token_range.token_count for token_range in ranges)
+        token_capacity = self._cpu_slot_capacity * self.page_size
+        if num_tokens > token_capacity:
+            raise RuntimeError(
+                "RetroSpec compact H2D selection exceeds the fixed pinned staging slot"
+            )
+
+        with self._cpu_slot_lock:
+            slot = self._cpu_slots[self._cpu_slot_cursor]
+            self._cpu_slot_cursor = (self._cpu_slot_cursor + 1) % len(self._cpu_slots)
+            if slot.in_use:
+                raise RuntimeError("RetroSpec pinned H2D staging ring is exhausted")
+            slot.in_use = True
+
+        if slot.reuse_ready_event is not None:
+            slot.reuse_ready_event.synchronize()
+            slot.reuse_ready_event = None
+
+        key_tokens = slot.key_pages.view(-1, pool.head_size)[:num_tokens]
+        value_tokens = slot.value_pages.view(-1, pool.head_size)[:num_tokens]
+        pool.read_compact_ranges_into(ranges, key_tokens, value_tokens)
+        return key_tokens, value_tokens, slot
+
     def release_cpu_slot(
         self,
         slot: _PinnedPageTransferSlot,
@@ -873,51 +1098,44 @@ class _FullVerificationTransferBuffer:
     def stage(
         self,
         pool: _LayerClusterPagePool,
-        logical_page_ids: torch.Tensor,
-        logical_page_ids_cpu: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.cuda.Event,
-    ]:
-        """Copy every valid logical page into the shared CUDA arena."""
+        descriptors: Sequence[RetroSpecFullVerificationDescriptor],
+    ) -> RetroSpecFullVerificationStaging:
+        """Copy only valid clustered tokens into the shared CUDA arena."""
         if pool.storage_device.type != "cpu":
             raise ValueError("Full-verification staging requires CPU backing pages")
         if pool.metadata_device != self.device:
             raise ValueError(
                 "Full-verification metadata and transfer buffer devices differ"
             )
-        if logical_page_ids.device != self.device:
-            raise ValueError("Logical page IDs must be on the transfer device")
-        if logical_page_ids.dtype not in (torch.int32, torch.int64):
-            raise ValueError("Logical page IDs must use an integral dtype")
-        if logical_page_ids_cpu.device.type != "cpu":
-            raise ValueError("CPU logical page IDs must reside on CPU")
-        if logical_page_ids_cpu.dtype != torch.int64:
-            raise ValueError("CPU logical page IDs must use int64")
-        if logical_page_ids_cpu.shape != logical_page_ids.shape:
-            raise ValueError("CPU and GPU logical page layouts do not match")
-        valid_page_mask_cpu = logical_page_ids_cpu >= 0
-        source_page_ids = logical_page_ids_cpu[valid_page_mask_cpu].contiguous()
-        num_pages = source_page_ids.numel()
+        if not descriptors:
+            raise ValueError("Full-verification staging requires request descriptors")
 
-        valid_page_mask = logical_page_ids >= 0
-        staging_page_ids = torch.full_like(
-            logical_page_ids,
-            -1,
-            dtype=torch.int64,
+        num_kv_heads = descriptors[0].num_kv_heads
+        if any(descriptor.num_kv_heads != num_kv_heads for descriptor in descriptors):
+            raise ValueError("Full-verification descriptors changed KV-head count")
+
+        token_counts_cpu = torch.tensor(
+            [descriptor.head_token_counts for descriptor in descriptors],
+            dtype=torch.int32,
+            device="cpu",
         )
+        flat_counts = token_counts_cpu.reshape(-1).to(dtype=torch.int64)
+        flat_offsets = torch.zeros_like(flat_counts)
+        if flat_offsets.numel() > 1:
+            flat_offsets[1:] = flat_counts.cumsum(0)[:-1]
+        token_offsets_cpu = flat_offsets.view_as(token_counts_cpu)
+        num_tokens = int(flat_counts.sum().item())
+        max_tokens_per_head = int(flat_counts.max().item()) if num_tokens else 0
 
-        if num_pages:
-            staging_page_ids.masked_scatter_(
-                valid_page_mask,
-                torch.arange(
-                    num_pages,
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-            )
+        ordered_ranges = tuple(
+            token_range
+            for descriptor in descriptors
+            for head_ranges in descriptor.head_ranges
+            for token_range in head_ranges
+        )
+        if sum(token_range.token_count for token_range in ordered_ranges) != num_tokens:
+            raise RuntimeError("Full-verification compact descriptor is inconsistent")
+        self._ensure_cpu_slots(pool)
 
         current_stream = torch.cuda.current_stream(self.device)
         arena = self._gpu_arenas[self._gpu_arena_cursor]
@@ -940,46 +1158,76 @@ class _FullVerificationTransferBuffer:
         with torch.cuda.stream(self._transfer_stream):
             self._ensure_capacity(
                 arena=arena,
-                required_pages=num_pages,
+                required_tokens=num_tokens,
+                required_metadata=token_counts_cpu.numel(),
                 dtype=pool.dtype,
                 head_size=pool.head_size,
             )
 
-            assert arena.key_pages is not None
-            assert arena.value_pages is not None
+            assert arena.key_tokens is not None
+            assert arena.value_tokens is not None
+            assert arena.token_offsets is not None
+            assert arena.token_counts is not None
 
-            staging_key_pages = arena.key_pages[:num_pages]
-            staging_value_pages = arena.value_pages[:num_pages]
+            staging_key_tokens = arena.key_tokens[:num_tokens]
+            staging_value_tokens = arena.value_tokens[:num_tokens]
+            staging_token_offsets = arena.token_offsets[
+                : token_counts_cpu.numel()
+            ].view(token_counts_cpu.shape)
+            staging_token_counts = arena.token_counts[: token_counts_cpu.numel()].view(
+                token_counts_cpu.shape
+            )
+            staging_token_offsets.copy_(token_offsets_cpu)
+            staging_token_counts.copy_(token_counts_cpu)
 
-            page_start = 0
-            while page_start < num_pages:
-                page_end = min(page_start + self._cpu_slot_capacity, num_pages)
-                source_chunk = source_page_ids[page_start:page_end]
-                cpu_keys, cpu_values, cpu_slot = self.stage_cpu_pages(
-                    pool, source_chunk
+            token_capacity = self._cpu_slot_capacity * self.page_size
+            token_start = 0
+            range_index = 0
+            range_offset = 0
+            while token_start < num_tokens:
+                remaining = min(token_capacity, num_tokens - token_start)
+                chunk_ranges: list[RetroSpecCompactTokenRange] = []
+                while remaining:
+                    source_range = ordered_ranges[range_index]
+                    token_count = min(
+                        remaining, source_range.token_count - range_offset
+                    )
+                    chunk_ranges.append(
+                        RetroSpecCompactTokenRange(
+                            slab_id=source_range.slab_id,
+                            token_offset=source_range.token_offset + range_offset,
+                            token_count=token_count,
+                        )
+                    )
+                    remaining -= token_count
+                    range_offset += token_count
+                    if range_offset == source_range.token_count:
+                        range_index += 1
+                        range_offset = 0
+
+                chunk_tokens = sum(
+                    token_range.token_count for token_range in chunk_ranges
                 )
-                staging_key_pages[page_start:page_end].copy_(
+                token_end = token_start + chunk_tokens
+                cpu_keys, cpu_values, cpu_slot = self.stage_cpu_ranges(
+                    pool, chunk_ranges
+                )
+                staging_key_tokens[token_start:token_end].copy_(
                     cpu_keys, non_blocking=self.pin_memory
                 )
-                staging_value_pages[page_start:page_end].copy_(
+                staging_value_tokens[token_start:token_end].copy_(
                     cpu_values, non_blocking=self.pin_memory
                 )
                 chunk_ready_event = torch.cuda.Event()
                 chunk_ready_event.record(self._transfer_stream)
                 self.release_cpu_slot(cpu_slot, chunk_ready_event)
-                page_start = page_end
+                token_start = token_end
 
             if self.performance_stats is not None:
-                transfer_bytes = (
-                    num_pages
-                    * self.page_size
-                    * pool.head_size
-                    * pool.dtype.itemsize
-                    * 2
-                )
+                transfer_bytes = num_tokens * pool.head_size * pool.dtype.itemsize * 2
                 self.performance_stats.add_counter(
-                    "full_verify_h2d_pages",
-                    num_pages,
+                    "full_verify_h2d_tokens",
+                    num_tokens,
                 )
                 self.performance_stats.add_counter(
                     "full_verify_h2d_bytes",
@@ -992,11 +1240,13 @@ class _FullVerificationTransferBuffer:
 
             ready_event.record(self._transfer_stream)
 
-        return (
-            staging_page_ids,
-            staging_key_pages,
-            staging_value_pages,
-            ready_event,
+        return RetroSpecFullVerificationStaging(
+            key_tokens=staging_key_tokens,
+            value_tokens=staging_value_tokens,
+            token_offsets=staging_token_offsets,
+            token_counts=staging_token_counts,
+            max_tokens_per_head=max_tokens_per_head,
+            ready_event=ready_event,
         )
 
 
@@ -3329,13 +3579,26 @@ class RetroSpecClusterPageStore:
             staging_ready_event=staging_ready_event,
         )
 
-    def resolve_full_verification_blocks(
+    def build_full_verification_descriptor(
         self,
         layer_name: str,
-        logical_page_ids: torch.Tensor,
-        logical_page_ids_cpu: torch.Tensor,
-    ) -> RetroSpecResolvedClusterPages:
-        """Stage every clustered KV page required by full verification."""
+        page_ids: torch.Tensor,
+        page_token_counts: torch.Tensor,
+    ) -> RetroSpecFullVerificationDescriptor:
+        """Build a persistent valid-token descriptor for one request segment."""
+        pool = self._layer_pools.get(layer_name)
+        if pool is None:
+            raise RuntimeError(
+                f"No RetroSpec page pool exists for layer {layer_name!r}"
+            )
+        return pool.build_full_verification_descriptor(page_ids, page_token_counts)
+
+    def resolve_full_verification_tokens(
+        self,
+        layer_name: str,
+        descriptors: Sequence[RetroSpecFullVerificationDescriptor],
+    ) -> RetroSpecFullVerificationStaging:
+        """Stage every valid clustered token required by full verification."""
         self.wait_for_resident_prefetches((layer_name,))
 
         with self._resident_state_lock:
@@ -3346,33 +3609,7 @@ class RetroSpecClusterPageStore:
                 )
 
             transfer_buffer = self._get_full_verification_buffer(pool)
-            (
-                staging_page_ids,
-                staging_key_pages,
-                staging_value_pages,
-                staging_ready_event,
-            ) = transfer_buffer.stage(
-                pool=pool,
-                logical_page_ids=logical_page_ids,
-                logical_page_ids_cpu=logical_page_ids_cpu,
-            )
-
-        resident_page_ids = torch.full_like(logical_page_ids, -1)
-        valid_cluster_mask = (logical_page_ids >= 0).any(dim=-1)
-
-        return RetroSpecResolvedClusterPages(
-            resident_page_ids=resident_page_ids,
-            staging_page_ids=staging_page_ids,
-            resident_key_pages=staging_key_pages[:0],
-            resident_value_pages=staging_value_pages[:0],
-            staging_key_pages=staging_key_pages,
-            staging_value_pages=staging_value_pages,
-            hit_cluster_mask=torch.zeros_like(valid_cluster_mask),
-            miss_cluster_mask=valid_cluster_mask,
-            hit_gate_ready_mask=torch.zeros_like(valid_cluster_mask),
-            resident_ready_event=None,
-            staging_ready_event=staging_ready_event,
-        )
+            return transfer_buffer.stage(pool=pool, descriptors=descriptors)
 
     def lookup_resident_clusters(
         self,

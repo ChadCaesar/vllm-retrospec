@@ -13,6 +13,8 @@ from .cluster_scoring import reduce_grouped_cluster_scores, score_resident_clust
 from .cluster_store import (
     RetroSpecClusterBlockTable,
     RetroSpecClusterPageStore,
+    RetroSpecFullVerificationDescriptor,
+    RetroSpecFullVerificationStaging,
     RetroSpecResolvedClusterPages,
     RetroSpecStagedClusterInput,
 )
@@ -95,11 +97,9 @@ class RetroSpecFullVerificationPlan:
     primary_exact_token_indices: torch.Tensor
     primary_exact_token_mask: torch.Tensor
 
-    exact_page_ids: torch.Tensor
-    exact_page_ids_cpu: torch.Tensor
-    exact_page_token_counts: torch.Tensor
+    clustered_descriptors: tuple[RetroSpecFullVerificationDescriptor, ...]
+    clustered_kv: RetroSpecFullVerificationStaging | None
     exact_token_counts: torch.Tensor
-    resolved_pages: RetroSpecResolvedClusterPages | None = None
 
 
 @dataclass(frozen=True)
@@ -138,21 +138,13 @@ class _RequestLayerIndex:
     segments: list[_RequestLayerSegment]
     num_clusters: int
     indexed_end: int
-    full_verification_page_ids_cpu: torch.Tensor | None
-
-
-@dataclass(frozen=True)
-class _FullVerificationPageLayout:
-    page_ids: torch.Tensor
-    page_ids_cpu: torch.Tensor
-    page_token_counts: torch.Tensor
+    full_verification_descriptor: RetroSpecFullVerificationDescriptor | None
 
 
 @dataclass(frozen=True)
 class _PrefetchedFullVerificationLayer:
     layer_name: str
-    layout: _FullVerificationPageLayout
-    resolved_pages: RetroSpecResolvedClusterPages | None
+    clustered_kv: RetroSpecFullVerificationStaging | None
 
 
 @dataclass(frozen=True)
@@ -841,7 +833,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             segments=[],
             num_clusters=0,
             indexed_end=indexed_end,
-            full_verification_page_ids_cpu=None,
+            full_verification_descriptor=None,
         )
 
     def _free_record(
@@ -1043,42 +1035,23 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         for staged_segment, _, cluster_blocks in built_segments:
             self.cluster_store.free(staged_segment.layer_name, cluster_blocks)
 
-    @staticmethod
     def _append_full_verification_page_descriptor(
+        self,
+        layer_name: str,
         record: _RequestLayerIndex,
         page_ids: torch.Tensor,
+        page_token_counts: torch.Tensor,
     ) -> None:
-        """Append one segment to the persistent CPU full-verify descriptor."""
-        if page_ids.device.type != "cpu":
-            raise ValueError("Full-verification page descriptors must reside on CPU")
-        if page_ids.ndim < 2:
-            raise ValueError("Cluster page IDs must include a KV-head dimension")
-
-        num_kv_heads = page_ids.shape[0]
-        previous = record.full_verification_page_ids_cpu
-        if previous is not None and previous.shape[0] != num_kv_heads:
-            raise RuntimeError("Full-verification descriptor changed KV-head count")
-
-        per_head_pages: list[torch.Tensor] = []
-        for head_index in range(num_kv_heads):
-            new_pages = page_ids[head_index].reshape(-1)
-            new_pages = new_pages[new_pages >= 0]
-            if previous is not None:
-                old_pages = previous[head_index]
-                old_pages = old_pages[old_pages >= 0]
-                new_pages = torch.cat((old_pages, new_pages))
-            per_head_pages.append(new_pages)
-
-        max_num_pages = max((pages.numel() for pages in per_head_pages), default=0)
-        descriptor = torch.full(
-            (num_kv_heads, max_num_pages),
-            -1,
-            dtype=torch.int64,
-            device="cpu",
+        """Append immutable valid-token ranges for one completed segment."""
+        descriptor = self.cluster_store.build_full_verification_descriptor(
+            layer_name,
+            page_ids,
+            page_token_counts,
         )
-        for head_index, pages in enumerate(per_head_pages):
-            descriptor[head_index, : pages.numel()].copy_(pages)
-        record.full_verification_page_ids_cpu = descriptor
+        previous = record.full_verification_descriptor
+        record.full_verification_descriptor = (
+            descriptor if previous is None else previous.append(descriptor)
+        )
 
     def _publish_built_segments(
         self,
@@ -1111,10 +1084,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                         segments=list(current_record.segments),
                         num_clusters=current_record.num_clusters,
                         indexed_end=current_record.indexed_end,
-                        full_verification_page_ids_cpu=(
-                            None
-                            if current_record.full_verification_page_ids_cpu is None
-                            else current_record.full_verification_page_ids_cpu.clone()
+                        full_verification_descriptor=(
+                            current_record.full_verification_descriptor
                         ),
                     )
 
@@ -1149,8 +1120,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 )
             )
             self._append_full_verification_page_descriptor(
+                staged_segment.layer_name,
                 record,
                 block_metadata.page_ids,
+                block_metadata.page_token_counts,
             )
 
             record.segments.append(
@@ -3061,71 +3034,23 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         return exact_keys, exact_values, exact_token_mask
 
-    @staticmethod
-    def _build_full_verification_pages(
-        view: RetroSpecResidentBatchView,
-        num_kv_heads: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size = view.request_slot_ids.shape[0]
-        device = view.request_slot_ids.device
-        shape = (batch_size, num_kv_heads, 1, view.max_num_pages)
-        page_ids = torch.full(shape, -1, dtype=torch.int64, device=device)
-        page_token_counts = torch.zeros_like(page_ids, dtype=torch.int32)
-        if view.arena is None or view.max_num_pages == 0:
-            return page_ids, page_token_counts
-
-        arena = view.arena
-        slots = view.request_slot_ids.clamp_min(0)
-        head_indices = torch.arange(num_kv_heads, dtype=torch.int64, device=device)[
-            None, :, None
-        ]
-        local_page_indices = torch.arange(
-            view.max_num_pages, dtype=torch.int64, device=device
-        )[None, None, :]
-        request_page_offsets = arena.page_offsets.index_select(0, slots)
-        request_page_counts = arena.num_pages.index_select(0, slots)
-        absolute_page_indices = request_page_offsets[:, None, None] + local_page_indices
-        absolute_page_indices.clamp_(max=arena.page_ids.shape[1] - 1)
-        valid = (view.request_slot_ids[:, None, None] >= 0) & (
-            local_page_indices < request_page_counts.unsqueeze(-1)
-        )
-        page_ids[:, :, 0] = arena.page_ids[
-            head_indices, absolute_page_indices
-        ].masked_fill(~valid, -1)
-        page_token_counts[:, :, 0] = arena.page_token_counts[
-            head_indices, absolute_page_indices
-        ].masked_fill(~valid, 0)
-        return page_ids, page_token_counts
-
-    def _pack_full_verification_page_ids_cpu(
+    def _get_full_verification_descriptors(
         self,
         layer_name: str,
         request_ids: Sequence[str],
-        output_shape: torch.Size,
-    ) -> torch.Tensor:
-        page_ids_cpu = torch.full(
-            output_shape,
-            -1,
-            dtype=torch.int64,
-            device="cpu",
-        )
+        num_kv_heads: int,
+    ) -> tuple[RetroSpecFullVerificationDescriptor, ...]:
         layer_indices = self._indices.get(layer_name, {})
-
-        for row, request_id in enumerate(request_ids):
+        descriptors: list[RetroSpecFullVerificationDescriptor] = []
+        for request_id in request_ids:
             record = layer_indices.get(request_id)
-            if record is None or record.full_verification_page_ids_cpu is None:
-                continue
-
-            descriptor = record.full_verification_page_ids_cpu
-            if descriptor.shape[0] != output_shape[1]:
+            descriptor = None if record is None else record.full_verification_descriptor
+            if descriptor is None:
+                descriptor = RetroSpecFullVerificationDescriptor.empty(num_kv_heads)
+            elif descriptor.num_kv_heads != num_kv_heads:
                 raise RuntimeError("Full-verification descriptor changed KV-head count")
-            if descriptor.shape[1] > output_shape[3]:
-                raise RuntimeError(
-                    "Full-verification descriptor exceeds resident page layout"
-                )
-            page_ids_cpu[row, :, 0, : descriptor.shape[1]].copy_(descriptor)
-
-        return page_ids_cpu
+            descriptors.append(descriptor)
+        return tuple(descriptors)
 
     def _prefetch_full_verification_layer(
         self,
@@ -3136,37 +3061,20 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         layer_name, num_kv_heads = self._full_verification_layers[layer_index]
         request_ids = self._full_verification_request_ids
-        self._validate_resident_index(layer_name, request_ids)
-        view = self._gpu_index_residency.get_active_view(
+        descriptors = self._get_full_verification_descriptors(
             layer_name,
             request_ids,
-            self._full_verification_device,
-        )
-        page_ids, page_token_counts = self._build_full_verification_pages(
-            view,
             num_kv_heads,
         )
-        page_ids_cpu = self._pack_full_verification_page_ids_cpu(
-            layer_name,
-            request_ids,
-            page_ids.shape,
-        )
-        layout = _FullVerificationPageLayout(
-            page_ids=page_ids,
-            page_ids_cpu=page_ids_cpu,
-            page_token_counts=page_token_counts,
-        )
-        resolved_pages = None
-        if view.max_num_pages > 0:
-            resolved_pages = self.cluster_store.resolve_full_verification_blocks(
+        clustered_kv = None
+        if any(descriptor.num_tokens for descriptor in descriptors):
+            clustered_kv = self.cluster_store.resolve_full_verification_tokens(
                 layer_name=layer_name,
-                logical_page_ids=page_ids,
-                logical_page_ids_cpu=page_ids_cpu,
+                descriptors=descriptors,
             )
         return _PrefetchedFullVerificationLayer(
             layer_name=layer_name,
-            layout=layout,
-            resolved_pages=resolved_pages,
+            clustered_kv=clustered_kv,
         )
 
     def begin_full_verification_pipeline(
@@ -3205,7 +3113,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     def consume_full_verification_layer(
         self,
         layer_name: str,
-    ) -> tuple[_FullVerificationPageLayout, RetroSpecResolvedClusterPages | None]:
+    ) -> RetroSpecFullVerificationStaging | None:
         if not self._full_verification_pipeline_active:
             raise RuntimeError("Full-verification pipeline is not active")
         prefetched = self._full_verification_prefetched
@@ -3223,7 +3131,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         self._full_verification_layer_cursor = next_cursor
         self._full_verification_prefetched = next_prefetched
-        return prefetched.layout, prefetched.resolved_pages
+        return prefetched.clustered_kv
 
     def end_full_verification_pipeline(self) -> None:
         self._full_verification_pipeline_active = False
@@ -3341,29 +3249,29 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             dim=2,
             dtype=torch.int32,
         )
-        resolved_pages = None
+        descriptors = self._get_full_verification_descriptors(
+            layer_name, request_ids, num_kv_heads
+        )
         if self._full_verification_pipeline_active:
-            layout, resolved_pages = self.consume_full_verification_layer(layer_name)
-            exact_page_ids = layout.page_ids
-            exact_page_ids_cpu = layout.page_ids_cpu
-            exact_page_token_counts = layout.page_token_counts
-            if exact_page_ids.shape[:2] != (len(request_ids), num_kv_heads):
+            clustered_kv = self.consume_full_verification_layer(layer_name)
+            if clustered_kv is not None and clustered_kv.token_counts.shape != (
+                len(request_ids),
+                num_kv_heads,
+            ):
                 raise RuntimeError(
-                    "Prefetched full-verification layout changed batch shape"
+                    "Prefetched full-verification staging changed batch shape"
                 )
         else:
-            exact_page_ids, exact_page_token_counts = (
-                self._build_full_verification_pages(view, num_kv_heads)
-            )
-            exact_page_ids_cpu = self._pack_full_verification_page_ids_cpu(
-                layer_name,
-                request_ids,
-                exact_page_ids.shape,
-            )
-        clustered_exact_token_counts = exact_page_token_counts.sum(
-            dim=(2, 3),
+            clustered_kv = None
+        clustered_exact_token_counts = torch.tensor(
+            [descriptor.head_token_counts for descriptor in descriptors],
             dtype=torch.int32,
+            device=primary_exact_token_counts.device,
         )
+        if clustered_exact_token_counts.shape != primary_exact_token_counts.shape:
+            raise RuntimeError(
+                "Full-verification clustered and native counts have different shapes"
+            )
         exact_token_counts = (
             primary_exact_token_counts + clustered_exact_token_counts
         ).contiguous()
@@ -3371,11 +3279,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             layer_name=layer_name,
             primary_exact_token_indices=primary_exact_token_indices,
             primary_exact_token_mask=primary_exact_token_mask,
-            exact_page_ids=exact_page_ids,
-            exact_page_ids_cpu=exact_page_ids_cpu,
-            exact_page_token_counts=exact_page_token_counts,
+            clustered_descriptors=descriptors,
+            clustered_kv=clustered_kv,
             exact_token_counts=exact_token_counts,
-            resolved_pages=resolved_pages,
         )
 
     def select_segmented(

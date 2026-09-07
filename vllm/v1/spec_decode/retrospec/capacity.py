@@ -290,18 +290,16 @@ def build_retrospec_long_context_capacity(
         num_kv_heads = spec.num_kv_heads
         per_head_page_bytes = spec.real_page_size_bytes // num_kv_heads
 
-        # Two full-verification transfer arenas and current/next page layouts
-        # are shared by all model layers.
-        transfer_pages = _next_power_of_two(
-            max(64, num_kv_heads * cluster_pages_per_head)
-        )
-        transfer_buffer_bytes = 2 * transfer_pages * per_head_page_bytes
+        # Two full-verification arenas hold valid clustered tokens only. The
+        # immutable CPU descriptors remove cluster-tail page padding and the
+        # old current/next dense page layouts.
+        transfer_tokens = _next_power_of_two(max(64, num_kv_heads * indexed_tokens))
+        transfer_token_bytes = per_head_page_bytes // block_size
+        transfer_buffer_bytes = 2 * transfer_tokens * transfer_token_bytes
 
         max_full_verify_workspace = max(
             max_full_verify_workspace,
-            transfer_buffer_bytes
-            + exact_attention_workspace_bytes
-            + 2 * cluster_pages_per_head * num_kv_heads * 12,
+            transfer_buffer_bytes + exact_attention_workspace_bytes,
         )
 
         # GPU k-means temporarily retains token K/V, assignments, centroids
