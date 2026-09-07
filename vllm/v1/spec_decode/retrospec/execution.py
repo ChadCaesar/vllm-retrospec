@@ -10,6 +10,9 @@ from vllm.triton_utils import tl, triton
 from .workspace import EXACT_ATTENTION_PARTITION_SIZE
 
 _EXACT_ATTENTION_BLOCK_TOKENS = 64
+_PARALLEL_FULL_BLOCK_QUERIES = 16
+_PARALLEL_FULL_BLOCK_TOKENS = 64
+_PARALLEL_FULL_NUM_SPLITS = 8
 
 
 @dataclass(frozen=True)
@@ -365,6 +368,237 @@ def _reduce_exact_partitions_kernel(
     tl.store(output_lse + lse_offset, lse)
 
 
+@triton.jit
+def _parallel_full_prefix_kernel(
+    query,
+    query_start_loc,
+    key_cache,
+    value_cache,
+    block_table,
+    token_indices,
+    token_mask,
+    page_token_counts,
+    staging_page_ids,
+    staging_key_pages,
+    staging_value_pages,
+    partial_output,
+    partial_max,
+    partial_sum,
+    query_stride_0,
+    query_stride_1,
+    query_stride_2,
+    key_stride_0,
+    key_stride_1,
+    key_stride_2,
+    key_stride_3,
+    value_stride_0,
+    value_stride_1,
+    value_stride_2,
+    value_stride_3,
+    block_table_stride_0,
+    block_table_stride_1,
+    staging_key_stride_0,
+    staging_key_stride_1,
+    staging_key_stride_2,
+    staging_value_stride_0,
+    staging_value_stride_1,
+    staging_value_stride_2,
+    partial_output_stride_0,
+    partial_output_stride_1,
+    partial_output_stride_2,
+    partial_output_stride_3,
+    stats_stride_0,
+    stats_stride_1,
+    stats_stride_2,
+    scale,
+    NUM_KV_HEADS: tl.constexpr,
+    QUERIES_PER_KV_HEAD: tl.constexpr,
+    MAX_PRIMARY_TOKENS: tl.constexpr,
+    MAX_PAGE_SLOTS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    HAS_PRIMARY: tl.constexpr,
+    HAS_CLUSTER_PAGES: tl.constexpr,
+):
+    request_idx = tl.program_id(0)
+    query_head_idx = tl.program_id(1)
+    query_tile_split_idx = tl.program_id(2)
+    query_tile_idx = query_tile_split_idx // NUM_SPLITS
+    split_idx = query_tile_split_idx % NUM_SPLITS
+    kv_head_idx = query_head_idx // QUERIES_PER_KV_HEAD
+
+    request_query_start = tl.load(query_start_loc + request_idx)
+    request_query_end = tl.load(query_start_loc + request_idx + 1)
+    query_indices = (
+        request_query_start + query_tile_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+    )
+    query_valid = query_indices < request_query_end
+    dimension_offsets = tl.arange(0, BLOCK_D)
+    dimension_valid = dimension_offsets < HEAD_SIZE
+    query_offsets = (
+        query_indices[:, None] * query_stride_0
+        + query_head_idx * query_stride_1
+        + dimension_offsets[None, :] * query_stride_2
+    )
+    query_vectors = tl.load(
+        query + query_offsets,
+        mask=query_valid[:, None] & dimension_valid[None, :],
+        other=0.0,
+    )
+
+    running_max = tl.full((BLOCK_M,), float("-inf"), tl.float32)
+    running_sum = tl.zeros((BLOCK_M,), tl.float32)
+    running_output = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+
+    if HAS_PRIMARY:
+        for token_start in tl.range(
+            split_idx * BLOCK_N,
+            MAX_PRIMARY_TOKENS,
+            NUM_SPLITS * BLOCK_N,
+        ):
+            token_offsets = token_start + tl.arange(0, BLOCK_N)
+            primary_valid = token_offsets < MAX_PRIMARY_TOKENS
+            metadata_offsets = (
+                request_idx * NUM_KV_HEADS + kv_head_idx
+            ) * MAX_PRIMARY_TOKENS + token_offsets
+            primary_valid &= tl.load(
+                token_mask + metadata_offsets, mask=primary_valid, other=0
+            ).to(tl.int1)
+            logical_token_indices = tl.load(
+                token_indices + metadata_offsets, mask=primary_valid, other=0
+            )
+            logical_block_indices = logical_token_indices // PAGE_SIZE
+            block_offsets = logical_token_indices % PAGE_SIZE
+            physical_block_indices = tl.load(
+                block_table
+                + request_idx * block_table_stride_0
+                + logical_block_indices * block_table_stride_1,
+                mask=primary_valid,
+                other=0,
+            ).to(tl.int64)
+            key_offsets = (
+                physical_block_indices[:, None] * key_stride_0
+                + block_offsets[:, None] * key_stride_1
+                + kv_head_idx * key_stride_2
+                + dimension_offsets[None, :] * key_stride_3
+            )
+            value_offsets = (
+                physical_block_indices[:, None] * value_stride_0
+                + block_offsets[:, None] * value_stride_1
+                + kv_head_idx * value_stride_2
+                + dimension_offsets[None, :] * value_stride_3
+            )
+            vector_valid = primary_valid[:, None] & dimension_valid[None, :]
+            key_vectors = tl.load(key_cache + key_offsets, mask=vector_valid, other=0.0)
+            value_vectors = tl.load(
+                value_cache + value_offsets, mask=vector_valid, other=0.0
+            )
+            score_valid = query_valid[:, None] & primary_valid[None, :]
+            scores = tl.dot(query_vectors, tl.trans(key_vectors)) * scale
+            scores = tl.where(score_valid, scores, float("-inf"))
+            block_max = tl.max(scores, axis=1)
+            updated_max = tl.maximum(running_max, block_max)
+            safe_updated_max = tl.where(updated_max == float("-inf"), 0.0, updated_max)
+            previous_scale = tl.where(
+                running_sum > 0.0, tl.exp(running_max - safe_updated_max), 0.0
+            )
+            probabilities = tl.where(
+                score_valid,
+                tl.exp(scores - safe_updated_max[:, None]),
+                0.0,
+            )
+            running_output = running_output * previous_scale[:, None] + tl.dot(
+                probabilities.to(value_vectors.dtype), value_vectors
+            )
+            running_sum = running_sum * previous_scale + tl.sum(probabilities, axis=1)
+            running_max = updated_max
+
+    if HAS_CLUSTER_PAGES:
+        for token_start in tl.range(
+            split_idx * BLOCK_N,
+            MAX_PAGE_SLOTS * PAGE_SIZE,
+            NUM_SPLITS * BLOCK_N,
+        ):
+            token_offsets = token_start + tl.arange(0, BLOCK_N)
+            page_slot_indices = token_offsets // PAGE_SIZE
+            offsets_in_page = token_offsets % PAGE_SIZE
+            page_valid = page_slot_indices < MAX_PAGE_SLOTS
+            metadata_offsets = (
+                request_idx * NUM_KV_HEADS + kv_head_idx
+            ) * MAX_PAGE_SLOTS + page_slot_indices
+            page_counts = tl.load(
+                page_token_counts + metadata_offsets, mask=page_valid, other=0
+            )
+            page_ids = tl.load(
+                staging_page_ids + metadata_offsets, mask=page_valid, other=-1
+            ).to(tl.int64)
+            page_valid &= (offsets_in_page < page_counts) & (page_ids >= 0)
+            key_offsets = (
+                page_ids[:, None] * staging_key_stride_0
+                + offsets_in_page[:, None] * staging_key_stride_1
+                + dimension_offsets[None, :] * staging_key_stride_2
+            )
+            value_offsets = (
+                page_ids[:, None] * staging_value_stride_0
+                + offsets_in_page[:, None] * staging_value_stride_1
+                + dimension_offsets[None, :] * staging_value_stride_2
+            )
+            vector_valid = page_valid[:, None] & dimension_valid[None, :]
+            key_vectors = tl.load(
+                staging_key_pages + key_offsets, mask=vector_valid, other=0.0
+            )
+            value_vectors = tl.load(
+                staging_value_pages + value_offsets, mask=vector_valid, other=0.0
+            )
+            score_valid = query_valid[:, None] & page_valid[None, :]
+            scores = tl.dot(query_vectors, tl.trans(key_vectors)) * scale
+            scores = tl.where(score_valid, scores, float("-inf"))
+            block_max = tl.max(scores, axis=1)
+            updated_max = tl.maximum(running_max, block_max)
+            safe_updated_max = tl.where(updated_max == float("-inf"), 0.0, updated_max)
+            previous_scale = tl.where(
+                running_sum > 0.0, tl.exp(running_max - safe_updated_max), 0.0
+            )
+            probabilities = tl.where(
+                score_valid,
+                tl.exp(scores - safe_updated_max[:, None]),
+                0.0,
+            )
+            running_output = running_output * previous_scale[:, None] + tl.dot(
+                probabilities.to(value_vectors.dtype), value_vectors
+            )
+            running_sum = running_sum * previous_scale + tl.sum(probabilities, axis=1)
+            running_max = updated_max
+
+    normalized_output = tl.where(
+        running_sum[:, None] > 0.0,
+        running_output / running_sum[:, None],
+        0.0,
+    )
+    partial_output_offsets = (
+        query_indices[:, None] * partial_output_stride_0
+        + query_head_idx * partial_output_stride_1
+        + split_idx * partial_output_stride_2
+        + dimension_offsets[None, :] * partial_output_stride_3
+    )
+    tl.store(
+        partial_output + partial_output_offsets,
+        normalized_output,
+        mask=query_valid[:, None] & dimension_valid[None, :],
+    )
+    stats_offsets = (
+        query_indices * stats_stride_0
+        + query_head_idx * stats_stride_1
+        + split_idx * stats_stride_2
+    )
+    tl.store(partial_max + stats_offsets, running_max, mask=query_valid)
+    tl.store(partial_sum + stats_offsets, running_sum, mask=query_valid)
+
+
 class RetroSpecExactAttentionWorkspace:
     """Reusable workspace for partitioned attention over three KV sources."""
 
@@ -393,37 +627,13 @@ class RetroSpecExactAttentionWorkspace:
         self._output: torch.Tensor | None = None
         self._output_lse: torch.Tensor | None = None
 
-    def _ensure_workspace(
-        self,
-        query: torch.Tensor,
-        required_partitions: int,
-    ) -> None:
-        if required_partitions > self._partition_capacity:
-            raise RuntimeError(
-                "Exact-attention source exceeds the planned workspace capacity: "
-                f"required {required_partitions} partitions, but the capacity "
-                f"planner reserved {self._partition_capacity}"
-            )
-
+    def _ensure_output_workspace(self, query: torch.Tensor) -> None:
         _, num_query_heads, head_size = query.shape
         configuration = (query.dtype, query.device, num_query_heads, head_size)
         if self._configuration is not None and self._configuration != configuration:
             raise ValueError("Exact-attention workspace configuration changed")
         if self._configuration is not None:
             return
-
-        partial_shape = (
-            self.max_num_queries,
-            num_query_heads,
-            self._partition_capacity,
-            head_size,
-        )
-        stats_shape = partial_shape[:-1]
-        partial_output = torch.empty(
-            partial_shape, dtype=query.dtype, device=query.device
-        )
-        partial_max = torch.empty(stats_shape, dtype=torch.float32, device=query.device)
-        partial_sum = torch.empty_like(partial_max)
         output = torch.empty(
             self.max_num_queries,
             num_query_heads,
@@ -436,13 +646,41 @@ class RetroSpecExactAttentionWorkspace:
             dtype=torch.float32,
             device=query.device,
         )
-
-        self._partial_output = partial_output
-        self._partial_max = partial_max
-        self._partial_sum = partial_sum
         self._output = output
         self._output_lse = output_lse
         self._configuration = configuration
+
+    def _ensure_workspace(
+        self,
+        query: torch.Tensor,
+        required_partitions: int,
+    ) -> None:
+        if required_partitions > self._partition_capacity:
+            raise RuntimeError(
+                "Exact-attention source exceeds the planned workspace capacity: "
+                f"required {required_partitions} partitions, but the capacity "
+                f"planner reserved {self._partition_capacity}"
+            )
+
+        self._ensure_output_workspace(query)
+        if self._partial_output is not None:
+            return
+
+        _, num_query_heads, head_size = query.shape
+        partial_shape = (
+            self.max_num_queries,
+            num_query_heads,
+            self._partition_capacity,
+            head_size,
+        )
+        stats_shape = partial_shape[:-1]
+        self._partial_output = torch.empty(
+            partial_shape, dtype=query.dtype, device=query.device
+        )
+        self._partial_max = torch.empty(
+            stats_shape, dtype=torch.float32, device=query.device
+        )
+        self._partial_sum = torch.empty_like(self._partial_max)
 
     def _validate_source(
         self,
@@ -577,6 +815,173 @@ class RetroSpecExactAttentionWorkspace:
                 raise ValueError("Exact pages must be on the query device")
 
         return num_kv_heads, max_primary_tokens, max_page_slots
+
+    def supports_parallel_full_prefix(
+        self,
+        source: RetroSpecExactKVSource,
+        query: torch.Tensor,
+    ) -> bool:
+        """Return whether the request-grouped full-prefix kernel can run."""
+        max_page_slots = (
+            source.page_token_counts.shape[2] * source.page_token_counts.shape[3]
+        )
+        return (
+            query.shape[-1] >= 16
+            and source.resident_pages is None
+            and (max_page_slots == 0 or source.staging_pages is not None)
+        )
+
+    def run_parallel_full_prefix(
+        self,
+        source: RetroSpecExactKVSource,
+        query: torch.Tensor,
+        scale: float,
+        query_start_loc: torch.Tensor,
+        max_query_len: int,
+        request_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run tiled exact attention over the immutable verification prefix."""
+        num_kv_heads, max_primary_tokens, max_page_slots = self._validate_source(
+            source, query, request_indices
+        )
+        if not self.supports_parallel_full_prefix(source, query):
+            raise ValueError(
+                "Exact KV source is unsupported by parallel full attention"
+            )
+        if query_start_loc.ndim != 1:
+            raise ValueError("query_start_loc must be one-dimensional")
+        if query_start_loc.dtype not in (torch.int32, torch.int64):
+            raise ValueError("query_start_loc must be integral")
+        if query_start_loc.device != query.device:
+            raise ValueError("query_start_loc must be on the query device")
+
+        batch_size = source.page_token_counts.shape[0]
+        if query_start_loc.shape != (batch_size + 1,):
+            raise ValueError("query_start_loc must contain one boundary per request")
+        if max_query_len <= 0 and query.shape[0] > 0:
+            raise ValueError("max_query_len must be positive for non-empty queries")
+
+        num_queries, num_query_heads, head_size = query.shape
+        num_splits = min(_PARALLEL_FULL_NUM_SPLITS, self._partition_capacity)
+        self._ensure_workspace(query, num_splits)
+        assert self._partial_output is not None
+        assert self._partial_max is not None
+        assert self._partial_sum is not None
+        assert self._output is not None
+        assert self._output_lse is not None
+
+        output = self._output[:num_queries]
+        output_lse = self._output_lse[: num_query_heads * num_queries].view(
+            num_query_heads, num_queries
+        )
+        if num_queries == 0:
+            return output, output_lse
+
+        primary = source.primary
+        current_stream = torch.cuda.current_stream(query.device)
+        for exact_source in (primary, source.staging_pages):
+            if exact_source is not None and exact_source.ready_event is not None:
+                current_stream.wait_event(exact_source.ready_event)
+
+        staging = source.staging_pages
+        dummy_page_ids = source.page_token_counts
+        dummy_key_pages = primary.key_cache[:, :, 0, :]
+        dummy_value_pages = primary.value_cache[:, :, 0, :]
+        staging_page_ids = dummy_page_ids if staging is None else staging.page_ids
+        staging_key_pages = dummy_key_pages if staging is None else staging.key_pages
+        staging_value_pages = (
+            dummy_value_pages if staging is None else staging.value_pages
+        )
+        block_d = triton.next_power_of_2(head_size)
+        query_tiles = triton.cdiv(max_query_len, _PARALLEL_FULL_BLOCK_QUERIES)
+
+        _parallel_full_prefix_kernel[
+            (
+                batch_size,
+                num_query_heads,
+                query_tiles * num_splits,
+            )
+        ](
+            query,
+            query_start_loc,
+            primary.key_cache,
+            primary.value_cache,
+            primary.block_table,
+            primary.token_indices,
+            primary.token_mask,
+            source.page_token_counts,
+            staging_page_ids,
+            staging_key_pages,
+            staging_value_pages,
+            self._partial_output,
+            self._partial_max,
+            self._partial_sum,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            primary.key_cache.stride(0),
+            primary.key_cache.stride(1),
+            primary.key_cache.stride(2),
+            primary.key_cache.stride(3),
+            primary.value_cache.stride(0),
+            primary.value_cache.stride(1),
+            primary.value_cache.stride(2),
+            primary.value_cache.stride(3),
+            primary.block_table.stride(0),
+            primary.block_table.stride(1),
+            staging_key_pages.stride(0),
+            staging_key_pages.stride(1),
+            staging_key_pages.stride(2),
+            staging_value_pages.stride(0),
+            staging_value_pages.stride(1),
+            staging_value_pages.stride(2),
+            self._partial_output.stride(0),
+            self._partial_output.stride(1),
+            self._partial_output.stride(2),
+            self._partial_output.stride(3),
+            self._partial_max.stride(0),
+            self._partial_max.stride(1),
+            self._partial_max.stride(2),
+            scale,
+            NUM_KV_HEADS=num_kv_heads,
+            QUERIES_PER_KV_HEAD=num_query_heads // num_kv_heads,
+            MAX_PRIMARY_TOKENS=max_primary_tokens,
+            MAX_PAGE_SLOTS=max_page_slots,
+            PAGE_SIZE=self.page_size,
+            HEAD_SIZE=head_size,
+            BLOCK_D=block_d,
+            BLOCK_M=_PARALLEL_FULL_BLOCK_QUERIES,
+            BLOCK_N=_PARALLEL_FULL_BLOCK_TOKENS,
+            NUM_SPLITS=num_splits,
+            HAS_PRIMARY=max_primary_tokens > 0,
+            HAS_CLUSTER_PAGES=max_page_slots > 0,
+            num_warps=4,
+            num_stages=2,
+        )
+
+        _reduce_exact_partitions_kernel[(num_queries, num_query_heads)](
+            self._partial_output,
+            self._partial_max,
+            self._partial_sum,
+            output,
+            output_lse,
+            self._partial_output.stride(0),
+            self._partial_output.stride(1),
+            self._partial_output.stride(2),
+            self._partial_output.stride(3),
+            self._partial_max.stride(0),
+            self._partial_max.stride(1),
+            self._partial_max.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            output_lse.stride(0),
+            output_lse.stride(1),
+            num_splits,
+            HEAD_SIZE=head_size,
+            BLOCK_D=block_d,
+        )
+        return output, output_lse
 
     def run(
         self,

@@ -1127,12 +1127,24 @@ class RetroSpecSparseAttention:
             value_cache=value_cache,
             block_table=attn_metadata.block_table,
         )
-        prefix_output, prefix_lse = self.exact_attention_workspace.run(
-            source,
-            query,
-            impl.scale,
-            request_indices=batch.request_indices,
-        )
+        if self.exact_attention_workspace.supports_parallel_full_prefix(source, query):
+            prefix_output, prefix_lse = (
+                self.exact_attention_workspace.run_parallel_full_prefix(
+                    source,
+                    query,
+                    impl.scale,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.max_query_len,
+                    batch.request_indices,
+                )
+            )
+        else:
+            prefix_output, prefix_lse = self.exact_attention_workspace.run(
+                source,
+                query,
+                impl.scale,
+                request_indices=batch.request_indices,
+            )
         local_output, local_lse = self._run_full_local_attention(
             impl,
             query,

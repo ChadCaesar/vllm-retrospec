@@ -446,3 +446,184 @@ def test_exact_attention_rejects_query_over_workspace_capacity():
             torch.zeros(2, 1, 64, dtype=torch.float16, device=device),
             1.0,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_parallel_full_prefix_matches_reference_for_mixed_requests():
+    device = torch.device("cuda")
+    torch.manual_seed(11)
+    page_size = 4
+    num_kv_heads = 2
+    num_query_heads = 4
+    head_size = 64
+    key_cache = torch.randn(
+        4, page_size, num_kv_heads, head_size, dtype=torch.float16, device=device
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device)
+    token_indices = torch.tensor(
+        [
+            [[0, 2, 5, 7, 0], [1, 3, 4, 6, 0]],
+            [[0, 1, 4, 7, 0], [0, 2, 5, 6, 0]],
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    token_mask = torch.tensor(
+        [
+            [[True, True, True, True, False], [True, False, True, True, False]],
+            [[True, True, False, True, False], [True, True, True, True, False]],
+        ],
+        dtype=torch.bool,
+        device=device,
+    )
+    page_counts = torch.tensor(
+        [
+            [[[4, 2], [1, 0]], [[3, 0], [4, 1]]],
+            [[[2, 4], [0, 3]], [[4, 4], [2, 0]]],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    page_ids = torch.full(page_counts.shape, -1, dtype=torch.int64, device=device)
+    valid_pages = page_counts > 0
+    page_ids[valid_pages] = torch.arange(valid_pages.sum(), device=device)
+    staging_keys = torch.randn(
+        int(valid_pages.sum()), page_size, head_size, dtype=torch.float16, device=device
+    )
+    staging_values = torch.randn_like(staging_keys)
+    source = _make_source(
+        key_cache,
+        value_cache,
+        block_table,
+        token_indices,
+        token_mask,
+        page_counts,
+        staging_pages=RetroSpecExactPageKVSource(
+            staging_keys, staging_values, page_ids
+        ),
+    )
+
+    query_lens = (3, 18)
+    query_start_loc = torch.tensor([0, 3, 21], dtype=torch.int32, device=device)
+    request_indices = torch.repeat_interleave(
+        torch.arange(2, dtype=torch.int64, device=device),
+        torch.tensor(query_lens, device=device),
+    )
+    query = torch.randn(
+        sum(query_lens),
+        num_query_heads,
+        head_size,
+        dtype=torch.float16,
+        device=device,
+    )
+    workspace = RetroSpecExactAttentionWorkspace(page_size, sum(query_lens), 4)
+
+    output, lse = workspace.run_parallel_full_prefix(
+        source,
+        query,
+        0.125,
+        query_start_loc,
+        max(query_lens),
+        request_indices,
+    )
+    expected_output, expected_lse = _reference_attention(
+        source, query, 0.125, request_indices
+    )
+
+    torch.testing.assert_close(output, expected_output, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=4e-3, rtol=4e-3)
+    assert workspace._partial_output.shape[2] == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_parallel_full_prefix_handles_cluster_only_and_empty_sources():
+    device = torch.device("cuda")
+    torch.manual_seed(12)
+    page_size = 4
+    head_size = 64
+    key_cache = torch.empty(
+        1, page_size, 1, head_size, dtype=torch.bfloat16, device=device
+    )
+    empty_indices = torch.empty(1, 1, 0, dtype=torch.int64, device=device)
+    empty_mask = torch.empty(1, 1, 0, dtype=torch.bool, device=device)
+    page_counts = torch.tensor([[[[4, 2]]]], dtype=torch.int32, device=device)
+    page_ids = torch.tensor([[[[0, 1]]]], dtype=torch.int64, device=device)
+    staging_keys = torch.randn(
+        2, page_size, head_size, dtype=torch.bfloat16, device=device
+    )
+    staging_values = torch.randn_like(staging_keys)
+    source = _make_source(
+        key_cache,
+        key_cache.clone(),
+        torch.zeros(1, 1, dtype=torch.int32, device=device),
+        empty_indices,
+        empty_mask,
+        page_counts,
+        staging_pages=RetroSpecExactPageKVSource(
+            staging_keys, staging_values, page_ids
+        ),
+    )
+    query = torch.randn(2, 2, head_size, dtype=torch.bfloat16, device=device)
+    request_indices = torch.zeros(2, dtype=torch.int64, device=device)
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, 2, 1)
+
+    output, lse = workspace.run_parallel_full_prefix(
+        source, query, 0.125, query_start_loc, 2, request_indices
+    )
+    expected = _reference_attention(source, query, 0.125, request_indices)
+    torch.testing.assert_close(output, expected[0], atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(lse, expected[1], atol=6e-3, rtol=6e-3)
+
+    empty_source = _make_source(
+        key_cache,
+        key_cache.clone(),
+        torch.zeros(1, 1, dtype=torch.int32, device=device),
+        empty_indices,
+        empty_mask,
+        torch.empty(1, 1, 0, 0, dtype=torch.int32, device=device),
+    )
+    empty_output, empty_lse = workspace.run_parallel_full_prefix(
+        empty_source, query, 0.125, query_start_loc, 2, request_indices
+    )
+    assert not empty_output.any()
+    assert torch.isneginf(empty_lse).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_parallel_full_prefix_falls_back_for_resident_pages():
+    device = torch.device("cuda")
+    page_size = 4
+    head_size = 64
+    key_cache = torch.zeros(
+        1, page_size, 1, head_size, dtype=torch.float16, device=device
+    )
+    page_counts = torch.full((1, 1, 1, 1), 4, dtype=torch.int32, device=device)
+    resident_pages = RetroSpecExactPageKVSource(
+        key_pages=key_cache[:, :, 0],
+        value_pages=key_cache[:, :, 0].clone(),
+        page_ids=torch.zeros(1, 1, 1, 1, dtype=torch.int64, device=device),
+    )
+    source = _make_source(
+        key_cache,
+        key_cache.clone(),
+        torch.zeros(1, 1, dtype=torch.int32, device=device),
+        torch.empty(1, 1, 0, dtype=torch.int64, device=device),
+        torch.empty(1, 1, 0, dtype=torch.bool, device=device),
+        page_counts,
+        resident_pages=resident_pages,
+    )
+    query = torch.zeros(1, 1, head_size, dtype=torch.float16, device=device)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, 1, 1)
+
+    assert not workspace.supports_parallel_full_prefix(source, query)
+    with pytest.raises(ValueError, match="unsupported by parallel full attention"):
+        workspace.run_parallel_full_prefix(
+            source,
+            query,
+            1.0,
+            torch.tensor([0, 1], dtype=torch.int32, device=device),
+            1,
+            torch.zeros(1, dtype=torch.int64, device=device),
+        )
