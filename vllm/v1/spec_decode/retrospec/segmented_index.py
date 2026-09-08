@@ -17,6 +17,7 @@ from .cluster_store import (
     RetroSpecFullVerificationDescriptor,
     RetroSpecFullVerificationStaging,
     RetroSpecFullVerificationTicket,
+    RetroSpecResidentPrefetchInput,
     RetroSpecResolvedClusterPages,
     RetroSpecStagedClusterInput,
 )
@@ -2873,19 +2874,22 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             ),
         )
 
-    def prefetch_sparse_verification(
+    def configure_sparse_prefetch_wave(self, max_layers: int) -> None:
+        self.cluster_store.configure_resident_prefetch_wave(max_layers)
+
+    def build_sparse_verification_prefetch(
         self,
         selection: RetroSpecTokenAttentionSelection,
         active_mask: torch.Tensor,
-    ) -> None:
-        """Submit GPU-produced resident accesses to the background ring."""
+    ) -> RetroSpecResidentPrefetchInput | None:
+        """Build one layer record for the current draft prefetch wave."""
         if not self.cluster_store.pin_memory:
-            return
+            return None
 
         cluster_ids = selection.prefetch_cluster_ids
         access_kinds = selection.prefetch_access_kinds
         if cluster_ids is None or access_kinds is None:
-            return
+            return None
 
         if active_mask.ndim != 1 or active_mask.dtype != torch.bool:
             raise ValueError("active_mask must be a one-dimensional boolean tensor")
@@ -2894,15 +2898,31 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         if active_mask.device != cluster_ids.device:
             raise ValueError("active_mask and selection must use one device")
         if cluster_ids.numel() == 0:
-            return
+            return None
 
         access_kinds.masked_fill_(~active_mask[:, None, None], 0)
-
-        self.cluster_store.prefetch_resident_clusters(
+        return RetroSpecResidentPrefetchInput(
             layer_name=selection.plan.layer_name,
             cluster_ids=cluster_ids,
             access_kinds=access_kinds,
         )
+
+    def submit_sparse_verification_prefetch_wave(
+        self,
+        records: Sequence[RetroSpecResidentPrefetchInput],
+    ) -> bool:
+        return self.cluster_store.prefetch_resident_cluster_wave(records)
+
+    def prefetch_sparse_verification(
+        self,
+        selection: RetroSpecTokenAttentionSelection,
+        active_mask: torch.Tensor,
+    ) -> bool:
+        """Compatibility wrapper for one layer's resident prefetch."""
+        record = self.build_sparse_verification_prefetch(selection, active_mask)
+        if record is None:
+            return False
+        return self.submit_sparse_verification_prefetch_wave((record,))
 
     def _materialize_token_selection(
         self,

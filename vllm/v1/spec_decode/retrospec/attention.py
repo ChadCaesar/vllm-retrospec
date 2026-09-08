@@ -21,7 +21,10 @@ from vllm.v1.attention.backends.flash_attn import (
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 from .capacity import get_retrospec_exact_attention_partition_capacity
-from .cluster_store import RetroSpecResolvedClusterPages
+from .cluster_store import (
+    RetroSpecResidentPrefetchInput,
+    RetroSpecResolvedClusterPages,
+)
 from .execution import (
     RetroSpecCompactKVSource,
     RetroSpecExactAttentionWorkspace,
@@ -229,6 +232,7 @@ class RetroSpecSparseAttention:
         self.selection_plans: list[dict[str, RetroSpecPlan]] = [
             {} for _ in range(self.num_speculative_tokens)
         ]
+        self._resident_prefetch_wave: list[RetroSpecResidentPrefetchInput] = []
 
     @property
     def uses_full_verification_offload(self) -> bool:
@@ -478,6 +482,7 @@ class RetroSpecSparseAttention:
         for layer_name, layer in layers.items():
             validated_layers[layer_name] = self._validate_layer(layer_name, layer)
 
+        self.index.configure_sparse_prefetch_wave(len(validated_layers))
         for layer_name, impl in validated_layers.items():
             original_forward = impl.forward
             wrapper = _RetroSpecLayerForward(self, layer_name, original_forward)
@@ -602,6 +607,7 @@ class RetroSpecSparseAttention:
 
         try:
             self.proposal_request_ids = request_ids
+            self._resident_prefetch_wave.clear()
             for plans in self.selection_plans:
                 plans.clear()
 
@@ -617,6 +623,7 @@ class RetroSpecSparseAttention:
             self.parallel_request_indices = None
             self.parallel_token_indices = None
             self.attention_mass_layer_count = 0
+            self._resident_prefetch_wave.clear()
 
             self.index.end_proposal()
             self.proposal_request_ids = ()
@@ -636,6 +643,8 @@ class RetroSpecSparseAttention:
             raise ValueError("PASSTHROUGH cannot be used as an active RetroSpec step.")
         if self.step_active:
             raise RuntimeError("The previous RetroSpec attention step is still active.")
+        if mode == RetroSpecAttentionMode.DRAFT and self._resident_prefetch_wave:
+            raise RuntimeError("The previous draft prefetch wave was not submitted.")
         if not 0 <= step_index < self.num_speculative_tokens:
             raise ValueError("step_index is outside the speculative token range.")
         if active_mask.ndim != 1 or active_mask.dtype != torch.bool:
@@ -746,6 +755,11 @@ class RetroSpecSparseAttention:
                 tuple(self.original_forwards),
                 self.active_mask,
             )
+            prefetch_wave = tuple(self._resident_prefetch_wave)
+            self._resident_prefetch_wave.clear()
+            if prefetch_wave:
+                with self.performance_stats.cpu_timer("draft_prefetch_wave_submit"):
+                    self.index.submit_sparse_verification_prefetch_wave(prefetch_wave)
 
         self.mode = RetroSpecAttentionMode.PASSTHROUGH
         self.step_active = False
@@ -1448,10 +1462,10 @@ class RetroSpecSparseAttention:
         self.attention_mass_layer_count += 1
 
         if self.mode == RetroSpecAttentionMode.DRAFT:
-            with self.performance_stats.cpu_timer("draft_prefetch_submit"):
-                self.index.prefetch_sparse_verification(
-                    selection=selection,
-                    active_mask=self.active_mask,
-                )
+            record = self.index.build_sparse_verification_prefetch(
+                selection=selection, active_mask=self.active_mask
+            )
+            if record is not None:
+                self._resident_prefetch_wave.append(record)
 
         return output

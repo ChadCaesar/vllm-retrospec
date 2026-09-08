@@ -83,6 +83,8 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     stats.add_counter("resident_cluster_misses", 1)
     stats.add_counter("prefetch_submitted", 3)
     stats.add_counter("prefetch_dropped", 1)
+    stats.add_counter("prefetch_waves_submitted", 1)
+    stats.add_counter("prefetch_wave_records", 3)
     stats.add_gpu_counter("draft_round_requests", torch.tensor([1, 1]))
     stats.add_gpu_counter("draft_tokens", torch.tensor([3, 5]))
     stats.add_gpu_counter("verified_tokens", torch.tensor([2, 4]))
@@ -103,6 +105,7 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     assert "full/request=0.500" in message
     assert "resident_hit_rate=0.900" in message
     assert "prefetch_drop_rate=0.250" in message
+    assert "prefetch_records/wave=3.00" in message
     assert "proposal_wall=12.000ms/1" in message
 
     assert not stats._cpu_counters

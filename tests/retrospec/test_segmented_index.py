@@ -125,17 +125,18 @@ def test_sparse_verification_prefetch_masks_inactive_draft_rows():
         prefetch_cluster_ids=cluster_ids,
         prefetch_access_kinds=access_kinds,
     )
-    index.cluster_store.prefetch_resident_clusters = Mock()
+    index.cluster_store.prefetch_resident_cluster_wave = Mock(return_value=True)
 
     index.prefetch_sparse_verification(
         selection,
         active_mask=torch.tensor([True, False]),
     )
 
-    call_kwargs = index.cluster_store.prefetch_resident_clusters.call_args.kwargs
-    assert call_kwargs["layer_name"] == "layer"
-    assert call_kwargs["cluster_ids"].tolist() == [[[0, 1]], [[2, 3]]]
-    assert call_kwargs["access_kinds"].tolist() == [[[1, 1]], [[0, 0]]]
+    records = index.cluster_store.prefetch_resident_cluster_wave.call_args.args[0]
+    assert len(records) == 1
+    assert records[0].layer_name == "layer"
+    assert records[0].cluster_ids.tolist() == [[[0, 1]], [[2, 3]]]
+    assert records[0].access_kinds.tolist() == [[[1, 1]], [[0, 0]]]
 
 
 def test_sparse_verification_prefetch_skips_empty_access_record():
@@ -145,11 +146,11 @@ def test_sparse_verification_prefetch_skips_empty_access_record():
         prefetch_cluster_ids=torch.empty((1, 1, 0), dtype=torch.int64),
         prefetch_access_kinds=torch.empty((1, 1, 0), dtype=torch.uint8),
     )
-    index.cluster_store.prefetch_resident_clusters = Mock()
+    index.cluster_store.prefetch_resident_cluster_wave = Mock()
 
     index.prefetch_sparse_verification(selection, active_mask=torch.tensor([True]))
 
-    index.cluster_store.prefetch_resident_clusters.assert_not_called()
+    index.cluster_store.prefetch_resident_cluster_wave.assert_not_called()
 
 
 def test_sparse_verification_prefetch_requires_pinned_cpu_backing():
@@ -158,14 +159,14 @@ def test_sparse_verification_prefetch_requires_pinned_cpu_backing():
         prefetch_cluster_ids=torch.tensor([[[0]]]),
         prefetch_access_kinds=torch.tensor([[[2]]], dtype=torch.uint8),
     )
-    index.cluster_store.prefetch_resident_clusters = Mock()
+    index.cluster_store.prefetch_resident_cluster_wave = Mock()
 
     index.prefetch_sparse_verification(
         selection,
         active_mask=torch.tensor([True]),
     )
 
-    index.cluster_store.prefetch_resident_clusters.assert_not_called()
+    index.cluster_store.prefetch_resident_cluster_wave.assert_not_called()
 
 
 def test_first_draft_warmup_is_marked_only_with_pinned_cpu_backing():

@@ -272,12 +272,14 @@ class RetroSpecPerformanceStats:
         resident_misses = counters.get("resident_cluster_misses", 0)
         prefetch_submitted = counters.get("prefetch_submitted", 0)
         prefetch_dropped = counters.get("prefetch_dropped", 0)
+        prefetch_waves = counters.get("prefetch_waves_submitted", 0)
 
         logger.info(
             "RetroSpec performance over %.2fs: counters={%s}; peaks={%s}; "
             "derived={draft_tokens/request=%.2f, expanded/sparse=%.3f, "
             "full/request=%.3f, resident_hit_rate=%.3f, "
-            "prefetch_drop_rate=%.3f}; cpu_avg={%s}; cuda_avg={%s}",
+            "prefetch_drop_rate=%.3f, prefetch_records/wave=%.2f}; "
+            "cpu_avg={%s}; cuda_avg={%s}",
             elapsed_seconds,
             self._format_counters(counters),
             self._format_counters(peaks),
@@ -289,6 +291,7 @@ class RetroSpecPerformanceStats:
                 prefetch_dropped,
                 prefetch_submitted + prefetch_dropped,
             ),
+            self._ratio(counters.get("prefetch_wave_records", 0), prefetch_waves),
             self._format_times(cpu_times),
             self._format_times(cuda_times),
         )

@@ -22,6 +22,7 @@ from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecCompactTokenRange,
     RetroSpecFullVerificationDescriptor,
     RetroSpecFullVerificationStaging,
+    RetroSpecResidentPrefetchInput,
     RetroSpecResolvedClusterPages,
 )
 from vllm.v1.spec_decode.retrospec.execution import (
@@ -1437,8 +1438,16 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
         side_effect=lambda *args: call_order.append("estimation")
         or (torch.zeros(2, 1, 1), torch.zeros(2, 1))
     )
-    controller.index.prefetch_sparse_verification = Mock(
-        side_effect=lambda **kwargs: call_order.append("prefetch")
+    prefetch_record = RetroSpecResidentPrefetchInput(
+        layer_name="layer",
+        cluster_ids=torch.zeros(2, 1, 1, dtype=torch.int64),
+        access_kinds=torch.ones(2, 1, 1, dtype=torch.uint8),
+    )
+    controller.index.build_sparse_verification_prefetch = Mock(
+        side_effect=lambda **kwargs: call_order.append("build") or prefetch_record
+    )
+    controller.index.submit_sparse_verification_prefetch_wave = Mock(
+        side_effect=lambda records: call_order.append("submit") or True
     )
     controller.index.complete_first_draft_warmup = Mock()
 
@@ -1475,15 +1484,45 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
         )
         controller.end_step()
 
-    assert call_order == ["exact", "estimation", "prefetch"]
-    controller.index.prefetch_sparse_verification.assert_called_once_with(
+    assert call_order == ["exact", "estimation", "build", "submit"]
+    controller.index.build_sparse_verification_prefetch.assert_called_once_with(
         selection=selection,
         active_mask=active_mask,
+    )
+    controller.index.submit_sparse_verification_prefetch_wave.assert_called_once_with(
+        (prefetch_record,)
     )
     assert controller.index.select_segmented.call_args.kwargs["warm_first_draft"]
     controller.index.complete_first_draft_warmup.assert_called_once_with(
         ("request-0", "request-1"), ("layer",), active_mask
     )
+
+
+def test_draft_end_step_submits_one_cross_layer_prefetch_wave():
+    controller = make_controller()
+    mark_installed(controller)
+    records = tuple(
+        RetroSpecResidentPrefetchInput(
+            layer_name=layer_name,
+            cluster_ids=torch.tensor([[[index]]], dtype=torch.int64),
+            access_kinds=torch.tensor([[[2]]], dtype=torch.uint8),
+        )
+        for index, layer_name in enumerate(("first", "second"))
+    )
+    controller.index.complete_first_draft_warmup = Mock()
+    controller.index.submit_sparse_verification_prefetch_wave = Mock(return_value=True)
+
+    with controller.proposal_context(["request"]):
+        controller.begin_step(RetroSpecAttentionMode.DRAFT, 0, torch.tensor([True]))
+        controller._resident_prefetch_wave.extend(records)
+        controller.attention_mass_sum[0] = 1.0
+        controller.attention_mass_layer_count = 2
+        controller.end_step()
+
+    controller.index.submit_sparse_verification_prefetch_wave.assert_called_once_with(
+        records
+    )
+    assert not controller._resident_prefetch_wave
 
 
 def test_parallel_verification_gathers_segmented_token_plan_rows():
