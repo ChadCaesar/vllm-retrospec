@@ -1130,9 +1130,16 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
     assert store.prefetch_resident_clusters("layer", cluster_ids, access_kinds)
     store.wait_for_resident_prefetches(("layer",))
     assert stats._cpu_counters["prefetch_submitted"] == 1
+    assert stats._cpu_counters["prefetch_input_clusters"] == cluster_ids.numel()
+    assert stats._cpu_counters["prefetch_worker_completed"] == 1
+    assert stats._cpu_counters["prefetch_reaped_tasks"] == 1
+    assert stats._cpu_counters["prefetch_waited_tasks"] == 1
     assert stats._cpu_counters["prefetch_candidate_clusters"] == 4
     assert stats._cpu_counters["resident_cluster_hits"] == 0
     assert stats._cpu_counters["resident_cluster_misses"] == 4
+    assert stats._cpu_times["prefetch_metadata_wait"][1] == 1
+    assert stats._cpu_times["prefetch_worker_wall"][1] == 1
+    assert stats._cpu_times["prefetch_wait_wall"][1] == 1
 
     access = store.lookup_resident_clusters(
         "layer", cluster_ids, metadata.page_ids, touch=False
@@ -1170,9 +1177,15 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
     reason="CUDA is required to resolve cluster pages",
 )
 def test_cpu_backing_store_stages_before_updating_resident_cache():
+    device = torch.device("cuda", torch.cuda.current_device())
+    stats = RetroSpecPerformanceStats(
+        device=device,
+        log_interval_seconds=60.0,
+    )
     store = RetroSpecClusterPageStore(
         page_size=2,
         cache_ratio=0.5,
+        performance_stats=stats,
     )
     keys, values, assignments, cluster_token_counts = make_cluster_data()
     table = store_cluster_data(
@@ -1187,6 +1200,7 @@ def test_cpu_backing_store_stages_before_updating_resident_cache():
 
     resolved = store.resolve_cluster_blocks("layer", cluster_ids, metadata.page_ids)
     torch.cuda.current_stream().synchronize()
+    stats._drain_cuda_samples()
 
     valid_pages = metadata.page_ids >= 0
     resident_pages = resolved.resident_page_ids >= 0
@@ -1204,6 +1218,12 @@ def test_cpu_backing_store_stages_before_updating_resident_cache():
         [True, True],
         [True, True],
     ]
+    assert stats._cpu_counters["verification_miss_pages"] == 6
+    assert stats._cpu_counters["verification_miss_h2d_bytes"] == (
+        resolved.staging_key_pages.nbytes + resolved.staging_value_pages.nbytes
+    )
+    assert stats._cpu_times["verification_miss_cpu_gather"][1] == 1
+    assert stats._cuda_times["verification_miss_h2d"][1] == 1
     assert store.num_resident_pages("layer") == 0
     assert store.num_resident_clusters("layer") == 0
 

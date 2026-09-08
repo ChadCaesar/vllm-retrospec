@@ -483,75 +483,82 @@ class RetroSpecProposer:
         assert self.model is not None
         model_timer = self.performance_stats.start_cuda_timer("draft_model")
 
-        exceeds_max_model_len = positions >= self.max_model_len
-        runnable_mask = active_mask & ~exceeds_max_model_len
-        clamped_positions = torch.where(
-            runnable_mask, positions, torch.zeros_like(positions)
-        )
+        with self.performance_stats.cuda_timer("draft_prepare"):
+            exceeds_max_model_len = positions >= self.max_model_len
+            runnable_mask = active_mask & ~exceeds_max_model_len
+            clamped_positions = torch.where(
+                runnable_mask, positions, torch.zeros_like(positions)
+            )
 
-        block_numbers = clamped_positions // self.block_size
-        block_ids = common_attn_metadata.block_table_tensor.gather(
-            dim=1, index=block_numbers.view(-1, 1)
-        ).view(-1)
+            block_numbers = clamped_positions // self.block_size
+            block_ids = common_attn_metadata.block_table_tensor.gather(
+                dim=1, index=block_numbers.view(-1, 1)
+            ).view(-1)
 
-        slot_mapping = self._slot_mapping[:batch_size]
-        slot_mapping.copy_(
-            block_ids * self.block_size + clamped_positions % self.block_size
-        )
-        slot_mapping.masked_fill_(~runnable_mask, PADDING_SLOT_ID)
+            slot_mapping = self._slot_mapping[:batch_size]
+            slot_mapping.copy_(
+                block_ids * self.block_size + clamped_positions % self.block_size
+            )
+            slot_mapping.masked_fill_(~runnable_mask, PADDING_SLOT_ID)
 
-        seq_lens = torch.where(
-            runnable_mask, clamped_positions + 1, torch.ones_like(clamped_positions)
-        ).to(dtype=common_attn_metadata.seq_lens.dtype)
+            seq_lens = torch.where(
+                runnable_mask,
+                clamped_positions + 1,
+                torch.ones_like(clamped_positions),
+            ).to(dtype=common_attn_metadata.seq_lens.dtype)
 
-        query_start_loc_cpu = torch.from_numpy(
-            self.token_arange_np[: batch_size + 1]
-        ).clone()
+            query_start_loc_cpu = torch.from_numpy(
+                self.token_arange_np[: batch_size + 1]
+            ).clone()
 
-        step_common_attn_metadata = common_attn_metadata.replace(
-            query_start_loc=self.arange[: batch_size + 1],
-            query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
-            _seq_lens_cpu=None,
-            _num_computed_tokens_cpu=None,
-            num_actual_tokens=batch_size,
-            max_query_len=1,
-            max_seq_len=min(
-                common_attn_metadata.max_seq_len + step_index + 1, self.max_model_len
+            step_common_attn_metadata = common_attn_metadata.replace(
+                query_start_loc=self.arange[: batch_size + 1],
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                _seq_lens_cpu=None,
+                _num_computed_tokens_cpu=None,
+                num_actual_tokens=batch_size,
+                max_query_len=1,
+                max_seq_len=min(
+                    common_attn_metadata.max_seq_len + step_index + 1,
+                    self.max_model_len,
+                ),
+                slot_mapping=slot_mapping,
+            )
+
+            builder = self._get_attention_metadata_builder()
+            attn_metadata = builder.build_for_drafting(
+                step_common_attn_metadata, step_index
+            )
+
+            per_layer_attn_metadata = {
+                layer_name: attn_metadata for layer_name in self.attn_layer_names
+            }
+            per_layer_slot_mapping = {
+                layer_name: slot_mapping for layer_name in self.attn_layer_names
+            }
+
+            self.sparse_attention.begin_step(attention_mode, step_index, runnable_mask)
+
+            # Verification inputs can contain the -1 sentinel for rows that did
+            # not produce a token at this draft position. The padded model call
+            # still embeds every row, so replace inactive IDs with a valid token;
+            # their output is ignored by the active mask.
+            safe_input_ids = torch.where(
+                runnable_mask,
+                input_ids[:batch_size],
+                torch.zeros_like(input_ids[:batch_size]),
+            )
+
+        with (
+            self.performance_stats.cuda_timer("draft_forward"),
+            set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=batch_size,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping=per_layer_slot_mapping,
             ),
-            slot_mapping=slot_mapping,
-        )
-
-        builder = self._get_attention_metadata_builder()
-        attn_metadata = builder.build_for_drafting(
-            step_common_attn_metadata, step_index
-        )
-
-        per_layer_attn_metadata = {
-            layer_name: attn_metadata for layer_name in self.attn_layer_names
-        }
-        per_layer_slot_mapping = {
-            layer_name: slot_mapping for layer_name in self.attn_layer_names
-        }
-
-        self.sparse_attention.begin_step(attention_mode, step_index, runnable_mask)
-
-        # Verification inputs can contain the -1 sentinel for rows that did
-        # not produce a token at this draft position. The padded model call
-        # still embeds every row, so replace inactive IDs with a valid token;
-        # their output is ignored by the active mask.
-        safe_input_ids = torch.where(
-            runnable_mask,
-            input_ids[:batch_size],
-            torch.zeros_like(input_ids[:batch_size]),
-        )
-
-        with set_forward_context(
-            per_layer_attn_metadata,
-            self.vllm_config,
-            num_tokens=batch_size,
-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            slot_mapping=per_layer_slot_mapping,
         ):
             hidden_states = self.model(
                 input_ids=safe_input_ids,
@@ -559,7 +566,8 @@ class RetroSpecProposer:
                 inputs_embeds=None,
             )
 
-        attention_mass = self.sparse_attention.end_step()
+        with self.performance_stats.cuda_timer("draft_end_step"):
+            attention_mass = self.sparse_attention.end_step()
 
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
@@ -568,17 +576,21 @@ class RetroSpecProposer:
                 "RetroSpec requires the target model to return hidden states."
             )
 
-        logits = self.model.compute_logits(hidden_states[:batch_size])
+        with self.performance_stats.cuda_timer("draft_logits"):
+            logits = self.model.compute_logits(hidden_states[:batch_size])
 
-        margin = None
-        if compute_margin:
-            top2_logits = torch.topk(logits.float(), k=2, dim=-1).values
-            margin = top2_logits[:, 0] - top2_logits[:, 1]
+            margin = None
+            if compute_margin:
+                top2_logits = torch.topk(logits.float(), k=2, dim=-1).values
+                margin = top2_logits[:, 0] - top2_logits[:, 1]
 
-        sampler_output = self.runner.sampler(
-            logits=logits, sampling_metadata=sampling_metadata
-        )
-        sampled_token_ids = sampler_output.sampled_token_ids.view(-1).to(torch.int32)
+        with self.performance_stats.cuda_timer("draft_sampling"):
+            sampler_output = self.runner.sampler(
+                logits=logits, sampling_metadata=sampling_metadata
+            )
+            sampled_token_ids = sampler_output.sampled_token_ids.view(-1).to(
+                torch.int32
+            )
 
         self.performance_stats.stop_cuda_timer(model_timer)
         return sampled_token_ids, margin, attention_mass
@@ -830,82 +842,89 @@ class RetroSpecProposer:
         if num_tokens > self.max_parallel_tokens:
             raise ValueError("Parallel verification exceeds the configured capacity")
 
-        timer_name = (
-            "sparse_verify_model"
+        stage_name = (
+            "sparse_verify"
             if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY
-            else "expanded_verify_model"
+            else "expanded_verify"
         )
-        model_timer = self.performance_stats.start_cuda_timer(timer_name)
+        model_timer = self.performance_stats.start_cuda_timer(f"{stage_name}_model")
 
-        request_indices = request_indices.to(torch.int64)
-        token_indices = token_indices.to(torch.int64)
-        positions = (
-            self.proposal_start_positions.index_select(0, request_indices)
-            + token_indices
-        )
+        with self.performance_stats.cuda_timer(f"{stage_name}_prepare"):
+            request_indices = request_indices.to(torch.int64)
+            token_indices = token_indices.to(torch.int64)
+            positions = (
+                self.proposal_start_positions.index_select(0, request_indices)
+                + token_indices
+            )
 
-        previous_token_indices = (token_indices - 1).clamp_min(0)
-        previous_token_ids = self._draft_token_ids[
-            request_indices, previous_token_indices
-        ]
-        initial_token_ids = self.proposal_input_ids.index_select(0, request_indices)
-        input_ids = torch.where(
-            token_indices == 0, initial_token_ids, previous_token_ids
-        )
+            previous_token_indices = (token_indices - 1).clamp_min(0)
+            previous_token_ids = self._draft_token_ids[
+                request_indices, previous_token_indices
+            ]
+            initial_token_ids = self.proposal_input_ids.index_select(0, request_indices)
+            input_ids = torch.where(
+                token_indices == 0, initial_token_ids, previous_token_ids
+            )
 
-        block_table = common_attn_metadata.block_table_tensor.index_select(
-            0, request_indices
-        )
-        block_numbers = positions // self.block_size
-        block_ids = block_table.gather(1, block_numbers.view(-1, 1)).view(-1)
+            block_table = common_attn_metadata.block_table_tensor.index_select(
+                0, request_indices
+            )
+            block_numbers = positions // self.block_size
+            block_ids = block_table.gather(1, block_numbers.view(-1, 1)).view(-1)
 
-        slot_mapping = self._verification_slot_mapping[:num_tokens]
-        slot_mapping.copy_(block_ids * self.block_size + positions % self.block_size)
-        seq_lens = (positions + 1).to(dtype=common_attn_metadata.seq_lens.dtype)
-        query_start_loc_cpu = torch.from_numpy(
-            self.parallel_token_arange_np[: num_tokens + 1]
-        ).clone()
+            slot_mapping = self._verification_slot_mapping[:num_tokens]
+            slot_mapping.copy_(
+                block_ids * self.block_size + positions % self.block_size
+            )
+            seq_lens = (positions + 1).to(dtype=common_attn_metadata.seq_lens.dtype)
+            query_start_loc_cpu = torch.from_numpy(
+                self.parallel_token_arange_np[: num_tokens + 1]
+            ).clone()
 
-        parallel_common_attn_metadata = common_attn_metadata.replace(
-            query_start_loc=self.parallel_arange[: num_tokens + 1],
-            query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
-            num_reqs=num_tokens,
-            num_actual_tokens=num_tokens,
-            max_query_len=1,
-            max_seq_len=min(
-                common_attn_metadata.max_seq_len + self.num_speculative_tokens,
-                self.max_model_len,
+            parallel_common_attn_metadata = common_attn_metadata.replace(
+                query_start_loc=self.parallel_arange[: num_tokens + 1],
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                num_reqs=num_tokens,
+                num_actual_tokens=num_tokens,
+                max_query_len=1,
+                max_seq_len=min(
+                    common_attn_metadata.max_seq_len + self.num_speculative_tokens,
+                    self.max_model_len,
+                ),
+                block_table_tensor=block_table,
+                slot_mapping=slot_mapping,
+                dcp_local_seq_lens=None,
+                dcp_local_seq_lens_cpu=None,
+                _seq_lens_cpu=None,
+                _num_computed_tokens_cpu=None,
+                _num_computed_tokens_cache=None,
+            )
+
+            builder = self._get_attention_metadata_builder()
+            attn_metadata = builder.build_for_drafting(
+                parallel_common_attn_metadata, draft_index=0
+            )
+            per_layer_attn_metadata = {
+                layer_name: attn_metadata for layer_name in self.attn_layer_names
+            }
+            per_layer_slot_mapping = {
+                layer_name: slot_mapping for layer_name in self.attn_layer_names
+            }
+
+            self.sparse_attention.begin_parallel_step(
+                attention_mode, request_indices, token_indices
+            )
+
+        with (
+            self.performance_stats.cuda_timer(f"{stage_name}_forward"),
+            set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping=per_layer_slot_mapping,
             ),
-            block_table_tensor=block_table,
-            slot_mapping=slot_mapping,
-            dcp_local_seq_lens=None,
-            dcp_local_seq_lens_cpu=None,
-            _seq_lens_cpu=None,
-            _num_computed_tokens_cpu=None,
-            _num_computed_tokens_cache=None,
-        )
-
-        builder = self._get_attention_metadata_builder()
-        attn_metadata = builder.build_for_drafting(
-            parallel_common_attn_metadata, draft_index=0
-        )
-        per_layer_attn_metadata = {
-            layer_name: attn_metadata for layer_name in self.attn_layer_names
-        }
-        per_layer_slot_mapping = {
-            layer_name: slot_mapping for layer_name in self.attn_layer_names
-        }
-
-        self.sparse_attention.begin_parallel_step(
-            attention_mode, request_indices, token_indices
-        )
-        with set_forward_context(
-            per_layer_attn_metadata,
-            self.vllm_config,
-            num_tokens=num_tokens,
-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            slot_mapping=per_layer_slot_mapping,
         ):
             hidden_states = self.model(
                 input_ids=input_ids,
@@ -913,7 +932,8 @@ class RetroSpecProposer:
                 inputs_embeds=None,
             )
 
-        attention_mass = self.sparse_attention.end_step()
+        with self.performance_stats.cuda_timer(f"{stage_name}_end_step"):
+            attention_mass = self.sparse_attention.end_step()
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
         if not isinstance(hidden_states, torch.Tensor):
@@ -921,30 +941,32 @@ class RetroSpecProposer:
                 "RetroSpec requires the target model to return hidden states."
             )
 
-        logits = self.model.compute_logits(hidden_states[:num_tokens])
-        if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
-            compute_margin = self.policy.sparse_margin_threshold is not None
-        else:
-            compute_margin = self.policy.expanded_margin_threshold is not None
+        with self.performance_stats.cuda_timer(f"{stage_name}_logits"):
+            logits = self.model.compute_logits(hidden_states[:num_tokens])
+            if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
+                compute_margin = self.policy.sparse_margin_threshold is not None
+            else:
+                compute_margin = self.policy.expanded_margin_threshold is not None
 
-        margin = None
-        if compute_margin:
-            top2_logits = torch.topk(logits.float(), k=2, dim=-1).values
-            margin = top2_logits[:, 0] - top2_logits[:, 1]
+            margin = None
+            if compute_margin:
+                top2_logits = torch.topk(logits.float(), k=2, dim=-1).values
+                margin = top2_logits[:, 0] - top2_logits[:, 1]
 
         if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
             sampled_output = self._sparse_sampled_token_ids
         else:
             sampled_output = self._expanded_sampled_token_ids
 
-        token_ids = self._sample_parallel_logits(
-            batch_size,
-            logits,
-            request_indices,
-            token_indices,
-            sampling_metadata,
-            sampled_output,
-        )
+        with self.performance_stats.cuda_timer(f"{stage_name}_sampling"):
+            token_ids = self._sample_parallel_logits(
+                batch_size,
+                logits,
+                request_indices,
+                token_indices,
+                sampling_metadata,
+                sampled_output,
+            )
         self.performance_stats.stop_cuda_timer(model_timer)
         return RetroSpecParallelVerificationOutput(
             request_indices=request_indices,
@@ -988,6 +1010,9 @@ class RetroSpecProposer:
             common_attn_metadata,
             sampling_metadata,
             RetroSpecAttentionMode.SPARSE_VERIFY,
+        )
+        sparse_boundary_timer = self.performance_stats.start_cuda_timer(
+            "sparse_verify_boundary"
         )
 
         expected_token_ids = self._draft_token_ids[
@@ -1098,6 +1123,7 @@ class RetroSpecProposer:
             expanded_boundary_offsets,
             out=expanded_sparse_indices,
         )
+        self.performance_stats.stop_cuda_timer(sparse_boundary_timer)
 
         if expanded_sparse_indices.numel() > 0:
             expanded_request_indices = sparse.request_indices.index_select(
@@ -1121,6 +1147,9 @@ class RetroSpecProposer:
                 common_attn_metadata,
                 sampling_metadata,
                 RetroSpecAttentionMode.EXPANDED_VERIFY,
+            )
+            expanded_boundary_timer = self.performance_stats.start_cuda_timer(
+                "expanded_verify_boundary"
             )
             sparse_boundary_token_ids = sparse.token_ids.index_select(
                 0, expanded_sparse_indices
@@ -1168,6 +1197,7 @@ class RetroSpecProposer:
                 expanded.request_indices,
                 expanded_decision.require_full,
             )
+            self.performance_stats.stop_cuda_timer(expanded_boundary_timer)
 
         self.state.set_stage(verification_active, RetroSpecStage.DRAFT)
         self.state.set_stage(require_full, RetroSpecStage.FULL_VERIFY)

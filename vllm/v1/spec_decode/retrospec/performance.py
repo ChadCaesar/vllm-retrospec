@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import Counter, deque
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Lock
-from time import monotonic
+from time import monotonic, perf_counter
 
 import torch
 
@@ -107,6 +109,34 @@ class RetroSpecPerformanceStats:
         if not self.enabled:
             return
         self._record_time(self._cpu_times, name, elapsed_seconds * 1000.0)
+
+    @contextmanager
+    def cpu_timer(self, name: str) -> Iterator[None]:
+        started_at = perf_counter() if self.enabled else None
+        try:
+            yield
+        finally:
+            if started_at is not None:
+                self.record_cpu_time(name, perf_counter() - started_at)
+
+    @contextmanager
+    def cuda_timer(
+        self,
+        name: str,
+        stream: torch.cuda.Stream | None = None,
+    ) -> Iterator[None]:
+        timer = self.start_cuda_timer(name, stream)
+        if timer is not None:
+            torch.cuda.nvtx.range_push(f"retrospec::{name}")
+
+        try:
+            yield
+        finally:
+            if timer is not None:
+                try:
+                    self.stop_cuda_timer(timer, stream)
+                finally:
+                    torch.cuda.nvtx.range_pop()
 
     def start_cuda_timer(
         self,

@@ -26,10 +26,17 @@ def test_disabled_stats_allocate_no_device_workspace(monkeypatch: pytest.MonkeyP
     stats.add_gpu_counter("unknown_counter", torch.ones(1, dtype=torch.int64))
     stats.observe_peak("queue_depth", 2)
     stats.record_cpu_time("proposal_wall", 0.1)
+    with (
+        stats.cpu_timer("disabled_cpu"),
+        stats.cuda_timer("disabled_cuda"),
+    ):
+        pass
     stats.maybe_log()
 
     assert not stats.enabled
     assert stats._gpu_counters.numel() == 0
+    assert not stats._cpu_times
+    assert not stats._pending_cuda_samples
     assert not messages
 
 
@@ -114,6 +121,61 @@ def test_enabled_stats_reject_unknown_gpu_counter():
         stats.add_gpu_counter("unknown", 1)
 
 
+def test_cpu_timer_records_elapsed_time(monkeypatch: pytest.MonkeyPatch):
+    clock = fake_clock([10.0, 10.025])
+    monkeypatch.setattr(performance, "perf_counter", lambda: next(clock))
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cpu"),
+        log_interval_seconds=1.0,
+    )
+
+    with stats.cpu_timer("page_resolve"):
+        pass
+
+    assert stats._cpu_times["page_resolve"] == pytest.approx((25.0, 1))
+
+
+def test_cuda_timer_balances_nvtx_range_on_error(monkeypatch: pytest.MonkeyPatch):
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cpu"),
+        log_interval_seconds=1.0,
+    )
+    fake_timer = object()
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        stats,
+        "start_cuda_timer",
+        lambda name, stream=None: fake_timer,
+    )
+    monkeypatch.setattr(
+        stats,
+        "stop_cuda_timer",
+        lambda timer, stream=None: calls.append(("stop", timer)),
+    )
+    monkeypatch.setattr(
+        torch.cuda.nvtx,
+        "range_push",
+        lambda name: calls.append(("push", name)),
+    )
+    monkeypatch.setattr(
+        torch.cuda.nvtx,
+        "range_pop",
+        lambda: calls.append(("pop", "")),
+    )
+
+    with (
+        pytest.raises(RuntimeError, match="timer failure"),
+        stats.cuda_timer("kernel"),
+    ):
+        raise RuntimeError("timer failure")
+
+    assert calls == [
+        ("push", "retrospec::kernel"),
+        ("stop", fake_timer),
+        ("pop", ""),
+    ]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_timer_is_drained_when_complete(monkeypatch: pytest.MonkeyPatch):
     device = torch.device("cuda", torch.cuda.current_device())
@@ -132,4 +194,26 @@ def test_cuda_timer_is_drained_when_complete(monkeypatch: pytest.MonkeyPatch):
     assert len(messages) == 1
     message = messages[0][0] % messages[0][1:]
     assert "kernel=" in message
+    assert "ms/1" in message
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_timer_context_is_drained_when_complete(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    device = torch.device("cuda", torch.cuda.current_device())
+    clock = fake_clock([100.0, 102.0])
+    monkeypatch.setattr(performance, "monotonic", lambda: next(clock))
+    messages: list[tuple[object, ...]] = []
+    monkeypatch.setattr(performance.logger, "info", lambda *args: messages.append(args))
+    stats = RetroSpecPerformanceStats(device=device, log_interval_seconds=1.0)
+
+    with stats.cuda_timer("context_kernel"):
+        torch.ones(32, device=device).mul_(2)
+    torch.cuda.synchronize(device)
+    stats.maybe_log()
+
+    assert len(messages) == 1
+    message = messages[0][0] % messages[0][1:]
+    assert "context_kernel=" in message
     assert "ms/1" in message

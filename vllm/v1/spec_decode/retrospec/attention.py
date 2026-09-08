@@ -1223,14 +1223,26 @@ class RetroSpecSparseAttention:
                 exact_token_mask.to(torch.int32),
             )
 
-        source, resolved_pages = self._resolve_exact_kv_source(
-            selection=selection,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_table=attn_metadata.block_table,
-        )
+        stage_name = {
+            RetroSpecAttentionMode.DRAFT: "draft",
+            RetroSpecAttentionMode.SPARSE_VERIFY: "sparse_verify",
+            RetroSpecAttentionMode.EXPANDED_VERIFY: "expanded_verify",
+        }[self.mode]
+        with (
+            self.performance_stats.cpu_timer(f"{stage_name}_page_resolve_wall"),
+            self.performance_stats.cuda_timer(f"{stage_name}_page_resolve"),
+        ):
+            source, resolved_pages = self._resolve_exact_kv_source(
+                selection=selection,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=attn_metadata.block_table,
+            )
         try:
-            exact_output = self.exact_attention_workspace.run(source, query, impl.scale)
+            with self.performance_stats.cuda_timer(f"{stage_name}_exact_attention"):
+                exact_output = self.exact_attention_workspace.run(
+                    source, query, impl.scale
+                )
         finally:
             if resolved_pages is not None and resolved_pages.read_lease is not None:
                 resolved_pages.read_lease.release()
@@ -1248,14 +1260,17 @@ class RetroSpecSparseAttention:
                     "Verification cache update requires resolved cluster pages"
                 )
 
-            self.index.cluster_store.admit_staged_clusters(
-                layer_name=selection.plan.layer_name,
-                cluster_ids=selection.exact_cluster_ids,
-                logical_page_ids=selection.exact_page_ids,
-                staging_page_ids=resolved_pages.staging_page_ids,
-                staging_key_pages=resolved_pages.staging_key_pages,
-                staging_value_pages=resolved_pages.staging_value_pages,
-            )
+            with self.performance_stats.cpu_timer(
+                f"{stage_name}_resident_admit_submit"
+            ):
+                self.index.cluster_store.admit_staged_clusters(
+                    layer_name=selection.plan.layer_name,
+                    cluster_ids=selection.exact_cluster_ids,
+                    logical_page_ids=selection.exact_page_ids,
+                    staging_page_ids=resolved_pages.staging_page_ids,
+                    staging_key_pages=resolved_pages.staging_key_pages,
+                    staging_value_pages=resolved_pages.staging_value_pages,
+                )
 
         return exact_output
 
@@ -1318,6 +1333,7 @@ class RetroSpecSparseAttention:
             raise RuntimeError("RetroSpec attention requires max_query_len=1.")
 
         if not self.index.has_cluster_pages(layer_name, self.proposal_request_ids):
+            self.performance_stats.add_counter("proposal_native_fallback_layers")
             result = original_forward(
                 layer,
                 query,
@@ -1337,22 +1353,24 @@ class RetroSpecSparseAttention:
         key_cache, value_cache = kv_cache.unbind(0)
 
         if self.mode == RetroSpecAttentionMode.DRAFT:
-            selection = self.index.select_segmented(
-                request_ids=self.proposal_request_ids,
-                layer_name=layer_name,
-                query=query,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                block_table=attn_metadata.block_table,
-                seq_lens=attn_metadata.seq_lens,
-                active_mask=self.active_mask,
-                scale=impl.scale,
-                warm_first_draft=True,
-            )
+            with self.performance_stats.cuda_timer("draft_selection_total"):
+                selection = self.index.select_segmented(
+                    request_ids=self.proposal_request_ids,
+                    layer_name=layer_name,
+                    query=query,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_table=attn_metadata.block_table,
+                    seq_lens=attn_metadata.seq_lens,
+                    active_mask=self.active_mask,
+                    scale=impl.scale,
+                    warm_first_draft=True,
+                )
             self.selection_plans[self.step_index][layer_name] = selection.plan
         else:
             if has_parallel_plan:
-                plan = self._gather_parallel_plan(layer_name)
+                with self.performance_stats.cuda_timer("verification_plan_gather"):
+                    plan = self._gather_parallel_plan(layer_name)
             else:
                 try:
                     plan = self.selection_plans[self.step_index][layer_name]
@@ -1369,9 +1387,10 @@ class RetroSpecSparseAttention:
             else:
                 raise RuntimeError(f"Unexpected RetroSpec attention mode: {self.mode}")
 
-            selection = self.index.materialize(
-                plan, level, key_cache, value_cache, attn_metadata.block_table
-            )
+            with self.performance_stats.cuda_timer("verification_plan_materialize"):
+                selection = self.index.materialize(
+                    plan, level, key_cache, value_cache, attn_metadata.block_table
+                )
 
         exact_output, exact_lse = self._run_exact_attention(
             impl,
@@ -1386,46 +1405,53 @@ class RetroSpecSparseAttention:
             torch.float16,
             torch.bfloat16,
         )
+        stage_name = {
+            RetroSpecAttentionMode.DRAFT: "draft",
+            RetroSpecAttentionMode.SPARSE_VERIFY: "sparse_verify",
+            RetroSpecAttentionMode.EXPANDED_VERIFY: "expanded_verify",
+        }[self.mode]
 
-        if can_use_fused_estimation:
-            (
-                estimation_keys,
-                estimation_values,
-                estimation_token_counts,
-            ) = self._get_grouped_estimation(selection)
+        with self.performance_stats.cuda_timer(f"{stage_name}_estimation_merge"):
+            if can_use_fused_estimation:
+                (
+                    estimation_keys,
+                    estimation_values,
+                    estimation_token_counts,
+                ) = self._get_grouped_estimation(selection)
 
-            merge_weighted_estimation(
-                output=output[:num_actual_tokens],
-                query=query,
-                estimation_keys=estimation_keys,
-                estimation_values=estimation_values,
-                estimation_token_counts=estimation_token_counts,
-                exact_output=exact_output,
-                exact_lse=exact_lse,
-                scale=impl.scale,
-            )
-        else:
-            estimation_output, estimation_lse = self._run_estimation_attention(
-                impl,
-                query,
-                selection,
-            )
+                merge_weighted_estimation(
+                    output=output[:num_actual_tokens],
+                    query=query,
+                    estimation_keys=estimation_keys,
+                    estimation_values=estimation_values,
+                    estimation_token_counts=estimation_token_counts,
+                    exact_output=exact_output,
+                    exact_lse=exact_lse,
+                    scale=impl.scale,
+                )
+            else:
+                estimation_output, estimation_lse = self._run_estimation_attention(
+                    impl,
+                    query,
+                    selection,
+                )
 
-            merge_attn_states(
-                output[:num_actual_tokens],
-                exact_output,
-                exact_lse,
-                estimation_output,
-                estimation_lse,
-            )
+                merge_attn_states(
+                    output[:num_actual_tokens],
+                    exact_output,
+                    exact_lse,
+                    estimation_output,
+                    estimation_lse,
+                )
 
         self.attention_mass_sum[: self.batch_size].add_(selection.attention_mass)
         self.attention_mass_layer_count += 1
 
         if self.mode == RetroSpecAttentionMode.DRAFT:
-            self.index.prefetch_sparse_verification(
-                selection=selection,
-                active_mask=self.active_mask,
-            )
+            with self.performance_stats.cpu_timer("draft_prefetch_submit"):
+                self.index.prefetch_sparse_verification(
+                    selection=selection,
+                    active_mask=self.active_mask,
+                )
 
         return output

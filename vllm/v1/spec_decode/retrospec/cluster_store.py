@@ -3108,6 +3108,15 @@ class RetroSpecClusterPageStore:
         )
         staging_value_pages = torch.empty_like(staging_key_pages)
 
+        if self.performance_stats is not None:
+            self.performance_stats.add_counter(
+                "verification_miss_pages", num_staging_pages
+            )
+            self.performance_stats.add_counter(
+                "verification_miss_h2d_bytes",
+                staging_key_pages.nbytes + staging_value_pages.nbytes,
+            )
+
         staging_ready_event: torch.cuda.Event | None = None
         if num_staging_pages:
             missing_logical_page_ids = logical_page_ids_cpu[
@@ -3120,8 +3129,27 @@ class RetroSpecClusterPageStore:
             page_start = 0
             while page_start < num_staging_pages:
                 page_end = min(page_start + page_capacity, num_staging_pages)
+                gather_started_at = (
+                    perf_counter()
+                    if self.performance_stats is not None
+                    and self.performance_stats.enabled
+                    else None
+                )
                 cpu_keys, cpu_values, cpu_slot = transfer_buffer.stage_cpu_pages(
                     pool, missing_logical_page_ids[page_start:page_end]
+                )
+                if gather_started_at is not None:
+                    self.performance_stats.record_cpu_time(
+                        "verification_miss_cpu_gather",
+                        perf_counter() - gather_started_at,
+                    )
+
+                h2d_timer = (
+                    None
+                    if self.performance_stats is None
+                    else self.performance_stats.start_cuda_timer(
+                        "verification_miss_h2d", current_stream
+                    )
                 )
                 staging_key_pages[page_start:page_end].copy_(
                     cpu_keys, non_blocking=self.pin_memory
@@ -3129,6 +3157,8 @@ class RetroSpecClusterPageStore:
                 staging_value_pages[page_start:page_end].copy_(
                     cpu_values, non_blocking=self.pin_memory
                 )
+                if self.performance_stats is not None:
+                    self.performance_stats.stop_cuda_timer(h2d_timer, current_stream)
                 chunk_ready_event = torch.cuda.Event()
                 chunk_ready_event.record(current_stream)
                 transfer_buffer.release_cpu_slot(cpu_slot, chunk_ready_event)
@@ -3218,8 +3248,21 @@ class RetroSpecClusterPageStore:
         self,
         staged: _StagedResidentPrefetch,
     ) -> None:
+        stats = self.performance_stats
+        background_started_at = (
+            perf_counter() if stats is not None and stats.enabled else None
+        )
+        completed = False
         try:
+            metadata_wait_started_at = (
+                perf_counter() if stats is not None and stats.enabled else None
+            )
             staged.metadata_ready_event.synchronize()
+            if metadata_wait_started_at is not None:
+                stats.record_cpu_time(
+                    "prefetch_metadata_wait",
+                    perf_counter() - metadata_wait_started_at,
+                )
 
             hit_cluster_ids = staged.cluster_ids_cpu.masked_fill(
                 staged.access_kinds_cpu != 1, -1
@@ -3249,6 +3292,7 @@ class RetroSpecClusterPageStore:
                 resident_cache.touch_cpu(hit_cluster_ids)
 
                 if not torch.any(miss_cluster_ids >= 0).item():
+                    completed = True
                     return
 
                 metadata = self._materialize_cluster_block_metadata_cpu(
@@ -3302,7 +3346,19 @@ class RetroSpecClusterPageStore:
                     raise
             if transfer_slot is not None:
                 transfer_buffer.release_cpu_slot(transfer_slot, access.ready_event)
+            completed = True
         finally:
+            if stats is not None:
+                stats.add_counter(
+                    "prefetch_worker_completed"
+                    if completed
+                    else "prefetch_worker_failed"
+                )
+                if background_started_at is not None:
+                    stats.record_cpu_time(
+                        "prefetch_worker_wall",
+                        perf_counter() - background_started_at,
+                    )
             self._release_resident_prefetch_slot(staged.slot)
 
     def _reap_resident_prefetches(
@@ -3333,8 +3389,28 @@ class RetroSpecClusterPageStore:
                 else:
                     self._resident_prefetch_futures.pop(layer_name, None)
 
-        for future in ready:
-            future.result()
+        if self.performance_stats is not None:
+            self.performance_stats.add_counter("prefetch_reaped_tasks", len(ready))
+            if wait:
+                self.performance_stats.add_counter("prefetch_waited_tasks", len(ready))
+
+        wait_started_at = (
+            perf_counter()
+            if wait
+            and ready
+            and self.performance_stats is not None
+            and self.performance_stats.enabled
+            else None
+        )
+        try:
+            for future in ready:
+                future.result()
+        finally:
+            if wait_started_at is not None:
+                self.performance_stats.record_cpu_time(
+                    "prefetch_wait_wall",
+                    perf_counter() - wait_started_at,
+                )
 
     def prefetch_resident_clusters(
         self,
@@ -3403,6 +3479,9 @@ class RetroSpecClusterPageStore:
 
             if self.performance_stats is not None:
                 self.performance_stats.add_counter("prefetch_submitted")
+                self.performance_stats.add_counter(
+                    "prefetch_input_clusters", cluster_ids.numel()
+                )
             return True
         except BaseException:
             stream.synchronize()

@@ -4,6 +4,7 @@
 from collections import deque
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from math import ceil
 
@@ -501,6 +502,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self._full_verification_prefetched: _PrefetchedFullVerificationLayer | None = (
             None
         )
+
+    def _cuda_timer(self, name: str) -> AbstractContextManager[None]:
+        if self.performance_stats is None:
+            return nullcontext()
+        return self.performance_stats.cuda_timer(name)
 
     def _stable_indexed_end(self, seq_len: int) -> int:
         """Return the exclusive end of tokens that may leave native GPU KV."""
@@ -3317,25 +3323,23 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 "Segmented token index request order does not match proposal order"
             )
 
-        view = self._get_resident_view(layer_name, request_ids, key_cache)
+        with self._cuda_timer("draft_selection_layout"):
+            view = self._get_resident_view(layer_name, request_ids, key_cache)
 
-        logical_token_ids, valid_token_mask, forced_exact_mask = (
-            self._build_token_layout(
-                block_table,
-                seq_lens,
+            logical_token_ids, valid_token_mask, forced_exact_mask = (
+                self._build_token_layout(block_table, seq_lens)
             )
-        )
 
-        # All valid tokens not covered by a complete clustered segment remain
-        # in the exact steady zone.
-        indexed_starts, indexed_ends, indexed_requests = (
-            self._get_resident_indexed_bounds(view, block_table.device)
-        )
-        forced_exact_mask |= valid_token_mask & (
-            ~indexed_requests.unsqueeze(1)
-            | (logical_token_ids.unsqueeze(0) < indexed_starts.unsqueeze(1))
-            | (logical_token_ids.unsqueeze(0) >= indexed_ends.unsqueeze(1))
-        )
+            # All valid tokens not covered by a complete clustered segment
+            # remain in the exact steady zone.
+            indexed_starts, indexed_ends, indexed_requests = (
+                self._get_resident_indexed_bounds(view, block_table.device)
+            )
+            forced_exact_mask |= valid_token_mask & (
+                ~indexed_requests.unsqueeze(1)
+                | (logical_token_ids.unsqueeze(0) < indexed_starts.unsqueeze(1))
+                | (logical_token_ids.unsqueeze(0) >= indexed_ends.unsqueeze(1))
+            )
 
         num_kv_heads = key_cache.shape[2]
         first_draft_warmup_mask = self._get_first_draft_warmup_mask(
@@ -3362,27 +3366,24 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 rounding_mode="floor",
             )
 
-        (
-            cluster_scores,
-            ranking_scores,
-            candidate_counts,
-            workspace,
-        ) = self._score_resident_view(
-            query,
-            view,
-            scale,
-            num_kv_heads,
-        )
+        with self._cuda_timer("draft_cluster_score"):
+            (
+                cluster_scores,
+                ranking_scores,
+                candidate_counts,
+                workspace,
+            ) = self._score_resident_view(query, view, scale, num_kv_heads)
 
-        cluster_zones = self._select_cluster_zones(
-            cluster_scores,
-            ranking_scores,
-            candidate_counts,
-            view=view,
-            first_draft_warmup_mask=first_draft_warmup_mask,
-            warmup_page_budgets=warmup_page_budgets,
-            workspace=workspace,
-        )
+        with self._cuda_timer("draft_cluster_topk"):
+            cluster_zones = self._select_cluster_zones(
+                cluster_scores,
+                ranking_scores,
+                candidate_counts,
+                view=view,
+                first_draft_warmup_mask=first_draft_warmup_mask,
+                warmup_page_budgets=warmup_page_budgets,
+                workspace=workspace,
+            )
 
         sparse_attn_by_head = self._sum_selected_scores(
             cluster_scores,
@@ -3421,60 +3422,69 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             torch.ones_like(expanded_attn),
         )
 
-        plan, output_workspace = self._make_plan(
-            layer_name=layer_name,
-            forced_exact_mask=forced_exact_mask,
-            cluster_zones=cluster_zones,
-            sparse_attn=sparse_attn,
-            expanded_attn=expanded_attn,
-            view=view,
-            num_kv_heads=num_kv_heads,
-            head_size=key_cache.shape[3],
-            dtype=key_cache.dtype,
-        )
+        with self._cuda_timer("draft_plan_build"):
+            plan, output_workspace = self._make_plan(
+                layer_name=layer_name,
+                forced_exact_mask=forced_exact_mask,
+                cluster_zones=cluster_zones,
+                sparse_attn=sparse_attn,
+                expanded_attn=expanded_attn,
+                view=view,
+                num_kv_heads=num_kv_heads,
+                head_size=key_cache.shape[3],
+                dtype=key_cache.dtype,
+            )
 
         prefetch_cluster_ids = None
         prefetch_access_kinds = None
         if first_draft_warmup_mask is not None:
-            warmup_cluster_ids, warmup_page_ids, _ = (
-                self._build_resident_exact_cluster_selection(
-                    view,
-                    cluster_zones.first_draft_warmup_indices,
-                    cluster_zones.first_draft_warmup_mask,
+            with self._cuda_timer("draft_first_warmup_resolve"):
+                warmup_cluster_ids, warmup_page_ids, _ = (
+                    self._build_resident_exact_cluster_selection(
+                        view,
+                        cluster_zones.first_draft_warmup_indices,
+                        cluster_zones.first_draft_warmup_mask,
+                    )
                 )
-            )
-            warmup_access = self.cluster_store.resolve_draft_cluster_blocks(
-                layer_name=layer_name,
-                cluster_ids=warmup_cluster_ids,
-                logical_page_ids=warmup_page_ids,
+                warmup_access = self.cluster_store.resolve_draft_cluster_blocks(
+                    layer_name=layer_name,
+                    cluster_ids=warmup_cluster_ids,
+                    logical_page_ids=warmup_page_ids,
+                    active_mask=active_mask,
+                    cache_page_ids=torch.empty_like(warmup_page_ids),
+                    hit_cluster_mask=torch.empty_like(
+                        warmup_cluster_ids, dtype=torch.bool
+                    ),
+                    miss_cluster_mask=torch.empty_like(
+                        warmup_cluster_ids, dtype=torch.bool
+                    ),
+                    hit_gate_ready_mask=torch.empty_like(
+                        warmup_cluster_ids, dtype=torch.bool
+                    ),
+                    access_kinds=torch.empty_like(
+                        warmup_cluster_ids, dtype=torch.uint8
+                    ),
+                )
+                if warmup_access.read_lease is not None:
+                    warmup_access.read_lease.release()
+                prefetch_cluster_ids = warmup_cluster_ids
+                prefetch_access_kinds = warmup_access.access_kinds
+
+        with self._cuda_timer("draft_plan_materialize"):
+            selection = self._materialize_draft_selection(
+                plan=plan,
+                output_workspace=output_workspace,
+                view=view,
+                cluster_zones=cluster_zones,
+                cluster_scores=cluster_scores,
+                has_clusters=has_clusters,
+                head_size=key_cache.shape[3],
+                dtype=key_cache.dtype,
                 active_mask=active_mask,
-                cache_page_ids=torch.empty_like(warmup_page_ids),
-                hit_cluster_mask=torch.empty_like(warmup_cluster_ids, dtype=torch.bool),
-                miss_cluster_mask=torch.empty_like(
-                    warmup_cluster_ids, dtype=torch.bool
-                ),
-                hit_gate_ready_mask=torch.empty_like(
-                    warmup_cluster_ids, dtype=torch.bool
-                ),
-                access_kinds=torch.empty_like(warmup_cluster_ids, dtype=torch.uint8),
+                prefetch_cluster_ids=prefetch_cluster_ids,
+                prefetch_access_kinds=prefetch_access_kinds,
             )
-            if warmup_access.read_lease is not None:
-                warmup_access.read_lease.release()
-            prefetch_cluster_ids = warmup_cluster_ids
-            prefetch_access_kinds = warmup_access.access_kinds
-        return self._materialize_draft_selection(
-            plan=plan,
-            output_workspace=output_workspace,
-            view=view,
-            cluster_zones=cluster_zones,
-            cluster_scores=cluster_scores,
-            has_clusters=has_clusters,
-            head_size=key_cache.shape[3],
-            dtype=key_cache.dtype,
-            active_mask=active_mask,
-            prefetch_cluster_ids=prefetch_cluster_ids,
-            prefetch_access_kinds=prefetch_access_kinds,
-        )
+        return selection
 
     def materialize(
         self,
