@@ -36,12 +36,26 @@ def _lookup(
     logical_page_ids: torch.Tensor,
     active_mask: torch.Tensor | None,
     table: tuple[torch.Tensor, ...],
+    plan_row_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    output_page_slots = torch.empty_like(logical_page_ids)
-    output_hit_mask = torch.empty_like(cluster_handles, dtype=torch.bool)
-    output_miss_mask = torch.empty_like(cluster_handles, dtype=torch.bool)
-    output_gate_ready = torch.empty_like(cluster_handles, dtype=torch.bool)
-    output_access_kinds = torch.empty_like(cluster_handles, dtype=torch.uint8)
+    output_batch = (
+        cluster_handles.shape[0]
+        if plan_row_indices is None
+        else plan_row_indices.shape[0]
+    )
+    cluster_shape = (output_batch, *cluster_handles.shape[1:])
+    page_shape = (*cluster_shape, logical_page_ids.shape[-1])
+    output_page_slots = torch.empty(
+        page_shape, dtype=logical_page_ids.dtype, device=logical_page_ids.device
+    )
+    output_hit_mask = torch.empty(
+        cluster_shape, dtype=torch.bool, device=cluster_handles.device
+    )
+    output_miss_mask = torch.empty_like(output_hit_mask)
+    output_gate_ready = torch.empty_like(output_hit_mask)
+    output_access_kinds = torch.empty(
+        cluster_shape, dtype=torch.uint8, device=cluster_handles.device
+    )
 
     lookup_resident_handles(
         cluster_handles=cluster_handles,
@@ -57,6 +71,7 @@ def _lookup(
         output_miss_mask=output_miss_mask,
         output_hit_gate_ready=output_gate_ready,
         output_access_kinds=output_access_kinds,
+        plan_row_indices=plan_row_indices,
     )
     return (
         output_page_slots,
@@ -165,6 +180,41 @@ def test_resident_handle_lookup_can_activate_all_valid_verification_rows():
     assert outputs[4].cpu().tolist() == [[[1, 2]], [[1, 0]]]
 
 
+def test_resident_handle_lookup_indexes_persistent_plan_rows():
+    device = torch.device("cuda")
+    table = _make_table()
+    update_resident_handles(
+        bucket_ids=torch.tensor([3, 4], dtype=torch.int32, device=device),
+        cluster_handles=torch.tensor([3, 4], dtype=torch.int64, device=device),
+        page_counts=torch.tensor([1, 2], dtype=torch.int32, device=device),
+        page_slots=torch.tensor([[5, -1], [6, 7]], dtype=torch.int32, device=device),
+        hit_gate_ready=torch.tensor([True, False], device=device),
+        table_handles=table[0],
+        table_versions=table[1],
+        table_page_counts=table[2],
+        table_page_slots=table[3],
+        table_hit_gate_ready=table[4],
+    )
+    handles = torch.tensor(
+        [[[3, 9]], [[4, -1]], [[9, 3]], [[4, 3]]],
+        dtype=torch.int64,
+        device=device,
+    )
+    pages = torch.arange(16, dtype=torch.int64, device=device).view(4, 1, 2, 2)
+    plan_rows = torch.tensor([3, 0, 1], dtype=torch.int64, device=device)
+
+    indexed = _lookup(handles, pages, None, table, plan_rows)
+    gathered = _lookup(
+        handles.index_select(0, plan_rows),
+        pages.index_select(0, plan_rows),
+        None,
+        table,
+    )
+
+    for actual, expected in zip(indexed, gathered):
+        torch.testing.assert_close(actual, expected)
+
+
 def test_compact_resident_misses_preserves_handles_and_flat_positions():
     device = torch.device("cuda")
     handles = torch.tensor(
@@ -191,6 +241,40 @@ def test_compact_resident_misses_preserves_handles_and_flat_positions():
         )
     )
     assert records == [(1, 11), (3, 12), (4, 10)]
+
+
+def test_compact_resident_misses_indexes_source_plan_rows():
+    device = torch.device("cuda")
+    handles = torch.tensor(
+        [[[10, 11]], [[20, 21]], [[30, 31]]],
+        dtype=torch.int64,
+        device=device,
+    )
+    misses = torch.tensor(
+        [[[True, False]], [[False, True]], [[True, True]]], device=device
+    )
+    plan_rows = torch.tensor([2, 0, 1], dtype=torch.int64, device=device)
+    output_handles = torch.empty(misses.numel(), dtype=torch.int64, device=device)
+    output_positions = torch.empty_like(output_handles)
+    output_count = torch.empty(1, dtype=torch.int32, device=device)
+
+    compact_resident_misses(
+        handles,
+        misses,
+        output_handles,
+        output_positions,
+        output_count,
+        plan_rows,
+    )
+
+    count = int(output_count.item())
+    records = sorted(
+        zip(
+            output_positions[:count].cpu().tolist(),
+            output_handles[:count].cpu().tolist(),
+        )
+    )
+    assert records == [(0, 30), (3, 11), (4, 20), (5, 21)]
 
 
 def test_scatter_staging_page_ids_expands_compact_occurrences():

@@ -46,6 +46,7 @@ class RetroSpecExactKVSource:
     page_token_counts: torch.Tensor
     resident_pages: RetroSpecExactPageKVSource | None = None
     staging_pages: RetroSpecExactPageKVSource | None = None
+    plan_row_indices: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,7 @@ class RetroSpecFullVerificationKVSource:
 def _multi_source_exact_partition_kernel(
     query,
     request_indices,
+    plan_row_indices,
     key_cache,
     value_cache,
     block_table,
@@ -130,6 +132,7 @@ def _multi_source_exact_partition_kernel(
     PARTITION_SIZE: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
     IDENTITY_REQUESTS: tl.constexpr,
+    USE_PLAN_ROWS: tl.constexpr,
     HAS_RESIDENT: tl.constexpr,
     HAS_STAGING: tl.constexpr,
 ):
@@ -137,9 +140,14 @@ def _multi_source_exact_partition_kernel(
     query_head_idx = tl.program_id(1)
     partition_idx = tl.program_id(2)
 
-    request_idx = query_idx
+    primary_request_idx = query_idx
     if not IDENTITY_REQUESTS:
-        request_idx = tl.load(request_indices + query_idx)
+        primary_request_idx = tl.load(request_indices + query_idx)
+    metadata_row_idx = primary_request_idx
+    resolved_page_row_idx = primary_request_idx
+    if USE_PLAN_ROWS:
+        metadata_row_idx = tl.load(plan_row_indices + query_idx)
+        resolved_page_row_idx = query_idx
     kv_head_idx = query_head_idx // QUERIES_PER_KV_HEAD
 
     dimension_offsets = tl.arange(0, BLOCK_D)
@@ -163,7 +171,7 @@ def _multi_source_exact_partition_kernel(
 
         primary_valid = source_valid & (token_offsets < MAX_PRIMARY_TOKENS)
         primary_metadata_offsets = (
-            request_idx * NUM_KV_HEADS + kv_head_idx
+            metadata_row_idx * NUM_KV_HEADS + kv_head_idx
         ) * MAX_PRIMARY_TOKENS + token_offsets
         primary_valid &= tl.load(
             token_mask + primary_metadata_offsets, mask=primary_valid, other=0
@@ -175,7 +183,7 @@ def _multi_source_exact_partition_kernel(
         block_offsets = logical_token_indices % PAGE_SIZE
         physical_block_indices = tl.load(
             block_table
-            + request_idx * block_table_stride_0
+            + primary_request_idx * block_table_stride_0
             + logical_block_indices * block_table_stride_1,
             mask=primary_valid,
             other=0,
@@ -205,11 +213,14 @@ def _multi_source_exact_partition_kernel(
         page_slot_indices = page_token_offsets // PAGE_SIZE
         offsets_in_page = page_token_offsets % PAGE_SIZE
         page_valid = source_valid & (token_offsets >= MAX_PRIMARY_TOKENS)
-        page_metadata_offsets = (
-            request_idx * NUM_KV_HEADS + kv_head_idx
+        page_count_offsets = (
+            metadata_row_idx * NUM_KV_HEADS + kv_head_idx
+        ) * MAX_PAGE_SLOTS + page_slot_indices
+        resolved_page_offsets = (
+            resolved_page_row_idx * NUM_KV_HEADS + kv_head_idx
         ) * MAX_PAGE_SLOTS + page_slot_indices
         page_counts = tl.load(
-            page_token_counts + page_metadata_offsets, mask=page_valid, other=0
+            page_token_counts + page_count_offsets, mask=page_valid, other=0
         )
         page_valid &= offsets_in_page < page_counts
 
@@ -217,7 +228,7 @@ def _multi_source_exact_partition_kernel(
         resident_ids = tl.zeros((BLOCK_TOKENS,), dtype=tl.int64)
         if HAS_RESIDENT:
             resident_ids = tl.load(
-                resident_page_ids + page_metadata_offsets,
+                resident_page_ids + resolved_page_offsets,
                 mask=page_valid,
                 other=-1,
             ).to(tl.int64)
@@ -249,7 +260,7 @@ def _multi_source_exact_partition_kernel(
         staging_valid = page_valid & ~resident_valid
         if HAS_STAGING:
             staging_ids = tl.load(
-                staging_page_ids + page_metadata_offsets,
+                staging_page_ids + resolved_page_offsets,
                 mask=staging_valid,
                 other=-1,
             ).to(tl.int64)
@@ -860,10 +871,11 @@ class RetroSpecExactAttentionWorkspace:
         if primary.block_table.ndim != 2:
             raise ValueError("Block table must have shape [batch, blocks]")
 
-        batch_size, num_kv_heads, max_primary_tokens = primary.token_indices.shape
-        if source.page_token_counts.shape[:2] != (batch_size, num_kv_heads):
+        metadata_rows, num_kv_heads, max_primary_tokens = primary.token_indices.shape
+        if source.page_token_counts.shape[:2] != (metadata_rows, num_kv_heads):
             raise ValueError("Primary and page metadata batch shapes must match")
-        if primary.block_table.shape[0] != batch_size:
+        plan_row_indices = source.plan_row_indices
+        if plan_row_indices is None and primary.block_table.shape[0] != metadata_rows:
             raise ValueError("Block table batch size does not match exact metadata")
         if primary.key_cache.shape[2:] != (num_kv_heads, query.shape[2]):
             raise ValueError("Primary KV shape does not match query metadata")
@@ -883,19 +895,25 @@ class RetroSpecExactAttentionWorkspace:
         ):
             raise ValueError("Exact-attention metadata must be integral")
 
-        tensors = (
+        tensors = [
             primary.key_cache,
             primary.value_cache,
             primary.block_table,
             primary.token_indices,
             primary.token_mask,
             source.page_token_counts,
-        )
+        ]
+        if plan_row_indices is not None:
+            if plan_row_indices.shape != (query.shape[0],):
+                raise ValueError("Plan rows must contain one entry per query")
+            if plan_row_indices.dtype not in (torch.int32, torch.int64):
+                raise ValueError("Plan rows must be integral")
+            tensors.append(plan_row_indices)
         if any(tensor.device != query.device for tensor in tensors):
             raise ValueError("All exact-attention tensors must be on the query device")
 
         if request_indices is None:
-            if query.shape[0] != batch_size:
+            if query.shape[0] != primary.block_table.shape[0]:
                 raise ValueError(
                     "Identity request mapping requires one query per request"
                 )
@@ -920,6 +938,11 @@ class RetroSpecExactAttentionWorkspace:
             )
 
         expected_page_shape = source.page_token_counts.shape
+        if plan_row_indices is not None:
+            expected_page_shape = (
+                query.shape[0],
+                *source.page_token_counts.shape[1:],
+            )
         for page_source in (source.resident_pages, source.staging_pages):
             if page_source is None:
                 continue
@@ -1277,6 +1300,11 @@ class RetroSpecExactAttentionWorkspace:
         request_mapping = (
             primary.token_indices if request_indices is None else request_indices
         )
+        plan_row_mapping = (
+            primary.token_indices
+            if source.plan_row_indices is None
+            else source.plan_row_indices
+        )
         block_d = triton.next_power_of_2(head_size)
 
         _multi_source_exact_partition_kernel[
@@ -1288,6 +1316,7 @@ class RetroSpecExactAttentionWorkspace:
         ](
             query,
             request_mapping,
+            plan_row_mapping,
             primary.key_cache,
             primary.value_cache,
             primary.block_table,
@@ -1346,6 +1375,7 @@ class RetroSpecExactAttentionWorkspace:
             PARTITION_SIZE=EXACT_ATTENTION_PARTITION_SIZE,
             BLOCK_TOKENS=_EXACT_ATTENTION_BLOCK_TOKENS,
             IDENTITY_REQUESTS=request_indices is None,
+            USE_PLAN_ROWS=source.plan_row_indices is not None,
             HAS_RESIDENT=resident is not None,
             HAS_STAGING=staging is not None,
         )

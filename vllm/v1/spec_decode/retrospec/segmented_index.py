@@ -87,6 +87,25 @@ class RetroSpecTokenAttentionSelection:
 
 
 @dataclass(frozen=True)
+class RetroSpecIndexedTokenAttentionSelection:
+    layer_name: str
+    plan_row_indices: torch.Tensor
+
+    primary_exact_token_indices: torch.Tensor
+    primary_exact_token_mask: torch.Tensor
+
+    exact_cluster_ids: torch.Tensor
+    exact_page_ids: torch.Tensor
+    exact_page_token_counts: torch.Tensor
+
+    estimation_keys: torch.Tensor
+    estimation_values: torch.Tensor
+    estimation_token_counts: torch.Tensor
+
+    attention_mass: torch.Tensor
+
+
+@dataclass(frozen=True)
 class RetroSpecFullVerificationPlan:
     """Exact committed-prefix layout used by target full verification.
 
@@ -477,122 +496,26 @@ class _SelectionPlanTable:
 
 
 @dataclass(frozen=True)
-class _ParallelPlanWorkspace:
-    linear_indices: torch.Tensor
+class _IndexedPlanWorkspace:
+    plan_row_indices: torch.Tensor
     valid_rows: torch.Tensor
-    plan: RetroSpecTokenSelectionPlan
-
-    @staticmethod
-    def _plan_sources(table: _SelectionPlanTable) -> dict[str, torch.Tensor]:
-        sparse_width = table.sparse_estimation_width
-        return {
-            "primary_exact_token_indices": table.primary_exact_token_indices,
-            "primary_exact_token_mask": table.primary_exact_token_mask,
-            "sparse_exact_cluster_ids": table.sparse_exact_cluster_ids,
-            "sparse_exact_page_ids": table.sparse_exact_page_ids,
-            "sparse_exact_page_token_counts": (table.sparse_exact_page_token_counts),
-            "sparse_estimation_keys": (
-                table.draft_estimation_keys[:, :, :, :sparse_width]
-            ),
-            "sparse_estimation_values": (
-                table.draft_estimation_values[:, :, :, :sparse_width]
-            ),
-            "sparse_estimation_token_counts": (
-                table.draft_estimation_token_counts[:, :, :, :sparse_width]
-            ),
-            "expanded_exact_cluster_ids": table.expanded_exact_cluster_ids,
-            "expanded_exact_page_ids": table.expanded_exact_page_ids,
-            "expanded_exact_page_token_counts": (
-                table.expanded_exact_page_token_counts
-            ),
-            "expanded_estimation_keys": table.expanded_estimation_keys,
-            "expanded_estimation_values": table.expanded_estimation_values,
-            "expanded_estimation_token_counts": (
-                table.expanded_estimation_token_counts
-            ),
-            "sparse_attn": table.sparse_attn,
-            "expanded_attn": table.expanded_attn,
-        }
 
     @classmethod
     def allocate(
-        cls, tables: Sequence[_SelectionPlanTable], pair_capacity: int
-    ) -> "_ParallelPlanWorkspace":
-        if not tables:
-            raise ValueError("Parallel plan workspace requires at least one table")
-        source_maps = tuple(cls._plan_sources(table) for table in tables)
-        reference = tables[0]
-
-        def output(name: str) -> torch.Tensor:
-            sources = tuple(source_map[name] for source_map in source_maps)
-            first = sources[0]
-            if any(
-                source.ndim != first.ndim
-                or source.dtype != first.dtype
-                or source.device != first.device
-                for source in sources[1:]
-            ):
-                raise NotImplementedError(
-                    "RetroSpec plan tables use incompatible attention layers"
-                )
-            tail_shape = tuple(
-                max(source.shape[axis] for source in sources)
-                for axis in range(2, first.ndim)
-            )
-            return torch.empty(
-                (pair_capacity, *tail_shape), dtype=first.dtype, device=first.device
-            )
-
+        cls, pair_capacity: int, device: torch.device
+    ) -> "_IndexedPlanWorkspace":
         return cls(
-            linear_indices=torch.empty(
-                pair_capacity, dtype=torch.int64, device=reference.valid_rows.device
+            plan_row_indices=torch.empty(
+                pair_capacity, dtype=torch.int64, device=device
             ),
-            valid_rows=torch.empty(
-                pair_capacity, dtype=torch.bool, device=reference.valid_rows.device
-            ),
-            plan=RetroSpecTokenSelectionPlan(
-                layer_name="",
-                primary_exact_token_indices=output("primary_exact_token_indices"),
-                primary_exact_token_mask=output("primary_exact_token_mask"),
-                sparse_exact_cluster_ids=output("sparse_exact_cluster_ids"),
-                sparse_exact_page_ids=output("sparse_exact_page_ids"),
-                sparse_exact_page_token_counts=output("sparse_exact_page_token_counts"),
-                sparse_estimation_keys=output("sparse_estimation_keys"),
-                sparse_estimation_values=output("sparse_estimation_values"),
-                sparse_estimation_token_counts=output("sparse_estimation_token_counts"),
-                expanded_exact_cluster_ids=output("expanded_exact_cluster_ids"),
-                expanded_exact_page_ids=output("expanded_exact_page_ids"),
-                expanded_exact_page_token_counts=output(
-                    "expanded_exact_page_token_counts"
-                ),
-                expanded_estimation_keys=output("expanded_estimation_keys"),
-                expanded_estimation_values=output("expanded_estimation_values"),
-                expanded_estimation_token_counts=output(
-                    "expanded_estimation_token_counts"
-                ),
-                sparse_attn=output("sparse_attn"),
-                expanded_attn=output("expanded_attn"),
-            ),
+            valid_rows=torch.empty(pair_capacity, dtype=torch.bool, device=device),
         )
 
-    def matches(self, table: _SelectionPlanTable, pair_capacity: int) -> bool:
-        if self.linear_indices.shape[0] < pair_capacity:
-            return False
-        if self.linear_indices.device != table.valid_rows.device:
-            return False
-
-        for name, source in self._plan_sources(table).items():
-            destination = getattr(self.plan, name)
-            if destination.dtype != source.dtype or destination.device != source.device:
-                return False
-            if destination.ndim != source.ndim - 1:
-                return False
-            if any(
-                available < required
-                for available, required in zip(destination.shape[1:], source.shape[2:])
-            ):
-                return False
-        return True
+    def matches(self, pair_capacity: int, device: torch.device) -> bool:
+        return (
+            self.plan_row_indices.shape[0] >= pair_capacity
+            and self.plan_row_indices.device == device
+        )
 
 
 class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
@@ -731,7 +654,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         # without walking per-step Python dictionaries.
         self._selection_plan_tables: dict[str, _SelectionPlanTable] = {}
         self._selection_plan_written_layers: set[str] = set()
-        self._parallel_plan_workspace: _ParallelPlanWorkspace | None = None
+        self._indexed_plan_workspace: _IndexedPlanWorkspace | None = None
 
         # CPU-offload construction is staged during layer execution and
         # committed after the complete prefill attention context.
@@ -2914,124 +2837,136 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         plan, _ = table.step(step_index, len(self._proposal_request_ids))
         return plan
 
-    def prepare_parallel_plan_workspace(self, pair_capacity: int) -> None:
+    def prepare_indexed_plan_workspace(self, pair_capacity: int) -> None:
         if pair_capacity <= 0:
-            raise ValueError("Parallel plan capacity must be positive")
+            raise ValueError("Indexed plan capacity must be positive")
         if not self._selection_plan_written_layers:
             return
 
-        tables = tuple(
-            self._selection_plan_tables[layer_name]
-            for layer_name in self._selection_plan_written_layers
-        )
-        workspace = self._parallel_plan_workspace
-        if workspace is None or any(
-            not workspace.matches(table, pair_capacity) for table in tables
-        ):
-            self._parallel_plan_workspace = _ParallelPlanWorkspace.allocate(
-                tables, pair_capacity
+        reference_layer = next(iter(self._selection_plan_written_layers))
+        device = self._selection_plan_tables[reference_layer].valid_rows.device
+        workspace = self._indexed_plan_workspace
+        if workspace is None or not workspace.matches(pair_capacity, device):
+            self._indexed_plan_workspace = _IndexedPlanWorkspace.allocate(
+                pair_capacity, device
             )
 
-    def gather_parallel_plan(
+    @staticmethod
+    def _flatten_plan_rows(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.flatten(0, 1)
+
+    def get_indexed_selection(
         self,
         layer_name: str,
+        level: RetroSpecAttentionLevel,
         request_indices: torch.Tensor,
         token_indices: torch.Tensor,
-    ) -> RetroSpecTokenSelectionPlan:
+    ) -> RetroSpecIndexedTokenAttentionSelection:
         table = self._selection_plan_tables.get(layer_name)
-        workspace = self._parallel_plan_workspace
+        workspace = self._indexed_plan_workspace
         if table is None:
             raise RuntimeError(
                 f"No draft selection plan exists for layer {layer_name!r}"
             )
         if workspace is None:
-            raise RuntimeError("Parallel plan workspace was not prepared")
+            raise RuntimeError("Indexed plan workspace was not prepared")
         if request_indices.shape != token_indices.shape:
-            raise ValueError("Parallel plan indices must have equal shapes")
+            raise ValueError("Indexed plan indices must have equal shapes")
         if request_indices.device != table.valid_rows.device:
-            raise ValueError("Parallel request indices use the wrong device")
+            raise ValueError("Indexed request indices use the wrong device")
         if token_indices.device != table.valid_rows.device:
-            raise ValueError("Parallel token indices use the wrong device")
+            raise ValueError("Indexed token indices use the wrong device")
 
         num_pairs = request_indices.numel()
-        if num_pairs > workspace.linear_indices.shape[0]:
-            raise ValueError("Parallel plan exceeds the prepared workspace")
+        if num_pairs > workspace.plan_row_indices.shape[0]:
+            raise ValueError("Indexed plan exceeds the prepared workspace")
 
-        linear_indices = workspace.linear_indices[:num_pairs]
-        linear_indices.copy_(token_indices)
-        linear_indices.mul_(table.batch_capacity)
-        linear_indices.add_(request_indices)
+        plan_rows = workspace.plan_row_indices[:num_pairs]
+        plan_rows.copy_(token_indices)
+        plan_rows.mul_(table.batch_capacity)
+        plan_rows.add_(request_indices)
 
         valid_rows = workspace.valid_rows[:num_pairs]
-        torch.index_select(table.valid_rows.view(-1), 0, linear_indices, out=valid_rows)
+        torch.index_select(table.valid_rows.view(-1), 0, plan_rows, out=valid_rows)
         torch._assert_async(
             valid_rows.all(),
             f"A draft selection plan is missing for layer {layer_name!r}",
         )
 
-        def gather(source: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
-            tail_slices = tuple(slice(0, size) for size in source.shape[2:])
-            destination = output[(slice(0, num_pairs), *tail_slices)]
-            torch.index_select(source.flatten(0, 1), 0, linear_indices, out=destination)
-            return destination
+        if level == RetroSpecAttentionLevel.SPARSE:
+            exact_cluster_ids = table.sparse_exact_cluster_ids
+            exact_page_ids = table.sparse_exact_page_ids
+            exact_page_token_counts = table.sparse_exact_page_token_counts
+            width = table.sparse_estimation_width
+            estimation_keys = table.draft_estimation_keys[:, :, :, :width]
+            estimation_values = table.draft_estimation_values[:, :, :, :width]
+            estimation_token_counts = table.draft_estimation_token_counts[
+                :, :, :, :width
+            ]
+            attention_mass = table.sparse_attn
+        elif level == RetroSpecAttentionLevel.EXPANDED:
+            exact_cluster_ids = table.expanded_exact_cluster_ids
+            exact_page_ids = table.expanded_exact_page_ids
+            exact_page_token_counts = table.expanded_exact_page_token_counts
+            estimation_keys = table.expanded_estimation_keys
+            estimation_values = table.expanded_estimation_values
+            estimation_token_counts = table.expanded_estimation_token_counts
+            attention_mass = table.expanded_attn
+        else:
+            raise ValueError(f"Unsupported RetroSpec attention level: {level}")
 
-        output = workspace.plan
-        sparse_width = table.sparse_estimation_width
-        return RetroSpecTokenSelectionPlan(
+        flatten = self._flatten_plan_rows
+        return RetroSpecIndexedTokenAttentionSelection(
             layer_name=layer_name,
-            primary_exact_token_indices=gather(
-                table.primary_exact_token_indices,
-                output.primary_exact_token_indices,
-            ),
-            primary_exact_token_mask=gather(
-                table.primary_exact_token_mask, output.primary_exact_token_mask
-            ),
-            sparse_exact_cluster_ids=gather(
-                table.sparse_exact_cluster_ids, output.sparse_exact_cluster_ids
-            ),
-            sparse_exact_page_ids=gather(
-                table.sparse_exact_page_ids, output.sparse_exact_page_ids
-            ),
-            sparse_exact_page_token_counts=gather(
-                table.sparse_exact_page_token_counts,
-                output.sparse_exact_page_token_counts,
-            ),
-            sparse_estimation_keys=gather(
-                table.draft_estimation_keys[:, :, :, :sparse_width],
-                output.sparse_estimation_keys,
-            ),
-            sparse_estimation_values=gather(
-                table.draft_estimation_values[:, :, :, :sparse_width],
-                output.sparse_estimation_values,
-            ),
-            sparse_estimation_token_counts=gather(
-                table.draft_estimation_token_counts[:, :, :, :sparse_width],
-                output.sparse_estimation_token_counts,
-            ),
-            expanded_exact_cluster_ids=gather(
-                table.expanded_exact_cluster_ids,
-                output.expanded_exact_cluster_ids,
-            ),
-            expanded_exact_page_ids=gather(
-                table.expanded_exact_page_ids, output.expanded_exact_page_ids
-            ),
-            expanded_exact_page_token_counts=gather(
-                table.expanded_exact_page_token_counts,
-                output.expanded_exact_page_token_counts,
-            ),
-            expanded_estimation_keys=gather(
-                table.expanded_estimation_keys, output.expanded_estimation_keys
-            ),
-            expanded_estimation_values=gather(
-                table.expanded_estimation_values, output.expanded_estimation_values
-            ),
-            expanded_estimation_token_counts=gather(
-                table.expanded_estimation_token_counts,
-                output.expanded_estimation_token_counts,
-            ),
-            sparse_attn=gather(table.sparse_attn, output.sparse_attn),
-            expanded_attn=gather(table.expanded_attn, output.expanded_attn),
+            plan_row_indices=plan_rows,
+            primary_exact_token_indices=flatten(table.primary_exact_token_indices),
+            primary_exact_token_mask=flatten(table.primary_exact_token_mask),
+            exact_cluster_ids=flatten(exact_cluster_ids),
+            exact_page_ids=flatten(exact_page_ids),
+            exact_page_token_counts=flatten(exact_page_token_counts),
+            estimation_keys=flatten(estimation_keys),
+            estimation_values=flatten(estimation_values),
+            estimation_token_counts=flatten(estimation_token_counts),
+            attention_mass=attention_mass.view(-1),
         )
+
+    def materialize_indexed_reference(
+        self, selection: RetroSpecIndexedTokenAttentionSelection
+    ) -> RetroSpecTokenAttentionSelection:
+        rows = selection.plan_row_indices
+
+        def gather(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.index_select(0, rows)
+
+        primary_indices = gather(selection.primary_exact_token_indices)
+        primary_mask = gather(selection.primary_exact_token_mask)
+        cluster_ids = gather(selection.exact_cluster_ids)
+        page_ids = gather(selection.exact_page_ids)
+        page_counts = gather(selection.exact_page_token_counts)
+        estimation_keys = gather(selection.estimation_keys)
+        estimation_values = gather(selection.estimation_values)
+        estimation_counts = gather(selection.estimation_token_counts)
+        attention_mass = gather(selection.attention_mass)
+        plan = RetroSpecTokenSelectionPlan(
+            layer_name=selection.layer_name,
+            primary_exact_token_indices=primary_indices,
+            primary_exact_token_mask=primary_mask,
+            sparse_exact_cluster_ids=cluster_ids,
+            sparse_exact_page_ids=page_ids,
+            sparse_exact_page_token_counts=page_counts,
+            sparse_estimation_keys=estimation_keys,
+            sparse_estimation_values=estimation_values,
+            sparse_estimation_token_counts=estimation_counts,
+            expanded_exact_cluster_ids=cluster_ids,
+            expanded_exact_page_ids=page_ids,
+            expanded_exact_page_token_counts=page_counts,
+            expanded_estimation_keys=estimation_keys,
+            expanded_estimation_values=estimation_values,
+            expanded_estimation_token_counts=estimation_counts,
+            sparse_attn=attention_mass,
+            expanded_attn=attention_mass,
+        )
+        return self._materialize_token_selection(plan, RetroSpecAttentionLevel.SPARSE)
 
     def _gather_selected_tokens(
         self,

@@ -11,9 +11,24 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecSegmentedTokenIndex,
 )
 from vllm.v1.spec_decode.retrospec.selection_kernels import (
+    add_indexed_values,
     gather_resident_estimation,
     gather_resident_exact_pages,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_add_indexed_values_reads_persistent_rows_without_gather():
+    device = torch.device("cuda")
+    destination = torch.tensor([1.0, 2.0, 3.0], device=device)
+    source = torch.tensor([0.25, 0.5, 1.0, 2.0, 4.0], device=device)
+    rows = torch.tensor([4, 0, 3], dtype=torch.int64, device=device)
+
+    add_indexed_values(destination, source, rows)
+
+    torch.testing.assert_close(
+        destination, torch.tensor([5.0, 2.25, 5.0], device=device)
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

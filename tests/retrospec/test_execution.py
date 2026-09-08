@@ -45,6 +45,7 @@ def _make_source(
     resident_pages: RetroSpecExactPageKVSource | None = None,
     staging_pages: RetroSpecExactPageKVSource | None = None,
     ready_event: torch.cuda.Event | None = None,
+    plan_row_indices: torch.Tensor | None = None,
 ) -> RetroSpecExactKVSource:
     return RetroSpecExactKVSource(
         primary=RetroSpecExactPrimaryKVSource(
@@ -58,6 +59,7 @@ def _make_source(
         page_token_counts=page_token_counts,
         resident_pages=resident_pages,
         staging_pages=staging_pages,
+        plan_row_indices=plan_row_indices,
     )
 
 
@@ -260,6 +262,64 @@ def test_exact_attention_maps_multiple_queries_to_their_requests():
 
     torch.testing.assert_close(output, expected[0], atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(lse, expected[1], atol=3e-3, rtol=3e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_exact_attention_indexes_plan_metadata_independently_of_block_table():
+    device = torch.device("cuda")
+    page_size = 4
+    head_size = 64
+    key_cache = torch.randn(
+        6, page_size, 1, head_size, dtype=torch.bfloat16, device=device
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.tensor(
+        [[0, 1], [2, 3], [4, 5]], dtype=torch.int32, device=device
+    )
+    table_token_indices = torch.tensor(
+        [[[0, 1, 4]], [[0, 2, 5]], [[1, 4, 6]], [[0, 3, 7]]],
+        dtype=torch.int64,
+        device=device,
+    )
+    table_token_mask = torch.tensor(
+        [
+            [[True, False, True]],
+            [[True, True, False]],
+            [[False, True, True]],
+            [[True, True, True]],
+        ],
+        dtype=torch.bool,
+        device=device,
+    )
+    plan_rows = torch.tensor([3, 0, 2], dtype=torch.int64, device=device)
+    table_page_counts = torch.empty(4, 1, 0, 0, dtype=torch.int32, device=device)
+    indexed_source = _make_source(
+        key_cache,
+        value_cache,
+        block_table,
+        table_token_indices,
+        table_token_mask,
+        table_page_counts,
+        plan_row_indices=plan_rows,
+    )
+    gathered_source = _make_source(
+        key_cache,
+        value_cache,
+        block_table,
+        table_token_indices.index_select(0, plan_rows),
+        table_token_mask.index_select(0, plan_rows),
+        table_page_counts.index_select(0, plan_rows),
+    )
+    query = torch.randn(3, 2, head_size, dtype=torch.bfloat16, device=device)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, 3, 1)
+
+    indexed_output, indexed_lse = workspace.run(indexed_source, query, 0.125)
+    indexed_output = indexed_output.clone()
+    indexed_lse = indexed_lse.clone()
+    gathered_output, gathered_lse = workspace.run(gathered_source, query, 0.125)
+
+    torch.testing.assert_close(indexed_output, gathered_output, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(indexed_lse, gathered_lse, atol=3e-3, rtol=3e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -158,6 +158,69 @@ def test_weighted_estimation_matches_reference_across_tiles(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_weighted_estimation_indexes_persistent_plan_rows(dtype):
+    device = torch.device("cuda")
+    torch.manual_seed(29)
+    num_queries = 3
+    num_table_rows = 6
+    num_query_heads = 4
+    num_kv_heads = 2
+    num_vectors = 19
+    head_size = 64
+    query = torch.randn(
+        num_queries, num_query_heads, head_size, dtype=dtype, device=device
+    )
+    table_keys = torch.randn(
+        num_table_rows,
+        num_kv_heads,
+        num_vectors,
+        head_size,
+        dtype=dtype,
+        device=device,
+    )
+    table_values = torch.randn_like(table_keys)
+    table_counts = torch.randint(
+        0,
+        8,
+        (num_table_rows, num_kv_heads, num_vectors),
+        dtype=torch.int32,
+        device=device,
+    )
+    plan_rows = torch.tensor([5, 1, 4], dtype=torch.int64, device=device)
+    exact_output = torch.randn_like(query)
+    exact_lse = torch.randn(
+        num_query_heads, num_queries, dtype=torch.float32, device=device
+    )
+    indexed_output = torch.empty_like(query)
+    gathered_output = torch.empty_like(query)
+
+    merge_weighted_estimation(
+        indexed_output,
+        query,
+        table_keys,
+        table_values,
+        table_counts,
+        exact_output,
+        exact_lse,
+        head_size**-0.5,
+        plan_rows,
+    )
+    merge_weighted_estimation(
+        gathered_output,
+        query,
+        table_keys.index_select(0, plan_rows),
+        table_values.index_select(0, plan_rows),
+        table_counts.index_select(0, plan_rows),
+        exact_output,
+        exact_lse,
+        head_size**-0.5,
+    )
+
+    torch.testing.assert_close(indexed_output, gathered_output, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_weighted_estimation_handles_empty_exact_state():
     device = torch.device("cuda")
     query = torch.zeros(1, 4, 64, dtype=torch.bfloat16, device=device)

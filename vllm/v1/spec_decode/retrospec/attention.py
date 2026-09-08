@@ -36,14 +36,16 @@ from .execution import (
 from .index import RetroSpecAttentionLevel
 from .performance import RetroSpecPerformanceStats
 from .segmented_index import (
+    RetroSpecIndexedTokenAttentionSelection,
     RetroSpecSegmentedTokenIndex,
     RetroSpecTokenAttentionSelection,
-    RetroSpecTokenSelectionPlan,
 )
+from .selection_kernels import add_indexed_values
 from .weighted_attention import merge_weighted_estimation
 
-RetroSpecSelection = RetroSpecTokenAttentionSelection
-RetroSpecPlan = RetroSpecTokenSelectionPlan
+RetroSpecSelection = (
+    RetroSpecTokenAttentionSelection | RetroSpecIndexedTokenAttentionSelection
+)
 
 
 @dataclass(frozen=True)
@@ -694,7 +696,7 @@ class RetroSpecSparseAttention:
             raise ValueError("A parallel verification step cannot be empty.")
         if num_tokens > self.max_parallel_tokens:
             raise ValueError("Parallel verification exceeds the configured capacity.")
-        self.index.prepare_parallel_plan_workspace(num_tokens)
+        self.index.prepare_indexed_plan_workspace(num_tokens)
 
         self.mode = mode
         self.step_index = -1
@@ -765,13 +767,15 @@ class RetroSpecSparseAttention:
 
         return attention_mass
 
-    def _gather_parallel_plan(self, layer_name: str) -> RetroSpecPlan:
+    def _get_indexed_selection(
+        self, layer_name: str, level: RetroSpecAttentionLevel
+    ) -> RetroSpecIndexedTokenAttentionSelection:
         request_indices = self.parallel_request_indices
         token_indices = self.parallel_token_indices
         if request_indices is None or token_indices is None:
             raise RuntimeError("No parallel verification plan is active")
-        return self.index.gather_parallel_plan(
-            layer_name, request_indices, token_indices
+        return self.index.get_indexed_selection(
+            layer_name, level, request_indices, token_indices
         )
 
     def _maybe_update_index(
@@ -1072,31 +1076,51 @@ class RetroSpecSparseAttention:
 
     def _resolve_exact_kv_source(
         self,
-        selection: RetroSpecTokenAttentionSelection,
+        selection: RetroSpecSelection,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
     ) -> tuple[RetroSpecExactKVSource, RetroSpecResolvedClusterPages | None]:
-        layer_name = selection.plan.layer_name
-        primary_token_indices = selection.plan.primary_exact_token_indices
-        primary_token_mask = selection.plan.primary_exact_token_mask
+        indexed = isinstance(selection, RetroSpecIndexedTokenAttentionSelection)
+        if indexed:
+            layer_name = selection.layer_name
+            primary_token_indices = selection.primary_exact_token_indices
+            primary_token_mask = selection.primary_exact_token_mask
+            plan_row_indices = selection.plan_row_indices
+            resolved_pages = None
+        else:
+            layer_name = selection.plan.layer_name
+            primary_token_indices = selection.plan.primary_exact_token_indices
+            primary_token_mask = selection.plan.primary_exact_token_mask
+            plan_row_indices = None
+            resolved_pages = selection.resolved_pages
+
         exact_cluster_ids = selection.exact_cluster_ids
         exact_page_ids = selection.exact_page_ids
         exact_page_token_counts = selection.exact_page_token_counts
-        resolved_pages = selection.resolved_pages
 
         if resolved_pages is None and exact_page_ids.numel():
             if exact_cluster_ids.device.type == "cuda" and self.mode in (
                 RetroSpecAttentionMode.SPARSE_VERIFY,
                 RetroSpecAttentionMode.EXPANDED_VERIFY,
             ):
-                resolved_pages = (
-                    self.index.cluster_store.resolve_verification_cluster_blocks(
-                        layer_name=layer_name,
-                        cluster_ids=exact_cluster_ids,
-                        logical_page_ids=exact_page_ids,
+                if plan_row_indices is None:
+                    resolved_pages = (
+                        self.index.cluster_store.resolve_verification_cluster_blocks(
+                            layer_name=layer_name,
+                            cluster_ids=exact_cluster_ids,
+                            logical_page_ids=exact_page_ids,
+                        )
                     )
-                )
+                else:
+                    resolved_pages = (
+                        self.index.cluster_store.resolve_verification_cluster_blocks(
+                            layer_name=layer_name,
+                            cluster_ids=exact_cluster_ids,
+                            logical_page_ids=exact_page_ids,
+                            plan_row_indices=plan_row_indices,
+                        )
+                    )
             else:
                 resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
                     layer_name=layer_name,
@@ -1134,6 +1158,7 @@ class RetroSpecSparseAttention:
             page_token_counts=exact_page_token_counts,
             resident_pages=resident_pages,
             staging_pages=staging_pages,
+            plan_row_indices=plan_row_indices,
         )
 
         return source, resolved_pages
@@ -1318,12 +1343,6 @@ class RetroSpecSparseAttention:
                     plan_slot=self.step_index,
                 )
         else:
-            if has_parallel_plan:
-                with self.performance_stats.cuda_timer("verification_plan_gather"):
-                    plan = self._gather_parallel_plan(layer_name)
-            else:
-                plan = self.index.get_selection_plan(layer_name, self.step_index)
-
             if self.mode == RetroSpecAttentionMode.SPARSE_VERIFY:
                 level = RetroSpecAttentionLevel.SPARSE
             elif self.mode == RetroSpecAttentionMode.EXPANDED_VERIFY:
@@ -1331,10 +1350,24 @@ class RetroSpecSparseAttention:
             else:
                 raise RuntimeError(f"Unexpected RetroSpec attention mode: {self.mode}")
 
-            with self.performance_stats.cuda_timer("verification_plan_materialize"):
-                selection = self.index.materialize(
-                    plan, level, key_cache, value_cache, attn_metadata.block_table
-                )
+            if has_parallel_plan:
+                with self.performance_stats.cuda_timer("verification_plan_index"):
+                    selection = self._get_indexed_selection(layer_name, level)
+                if query.device.type != "cuda" or query.dtype not in (
+                    torch.float16,
+                    torch.bfloat16,
+                ):
+                    selection = self.index.materialize_indexed_reference(selection)
+            else:
+                plan = self.index.get_selection_plan(layer_name, self.step_index)
+                with self.performance_stats.cuda_timer("verification_plan_materialize"):
+                    selection = self.index.materialize(
+                        plan,
+                        level,
+                        key_cache,
+                        value_cache,
+                        attn_metadata.block_table,
+                    )
 
         exact_output, exact_lse = self._run_exact_attention(
             impl,
@@ -1372,6 +1405,13 @@ class RetroSpecSparseAttention:
                     exact_output=exact_output,
                     exact_lse=exact_lse,
                     scale=impl.scale,
+                    plan_row_indices=(
+                        selection.plan_row_indices
+                        if isinstance(
+                            selection, RetroSpecIndexedTokenAttentionSelection
+                        )
+                        else None
+                    ),
                 )
             else:
                 estimation_output, estimation_lse = self._run_estimation_attention(
@@ -1388,7 +1428,14 @@ class RetroSpecSparseAttention:
                     estimation_lse,
                 )
 
-        self.attention_mass_sum[: self.batch_size].add_(selection.attention_mass)
+        if isinstance(selection, RetroSpecIndexedTokenAttentionSelection):
+            add_indexed_values(
+                self.attention_mass_sum[: self.batch_size],
+                selection.attention_mass,
+                selection.plan_row_indices,
+            )
+        else:
+            self.attention_mass_sum[: self.batch_size].add_(selection.attention_mass)
         self.attention_mass_layer_count += 1
 
         if self.mode == RetroSpecAttentionMode.DRAFT:

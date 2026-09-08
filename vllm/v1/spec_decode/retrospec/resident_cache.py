@@ -1032,22 +1032,30 @@ class RetroSpecResidentClusterCache:
         miss_cluster_mask: torch.Tensor,
         hit_gate_ready_mask: torch.Tensor,
         access_kinds: torch.Tensor,
+        plan_row_indices: torch.Tensor | None = None,
     ) -> RetroSpecResidentPageAccess:
         """Resolve handles without synchronizing or parsing on the CPU."""
         if cluster_ids.device != self.device or page_ids.device != self.device:
             raise ValueError("GPU resident lookup tensors must use the cache device")
         if page_ids.shape[:-1] != cluster_ids.shape:
             raise ValueError("Cluster IDs and logical pages do not match")
-        if cache_page_ids.shape != page_ids.shape:
-            raise ValueError("Resident page output does not match logical pages")
-        if hit_cluster_mask.shape != cluster_ids.shape:
-            raise ValueError("Resident hit output does not match cluster IDs")
-        if miss_cluster_mask.shape != cluster_ids.shape:
-            raise ValueError("Resident miss output does not match cluster IDs")
-        if hit_gate_ready_mask.shape != cluster_ids.shape:
-            raise ValueError("Resident gate output does not match cluster IDs")
-        if access_kinds.shape != cluster_ids.shape:
-            raise ValueError("Resident access output does not match cluster IDs")
+        output_batch = (
+            cluster_ids.shape[0]
+            if plan_row_indices is None
+            else plan_row_indices.shape[0]
+        )
+        output_cluster_shape = (output_batch, *cluster_ids.shape[1:])
+        output_page_shape = (*output_cluster_shape, page_ids.shape[-1])
+        if cache_page_ids.shape != output_page_shape:
+            raise ValueError("Resident page output has the wrong indexed shape")
+        for output in (
+            hit_cluster_mask,
+            miss_cluster_mask,
+            hit_gate_ready_mask,
+            access_kinds,
+        ):
+            if output.shape != output_cluster_shape:
+                raise ValueError("Resident lookup output has the wrong indexed shape")
 
         self._gpu_access_lock.acquire()
         try:
@@ -1066,6 +1074,7 @@ class RetroSpecResidentClusterCache:
                 output_miss_mask=miss_cluster_mask,
                 output_hit_gate_ready=hit_gate_ready_mask,
                 output_access_kinds=access_kinds,
+                plan_row_indices=plan_row_indices,
             )
         except BaseException:
             self._gpu_access_lock.release()

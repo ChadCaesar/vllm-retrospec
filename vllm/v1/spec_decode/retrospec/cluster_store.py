@@ -4147,14 +4147,22 @@ class RetroSpecClusterPageStore:
         layer_name: str,
         cluster_ids: torch.Tensor,
         logical_page_ids: torch.Tensor,
+        plan_row_indices: torch.Tensor | None = None,
     ) -> RetroSpecResolvedClusterPages:
-        """Resolve verification pages with GPU hits and compact CPU misses."""
+        """Resolve verification pages from direct or indexed plan metadata."""
         if cluster_ids.device.type != "cuda":
             raise ValueError("GPU verification lookup requires CUDA")
         if logical_page_ids.shape[:-1] != cluster_ids.shape:
             raise ValueError("Logical pages do not match verification cluster IDs")
         if logical_page_ids.device != cluster_ids.device:
             raise ValueError("Verification handles and pages must use one device")
+        if plan_row_indices is not None:
+            if plan_row_indices.ndim != 1:
+                raise ValueError("plan_row_indices must be one-dimensional")
+            if plan_row_indices.dtype not in (torch.int32, torch.int64):
+                raise ValueError("plan_row_indices must be integral")
+            if plan_row_indices.device != cluster_ids.device:
+                raise ValueError("Indexed plan rows must use the lookup device")
 
         self.wait_for_resident_prefetches((layer_name,))
         with self._resident_state_lock:
@@ -4163,11 +4171,26 @@ class RetroSpecClusterPageStore:
         current_stream = torch.cuda.current_stream(cluster_ids.device)
         resident_cache.wait_for_pending_copies(current_stream)
 
-        resident_page_ids = torch.empty_like(logical_page_ids)
-        hit_cluster_mask = torch.empty_like(cluster_ids, dtype=torch.bool)
-        miss_cluster_mask = torch.empty_like(cluster_ids, dtype=torch.bool)
-        hit_gate_ready_mask = torch.empty_like(cluster_ids, dtype=torch.bool)
-        access_kinds = torch.empty_like(cluster_ids, dtype=torch.uint8)
+        num_queries = (
+            cluster_ids.shape[0]
+            if plan_row_indices is None
+            else plan_row_indices.shape[0]
+        )
+        cluster_shape = torch.Size((num_queries, *cluster_ids.shape[1:]))
+        page_shape = torch.Size((*cluster_shape, logical_page_ids.shape[-1]))
+        resident_page_ids = torch.empty(
+            page_shape,
+            dtype=logical_page_ids.dtype,
+            device=logical_page_ids.device,
+        )
+        hit_cluster_mask = torch.empty(
+            cluster_shape, dtype=torch.bool, device=cluster_ids.device
+        )
+        miss_cluster_mask = torch.empty_like(hit_cluster_mask)
+        hit_gate_ready_mask = torch.empty_like(hit_cluster_mask)
+        access_kinds = torch.empty(
+            cluster_shape, dtype=torch.uint8, device=cluster_ids.device
+        )
         resident_lookup_timer = (
             None
             if self.performance_stats is None
@@ -4184,6 +4207,7 @@ class RetroSpecClusterPageStore:
             miss_cluster_mask=miss_cluster_mask,
             hit_gate_ready_mask=hit_gate_ready_mask,
             access_kinds=access_kinds,
+            plan_row_indices=plan_row_indices,
         )
         if self.performance_stats is not None:
             self.performance_stats.stop_cuda_timer(
@@ -4192,8 +4216,9 @@ class RetroSpecClusterPageStore:
 
         slot: _PinnedVerificationMissSlot | None = None
         try:
+            cluster_capacity = miss_cluster_mask.numel()
             slot, arena = self._acquire_verification_resolve_workspace(
-                cluster_ids.device, cluster_ids.numel()
+                cluster_ids.device, cluster_capacity
             )
             if (
                 arena.cluster_ids is None
@@ -4217,12 +4242,13 @@ class RetroSpecClusterPageStore:
                 output_handles=arena.cluster_ids,
                 output_positions=arena.positions,
                 output_count=arena.miss_count,
+                plan_row_indices=plan_row_indices,
             )
             if self.performance_stats is not None:
                 self.performance_stats.stop_cuda_timer(lookup_timer, current_stream)
-                valid_clusters = cluster_ids >= 0
                 self.performance_stats.add_gpu_counter(
-                    "verification_lookup_clusters", valid_clusters
+                    "verification_lookup_clusters",
+                    access.hit_cluster_mask | access.miss_cluster_mask,
                 )
                 self.performance_stats.add_gpu_counter(
                     "verification_resident_hits", access.hit_cluster_mask
@@ -4241,7 +4267,7 @@ class RetroSpecClusterPageStore:
             lookup_ready_event = torch.cuda.Event()
             lookup_ready_event.record(current_stream)
             metadata_stream = self._get_verification_metadata_stream(cluster_ids.device)
-            record_capacity = cluster_ids.numel()
+            record_capacity = cluster_capacity
             with torch.cuda.stream(metadata_stream):
                 metadata_stream.wait_event(lookup_ready_event)
                 slot.cluster_id_storage[:record_capacity].copy_(
@@ -4269,7 +4295,7 @@ class RetroSpecClusterPageStore:
                 )
 
             num_misses = int(slot.miss_count_storage.item())
-            if num_misses < 0 or num_misses > cluster_ids.numel():
+            if num_misses < 0 or num_misses > cluster_capacity:
                 raise RuntimeError("GPU verification miss count is out of bounds")
             if self.performance_stats is not None:
                 metadata_bytes = (
@@ -4284,7 +4310,12 @@ class RetroSpecClusterPageStore:
                     "verification_miss_metadata_d2h_bytes", metadata_bytes
                 )
 
-            staging_page_ids = torch.full_like(logical_page_ids, -1)
+            staging_page_ids = torch.full(
+                page_shape,
+                -1,
+                dtype=logical_page_ids.dtype,
+                device=logical_page_ids.device,
+            )
             if num_misses == 0:
                 self._release_verification_miss_slot(slot, None)
                 slot = None
@@ -4316,7 +4347,7 @@ class RetroSpecClusterPageStore:
                 unique_page_ids_cpu,
             ) = self._build_verification_miss_metadata(
                 layer_name=layer_name,
-                cluster_shape=cluster_ids.shape,
+                cluster_shape=cluster_shape,
                 max_pages=logical_page_ids.shape[-1],
                 slot=slot,
                 num_misses=num_misses,

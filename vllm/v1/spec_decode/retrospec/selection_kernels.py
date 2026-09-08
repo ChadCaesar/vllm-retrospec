@@ -7,6 +7,56 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
+def _add_indexed_values_kernel(
+    destination,
+    source,
+    row_indices,
+    num_rows,
+    destination_stride,
+    source_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = offsets < num_rows
+    source_rows = tl.load(row_indices + offsets, mask=valid, other=0)
+    values = tl.load(source + source_rows * source_stride, mask=valid, other=0.0)
+    current = tl.load(destination + offsets * destination_stride, mask=valid, other=0.0)
+    tl.store(destination + offsets * destination_stride, current + values, mask=valid)
+
+
+def add_indexed_values(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    row_indices: torch.Tensor,
+) -> None:
+    if destination.device.type != "cuda":
+        raise ValueError("Indexed accumulation requires CUDA tensors")
+    if destination.ndim != 1 or source.ndim != 1 or row_indices.ndim != 1:
+        raise ValueError("Indexed accumulation expects one-dimensional tensors")
+    if destination.shape != row_indices.shape:
+        raise ValueError("Destination and indexed rows must have equal shapes")
+    if row_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Indexed rows must be integral")
+    if destination.dtype != source.dtype:
+        raise ValueError("Indexed accumulation dtypes must match")
+    if any(tensor.device != destination.device for tensor in (source, row_indices)):
+        raise ValueError("Indexed accumulation tensors must use one device")
+    if destination.numel() == 0:
+        return
+
+    block_size = 256
+    _add_indexed_values_kernel[(triton.cdiv(destination.numel(), block_size),)](
+        destination,
+        source,
+        row_indices,
+        destination.numel(),
+        destination.stride(0),
+        source.stride(0),
+        BLOCK_SIZE=block_size,
+    )
+
+
+@triton.jit
 def _gather_resident_estimation_kernel(
     cluster_keys,
     cluster_values,

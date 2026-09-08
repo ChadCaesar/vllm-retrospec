@@ -32,6 +32,7 @@ from vllm.v1.spec_decode.retrospec.execution import (
 from vllm.v1.spec_decode.retrospec.index import RetroSpecAttentionLevel
 from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecFullVerificationPlan,
+    RetroSpecIndexedTokenAttentionSelection,
     RetroSpecSegmentedTokenIndex,
     RetroSpecTokenAttentionSelection,
     RetroSpecTokenSelectionPlan,
@@ -1599,7 +1600,7 @@ def test_draft_end_step_submits_one_cross_layer_prefetch_wave():
     assert not controller._resident_prefetch_wave
 
 
-def test_parallel_verification_gathers_segmented_token_plan_rows():
+def test_parallel_verification_indexes_persistent_token_plan_rows():
     controller = make_controller()
     mark_installed(controller)
     step_zero = replace(
@@ -1684,26 +1685,47 @@ def test_parallel_verification_gathers_segmented_token_plan_rows():
             token_indices=torch.tensor([0, 1, 1], dtype=torch.int64),
         )
 
-        plan = controller._gather_parallel_plan("layer")
-        assert isinstance(plan, RetroSpecTokenSelectionPlan)
-        expected_rows = ((step_zero, 1), (step_one, 0), (step_one, 1))
-        for field_name in _TOKEN_PLAN_TENSOR_FIELDS:
-            expected = torch.stack(
-                [getattr(source, field_name)[row] for source, row in expected_rows]
-            )
-            torch.testing.assert_close(getattr(plan, field_name), expected)
-        other_plan = controller._gather_parallel_plan("other")
-        assert other_plan.sparse_exact_page_ids.shape == (3, 1, 1, 3)
-        assert other_plan.expanded_exact_page_ids.shape == (3, 1, 2, 3)
-        assert other_plan.sparse_exact_page_ids.tolist() == [
-            [[[153, 154, 155]]],
-            [[[150, 151, 152]]],
-            [[[153, 154, 155]]],
-        ]
-        first_data_ptrs = tuple(
-            getattr(plan, field_name).data_ptr()
-            for field_name in _TOKEN_PLAN_TENSOR_FIELDS
+        selection = controller._get_indexed_selection(
+            "layer", RetroSpecAttentionLevel.EXPANDED
         )
+        assert isinstance(selection, RetroSpecIndexedTokenAttentionSelection)
+        assert selection.plan_row_indices.tolist() == [1, 2, 3]
+
+        table = controller.index._selection_plan_tables["layer"]
+        indexed_fields = {
+            "primary_exact_token_indices": table.primary_exact_token_indices,
+            "primary_exact_token_mask": table.primary_exact_token_mask,
+            "exact_cluster_ids": table.expanded_exact_cluster_ids,
+            "exact_page_ids": table.expanded_exact_page_ids,
+            "exact_page_token_counts": table.expanded_exact_page_token_counts,
+            "estimation_keys": table.expanded_estimation_keys,
+            "estimation_values": table.expanded_estimation_values,
+            "estimation_token_counts": table.expanded_estimation_token_counts,
+            "attention_mass": table.expanded_attn,
+        }
+        for field_name, source in indexed_fields.items():
+            actual = getattr(selection, field_name)
+            assert (
+                actual.untyped_storage().data_ptr()
+                == source.untyped_storage().data_ptr()
+            )
+            expected = source.flatten(0, 1).index_select(0, selection.plan_row_indices)
+            torch.testing.assert_close(
+                actual.index_select(0, selection.plan_row_indices), expected
+            )
+
+        other_selection = controller._get_indexed_selection(
+            "other", RetroSpecAttentionLevel.EXPANDED
+        )
+        assert other_selection.exact_page_ids.shape == (4, 1, 2, 3)
+        assert other_selection.exact_page_ids.index_select(
+            0, other_selection.plan_row_indices
+        ).tolist() == [
+            [[[176, 177, 178], [179, 180, 181]]],
+            [[[170, 171, 172], [173, 174, 175]]],
+            [[[176, 177, 178], [179, 180, 181]]],
+        ]
+        first_row_pointer = selection.plan_row_indices.data_ptr()
 
         controller.attention_mass_layer_count = 1
         controller.end_step()
@@ -1713,13 +1735,14 @@ def test_parallel_verification_gathers_segmented_token_plan_rows():
             request_indices=torch.tensor([0, 1], dtype=torch.int64),
             token_indices=torch.tensor([1, 0], dtype=torch.int64),
         )
-        reused = controller._gather_parallel_plan("layer")
-        reused_data_ptrs = tuple(
-            getattr(reused, field_name).data_ptr()
-            for field_name in _TOKEN_PLAN_TENSOR_FIELDS
+        reused = controller._get_indexed_selection(
+            "layer", RetroSpecAttentionLevel.SPARSE
         )
-        assert reused_data_ptrs == first_data_ptrs
-        assert reused.primary_exact_token_indices.tolist() == [
+        assert reused.plan_row_indices.data_ptr() == first_row_pointer
+        assert reused.plan_row_indices.tolist() == [2, 1]
+        assert reused.primary_exact_token_indices.index_select(
+            0, reused.plan_row_indices
+        ).tolist() == [
             [[4, 5]],
             [[2, 3]],
         ]
@@ -1744,7 +1767,7 @@ def test_parallel_verification_rejects_missing_token_plan():
         )
 
         with pytest.raises(RuntimeError, match="selection plan is missing"):
-            controller._gather_parallel_plan("layer")
+            controller._get_indexed_selection("layer", RetroSpecAttentionLevel.SPARSE)
 
 
 def test_end_step_requires_completed_attention_layer():

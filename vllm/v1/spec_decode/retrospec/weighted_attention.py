@@ -10,6 +10,7 @@ from vllm.triton_utils import tl, triton
 def _merge_weighted_estimation_kernel(
     output,
     query,
+    plan_row_indices,
     estimation_keys,
     estimation_values,
     estimation_token_counts,
@@ -39,6 +40,7 @@ def _merge_weighted_estimation_kernel(
     exact_output_stride_2,
     exact_lse_stride_0,
     exact_lse_stride_1,
+    USE_PLAN_ROWS: tl.constexpr,
     QUERIES_PER_KV: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -46,6 +48,9 @@ def _merge_weighted_estimation_kernel(
 ):
     batch_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
+    estimation_row_idx = batch_idx
+    if USE_PLAN_ROWS:
+        estimation_row_idx = tl.load(plan_row_indices + batch_idx)
 
     kv_head_idx = query_head_idx // QUERIES_PER_KV
 
@@ -104,7 +109,7 @@ def _merge_weighted_estimation_kernel(
         vector_mask = vector_offsets < num_estimation_vectors
 
         count_offsets = (
-            batch_idx * count_stride_0
+            estimation_row_idx * count_stride_0
             + kv_head_idx * count_stride_1
             + vector_offsets * count_stride_2
         )
@@ -117,7 +122,7 @@ def _merge_weighted_estimation_kernel(
         valid_vectors = vector_mask & (token_counts > 0)
 
         key_offsets = (
-            batch_idx * key_stride_0
+            estimation_row_idx * key_stride_0
             + kv_head_idx * key_stride_1
             + vector_offsets[:, None] * key_stride_2
             + head_offsets[None, :] * key_stride_3
@@ -160,7 +165,7 @@ def _merge_weighted_estimation_kernel(
         )
 
         value_offsets = (
-            batch_idx * value_stride_0
+            estimation_row_idx * value_stride_0
             + kv_head_idx * value_stride_1
             + vector_offsets[:, None] * value_stride_2
             + head_offsets[None, :] * value_stride_3
@@ -209,6 +214,7 @@ def merge_weighted_estimation(
     exact_output: torch.Tensor,
     exact_lse: torch.Tensor,
     scale: float,
+    plan_row_indices: torch.Tensor | None = None,
 ) -> None:
     """Merge weighted centroid attention into an exact attention state.
 
@@ -244,8 +250,15 @@ def merge_weighted_estimation(
     batch_size, num_query_heads, head_size = query.shape
     key_batch_size, num_kv_heads, num_vectors, key_head_size = estimation_keys.shape
 
-    if key_batch_size != batch_size:
+    if plan_row_indices is None and key_batch_size != batch_size:
         raise ValueError("Estimation KV batch size does not match query")
+    if plan_row_indices is not None:
+        if plan_row_indices.shape != (batch_size,):
+            raise ValueError("Plan rows must contain one entry per query")
+        if plan_row_indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Plan rows must be integral")
+        if plan_row_indices.device != query.device:
+            raise ValueError("Plan rows must be on the query device")
     if key_head_size != head_size:
         raise ValueError("Estimation KV head size does not match query")
     if num_kv_heads <= 0:
@@ -257,14 +270,16 @@ def merge_weighted_estimation(
     if exact_lse.shape != (num_query_heads, batch_size):
         raise ValueError("Exact LSE must have shape [num_query_heads, batch]")
 
-    tensors = (
+    tensors = [
         output,
         estimation_keys,
         estimation_values,
         estimation_token_counts,
         exact_output,
         exact_lse,
-    )
+    ]
+    if plan_row_indices is not None:
+        tensors.append(plan_row_indices)
     if any(tensor.device != query.device for tensor in tensors):
         raise ValueError("All weighted attention tensors must be on one device")
     if output.dtype != query.dtype or exact_output.dtype != query.dtype:
@@ -302,6 +317,7 @@ def merge_weighted_estimation(
     _merge_weighted_estimation_kernel[(batch_size, num_query_heads)](
         output,
         query,
+        estimation_keys if plan_row_indices is None else plan_row_indices,
         estimation_keys,
         estimation_values,
         estimation_token_counts,
@@ -331,6 +347,7 @@ def merge_weighted_estimation(
         exact_output.stride(2),
         exact_lse.stride(0),
         exact_lse.stride(1),
+        USE_PLAN_ROWS=plan_row_indices is not None,
         QUERIES_PER_KV=queries_per_kv,
         HEAD_SIZE=head_size,
         BLOCK_M=block_m,

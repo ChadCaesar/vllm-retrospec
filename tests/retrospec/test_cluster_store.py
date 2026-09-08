@@ -1513,6 +1513,60 @@ def test_gpu_verification_resolution_all_hit_skips_staging_and_admission():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
+    reason="CUDA is required for indexed verification resolution",
+)
+def test_gpu_verification_resolution_indexes_persistent_plan_rows():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(page_size=2, pin_memory=True, cache_ratio=1.0)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    cluster_ids, metadata = get_runtime_blocks(store, table, device)
+    store.admit_resident_clusters(
+        "layer", cluster_ids.unsqueeze(0), metadata.page_ids.unsqueeze(0)
+    )
+
+    table_cluster_ids = torch.stack(
+        (cluster_ids, cluster_ids.flip(-1), torch.full_like(cluster_ids, -1))
+    )
+    table_page_ids = torch.stack(
+        (
+            metadata.page_ids,
+            metadata.page_ids.flip(-2),
+            torch.full_like(metadata.page_ids, -1),
+        )
+    )
+    plan_rows = torch.tensor([1, 0, 1], dtype=torch.int64, device=device)
+    indexed = store.resolve_verification_cluster_blocks(
+        "layer", table_cluster_ids, table_page_ids, plan_rows
+    )
+    if indexed.read_lease is not None:
+        indexed.read_lease.release()
+
+    gathered = store.resolve_verification_cluster_blocks(
+        "layer",
+        table_cluster_ids.index_select(0, plan_rows),
+        table_page_ids.index_select(0, plan_rows),
+    )
+
+    torch.testing.assert_close(indexed.resident_page_ids, gathered.resident_page_ids)
+    torch.testing.assert_close(indexed.hit_cluster_mask, gathered.hit_cluster_mask)
+    torch.testing.assert_close(indexed.miss_cluster_mask, gathered.miss_cluster_mask)
+    assert indexed.miss_admission is None
+    assert gathered.miss_admission is None
+    if gathered.read_lease is not None:
+        gathered.read_lease.release()
+    store.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
     reason="CUDA is required to resolve cluster pages",
 )
 def test_cpu_backing_store_resident_only_resolution_does_not_admit_misses():
