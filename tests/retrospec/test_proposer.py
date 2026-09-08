@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import Mock, patch
@@ -12,7 +13,9 @@ import torch
 from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.retrospec import (
     RetroSpecAttentionMode,
     RetroSpecProposer,
@@ -80,9 +83,24 @@ def make_common_metadata(seq_lens: list[int]) -> CommonAttentionMetadata:
 
 
 def make_sampling_metadata(*, all_greedy: bool) -> SamplingMetadata:
-    return cast(
-        SamplingMetadata,
-        SimpleNamespace(all_greedy=all_greedy),
+    max_batch_size = 8
+    return SamplingMetadata(
+        temperature=None if all_greedy else torch.ones(max_batch_size),
+        all_greedy=all_greedy,
+        all_random=not all_greedy,
+        top_p=None,
+        top_k=None,
+        generators={},
+        max_num_logprobs=None,
+        no_penalties=True,
+        prompt_token_ids=None,
+        frequency_penalties=torch.zeros(max_batch_size),
+        presence_penalties=torch.zeros(max_batch_size),
+        repetition_penalties=torch.ones(max_batch_size),
+        output_token_ids=[],
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=LogitsProcessors(),
     )
 
 
@@ -790,6 +808,160 @@ def test_verification_compaction_reuses_fixed_output(device):
         ),
     ],
 )
+def test_parallel_sampling_uses_one_raw_argmax_for_plain_greedy(device):
+    sampler = Mock()
+    proposer = RetroSpecProposer(
+        make_vllm_config(), device, make_runner(sampler=sampler)
+    )
+    logits = torch.tensor(
+        [[4.0, 4.0, 1.0], [3.0, 2.0, 1.0], [0.0, 1.0, 5.0]], device=device
+    )
+    metadata = make_sampling_metadata(all_greedy=True)
+    reference = Sampler()(
+        logits=logits.clone(), sampling_metadata=metadata
+    ).sampled_token_ids.view(-1)
+
+    sampled = proposer._sample_parallel_logits(
+        batch_size=2,
+        logits=logits,
+        request_indices=torch.tensor([1, 0, 1], dtype=torch.int64, device=device),
+        token_indices=torch.tensor([0, 1, 1], dtype=torch.int64, device=device),
+        sampling_metadata=metadata,
+        output=proposer._sparse_sampled_token_ids,
+    )
+
+    torch.testing.assert_close(sampled, reference)
+    assert sampled.data_ptr() == proposer._sparse_sampled_token_ids.data_ptr()
+    assert proposer._verification_step_logits is None
+    sampler.assert_not_called()
+
+
+def test_parallel_sampling_builds_pair_metadata_once_for_indexable_constraints(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "vllm.v1.sample.ops.penalties.is_pin_memory_available", lambda: False
+    )
+    captured_metadata: list[SamplingMetadata] = []
+    sampler = Sampler()
+    sampler.pin_memory = False
+
+    def sample(*, logits, sampling_metadata):
+        captured_metadata.append(sampling_metadata)
+        return sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+    proposer = RetroSpecProposer(
+        make_vllm_config(), torch.device("cpu"), make_runner(sampler=sample)
+    )
+    allowed_mask = torch.tensor(
+        [
+            [False, True, False, False],
+            [False, False, True, False],
+            [True, False, False, False],
+        ]
+    )
+    metadata = replace(
+        make_sampling_metadata(all_greedy=True),
+        no_penalties=False,
+        prompt_token_ids=torch.tensor([[1, 2], [3, 0], [1, 3]]),
+        frequency_penalties=torch.tensor([0.1, 0.2, 0.3]),
+        presence_penalties=torch.tensor([0.4, 0.5, 0.6]),
+        repetition_penalties=torch.tensor([1.1, 1.2, 1.3]),
+        output_token_ids=[[1], [2], [3]],
+        allowed_token_ids_mask=allowed_mask,
+        bad_words_token_ids={0: [[1]], 2: [[2]]},
+    )
+    request_indices = torch.tensor([2, 0, 2], dtype=torch.int64)
+    token_indices = torch.tensor([0, 1, 1], dtype=torch.int64)
+    logits = torch.tensor(
+        [[0.0, 1.0, 3.0, 2.0], [4.0, 1.0, 0.0, 2.0], [0.0, 5.0, 1.0, 2.0]]
+    )
+    reference_sampler = Sampler()
+    reference_sampler.pin_memory = False
+    reference_proposer = RetroSpecProposer(
+        make_vllm_config(),
+        torch.device("cpu"),
+        make_runner(sampler=reference_sampler),
+    )
+    reference_output = reference_proposer._sparse_sampled_token_ids[: logits.shape[0]]
+    sampler_calls = reference_proposer._sample_parallel_logits_by_position(
+        batch_size=3,
+        logits=logits.clone(),
+        request_indices=request_indices,
+        token_indices=token_indices,
+        sampling_metadata=metadata,
+        sampled_token_ids=reference_output,
+    )
+
+    sampled = proposer._sample_parallel_logits(
+        batch_size=3,
+        logits=logits.clone(),
+        request_indices=request_indices,
+        token_indices=token_indices,
+        sampling_metadata=metadata,
+        output=proposer._sparse_sampled_token_ids,
+    )
+
+    assert sampler_calls == 2
+    torch.testing.assert_close(sampled, reference_output)
+    assert len(captured_metadata) == 1
+    pair_metadata = captured_metadata[0]
+    assert pair_metadata.max_num_logprobs is None
+    assert pair_metadata.output_token_ids == [[3], [1], [3]]
+    assert pair_metadata.bad_words_token_ids == {
+        0: [[2]],
+        1: [[1]],
+        2: [[2]],
+    }
+    assert pair_metadata.prompt_token_ids.tolist() == [[1, 3], [1, 2], [1, 3]]
+    assert pair_metadata.frequency_penalties.tolist() == pytest.approx([0.3, 0.1, 0.3])
+    assert pair_metadata.presence_penalties.tolist() == pytest.approx([0.6, 0.4, 0.6])
+    assert pair_metadata.repetition_penalties.tolist() == pytest.approx([1.3, 1.1, 1.3])
+    assert torch.equal(pair_metadata.allowed_token_ids_mask, allowed_mask[[2, 0, 2]])
+
+
+def test_parallel_sampling_retains_position_fallback_for_indexed_processors():
+    sampling_calls: list[torch.Tensor] = []
+
+    def sample(*, logits, sampling_metadata):
+        sampling_calls.append(logits.clone())
+        return SimpleNamespace(sampled_token_ids=logits.argmax(dim=-1, keepdim=True))
+
+    processors = LogitsProcessors()
+    processors.non_argmax_invariant.append(Mock())
+    metadata = replace(make_sampling_metadata(all_greedy=True), logitsprocs=processors)
+    proposer = RetroSpecProposer(
+        make_vllm_config(), torch.device("cpu"), make_runner(sampler=sample)
+    )
+    logits = torch.tensor([[0.0, 4.0, 1.0], [3.0, 2.0, 1.0], [0.0, 1.0, 5.0]])
+
+    sampled = proposer._sample_parallel_logits(
+        batch_size=2,
+        logits=logits,
+        request_indices=torch.tensor([1, 0, 1], dtype=torch.int64),
+        token_indices=torch.tensor([0, 1, 1], dtype=torch.int64),
+        sampling_metadata=metadata,
+        output=proposer._sparse_sampled_token_ids,
+    )
+
+    assert sampled.tolist() == [1, 0, 2]
+    assert len(sampling_calls) == 2
+    assert all(call.shape == (2, 3) for call in sampling_calls)
+    assert proposer._verification_step_logits is not None
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        torch.device("cpu"),
+        pytest.param(
+            torch.device("cuda"),
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is required"
+            ),
+        ),
+    ],
+)
 def test_first_verification_boundary_reduces_by_request(device):
     proposer = RetroSpecProposer(make_vllm_config(), device, make_runner())
     request_indices = torch.tensor([0, 0, 1, 1, 1, 2], dtype=torch.int64, device=device)
@@ -1433,7 +1605,7 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     assert (result.margin is not None) is expect_margin
     if result.margin is not None:
         assert result.margin.tolist() == [1.0, 2.0, 3.0]
-    assert len(sampling_calls) == 2
+    assert len(sampling_calls) == 0
     proposer.sparse_attention.begin_parallel_step.assert_called_once()
     begin_args = proposer.sparse_attention.begin_parallel_step.call_args.args
     assert begin_args[0] == attention_mode

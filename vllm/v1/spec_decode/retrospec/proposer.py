@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import perf_counter
 from typing import TYPE_CHECKING
 
@@ -206,6 +206,11 @@ class RetroSpecProposer:
         self._expanded_sampled_token_ids = torch.empty(
             self.max_batch_size, dtype=torch.int32, device=device
         )
+        self._verification_argmax_token_ids = torch.empty(
+            self.max_parallel_tokens, dtype=torch.int64, device=device
+        )
+        # Allocated only when row-indexed logits processors force the legacy
+        # per-position compatibility path.
         self._verification_step_logits: torch.Tensor | None = None
 
         self.backup_next_token_ids = CpuGpuBuffer(
@@ -764,21 +769,96 @@ class RetroSpecProposer:
             self._verification_step_logits = workspace
         return workspace[:batch_size]
 
-    def _sample_parallel_logits(
+    @staticmethod
+    def _can_use_raw_greedy_verification_sampling(
+        sampling_metadata: SamplingMetadata,
+    ) -> bool:
+        return (
+            sampling_metadata.all_greedy
+            and sampling_metadata.no_penalties
+            and sampling_metadata.allowed_token_ids_mask is None
+            and not sampling_metadata.bad_words_token_ids
+            and not sampling_metadata.logitsprocs.non_argmax_invariant
+        )
+
+    @staticmethod
+    def _build_parallel_sampling_metadata(
+        sampling_metadata: SamplingMetadata,
+        request_indices: torch.Tensor,
+    ) -> SamplingMetadata:
+        """Expand request-row sampling state to verification-pair rows."""
+        if not sampling_metadata.all_greedy:
+            raise ValueError("RetroSpec parallel sampling requires greedy requests")
+        if sampling_metadata.logitsprocs.non_argmax_invariant:
+            raise ValueError(
+                "Row-indexed logits processors require position-wise sampling"
+            )
+
+        def select_rows(tensor: torch.Tensor | None) -> torch.Tensor | None:
+            if tensor is None:
+                return None
+            return tensor.index_select(0, request_indices)
+
+        needs_output_history = not sampling_metadata.no_penalties or bool(
+            sampling_metadata.bad_words_token_ids
+        )
+        if needs_output_history:
+            request_rows = request_indices.detach().cpu().tolist()
+            output_token_ids = [
+                sampling_metadata.output_token_ids[request_index]
+                for request_index in request_rows
+            ]
+            bad_words_token_ids = {
+                pair_index: bad_words
+                for pair_index, request_index in enumerate(request_rows)
+                if (
+                    bad_words := sampling_metadata.bad_words_token_ids.get(
+                        request_index
+                    )
+                )
+            }
+        else:
+            output_token_ids = []
+            bad_words_token_ids = {}
+
+        return replace(
+            sampling_metadata,
+            temperature=None,
+            all_greedy=True,
+            all_random=False,
+            top_p=None,
+            top_k=None,
+            generators={},
+            max_num_logprobs=None,
+            prompt_token_ids=select_rows(sampling_metadata.prompt_token_ids),
+            frequency_penalties=sampling_metadata.frequency_penalties.index_select(
+                0, request_indices
+            ),
+            presence_penalties=sampling_metadata.presence_penalties.index_select(
+                0, request_indices
+            ),
+            repetition_penalties=sampling_metadata.repetition_penalties.index_select(
+                0, request_indices
+            ),
+            output_token_ids=output_token_ids,
+            allowed_token_ids_mask=select_rows(
+                sampling_metadata.allowed_token_ids_mask
+            ),
+            bad_words_token_ids=bad_words_token_ids,
+            spec_token_ids=None,
+        )
+
+    def _sample_parallel_logits_by_position(
         self,
         batch_size: int,
         logits: torch.Tensor,
         request_indices: torch.Tensor,
         token_indices: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        if output.shape[0] < logits.shape[0]:
-            raise ValueError("Sample output exceeds its verification workspace")
-
-        sampled_token_ids = output[: logits.shape[0]]
-        sampled_token_ids.fill_(-1)
-
+        sampled_token_ids: torch.Tensor,
+    ) -> int:
+        """Sample with processors whose state is keyed by original batch row."""
+        sampler_calls = 0
         for token_index in range(self.num_speculative_tokens):
             token_mask = self._verification_pair_mask[: token_indices.shape[0]]
             torch.eq(token_indices, token_index, out=token_mask)
@@ -803,7 +883,65 @@ class RetroSpecProposer:
             sampled_token_ids.index_copy_(
                 0, flat_indices, step_token_ids.index_select(0, request_rows)
             )
+            sampler_calls += 1
+        return sampler_calls
 
+    def _sample_parallel_logits(
+        self,
+        batch_size: int,
+        logits: torch.Tensor,
+        request_indices: torch.Tensor,
+        token_indices: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        if output.shape[0] < logits.shape[0]:
+            raise ValueError("Sample output exceeds its verification workspace")
+        if not sampling_metadata.all_greedy:
+            raise ValueError("RetroSpec parallel sampling requires greedy requests")
+
+        num_tokens = logits.shape[0]
+        sampled_token_ids = output[:num_tokens]
+
+        if self._can_use_raw_greedy_verification_sampling(sampling_metadata):
+            argmax_token_ids = self._verification_argmax_token_ids[:num_tokens]
+            torch.argmax(logits, dim=-1, out=argmax_token_ids)
+            sampled_token_ids.copy_(argmax_token_ids)
+            self.performance_stats.add_counter(
+                "verification_sampling_argmax_tokens", num_tokens
+            )
+            self.performance_stats.add_counter("verification_sampling_launches")
+            return sampled_token_ids
+
+        if not sampling_metadata.logitsprocs.non_argmax_invariant:
+            pair_metadata = self._build_parallel_sampling_metadata(
+                sampling_metadata, request_indices
+            )
+            sampler_output = self.runner.sampler(
+                logits=logits, sampling_metadata=pair_metadata
+            )
+            sampled_token_ids.copy_(sampler_output.sampled_token_ids.view(-1))
+            self.performance_stats.add_counter(
+                "verification_sampling_batched_tokens", num_tokens
+            )
+            self.performance_stats.add_counter("verification_sampling_launches")
+            return sampled_token_ids
+
+        sampled_token_ids.fill_(-1)
+        sampler_calls = self._sample_parallel_logits_by_position(
+            batch_size=batch_size,
+            logits=logits,
+            request_indices=request_indices,
+            token_indices=token_indices,
+            sampling_metadata=sampling_metadata,
+            sampled_token_ids=sampled_token_ids,
+        )
+        self.performance_stats.add_counter(
+            "verification_sampling_fallback_tokens", num_tokens
+        )
+        self.performance_stats.add_counter(
+            "verification_sampling_launches", sampler_calls
+        )
         return sampled_token_ids
 
     def _run_parallel_verification(
