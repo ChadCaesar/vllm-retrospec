@@ -1026,14 +1026,14 @@ class RetroSpecResidentClusterCache:
         self,
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
-        active_mask: torch.Tensor,
+        active_mask: torch.Tensor | None,
         cache_page_ids: torch.Tensor,
         hit_cluster_mask: torch.Tensor,
         miss_cluster_mask: torch.Tensor,
         hit_gate_ready_mask: torch.Tensor,
         access_kinds: torch.Tensor,
     ) -> RetroSpecResidentPageAccess:
-        """Resolve draft handles without synchronizing or parsing on the CPU."""
+        """Resolve handles without synchronizing or parsing on the CPU."""
         if cluster_ids.device != self.device or page_ids.device != self.device:
             raise ValueError("GPU resident lookup tensors must use the cache device")
         if page_ids.shape[:-1] != cluster_ids.shape:

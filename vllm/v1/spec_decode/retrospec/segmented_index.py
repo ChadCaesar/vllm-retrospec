@@ -2314,6 +2314,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             device,
             batch_size * num_kv_heads * max_access_width,
         )
+        self.cluster_store.reserve_verification_resolve_workspace(
+            device,
+            batch_size
+            * self.num_speculative_tokens
+            * num_kv_heads
+            * expanded_retrieval_width,
+        )
         next_cursor = self._selection_output_workspace_cursors.get(layer_name, 0)
         # A proposal may contain several sparse-verification rounds. Only the
         # current round's plans remain live, so recycle the fixed speculative

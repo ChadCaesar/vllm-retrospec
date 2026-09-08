@@ -25,6 +25,7 @@ from .resident_cache import (
     RetroSpecResidentPageAccess,
     RetroSpecResidentReadLease,
 )
+from .resident_kernels import compact_resident_misses, scatter_staging_page_ids
 
 RetroSpecClusterResolveMode = Literal[
     "resident_only",
@@ -245,6 +246,89 @@ class _PinnedSelectionSlot:
         self.pinned_memory.release(self.access_kind_storage)
         self.cluster_id_storage = None
         self.access_kind_storage = None
+
+
+@dataclass
+class _PinnedVerificationMissSlot:
+    """Pinned metadata for one GPU-compacted verification miss batch."""
+
+    pinned_memory: RetroSpecPinnedMemoryManager
+    cluster_id_storage: torch.Tensor | None = None
+    position_storage: torch.Tensor | None = None
+    staging_start_storage: torch.Tensor | None = None
+    page_count_storage: torch.Tensor | None = None
+    miss_count_storage: torch.Tensor | None = None
+    capacity: int = 0
+    in_use: bool = False
+    reuse_ready_event: torch.cuda.Event | None = None
+
+    def reserve_capacity(self, capacity: int) -> None:
+        if capacity <= self.capacity:
+            return
+        self.cluster_id_storage = self.pinned_memory.replace(
+            self.cluster_id_storage,
+            (capacity,),
+            torch.int64,
+            "verification-miss-cluster-ids",
+        )
+        self.position_storage = self.pinned_memory.replace(
+            self.position_storage,
+            (capacity,),
+            torch.int64,
+            "verification-miss-positions",
+        )
+        self.staging_start_storage = self.pinned_memory.replace(
+            self.staging_start_storage,
+            (capacity,),
+            torch.int64,
+            "verification-miss-staging-starts",
+        )
+        self.page_count_storage = self.pinned_memory.replace(
+            self.page_count_storage,
+            (capacity,),
+            torch.int32,
+            "verification-miss-page-counts",
+        )
+        if self.miss_count_storage is None:
+            self.miss_count_storage = self.pinned_memory.empty(
+                (1,), torch.int32, "verification-miss-count"
+            )
+        self.capacity = capacity
+
+    def release_storage(self) -> None:
+        self.pinned_memory.release(self.cluster_id_storage)
+        self.pinned_memory.release(self.position_storage)
+        self.pinned_memory.release(self.staging_start_storage)
+        self.pinned_memory.release(self.page_count_storage)
+        self.pinned_memory.release(self.miss_count_storage)
+        self.cluster_id_storage = None
+        self.position_storage = None
+        self.staging_start_storage = None
+        self.page_count_storage = None
+        self.miss_count_storage = None
+        self.capacity = 0
+
+
+@dataclass
+class _VerificationResolveGPUArena:
+    """Reusable device records for one verification resident lookup."""
+
+    cluster_ids: torch.Tensor | None = None
+    positions: torch.Tensor | None = None
+    staging_starts: torch.Tensor | None = None
+    page_counts: torch.Tensor | None = None
+    miss_count: torch.Tensor | None = None
+    capacity: int = 0
+
+    def reserve_capacity(self, capacity: int, device: torch.device) -> None:
+        if capacity <= self.capacity:
+            return
+        self.cluster_ids = torch.empty(capacity, dtype=torch.int64, device=device)
+        self.positions = torch.empty(capacity, dtype=torch.int64, device=device)
+        self.staging_starts = torch.empty(capacity, dtype=torch.int64, device=device)
+        self.page_counts = torch.empty(capacity, dtype=torch.int32, device=device)
+        self.miss_count = torch.empty(1, dtype=torch.int32, device=device)
+        self.capacity = capacity
 
 
 @dataclass(frozen=True)
@@ -541,6 +625,20 @@ class RetroSpecResolvedClusterPages:
     staging_ready_event: torch.cuda.Event | None = None
     access_kinds: torch.Tensor | None = None
     read_lease: RetroSpecResidentReadLease | None = None
+    miss_admission: "RetroSpecVerificationMissAdmission | None" = None
+
+
+@dataclass(frozen=True)
+class RetroSpecVerificationMissAdmission:
+    """Compact CPU metadata for admitting verification misses after attention."""
+
+    layer_name: str
+    cluster_ids_cpu: torch.Tensor
+    logical_page_ids_cpu: torch.Tensor
+    staging_page_ids_cpu: torch.Tensor
+    staging_key_pages: torch.Tensor
+    staging_value_pages: torch.Tensor
+    staging_ready_event: torch.cuda.Event | None
 
 
 @dataclass(frozen=True)
@@ -1371,6 +1469,7 @@ class RetroSpecClusterPageStore:
     """CPU cluster-page backing store with a bounded GPU resident cache."""
 
     _RESIDENT_PREFETCH_RING_SIZE = 2
+    _VERIFICATION_MISS_RING_SIZE = 2
 
     def __init__(
         self,
@@ -1466,6 +1565,15 @@ class RetroSpecClusterPageStore:
             max_workers=1,
             thread_name_prefix="retrospec-resident-prefetch",
         )
+        self._verification_miss_slots: dict[
+            torch.device, list[_PinnedVerificationMissSlot]
+        ] = {}
+        self._verification_gpu_arenas: dict[
+            torch.device, list[_VerificationResolveGPUArena]
+        ] = {}
+        self._verification_resolve_cursors: dict[torch.device, int] = {}
+        self._verification_metadata_streams: dict[torch.device, torch.cuda.Stream] = {}
+        self._verification_resolve_lock = Lock()
         self._resident_state_lock = RLock()
         self._closed = False
 
@@ -3699,6 +3807,246 @@ class RetroSpecClusterPageStore:
         for resident_cache in resident_caches:
             resident_cache.synchronize_pending_copies()
 
+    def _get_verification_metadata_stream(
+        self, device: torch.device
+    ) -> torch.cuda.Stream:
+        device = self._canonical_cuda_device(device)
+        stream = self._verification_metadata_streams.get(device)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._verification_metadata_streams[device] = stream
+        return stream
+
+    def reserve_verification_resolve_workspace(
+        self, device: torch.device, cluster_capacity: int
+    ) -> None:
+        """Reserve compact records from the actual active selection width."""
+        if cluster_capacity <= 0:
+            return
+        device = self._canonical_cuda_device(device)
+
+        with self._verification_resolve_lock:
+            slots = self._verification_miss_slots.setdefault(
+                device,
+                [
+                    _PinnedVerificationMissSlot(self._pinned_memory)
+                    for _ in range(self._VERIFICATION_MISS_RING_SIZE)
+                ],
+            )
+            arenas = self._verification_gpu_arenas.setdefault(
+                device,
+                [
+                    _VerificationResolveGPUArena()
+                    for _ in range(self._VERIFICATION_MISS_RING_SIZE)
+                ],
+            )
+            for slot in slots:
+                if slot.in_use and cluster_capacity > slot.capacity:
+                    raise RuntimeError(
+                        "Cannot grow an active verification-miss metadata slot"
+                    )
+                if not slot.in_use:
+                    slot.reserve_capacity(cluster_capacity)
+            for arena in arenas:
+                arena.reserve_capacity(cluster_capacity, device)
+
+    def _acquire_verification_resolve_workspace(
+        self, device: torch.device, cluster_capacity: int
+    ) -> tuple[
+        _PinnedVerificationMissSlot,
+        _VerificationResolveGPUArena,
+    ]:
+        self.reserve_verification_resolve_workspace(device, cluster_capacity)
+        device = self._canonical_cuda_device(device)
+
+        with self._verification_resolve_lock:
+            cursor = self._verification_resolve_cursors.get(device, 0)
+            self._verification_resolve_cursors[device] = (
+                cursor + 1
+            ) % self._VERIFICATION_MISS_RING_SIZE
+            slot = self._verification_miss_slots[device][cursor]
+            arena = self._verification_gpu_arenas[device][cursor]
+            if slot.in_use:
+                raise RuntimeError("Verification-miss metadata ring is exhausted")
+            slot.in_use = True
+
+        if slot.reuse_ready_event is not None:
+            slot.reuse_ready_event.synchronize()
+            slot.reuse_ready_event = None
+        return slot, arena
+
+    def _release_verification_miss_slot(
+        self,
+        slot: _PinnedVerificationMissSlot,
+        reuse_ready_event: torch.cuda.Event | None,
+    ) -> None:
+        with self._verification_resolve_lock:
+            if not slot.in_use:
+                raise RuntimeError("Verification-miss metadata slot was already free")
+            slot.reuse_ready_event = reuse_ready_event
+            slot.in_use = False
+
+    def _stage_verification_miss_pages(
+        self,
+        pool: _LayerClusterPagePool,
+        page_ids_cpu: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Event | None]:
+        num_pages = page_ids_cpu.numel()
+        if num_pages == 0:
+            shape = (0, pool.page_size, pool.head_size)
+            key_pages = torch.empty(
+                shape, dtype=pool.dtype, device=pool.metadata_device
+            )
+            return key_pages, torch.empty_like(key_pages), None
+
+        staging_shape = (num_pages, pool.page_size, pool.head_size)
+        staging_key_pages = torch.empty(
+            staging_shape, dtype=pool.dtype, device=pool.metadata_device
+        )
+        staging_value_pages = torch.empty_like(staging_key_pages)
+        transfer_buffer = self._get_full_verification_buffer(pool)
+        page_capacity = transfer_buffer.cpu_slot_capacity(pool)
+        transfer_stream = self._get_resident_prefetch_stream(pool.metadata_device)
+        staging_key_pages.record_stream(transfer_stream)
+        staging_value_pages.record_stream(transfer_stream)
+        h2d_timer = (
+            None
+            if self.performance_stats is None
+            else self.performance_stats.start_cuda_timer(
+                "verification_miss_h2d", transfer_stream
+            )
+        )
+
+        page_start = 0
+        while page_start < num_pages:
+            page_end = min(page_start + page_capacity, num_pages)
+            gather_started_at = (
+                perf_counter()
+                if self.performance_stats is not None and self.performance_stats.enabled
+                else None
+            )
+            cpu_keys, cpu_values, cpu_slot = transfer_buffer.stage_cpu_pages(
+                pool, page_ids_cpu[page_start:page_end]
+            )
+            if gather_started_at is not None:
+                self.performance_stats.record_cpu_time(
+                    "verification_miss_cpu_gather",
+                    perf_counter() - gather_started_at,
+                )
+
+            try:
+                with torch.cuda.stream(transfer_stream):
+                    staging_key_pages[page_start:page_end].copy_(
+                        cpu_keys, non_blocking=self.pin_memory
+                    )
+                    staging_value_pages[page_start:page_end].copy_(
+                        cpu_values, non_blocking=self.pin_memory
+                    )
+                    chunk_ready_event = torch.cuda.Event()
+                    chunk_ready_event.record(transfer_stream)
+            except BaseException:
+                transfer_stream.synchronize()
+                transfer_buffer.release_cpu_slot(cpu_slot, None)
+                raise
+            transfer_buffer.release_cpu_slot(cpu_slot, chunk_ready_event)
+            page_start = page_end
+
+        with torch.cuda.stream(transfer_stream):
+            if self.performance_stats is not None:
+                self.performance_stats.stop_cuda_timer(h2d_timer, transfer_stream)
+            staging_ready_event = torch.cuda.Event()
+            staging_ready_event.record(transfer_stream)
+
+        if self.performance_stats is not None:
+            self.performance_stats.add_counter("verification_miss_pages", num_pages)
+            self.performance_stats.add_counter(
+                "verification_miss_h2d_bytes",
+                staging_key_pages.nbytes + staging_value_pages.nbytes,
+            )
+            self.performance_stats.observe_peak(
+                "verification_miss_staging_bytes",
+                staging_key_pages.nbytes + staging_value_pages.nbytes,
+            )
+        return staging_key_pages, staging_value_pages, staging_ready_event
+
+    def _build_verification_miss_metadata(
+        self,
+        layer_name: str,
+        cluster_shape: torch.Size,
+        max_pages: int,
+        slot: _PinnedVerificationMissSlot,
+        num_misses: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        if slot.cluster_id_storage is None or slot.position_storage is None:
+            raise RuntimeError("Verification-miss CPU input storage is unavailable")
+        if slot.staging_start_storage is None or slot.page_count_storage is None:
+            raise RuntimeError("Verification-miss CPU output storage is unavailable")
+
+        cluster_ids = slot.cluster_id_storage[:num_misses].tolist()
+        positions = slot.position_storage[:num_misses].tolist()
+        retrieval_width = cluster_shape[-1]
+        record_order = sorted(
+            range(num_misses),
+            key=lambda index: (
+                positions[index] % retrieval_width,
+                positions[index] // retrieval_width,
+            ),
+        )
+
+        descriptors = self._cluster_block_descriptors.get(layer_name)
+        if descriptors is None:
+            raise RuntimeError(f"No cluster descriptors exist for {layer_name!r}")
+        allocated_cluster_ids = self._get_allocated_cluster_ids(layer_name)
+
+        ordered_cluster_ids: list[int] = []
+        staging_start_by_cluster: dict[int, int] = {}
+        unique_page_ids: list[int] = []
+        for record_index in record_order:
+            cluster_id = int(cluster_ids[record_index])
+            if cluster_id not in allocated_cluster_ids:
+                raise RuntimeError(
+                    f"Verification selected stale cluster handle {cluster_id}"
+                )
+            descriptor = descriptors[cluster_id]
+            page_count = len(descriptor.page_ids)
+            if page_count > max_pages:
+                raise RuntimeError(
+                    "Verification descriptor exceeds the packed page-table width"
+                )
+            staging_start = staging_start_by_cluster.get(cluster_id)
+            if staging_start is None:
+                staging_start = len(unique_page_ids)
+                staging_start_by_cluster[cluster_id] = staging_start
+                ordered_cluster_ids.append(cluster_id)
+                unique_page_ids.extend(descriptor.page_ids)
+            slot.staging_start_storage[record_index] = staging_start
+            slot.page_count_storage[record_index] = page_count
+
+        cluster_ids_cpu = torch.tensor(ordered_cluster_ids, dtype=torch.int64)
+        metadata = self._materialize_cluster_block_metadata_cpu(
+            layer_name, cluster_ids_cpu, page_width=max_pages
+        )
+        staging_page_ids_cpu = torch.full_like(metadata.page_ids, -1)
+        for row_index, cluster_id in enumerate(ordered_cluster_ids):
+            descriptor = descriptors[cluster_id]
+            staging_start = staging_start_by_cluster[cluster_id]
+            page_count = len(descriptor.page_ids)
+            staging_page_ids_cpu[row_index, :page_count] = torch.arange(
+                staging_start, staging_start + page_count, dtype=torch.int64
+            )
+
+        return (
+            cluster_ids_cpu,
+            metadata.page_ids,
+            staging_page_ids_cpu,
+            torch.tensor(unique_page_ids, dtype=torch.int64),
+        )
+
     def close(self) -> None:
         if self._closed:
             return
@@ -3730,6 +4078,20 @@ class RetroSpecClusterPageStore:
                     )
                 slot.release_storage()
         self._resident_prefetch_slots.clear()
+
+        for slots in self._verification_miss_slots.values():
+            for slot in slots:
+                if slot.in_use:
+                    raise RuntimeError(
+                        "Cannot close an active verification-miss metadata slot"
+                    )
+                if slot.reuse_ready_event is not None:
+                    slot.reuse_ready_event.synchronize()
+                slot.release_storage()
+        self._verification_miss_slots.clear()
+        self._verification_gpu_arenas.clear()
+        self._verification_resolve_cursors.clear()
+        self._verification_metadata_streams.clear()
 
     def resolve_draft_cluster_blocks(
         self,
@@ -3779,6 +4141,257 @@ class RetroSpecClusterPageStore:
             access_kinds=access.access_kinds,
             read_lease=access.read_lease,
         )
+
+    def resolve_verification_cluster_blocks(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+        logical_page_ids: torch.Tensor,
+    ) -> RetroSpecResolvedClusterPages:
+        """Resolve verification pages with GPU hits and compact CPU misses."""
+        if cluster_ids.device.type != "cuda":
+            raise ValueError("GPU verification lookup requires CUDA")
+        if logical_page_ids.shape[:-1] != cluster_ids.shape:
+            raise ValueError("Logical pages do not match verification cluster IDs")
+        if logical_page_ids.device != cluster_ids.device:
+            raise ValueError("Verification handles and pages must use one device")
+
+        self.wait_for_resident_prefetches((layer_name,))
+        with self._resident_state_lock:
+            pool, resident_cache = self._get_or_create_resident_cache(layer_name)
+
+        current_stream = torch.cuda.current_stream(cluster_ids.device)
+        resident_cache.wait_for_pending_copies(current_stream)
+
+        resident_page_ids = torch.empty_like(logical_page_ids)
+        hit_cluster_mask = torch.empty_like(cluster_ids, dtype=torch.bool)
+        miss_cluster_mask = torch.empty_like(cluster_ids, dtype=torch.bool)
+        hit_gate_ready_mask = torch.empty_like(cluster_ids, dtype=torch.bool)
+        access_kinds = torch.empty_like(cluster_ids, dtype=torch.uint8)
+        resident_lookup_timer = (
+            None
+            if self.performance_stats is None
+            else self.performance_stats.start_cuda_timer(
+                "verification_gpu_lookup", current_stream
+            )
+        )
+        access = resident_cache.lookup_gpu(
+            cluster_ids=cluster_ids,
+            page_ids=logical_page_ids,
+            active_mask=None,
+            cache_page_ids=resident_page_ids,
+            hit_cluster_mask=hit_cluster_mask,
+            miss_cluster_mask=miss_cluster_mask,
+            hit_gate_ready_mask=hit_gate_ready_mask,
+            access_kinds=access_kinds,
+        )
+        if self.performance_stats is not None:
+            self.performance_stats.stop_cuda_timer(
+                resident_lookup_timer, current_stream
+            )
+
+        slot: _PinnedVerificationMissSlot | None = None
+        try:
+            slot, arena = self._acquire_verification_resolve_workspace(
+                cluster_ids.device, cluster_ids.numel()
+            )
+            if (
+                arena.cluster_ids is None
+                or arena.positions is None
+                or arena.staging_starts is None
+                or arena.page_counts is None
+                or arena.miss_count is None
+            ):
+                raise RuntimeError("Verification GPU compact arena is unavailable")
+
+            lookup_timer = (
+                None
+                if self.performance_stats is None
+                else self.performance_stats.start_cuda_timer(
+                    "verification_miss_compact", current_stream
+                )
+            )
+            compact_resident_misses(
+                cluster_handles=cluster_ids,
+                miss_mask=access.miss_cluster_mask,
+                output_handles=arena.cluster_ids,
+                output_positions=arena.positions,
+                output_count=arena.miss_count,
+            )
+            if self.performance_stats is not None:
+                self.performance_stats.stop_cuda_timer(lookup_timer, current_stream)
+                valid_clusters = cluster_ids >= 0
+                self.performance_stats.add_gpu_counter(
+                    "verification_lookup_clusters", valid_clusters
+                )
+                self.performance_stats.add_gpu_counter(
+                    "verification_resident_hits", access.hit_cluster_mask
+                )
+                self.performance_stats.add_gpu_counter(
+                    "verification_resident_misses", access.miss_cluster_mask
+                )
+
+            if (
+                slot.cluster_id_storage is None
+                or slot.position_storage is None
+                or slot.miss_count_storage is None
+            ):
+                raise RuntimeError("Verification pinned compact slot is unavailable")
+
+            lookup_ready_event = torch.cuda.Event()
+            lookup_ready_event.record(current_stream)
+            metadata_stream = self._get_verification_metadata_stream(cluster_ids.device)
+            record_capacity = cluster_ids.numel()
+            with torch.cuda.stream(metadata_stream):
+                metadata_stream.wait_event(lookup_ready_event)
+                slot.cluster_id_storage[:record_capacity].copy_(
+                    arena.cluster_ids[:record_capacity], non_blocking=self.pin_memory
+                )
+                slot.position_storage[:record_capacity].copy_(
+                    arena.positions[:record_capacity], non_blocking=self.pin_memory
+                )
+                slot.miss_count_storage.copy_(
+                    arena.miss_count, non_blocking=self.pin_memory
+                )
+                metadata_ready_event = torch.cuda.Event()
+                metadata_ready_event.record(metadata_stream)
+
+            wait_started_at = (
+                perf_counter()
+                if self.performance_stats is not None and self.performance_stats.enabled
+                else None
+            )
+            metadata_ready_event.synchronize()
+            if wait_started_at is not None:
+                self.performance_stats.record_cpu_time(
+                    "verification_miss_metadata_wait",
+                    perf_counter() - wait_started_at,
+                )
+
+            num_misses = int(slot.miss_count_storage.item())
+            if num_misses < 0 or num_misses > cluster_ids.numel():
+                raise RuntimeError("GPU verification miss count is out of bounds")
+            if self.performance_stats is not None:
+                metadata_bytes = (
+                    record_capacity
+                    * (
+                        slot.cluster_id_storage.element_size()
+                        + slot.position_storage.element_size()
+                    )
+                    + slot.miss_count_storage.element_size()
+                )
+                self.performance_stats.add_counter(
+                    "verification_miss_metadata_d2h_bytes", metadata_bytes
+                )
+
+            staging_page_ids = torch.full_like(logical_page_ids, -1)
+            if num_misses == 0:
+                self._release_verification_miss_slot(slot, None)
+                slot = None
+                empty_pages = resident_cache.key_pages[:0]
+                return RetroSpecResolvedClusterPages(
+                    resident_page_ids=access.cache_page_ids,
+                    staging_page_ids=staging_page_ids,
+                    resident_key_pages=resident_cache.key_pages,
+                    resident_value_pages=resident_cache.value_pages,
+                    staging_key_pages=empty_pages,
+                    staging_value_pages=resident_cache.value_pages[:0],
+                    hit_cluster_mask=access.hit_cluster_mask,
+                    miss_cluster_mask=access.miss_cluster_mask,
+                    hit_gate_ready_mask=access.hit_gate_ready_mask,
+                    resident_ready_event=None,
+                    access_kinds=access.access_kinds,
+                    read_lease=access.read_lease,
+                )
+
+            descriptor_started_at = (
+                perf_counter()
+                if self.performance_stats is not None and self.performance_stats.enabled
+                else None
+            )
+            (
+                miss_cluster_ids_cpu,
+                miss_page_ids_cpu,
+                miss_staging_page_ids_cpu,
+                unique_page_ids_cpu,
+            ) = self._build_verification_miss_metadata(
+                layer_name=layer_name,
+                cluster_shape=cluster_ids.shape,
+                max_pages=logical_page_ids.shape[-1],
+                slot=slot,
+                num_misses=num_misses,
+            )
+            if descriptor_started_at is not None:
+                self.performance_stats.record_cpu_time(
+                    "verification_miss_descriptor_build",
+                    perf_counter() - descriptor_started_at,
+                )
+
+            arena.staging_starts[:num_misses].copy_(
+                slot.staging_start_storage[:num_misses],
+                non_blocking=self.pin_memory,
+            )
+            arena.page_counts[:num_misses].copy_(
+                slot.page_count_storage[:num_misses],
+                non_blocking=self.pin_memory,
+            )
+            scatter_staging_page_ids(
+                miss_positions=arena.positions,
+                staging_starts=arena.staging_starts,
+                page_counts=arena.page_counts,
+                num_misses=num_misses,
+                output_page_ids=staging_page_ids,
+            )
+            slot_ready_event = torch.cuda.Event()
+            slot_ready_event.record(current_stream)
+            self._release_verification_miss_slot(slot, slot_ready_event)
+            slot = None
+
+            staging_key_pages, staging_value_pages, staging_ready_event = (
+                self._stage_verification_miss_pages(pool, unique_page_ids_cpu)
+            )
+            num_unique_misses = miss_cluster_ids_cpu.numel()
+            if self.performance_stats is not None:
+                self.performance_stats.add_counter(
+                    "verification_unique_miss_clusters", num_unique_misses
+                )
+                self.performance_stats.add_counter(
+                    "verification_duplicate_miss_clusters",
+                    num_misses - num_unique_misses,
+                )
+
+            admission = RetroSpecVerificationMissAdmission(
+                layer_name=layer_name,
+                cluster_ids_cpu=miss_cluster_ids_cpu,
+                logical_page_ids_cpu=miss_page_ids_cpu,
+                staging_page_ids_cpu=miss_staging_page_ids_cpu,
+                staging_key_pages=staging_key_pages,
+                staging_value_pages=staging_value_pages,
+                staging_ready_event=staging_ready_event,
+            )
+            return RetroSpecResolvedClusterPages(
+                resident_page_ids=access.cache_page_ids,
+                staging_page_ids=staging_page_ids,
+                resident_key_pages=resident_cache.key_pages,
+                resident_value_pages=resident_cache.value_pages,
+                staging_key_pages=staging_key_pages,
+                staging_value_pages=staging_value_pages,
+                hit_cluster_mask=access.hit_cluster_mask,
+                miss_cluster_mask=access.miss_cluster_mask,
+                hit_gate_ready_mask=access.hit_gate_ready_mask,
+                resident_ready_event=None,
+                staging_ready_event=staging_ready_event,
+                access_kinds=access.access_kinds,
+                read_lease=access.read_lease,
+                miss_admission=admission,
+            )
+        except BaseException:
+            if slot is not None:
+                current_stream.synchronize()
+                self._release_verification_miss_slot(slot, None)
+            if access.read_lease is not None:
+                access.read_lease.release()
+            raise
 
     def resolve_cluster_blocks(
         self,
@@ -4073,6 +4686,39 @@ class RetroSpecClusterPageStore:
                     staging_value_pages=staging_value_pages,
                     cluster_ids_cpu=cluster_ids_cpu,
                     page_ids_cpu=page_ids_cpu,
+                )
+
+    def admit_verification_misses(
+        self,
+        admission: RetroSpecVerificationMissAdmission | None,
+    ) -> None:
+        """Admit compact verification misses without re-reading GPU metadata."""
+        if admission is None or admission.cluster_ids_cpu.numel() == 0:
+            return
+
+        with self._resident_state_lock:
+            pool, resident_cache = self._get_or_create_resident_cache(
+                admission.layer_name
+            )
+            cluster_groups = self._get_cluster_groups(
+                admission.layer_name, admission.cluster_ids_cpu
+            )
+            with resident_cache.mutation_guard():
+                resident_cache.admit_staged(
+                    cluster_ids=admission.cluster_ids_cpu,
+                    page_ids=admission.logical_page_ids_cpu,
+                    cluster_groups=cluster_groups,
+                    allocated_cluster_ids=self._get_allocated_cluster_ids(
+                        admission.layer_name
+                    ),
+                    allocated_page_ids=pool.allocated_page_ids,
+                    staging_page_ids=admission.staging_page_ids_cpu,
+                    staging_key_pages=admission.staging_key_pages,
+                    staging_value_pages=admission.staging_value_pages,
+                    cluster_ids_cpu=admission.cluster_ids_cpu,
+                    page_ids_cpu=admission.logical_page_ids_cpu,
+                    reuse_ready_event=admission.staging_ready_event,
+                    lookup_after_admit=False,
                 )
 
     def get_resident_page_storage(

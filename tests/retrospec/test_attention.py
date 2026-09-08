@@ -24,6 +24,7 @@ from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecFullVerificationStaging,
     RetroSpecResidentPrefetchInput,
     RetroSpecResolvedClusterPages,
+    RetroSpecVerificationMissAdmission,
 )
 from vllm.v1.spec_decode.retrospec.execution import (
     RetroSpecExactKVSource,
@@ -1168,6 +1169,15 @@ def test_exact_attention_resolves_resident_and_staging_pages(
     staging_keys = torch.ones(1, 2, 1, dtype=torch.float16, device=device)
     staging_values = staging_keys.clone()
     resident_ready_event = torch.cuda.Event()
+    miss_admission = RetroSpecVerificationMissAdmission(
+        layer_name="layer",
+        cluster_ids_cpu=torch.tensor([1], dtype=torch.int64),
+        logical_page_ids_cpu=torch.tensor([[1]], dtype=torch.int64),
+        staging_page_ids_cpu=torch.tensor([[0]], dtype=torch.int64),
+        staging_key_pages=staging_keys,
+        staging_value_pages=staging_values,
+        staging_ready_event=None,
+    )
     resolved = RetroSpecResolvedClusterPages(
         resident_page_ids=resident_page_ids,
         staging_page_ids=staging_page_ids,
@@ -1179,15 +1189,19 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         miss_cluster_mask=torch.tensor([[[False, True]]], device=device),
         hit_gate_ready_mask=torch.ones(1, 1, 2, dtype=torch.bool, device=device),
         resident_ready_event=resident_ready_event,
+        miss_admission=miss_admission,
     )
     if pre_resolved:
         selection = replace(selection, resolved_pages=resolved)
 
     controller.index.cluster_store.resolve_cluster_blocks = Mock(return_value=resolved)
+    controller.index.cluster_store.resolve_verification_cluster_blocks = Mock(
+        return_value=resolved
+    )
 
     call_order: list[str] = []
-    controller.index.cluster_store.admit_staged_clusters = Mock(
-        side_effect=lambda **_: call_order.append("admit"),
+    controller.index.cluster_store.admit_verification_misses = Mock(
+        side_effect=lambda *_: call_order.append("admit"),
     )
     expected_output = (
         torch.zeros(1, 1, 1, dtype=torch.float16, device=device),
@@ -1217,26 +1231,22 @@ def test_exact_attention_resolves_resident_and_staging_pages(
 
     assert result is expected_output
     if pre_resolved:
+        controller.index.cluster_store.resolve_verification_cluster_blocks.assert_not_called()
         controller.index.cluster_store.resolve_cluster_blocks.assert_not_called()
     else:
-        controller.index.cluster_store.resolve_cluster_blocks.assert_called_once_with(
+        controller.index.cluster_store.resolve_verification_cluster_blocks.assert_called_once_with(
             layer_name="layer",
             cluster_ids=cluster_ids,
             logical_page_ids=page_ids,
-            mode="verification",
         )
+        controller.index.cluster_store.resolve_cluster_blocks.assert_not_called()
     if expect_admission:
-        controller.index.cluster_store.admit_staged_clusters.assert_called_once_with(
-            layer_name="layer",
-            cluster_ids=cluster_ids,
-            logical_page_ids=page_ids,
-            staging_page_ids=staging_page_ids,
-            staging_key_pages=staging_keys,
-            staging_value_pages=staging_values,
+        controller.index.cluster_store.admit_verification_misses.assert_called_once_with(
+            miss_admission
         )
         assert call_order == ["attention", "admit"]
     else:
-        controller.index.cluster_store.admit_staged_clusters.assert_not_called()
+        controller.index.cluster_store.admit_verification_misses.assert_not_called()
         assert call_order == ["attention"]
     source = run.call_args.args[0]
     assert isinstance(source, RetroSpecExactKVSource)

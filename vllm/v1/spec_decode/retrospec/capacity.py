@@ -316,6 +316,31 @@ def build_retrospec_long_context_capacity(
     selection_workspace_bytes = total_resident_clusters * (
         4 * num_query_heads + 24 * max_kv_heads
     )
+    max_retrieval_clusters = min(
+        ceil(num_clusters_per_request * config.retrospec_retrieval_ratio),
+        num_clusters_per_request,
+    )
+    estimation_ratio = getattr(config, "retrospec_estimation_ratio", 0.232)
+    max_estimation_clusters = min(
+        ceil(num_clusters_per_request * estimation_ratio),
+        num_clusters_per_request - max_retrieval_clusters,
+    )
+    max_expanded_clusters = min(
+        max_retrieval_clusters * 2,
+        max_retrieval_clusters + max_estimation_clusters,
+    )
+    verification_record_capacity = (
+        planning_requests
+        * config.num_speculative_tokens
+        * max_kv_heads
+        * max_expanded_clusters
+    )
+    # Each of two reusable device arenas stores a cluster handle, its original
+    # flat position, a staging-page start, a page count and one count scalar.
+    verification_metadata_bytes = 2 * (
+        verification_record_capacity * (8 + 8 + 8 + 4) + 4
+    )
+    selection_workspace_bytes += verification_metadata_bytes
 
     phase_workspace_bytes = max(
         max_full_verify_workspace + selection_workspace_bytes,

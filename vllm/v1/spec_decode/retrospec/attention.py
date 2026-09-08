@@ -1152,12 +1152,24 @@ class RetroSpecSparseAttention:
         resolved_pages = selection.resolved_pages
 
         if resolved_pages is None and exact_page_ids.numel():
-            resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
-                layer_name=layer_name,
-                cluster_ids=exact_cluster_ids,
-                logical_page_ids=exact_page_ids,
-                mode="verification",
-            )
+            if exact_cluster_ids.device.type == "cuda" and self.mode in (
+                RetroSpecAttentionMode.SPARSE_VERIFY,
+                RetroSpecAttentionMode.EXPANDED_VERIFY,
+            ):
+                resolved_pages = (
+                    self.index.cluster_store.resolve_verification_cluster_blocks(
+                        layer_name=layer_name,
+                        cluster_ids=exact_cluster_ids,
+                        logical_page_ids=exact_page_ids,
+                    )
+                )
+            else:
+                resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
+                    layer_name=layer_name,
+                    cluster_ids=exact_cluster_ids,
+                    logical_page_ids=exact_page_ids,
+                    mode="verification",
+                )
 
         resident_pages = None
         staging_pages = None
@@ -1267,23 +1279,13 @@ class RetroSpecSparseAttention:
                 RetroSpecAttentionMode.SPARSE_VERIFY,
                 RetroSpecAttentionMode.EXPANDED_VERIFY,
             )
-            and selection.exact_page_ids.numel()
+            and resolved_pages is not None
         ):
-            if resolved_pages is None:
-                raise RuntimeError(
-                    "Verification cache update requires resolved cluster pages"
-                )
-
             with self.performance_stats.cpu_timer(
                 f"{stage_name}_resident_admit_submit"
             ):
-                self.index.cluster_store.admit_staged_clusters(
-                    layer_name=selection.plan.layer_name,
-                    cluster_ids=selection.exact_cluster_ids,
-                    logical_page_ids=selection.exact_page_ids,
-                    staging_page_ids=resolved_pages.staging_page_ids,
-                    staging_key_pages=resolved_pages.staging_key_pages,
-                    staging_value_pages=resolved_pages.staging_value_pages,
+                self.index.cluster_store.admit_verification_misses(
+                    resolved_pages.miss_admission
                 )
 
         return exact_output

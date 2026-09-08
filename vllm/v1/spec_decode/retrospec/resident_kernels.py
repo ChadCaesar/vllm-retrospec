@@ -33,6 +33,7 @@ def _lookup_resident_handles_kernel(
     TABLE_CAPACITY: tl.constexpr,
     MAX_PAGES: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
+    USE_ACTIVE_MASK: tl.constexpr,
 ):
     cluster_index = tl.program_id(0)
     valid_cluster = cluster_index < num_clusters
@@ -42,8 +43,11 @@ def _lookup_resident_handles_kernel(
         mask=valid_cluster,
         other=-1,
     ).to(tl.int64)
-    request_index = cluster_index // CLUSTERS_PER_REQUEST
-    active = tl.load(active_mask + request_index, mask=valid_cluster, other=0)
+    if USE_ACTIVE_MASK:
+        request_index = cluster_index // CLUSTERS_PER_REQUEST
+        active = tl.load(active_mask + request_index, mask=valid_cluster, other=0)
+    else:
+        active = True
     valid_cluster &= (handle >= 0) & active
 
     first_bucket = handle & (TABLE_CAPACITY - 1)
@@ -148,6 +152,62 @@ def _lookup_resident_handles_kernel(
 
 
 @triton.jit
+def _compact_resident_misses_kernel(
+    cluster_handles,
+    miss_mask,
+    output_handles,
+    output_positions,
+    output_count,
+    num_handles,
+    BLOCK_SIZE: tl.constexpr,
+):
+    block_start = tl.program_id(0) * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    valid = offsets < num_handles
+
+    handles = tl.load(cluster_handles + offsets, mask=valid, other=-1)
+    misses = tl.load(miss_mask + offsets, mask=valid, other=0)
+    selected = valid & misses & (handles >= 0)
+
+    selected_i32 = selected.to(tl.int32)
+    local_offsets = tl.cumsum(selected_i32, axis=0) - 1
+    block_count = tl.sum(selected_i32, axis=0)
+    output_start = tl.atomic_add(output_count, block_count)
+
+    destinations = output_start + local_offsets
+    tl.store(output_handles + destinations, handles, mask=selected)
+    tl.store(output_positions + destinations, offsets, mask=selected)
+
+
+@triton.jit
+def _scatter_staging_page_ids_kernel(
+    miss_positions,
+    staging_starts,
+    page_counts,
+    output_page_ids,
+    num_misses,
+    output_page_stride,
+    MAX_PAGES: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,
+):
+    miss_index = tl.program_id(0)
+    valid_miss = miss_index < num_misses
+
+    position = tl.load(miss_positions + miss_index, mask=valid_miss, other=0)
+    staging_start = tl.load(staging_starts + miss_index, mask=valid_miss, other=0)
+    page_count = tl.load(page_counts + miss_index, mask=valid_miss, other=0)
+
+    page_offsets = tl.arange(0, BLOCK_PAGES)
+    valid_page = valid_miss & (page_offsets < page_count)
+    output_offsets = position * output_page_stride + page_offsets
+    tl.store(
+        output_page_ids + output_offsets,
+        staging_start + page_offsets,
+        mask=valid_page & (page_offsets < MAX_PAGES),
+    )
+
+
+@triton.jit
 def _update_resident_handles_kernel(
     bucket_ids,
     cluster_handles,
@@ -202,7 +262,7 @@ def _update_resident_handles_kernel(
 def lookup_resident_handles(
     cluster_handles: torch.Tensor,
     logical_page_ids: torch.Tensor,
-    active_mask: torch.Tensor,
+    active_mask: torch.Tensor | None,
     table_handles: torch.Tensor,
     table_versions: torch.Tensor,
     table_page_counts: torch.Tensor,
@@ -220,13 +280,15 @@ def lookup_resident_handles(
         raise ValueError("Cluster handles must have shape [batch, heads, clusters]")
     if logical_page_ids.shape[:-1] != cluster_handles.shape:
         raise ValueError("Logical pages do not match cluster handles")
-    if active_mask.shape != (cluster_handles.shape[0],):
+    if active_mask is not None and active_mask.shape != (cluster_handles.shape[0],):
         raise ValueError("active_mask does not match the batch size")
 
     if table_handles.numel() == 0:
         output_page_slots.fill_(-1)
         output_hit_mask.zero_()
-        valid = (cluster_handles >= 0) & active_mask[:, None, None]
+        valid = cluster_handles >= 0
+        if active_mask is not None:
+            valid &= active_mask[:, None, None]
         output_miss_mask.copy_(valid)
         output_hit_gate_ready.zero_()
         output_access_kinds.copy_(valid.to(torch.uint8) * 2)
@@ -242,11 +304,12 @@ def lookup_resident_handles(
     )
     flat_output_pages = output_page_slots.reshape_as(flat_pages)
     clusters_per_request = cluster_handles.shape[1] * cluster_handles.shape[2]
+    mask_source = cluster_handles if active_mask is None else active_mask
 
     _lookup_resident_handles_kernel[(flat_handles.numel(),)](
         flat_handles,
         flat_pages,
-        active_mask,
+        mask_source,
         table_handles,
         table_versions,
         table_page_counts,
@@ -269,6 +332,84 @@ def lookup_resident_handles(
         TABLE_CAPACITY=table_capacity,
         MAX_PAGES=logical_page_ids.shape[-1],
         BLOCK_PAGES=triton.next_power_of_2(logical_page_ids.shape[-1]),
+        USE_ACTIVE_MASK=active_mask is not None,
+    )
+
+
+def compact_resident_misses(
+    cluster_handles: torch.Tensor,
+    miss_mask: torch.Tensor,
+    output_handles: torch.Tensor,
+    output_positions: torch.Tensor,
+    output_count: torch.Tensor,
+) -> None:
+    if cluster_handles.device.type != "cuda":
+        raise ValueError("Resident miss compaction requires CUDA tensors")
+    if cluster_handles.shape != miss_mask.shape:
+        raise ValueError("Cluster handles and miss mask must have equal shapes")
+    if output_handles.numel() < cluster_handles.numel():
+        raise ValueError("Compact handle output does not have enough capacity")
+    if output_positions.numel() < cluster_handles.numel():
+        raise ValueError("Compact position output does not have enough capacity")
+    if output_count.shape != (1,):
+        raise ValueError("Compact miss count must contain one element")
+
+    output_count.zero_()
+    if cluster_handles.numel() == 0:
+        return
+
+    block_size = 256
+    _compact_resident_misses_kernel[
+        (triton.cdiv(cluster_handles.numel(), block_size),)
+    ](
+        cluster_handles.reshape(-1),
+        miss_mask.reshape(-1),
+        output_handles,
+        output_positions,
+        output_count,
+        cluster_handles.numel(),
+        BLOCK_SIZE=block_size,
+    )
+
+
+def scatter_staging_page_ids(
+    miss_positions: torch.Tensor,
+    staging_starts: torch.Tensor,
+    page_counts: torch.Tensor,
+    num_misses: int,
+    output_page_ids: torch.Tensor,
+) -> None:
+    if output_page_ids.device.type != "cuda":
+        raise ValueError("Staging-page scatter requires CUDA tensors")
+    if output_page_ids.ndim < 2:
+        raise ValueError("Staging-page output must include a page dimension")
+    if num_misses < 0:
+        raise ValueError("num_misses must be non-negative")
+    if any(
+        tensor.device != output_page_ids.device
+        for tensor in (miss_positions, staging_starts, page_counts)
+    ):
+        raise ValueError("Staging-page scatter tensors must use one CUDA device")
+    if any(
+        tensor.numel() < num_misses
+        for tensor in (miss_positions, staging_starts, page_counts)
+    ):
+        raise ValueError("Staging-page scatter input does not have enough capacity")
+
+    output_page_ids.fill_(-1)
+    if num_misses == 0:
+        return
+
+    max_pages = output_page_ids.shape[-1]
+    _scatter_staging_page_ids_kernel[(num_misses,)](
+        miss_positions,
+        staging_starts,
+        page_counts,
+        output_page_ids.reshape(-1),
+        num_misses,
+        max_pages,
+        MAX_PAGES=max_pages,
+        BLOCK_PAGES=triton.next_power_of_2(max_pages),
     )
 
 

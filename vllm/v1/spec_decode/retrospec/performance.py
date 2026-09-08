@@ -42,6 +42,9 @@ class RetroSpecPerformanceStats:
         "draft_tokens",
         "verified_tokens",
         "proposed_tokens",
+        "verification_lookup_clusters",
+        "verification_resident_hits",
+        "verification_resident_misses",
     )
 
     def __init__(
@@ -270,6 +273,8 @@ class RetroSpecPerformanceStats:
         full_requests = counters.get("full_verify_requests", 0)
         resident_hits = counters.get("resident_cluster_hits", 0)
         resident_misses = counters.get("resident_cluster_misses", 0)
+        verification_hits = counters.get("verification_resident_hits", 0)
+        verification_misses = counters.get("verification_resident_misses", 0)
         prefetch_submitted = counters.get("prefetch_submitted", 0)
         prefetch_dropped = counters.get("prefetch_dropped", 0)
         prefetch_waves = counters.get("prefetch_waves_submitted", 0)
@@ -278,6 +283,7 @@ class RetroSpecPerformanceStats:
             "RetroSpec performance over %.2fs: counters={%s}; peaks={%s}; "
             "derived={draft_tokens/request=%.2f, expanded/sparse=%.3f, "
             "full/request=%.3f, resident_hit_rate=%.3f, "
+            "verification_hit_rate=%.3f, "
             "prefetch_drop_rate=%.3f, prefetch_records/wave=%.2f}; "
             "cpu_avg={%s}; cuda_avg={%s}",
             elapsed_seconds,
@@ -287,6 +293,10 @@ class RetroSpecPerformanceStats:
             self._ratio(expanded_tokens, sparse_tokens),
             self._ratio(full_requests, proposal_requests),
             self._ratio(resident_hits, resident_hits + resident_misses),
+            self._ratio(
+                verification_hits,
+                verification_hits + verification_misses,
+            ),
             self._ratio(
                 prefetch_dropped,
                 prefetch_submitted + prefetch_dropped,

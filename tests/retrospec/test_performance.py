@@ -89,6 +89,9 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     stats.add_gpu_counter("draft_tokens", torch.tensor([3, 5]))
     stats.add_gpu_counter("verified_tokens", torch.tensor([2, 4]))
     stats.add_gpu_counter("proposed_tokens", torch.tensor([2, 3]))
+    stats.add_gpu_counter("verification_lookup_clusters", torch.tensor([10]))
+    stats.add_gpu_counter("verification_resident_hits", torch.tensor([9]))
+    stats.add_gpu_counter("verification_resident_misses", torch.tensor([1]))
     stats.observe_peak("cluster_build_queue_depth", 2)
     stats.record_cpu_time("proposal_wall", 0.012)
 
@@ -104,6 +107,7 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     assert "expanded/sparse=0.250" in message
     assert "full/request=0.500" in message
     assert "resident_hit_rate=0.900" in message
+    assert "verification_hit_rate=0.900" in message
     assert "prefetch_drop_rate=0.250" in message
     assert "prefetch_records/wave=3.00" in message
     assert "proposal_wall=12.000ms/1" in message

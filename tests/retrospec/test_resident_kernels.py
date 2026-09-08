@@ -5,7 +5,9 @@ import pytest
 import torch
 
 from vllm.v1.spec_decode.retrospec.resident_kernels import (
+    compact_resident_misses,
     lookup_resident_handles,
+    scatter_staging_page_ids,
     update_resident_handles,
 )
 
@@ -32,7 +34,7 @@ def _make_table(
 def _lookup(
     cluster_handles: torch.Tensor,
     logical_page_ids: torch.Tensor,
-    active_mask: torch.Tensor,
+    active_mask: torch.Tensor | None,
     table: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, ...]:
     output_page_slots = torch.empty_like(logical_page_ids)
@@ -132,3 +134,75 @@ def test_resident_handle_lookup_reports_tombstone_and_unknown_handle_as_miss():
     assert outputs[1].cpu().tolist() == [[[False, False]]]
     assert outputs[2].cpu().tolist() == [[[True, True]]]
     assert outputs[4].cpu().tolist() == [[[2, 2]]]
+
+
+def test_resident_handle_lookup_can_activate_all_valid_verification_rows():
+    device = torch.device("cuda")
+    table = _make_table()
+    update_resident_handles(
+        bucket_ids=torch.tensor([3], dtype=torch.int32, device=device),
+        cluster_handles=torch.tensor([3], dtype=torch.int64, device=device),
+        page_counts=torch.tensor([1], dtype=torch.int32, device=device),
+        page_slots=torch.tensor([[5, -1]], dtype=torch.int32, device=device),
+        hit_gate_ready=torch.tensor([True], device=device),
+        table_handles=table[0],
+        table_versions=table[1],
+        table_page_counts=table[2],
+        table_page_slots=table[3],
+        table_hit_gate_ready=table[4],
+    )
+
+    handles = torch.tensor([[[3, 9]], [[3, -1]]], dtype=torch.int64, device=device)
+    pages = torch.tensor(
+        [[[[20, -1], [30, -1]]], [[[20, -1], [-1, -1]]]],
+        dtype=torch.int64,
+        device=device,
+    )
+    outputs = _lookup(handles, pages, None, table)
+
+    assert outputs[1].cpu().tolist() == [[[True, False]], [[True, False]]]
+    assert outputs[2].cpu().tolist() == [[[False, True]], [[False, False]]]
+    assert outputs[4].cpu().tolist() == [[[1, 2]], [[1, 0]]]
+
+
+def test_compact_resident_misses_preserves_handles_and_flat_positions():
+    device = torch.device("cuda")
+    handles = torch.tensor(
+        [[[10, 11, -1], [12, 10, 13]]], dtype=torch.int64, device=device
+    )
+    misses = torch.tensor([[[False, True, True], [True, True, False]]], device=device)
+    output_handles = torch.empty(handles.numel(), dtype=torch.int64, device=device)
+    output_positions = torch.empty_like(output_handles)
+    output_count = torch.empty(1, dtype=torch.int32, device=device)
+
+    compact_resident_misses(
+        handles,
+        misses,
+        output_handles,
+        output_positions,
+        output_count,
+    )
+
+    count = int(output_count.item())
+    records = sorted(
+        zip(
+            output_positions[:count].cpu().tolist(),
+            output_handles[:count].cpu().tolist(),
+        )
+    )
+    assert records == [(1, 11), (3, 12), (4, 10)]
+
+
+def test_scatter_staging_page_ids_expands_compact_occurrences():
+    device = torch.device("cuda")
+    output = torch.empty((2, 1, 3, 3), dtype=torch.int64, device=device)
+    positions = torch.tensor([1, 3, 4], dtype=torch.int64, device=device)
+    starts = torch.tensor([0, 2, 0], dtype=torch.int64, device=device)
+    counts = torch.tensor([2, 1, 2], dtype=torch.int32, device=device)
+
+    scatter_staging_page_ids(positions, starts, counts, 3, output)
+
+    assert output.cpu().tolist() == [
+        [[[-1, -1, -1], [0, 1, -1], [-1, -1, -1]]],
+        [[[2, -1, -1], [0, 1, -1], [-1, -1, -1]]],
+    ]

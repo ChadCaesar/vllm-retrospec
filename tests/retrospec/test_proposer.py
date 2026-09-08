@@ -1256,6 +1256,9 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
         "draft_tokens": 4,
         "verified_tokens": 4,
         "proposed_tokens": 4,
+        "verification_lookup_clusters": 0,
+        "verification_resident_hits": 0,
+        "verification_resident_misses": 0,
     }
     assert stats._cpu_times["proposal_wall"][1] == 1
 

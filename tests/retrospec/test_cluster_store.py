@@ -215,6 +215,36 @@ def get_runtime_blocks(store, table, device):
     return cluster_ids, metadata
 
 
+def materialize_resolved_pages(resolved):
+    page_shape = resolved.resident_key_pages.shape[1:]
+    output_shape = (*resolved.resident_page_ids.shape, *page_shape)
+    keys = torch.zeros(
+        output_shape,
+        dtype=resolved.resident_key_pages.dtype,
+        device=resolved.resident_key_pages.device,
+    )
+    values = torch.zeros_like(keys)
+
+    resident_mask = resolved.resident_page_ids >= 0
+    if resident_mask.any():
+        resident_slots = resolved.resident_page_ids[resident_mask].to(torch.int64)
+        keys[resident_mask] = resolved.resident_key_pages.index_select(
+            0, resident_slots
+        )
+        values[resident_mask] = resolved.resident_value_pages.index_select(
+            0, resident_slots
+        )
+
+    staging_mask = resolved.staging_page_ids >= 0
+    if staging_mask.any():
+        staging_slots = resolved.staging_page_ids[staging_mask].to(torch.int64)
+        keys[staging_mask] = resolved.staging_key_pages.index_select(0, staging_slots)
+        values[staging_mask] = resolved.staging_value_pages.index_select(
+            0, staging_slots
+        )
+    return keys, values, resident_mask | staging_mask
+
+
 def test_cluster_store_packs_per_head_clusters_across_pages():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -1352,6 +1382,133 @@ def test_cpu_backing_store_stages_before_updating_resident_cache():
         resident_values.index_select(0, resident_slots).cpu(),
         resident_backing_values,
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for GPU-native verification resolution",
+)
+def test_gpu_verification_resolution_deduplicates_miss_pages_before_h2d():
+    device = torch.device("cuda", torch.cuda.current_device())
+    stats = RetroSpecPerformanceStats(device=device, log_interval_seconds=60.0)
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        pin_memory=True,
+        cache_ratio=0.5,
+        performance_stats=stats,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    cluster_ids, metadata = get_runtime_blocks(store, table, device)
+    selected_cluster_ids = torch.cat((cluster_ids, cluster_ids), dim=-1).unsqueeze(0)
+    selected_page_ids = torch.cat(
+        (metadata.page_ids, metadata.page_ids), dim=-2
+    ).unsqueeze(0)
+
+    reference_store = RetroSpecClusterPageStore(
+        page_size=2,
+        pin_memory=True,
+        cache_ratio=0.5,
+    )
+    reference_table = store_cluster_data(
+        reference_store,
+        "layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    reference_cluster_ids, reference_metadata = get_runtime_blocks(
+        reference_store, reference_table, device
+    )
+    reference = reference_store.resolve_cluster_blocks(
+        "layer",
+        torch.cat((reference_cluster_ids, reference_cluster_ids), dim=-1).unsqueeze(0),
+        torch.cat(
+            (reference_metadata.page_ids, reference_metadata.page_ids), dim=-2
+        ).unsqueeze(0),
+    )
+
+    resolved = store.resolve_verification_cluster_blocks(
+        "layer", selected_cluster_ids, selected_page_ids
+    )
+    assert resolved.miss_cluster_mask.all()
+    assert not resolved.hit_cluster_mask.any()
+    assert resolved.miss_admission is not None
+    assert resolved.miss_admission.cluster_ids_cpu.numel() == cluster_ids.numel()
+    assert resolved.staging_key_pages.shape[0] == (metadata.page_ids >= 0).sum()
+    assert torch.equal(
+        resolved.staging_page_ids[..., : cluster_ids.shape[-1], :],
+        resolved.staging_page_ids[..., cluster_ids.shape[-1] :, :],
+    )
+
+    reference.staging_ready_event.synchronize()
+    resolved.staging_ready_event.synchronize()
+    reference_keys, reference_values, reference_mask = materialize_resolved_pages(
+        reference
+    )
+    resolved_keys, resolved_values, resolved_mask = materialize_resolved_pages(resolved)
+    torch.testing.assert_close(resolved_keys, reference_keys)
+    torch.testing.assert_close(resolved_values, reference_values)
+    torch.testing.assert_close(resolved_mask, reference_mask)
+    if reference.read_lease is not None:
+        reference.read_lease.release()
+    if resolved.read_lease is not None:
+        resolved.read_lease.release()
+    store.admit_verification_misses(resolved.miss_admission)
+    store.synchronize_resident_prefetches(("layer",))
+    assert store.num_resident_pages("layer") == 3
+    assert stats._cpu_counters["verification_unique_miss_clusters"] == 4
+    assert stats._cpu_counters["verification_duplicate_miss_clusters"] == 4
+    assert stats._cpu_counters["verification_miss_pages"] == 6
+    reference_store.close()
+    store.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for GPU-native verification resolution",
+)
+def test_gpu_verification_resolution_all_hit_skips_staging_and_admission():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        pin_memory=True,
+        cache_ratio=1.0,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    cluster_ids, metadata = get_runtime_blocks(store, table, device)
+    selected_cluster_ids = cluster_ids.unsqueeze(0)
+    selected_page_ids = metadata.page_ids.unsqueeze(0)
+    store.admit_resident_clusters("layer", selected_cluster_ids, selected_page_ids)
+
+    resolved = store.resolve_verification_cluster_blocks(
+        "layer", selected_cluster_ids, selected_page_ids
+    )
+    assert resolved.hit_cluster_mask.all()
+    assert not resolved.miss_cluster_mask.any()
+    assert resolved.staging_key_pages.shape[0] == 0
+    assert resolved.staging_value_pages.shape[0] == 0
+    assert resolved.miss_admission is None
+    assert torch.all(resolved.staging_page_ids == -1)
+    if resolved.read_lease is not None:
+        resolved.read_lease.release()
+    store.close()
 
 
 @pytest.mark.skipif(
