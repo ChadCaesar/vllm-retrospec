@@ -283,7 +283,7 @@ def test_gather_resident_exact_pages_matches_request_slot_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_selection_output_workspace_recycles_step_slots_and_reuses_proposals():
+def test_selection_plan_table_reuses_fixed_step_slots_across_proposals():
     device = torch.device("cuda", torch.cuda.current_device())
     index = RetroSpecSegmentedTokenIndex(
         block_size=2,
@@ -306,33 +306,36 @@ def test_selection_output_workspace_recycles_step_slots_and_reuses_proposals():
 
     index.begin_proposal(["request"])
     try:
-        first = index._get_selection_output_workspace(
-            "layer", view, 1, 1, 8, torch.float16, device
+        _, first, table = index._get_selection_plan_step(
+            "layer", 0, view, 1, 1, 8, torch.float16, device
         )
-        second = index._get_selection_output_workspace(
-            "layer", view, 1, 1, 8, torch.float16, device
+        _, second, second_table = index._get_selection_plan_step(
+            "layer", 1, view, 1, 1, 8, torch.float16, device
         )
-        recycled = index._get_selection_output_workspace(
-            "layer", view, 1, 1, 8, torch.float16, device
+        _, same_first, same_table = index._get_selection_plan_step(
+            "layer", 0, view, 1, 1, 8, torch.float16, device
         )
     finally:
         index.end_proposal()
 
-    assert first is not second
-    assert recycled is first
+    assert second_table is table
+    assert same_table is table
     assert first.draft_estimation_keys.data_ptr() != (
         second.draft_estimation_keys.data_ptr()
+    )
+    assert same_first.draft_estimation_keys.data_ptr() == (
+        first.draft_estimation_keys.data_ptr()
     )
 
     index.begin_proposal(["request"])
     try:
-        reused = index._get_selection_output_workspace(
-            "layer", view, 1, 1, 8, torch.float16, device
+        _, reused, reused_table = index._get_selection_plan_step(
+            "layer", 0, view, 1, 1, 8, torch.float16, device
         )
     finally:
         index.end_proposal()
 
-    assert reused is first
+    assert reused_table is table
     assert reused.draft_estimation_keys.data_ptr() == (
         first.draft_estimation_keys.data_ptr()
     )

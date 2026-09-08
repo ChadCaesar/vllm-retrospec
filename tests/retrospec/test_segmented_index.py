@@ -31,10 +31,11 @@ def make_index(
     max_pending_cluster_builds: int = 2,
     max_resident_requests: int = 1,
     first_draft_warmup_multiplier: int = 4,
+    num_speculative_tokens: int = 1,
 ) -> RetroSpecSegmentedTokenIndex:
     return RetroSpecSegmentedTokenIndex(
         block_size=2,
-        num_speculative_tokens=1,
+        num_speculative_tokens=num_speculative_tokens,
         retrieval_ratio=retrieval_ratio,
         estimation_ratio=estimation_ratio,
         prefill_segment_size_tokens=prefill_segment_size_tokens,
@@ -792,6 +793,70 @@ def test_bounded_mask_packing_uses_fixed_width_and_preserves_valid_indices():
     ]
     assert indices[0, 0, packed_mask[0, 0]].tolist() == [1, 3, 5]
     assert indices[1, 0, packed_mask[1, 0]].tolist() == [0]
+
+
+def test_bounded_mask_packing_writes_preallocated_outputs():
+    mask = torch.tensor([[[False, True, False, True]]])
+    indices = torch.full((1, 1, 3), -1, dtype=torch.int64)
+    packed_mask = torch.ones_like(indices, dtype=torch.bool)
+    topk_order = torch.empty_like(indices)
+
+    result_indices, result_mask = (
+        RetroSpecSegmentedTokenIndex._pack_bounded_mask_indices(
+            mask,
+            output_width=3,
+            output_indices=indices,
+            output_mask=packed_mask,
+            topk_order=topk_order,
+        )
+    )
+
+    assert result_indices.data_ptr() == indices.data_ptr()
+    assert result_mask.data_ptr() == packed_mask.data_ptr()
+    assert packed_mask.tolist() == [[[True, True, False]]]
+    assert indices[packed_mask].tolist() == [1, 3]
+
+
+def test_selection_plan_table_grows_only_between_proposals():
+    index = make_index(num_speculative_tokens=2, max_resident_requests=2)
+    first_view = make_empty_resident_view(1, 2, torch.device("cpu"))
+    larger_view = make_empty_resident_view(2, 4, torch.device("cpu"))
+
+    index.begin_proposal(["request"])
+    try:
+        index._get_selection_plan_step(
+            "layer", 0, first_view, 1, 1, 1, torch.float32, torch.device("cpu")
+        )
+        index._selection_plan_written_layers.add("layer")
+        with pytest.raises(RuntimeError, match="shape changed"):
+            index._get_selection_plan_step(
+                "layer",
+                1,
+                larger_view,
+                2,
+                1,
+                1,
+                torch.float32,
+                torch.device("cpu"),
+            )
+    finally:
+        index.end_proposal()
+
+    index.begin_proposal(["first", "second"])
+    try:
+        index._get_selection_plan_step(
+            "layer",
+            0,
+            larger_view,
+            2,
+            1,
+            1,
+            torch.float32,
+            torch.device("cpu"),
+        )
+        assert index._selection_plan_tables["layer"].batch_capacity == 2
+    finally:
+        index.end_proposal()
 
 
 def test_primary_exact_capacity_covers_every_up_to_date_layout():

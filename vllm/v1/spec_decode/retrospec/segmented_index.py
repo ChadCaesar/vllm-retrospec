@@ -180,13 +180,36 @@ class _ClusterSelectionWorkspace:
 
 
 @dataclass(frozen=True)
-class _SelectionOutputWorkspace:
+class _SelectionStepWorkspace:
+    draft_exact_page_token_counts: torch.Tensor
+    draft_resident_page_ids: torch.Tensor
+    draft_resident_hit_mask: torch.Tensor
+    draft_resident_miss_mask: torch.Tensor
+    draft_resident_hit_gate_ready_mask: torch.Tensor
+    draft_resident_access_kinds: torch.Tensor
+
+    draft_estimation_keys: torch.Tensor
+    draft_estimation_values: torch.Tensor
+    draft_estimation_token_counts: torch.Tensor
+    sparse_estimation_width: int
+    sparse_retrieval_width: int
+
+
+@dataclass(frozen=True)
+class _SelectionPlanTable:
+    layer_name: str
+    valid_rows: torch.Tensor
+
+    primary_exact_token_indices: torch.Tensor
+    primary_exact_token_mask: torch.Tensor
+
     sparse_exact_cluster_ids: torch.Tensor
     sparse_exact_page_ids: torch.Tensor
     sparse_exact_page_token_counts: torch.Tensor
     expanded_exact_cluster_ids: torch.Tensor
     expanded_exact_page_ids: torch.Tensor
     expanded_exact_page_token_counts: torch.Tensor
+
     draft_exact_page_token_counts: torch.Tensor
     draft_resident_page_ids: torch.Tensor
     draft_resident_hit_mask: torch.Tensor
@@ -201,14 +224,21 @@ class _SelectionOutputWorkspace:
     expanded_estimation_values: torch.Tensor
     expanded_estimation_token_counts: torch.Tensor
 
+    sparse_attn: torch.Tensor
+    expanded_attn: torch.Tensor
+    primary_topk_order: torch.Tensor
+
     sparse_estimation_width: int
     sparse_retrieval_width: int
 
     @classmethod
     def allocate(
         cls,
-        batch_size: int,
+        layer_name: str,
+        num_steps: int,
+        batch_capacity: int,
         num_kv_heads: int,
+        primary_exact_width: int,
         sparse_retrieval_width: int,
         expanded_retrieval_width: int,
         sparse_estimation_width: int,
@@ -216,34 +246,42 @@ class _SelectionOutputWorkspace:
         head_size: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> "_SelectionOutputWorkspace":
+    ) -> "_SelectionPlanTable":
+        prefix = (num_steps, batch_capacity, num_kv_heads)
         sparse_cluster_shape = (
-            batch_size,
-            num_kv_heads,
+            *prefix,
             sparse_retrieval_width,
         )
         expanded_cluster_shape = (
-            batch_size,
-            num_kv_heads,
+            *prefix,
             expanded_retrieval_width,
         )
         sparse_page_shape = (*sparse_cluster_shape, max_pages_per_cluster)
         expanded_page_shape = (*expanded_cluster_shape, max_pages_per_cluster)
         draft_estimation_width = sparse_estimation_width + sparse_retrieval_width
         draft_estimation_shape = (
-            batch_size,
-            num_kv_heads,
+            *prefix,
             draft_estimation_width,
             head_size,
         )
         expanded_estimation_shape = (
-            batch_size,
-            num_kv_heads,
+            *prefix,
             sparse_estimation_width,
             head_size,
         )
+        primary_shape = (*prefix, primary_exact_width)
 
         return cls(
+            layer_name=layer_name,
+            valid_rows=torch.zeros(
+                (num_steps, batch_capacity), dtype=torch.bool, device=device
+            ),
+            primary_exact_token_indices=torch.empty(
+                primary_shape, dtype=torch.int64, device=device
+            ),
+            primary_exact_token_mask=torch.empty(
+                primary_shape, dtype=torch.bool, device=device
+            ),
             sparse_exact_cluster_ids=torch.empty(
                 sparse_cluster_shape, dtype=torch.int64, device=device
             ),
@@ -300,14 +338,31 @@ class _SelectionOutputWorkspace:
                 dtype=torch.int32,
                 device=device,
             ),
+            sparse_attn=torch.empty(
+                (num_steps, batch_capacity), dtype=torch.float32, device=device
+            ),
+            expanded_attn=torch.empty(
+                (num_steps, batch_capacity), dtype=torch.float32, device=device
+            ),
+            primary_topk_order=torch.empty(
+                (batch_capacity, num_kv_heads, primary_exact_width),
+                dtype=torch.int64,
+                device=device,
+            ),
             sparse_estimation_width=sparse_estimation_width,
             sparse_retrieval_width=sparse_retrieval_width,
         )
 
+    @property
+    def batch_capacity(self) -> int:
+        return self.valid_rows.shape[1]
+
     def matches(
         self,
+        num_steps: int,
         batch_size: int,
         num_kv_heads: int,
+        primary_exact_width: int,
         sparse_retrieval_width: int,
         expanded_retrieval_width: int,
         sparse_estimation_width: int,
@@ -317,21 +372,23 @@ class _SelectionOutputWorkspace:
         device: torch.device,
     ) -> bool:
         return (
-            self.sparse_exact_cluster_ids.shape
-            == (batch_size, num_kv_heads, sparse_retrieval_width)
-            and self.expanded_exact_cluster_ids.shape
-            == (batch_size, num_kv_heads, expanded_retrieval_width)
+            self.valid_rows.shape[0] == num_steps
+            and self.batch_capacity >= batch_size
+            and self.primary_exact_token_indices.shape[2:]
+            == (num_kv_heads, primary_exact_width)
+            and self.sparse_exact_cluster_ids.shape[2:]
+            == (num_kv_heads, sparse_retrieval_width)
+            and self.expanded_exact_cluster_ids.shape[2:]
+            == (num_kv_heads, expanded_retrieval_width)
             and self.sparse_exact_page_ids.shape[-1] == max_pages_per_cluster
-            and self.draft_estimation_keys.shape
+            and self.draft_estimation_keys.shape[2:]
             == (
-                batch_size,
                 num_kv_heads,
                 sparse_estimation_width + sparse_retrieval_width,
                 head_size,
             )
-            and self.expanded_estimation_keys.shape
+            and self.expanded_estimation_keys.shape[2:]
             == (
-                batch_size,
                 num_kv_heads,
                 sparse_estimation_width,
                 head_size,
@@ -339,6 +396,203 @@ class _SelectionOutputWorkspace:
             and self.draft_estimation_keys.dtype == dtype
             and self.draft_estimation_keys.device == device
         )
+
+    def step(
+        self, step_index: int, batch_size: int
+    ) -> tuple[RetroSpecTokenSelectionPlan, _SelectionStepWorkspace]:
+        if not 0 <= step_index < self.valid_rows.shape[0]:
+            raise IndexError("Selection-plan step is out of range")
+        if not 0 < batch_size <= self.batch_capacity:
+            raise ValueError("Selection-plan batch exceeds table capacity")
+
+        draft_keys = self.draft_estimation_keys[step_index, :batch_size]
+        draft_values = self.draft_estimation_values[step_index, :batch_size]
+        draft_counts = self.draft_estimation_token_counts[step_index, :batch_size]
+        sparse_width = self.sparse_estimation_width
+        plan = RetroSpecTokenSelectionPlan(
+            layer_name=self.layer_name,
+            primary_exact_token_indices=(
+                self.primary_exact_token_indices[step_index, :batch_size]
+            ),
+            primary_exact_token_mask=(
+                self.primary_exact_token_mask[step_index, :batch_size]
+            ),
+            sparse_exact_cluster_ids=(
+                self.sparse_exact_cluster_ids[step_index, :batch_size]
+            ),
+            sparse_exact_page_ids=(self.sparse_exact_page_ids[step_index, :batch_size]),
+            sparse_exact_page_token_counts=(
+                self.sparse_exact_page_token_counts[step_index, :batch_size]
+            ),
+            sparse_estimation_keys=draft_keys[:, :, :sparse_width],
+            sparse_estimation_values=draft_values[:, :, :sparse_width],
+            sparse_estimation_token_counts=draft_counts[:, :, :sparse_width],
+            expanded_exact_cluster_ids=(
+                self.expanded_exact_cluster_ids[step_index, :batch_size]
+            ),
+            expanded_exact_page_ids=(
+                self.expanded_exact_page_ids[step_index, :batch_size]
+            ),
+            expanded_exact_page_token_counts=(
+                self.expanded_exact_page_token_counts[step_index, :batch_size]
+            ),
+            expanded_estimation_keys=(
+                self.expanded_estimation_keys[step_index, :batch_size]
+            ),
+            expanded_estimation_values=(
+                self.expanded_estimation_values[step_index, :batch_size]
+            ),
+            expanded_estimation_token_counts=(
+                self.expanded_estimation_token_counts[step_index, :batch_size]
+            ),
+            sparse_attn=self.sparse_attn[step_index, :batch_size],
+            expanded_attn=self.expanded_attn[step_index, :batch_size],
+        )
+        workspace = _SelectionStepWorkspace(
+            draft_exact_page_token_counts=(
+                self.draft_exact_page_token_counts[step_index, :batch_size]
+            ),
+            draft_resident_page_ids=(
+                self.draft_resident_page_ids[step_index, :batch_size]
+            ),
+            draft_resident_hit_mask=(
+                self.draft_resident_hit_mask[step_index, :batch_size]
+            ),
+            draft_resident_miss_mask=(
+                self.draft_resident_miss_mask[step_index, :batch_size]
+            ),
+            draft_resident_hit_gate_ready_mask=(
+                self.draft_resident_hit_gate_ready_mask[step_index, :batch_size]
+            ),
+            draft_resident_access_kinds=(
+                self.draft_resident_access_kinds[step_index, :batch_size]
+            ),
+            draft_estimation_keys=draft_keys,
+            draft_estimation_values=draft_values,
+            draft_estimation_token_counts=draft_counts,
+            sparse_estimation_width=sparse_width,
+            sparse_retrieval_width=self.sparse_retrieval_width,
+        )
+        return plan, workspace
+
+
+@dataclass(frozen=True)
+class _ParallelPlanWorkspace:
+    linear_indices: torch.Tensor
+    valid_rows: torch.Tensor
+    plan: RetroSpecTokenSelectionPlan
+
+    @staticmethod
+    def _plan_sources(table: _SelectionPlanTable) -> dict[str, torch.Tensor]:
+        sparse_width = table.sparse_estimation_width
+        return {
+            "primary_exact_token_indices": table.primary_exact_token_indices,
+            "primary_exact_token_mask": table.primary_exact_token_mask,
+            "sparse_exact_cluster_ids": table.sparse_exact_cluster_ids,
+            "sparse_exact_page_ids": table.sparse_exact_page_ids,
+            "sparse_exact_page_token_counts": (table.sparse_exact_page_token_counts),
+            "sparse_estimation_keys": (
+                table.draft_estimation_keys[:, :, :, :sparse_width]
+            ),
+            "sparse_estimation_values": (
+                table.draft_estimation_values[:, :, :, :sparse_width]
+            ),
+            "sparse_estimation_token_counts": (
+                table.draft_estimation_token_counts[:, :, :, :sparse_width]
+            ),
+            "expanded_exact_cluster_ids": table.expanded_exact_cluster_ids,
+            "expanded_exact_page_ids": table.expanded_exact_page_ids,
+            "expanded_exact_page_token_counts": (
+                table.expanded_exact_page_token_counts
+            ),
+            "expanded_estimation_keys": table.expanded_estimation_keys,
+            "expanded_estimation_values": table.expanded_estimation_values,
+            "expanded_estimation_token_counts": (
+                table.expanded_estimation_token_counts
+            ),
+            "sparse_attn": table.sparse_attn,
+            "expanded_attn": table.expanded_attn,
+        }
+
+    @classmethod
+    def allocate(
+        cls, tables: Sequence[_SelectionPlanTable], pair_capacity: int
+    ) -> "_ParallelPlanWorkspace":
+        if not tables:
+            raise ValueError("Parallel plan workspace requires at least one table")
+        source_maps = tuple(cls._plan_sources(table) for table in tables)
+        reference = tables[0]
+
+        def output(name: str) -> torch.Tensor:
+            sources = tuple(source_map[name] for source_map in source_maps)
+            first = sources[0]
+            if any(
+                source.ndim != first.ndim
+                or source.dtype != first.dtype
+                or source.device != first.device
+                for source in sources[1:]
+            ):
+                raise NotImplementedError(
+                    "RetroSpec plan tables use incompatible attention layers"
+                )
+            tail_shape = tuple(
+                max(source.shape[axis] for source in sources)
+                for axis in range(2, first.ndim)
+            )
+            return torch.empty(
+                (pair_capacity, *tail_shape), dtype=first.dtype, device=first.device
+            )
+
+        return cls(
+            linear_indices=torch.empty(
+                pair_capacity, dtype=torch.int64, device=reference.valid_rows.device
+            ),
+            valid_rows=torch.empty(
+                pair_capacity, dtype=torch.bool, device=reference.valid_rows.device
+            ),
+            plan=RetroSpecTokenSelectionPlan(
+                layer_name="",
+                primary_exact_token_indices=output("primary_exact_token_indices"),
+                primary_exact_token_mask=output("primary_exact_token_mask"),
+                sparse_exact_cluster_ids=output("sparse_exact_cluster_ids"),
+                sparse_exact_page_ids=output("sparse_exact_page_ids"),
+                sparse_exact_page_token_counts=output("sparse_exact_page_token_counts"),
+                sparse_estimation_keys=output("sparse_estimation_keys"),
+                sparse_estimation_values=output("sparse_estimation_values"),
+                sparse_estimation_token_counts=output("sparse_estimation_token_counts"),
+                expanded_exact_cluster_ids=output("expanded_exact_cluster_ids"),
+                expanded_exact_page_ids=output("expanded_exact_page_ids"),
+                expanded_exact_page_token_counts=output(
+                    "expanded_exact_page_token_counts"
+                ),
+                expanded_estimation_keys=output("expanded_estimation_keys"),
+                expanded_estimation_values=output("expanded_estimation_values"),
+                expanded_estimation_token_counts=output(
+                    "expanded_estimation_token_counts"
+                ),
+                sparse_attn=output("sparse_attn"),
+                expanded_attn=output("expanded_attn"),
+            ),
+        )
+
+    def matches(self, table: _SelectionPlanTable, pair_capacity: int) -> bool:
+        if self.linear_indices.shape[0] < pair_capacity:
+            return False
+        if self.linear_indices.device != table.valid_rows.device:
+            return False
+
+        for name, source in self._plan_sources(table).items():
+            destination = getattr(self.plan, name)
+            if destination.dtype != source.dtype or destination.device != source.device:
+                return False
+            if destination.ndim != source.ndim - 1:
+                return False
+            if any(
+                available < required
+                for available, required in zip(destination.shape[1:], source.shape[2:])
+            ):
+                return False
+        return True
 
 
 class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
@@ -425,6 +679,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self.num_kmeans_iterations = num_kmeans_iterations
         self.max_pending_cluster_builds = max_pending_cluster_builds
         self.first_draft_warmup_multiplier = first_draft_warmup_multiplier
+        self.max_model_len = max_model_len
         self.performance_stats = performance_stats
         effective_cache_ratio = cache_ratio
         if cache_ratio == 0.0:
@@ -471,13 +726,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         # plan before the workspace is reused.
         self._cluster_selection_workspace: _ClusterSelectionWorkspace | None = None
 
-        # One output slot is retained for each layer and speculative step.
-        # Plans stay live until parallel verification finishes, so slots may
-        # be reused across proposals but not across steps in one proposal.
-        self._selection_output_workspaces: dict[
-            str, list[_SelectionOutputWorkspace]
-        ] = {}
-        self._selection_output_workspace_cursors: dict[str, int] = {}
+        # One contiguous table is retained per layer. Its first dimensions are
+        # [draft_step, request], so verification can gather packed pair rows
+        # without walking per-step Python dictionaries.
+        self._selection_plan_tables: dict[str, _SelectionPlanTable] = {}
+        self._selection_plan_written_layers: set[str] = set()
+        self._parallel_plan_workspace: _ParallelPlanWorkspace | None = None
 
         # CPU-offload construction is staged during layer execution and
         # committed after the complete prefill attention context.
@@ -796,7 +1050,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             )
         request_ids = tuple(request_ids)
         self._gpu_index_residency.activate(request_ids)
-        self._selection_output_workspace_cursors.clear()
+        for table in self._selection_plan_tables.values():
+            table.valid_rows.zero_()
+        self._selection_plan_written_layers.clear()
         self._proposal_read_leases.clear()
         self._proposal_active = True
         self._proposal_request_ids = request_ids
@@ -811,6 +1067,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             for lease in self._proposal_read_leases:
                 lease.release()
             self._proposal_read_leases.clear()
+            self._selection_plan_written_layers.clear()
             self._proposal_active = False
             self._proposal_request_ids = ()
 
@@ -2202,29 +2459,46 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     def _pack_bounded_mask_indices(
         mask: torch.Tensor,
         output_width: int,
+        output_indices: torch.Tensor | None = None,
+        output_mask: torch.Tensor | None = None,
+        topk_order: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Pack True positions using a synchronization-free upper bound."""
         if output_width < 0:
             raise ValueError("output_width must be non-negative")
+        supplied_outputs = (output_indices, output_mask, topk_order)
+        if any(output is not None for output in supplied_outputs) and not all(
+            output is not None for output in supplied_outputs
+        ):
+            raise ValueError("Bounded packing outputs must be supplied together")
 
         max_num_items = mask.shape[-1]
         leading_shape = mask.shape[:-1]
-        output_width = min(output_width, max_num_items)
+        active_width = min(output_width, max_num_items)
 
-        if output_width == 0:
-            empty_shape = (*leading_shape, 0)
-            return (
-                torch.empty(
-                    empty_shape,
-                    dtype=torch.int64,
-                    device=mask.device,
-                ),
-                torch.empty(
-                    empty_shape,
-                    dtype=torch.bool,
-                    device=mask.device,
-                ),
+        if output_indices is None:
+            output_indices = torch.empty(
+                (*leading_shape, active_width),
+                dtype=torch.int64,
+                device=mask.device,
             )
+            output_mask = torch.empty_like(output_indices, dtype=torch.bool)
+            topk_order = torch.empty_like(output_indices)
+        else:
+            expected_shape = (*leading_shape, output_width)
+            if output_indices.shape != expected_shape:
+                raise ValueError("Bounded packing index output has an invalid shape")
+            if output_mask is None or output_mask.shape != expected_shape:
+                raise ValueError("Bounded packing mask output has an invalid shape")
+            if topk_order is None or topk_order.shape != expected_shape:
+                raise ValueError("Bounded packing scratch output has an invalid shape")
+            output_indices.zero_()
+            output_mask.zero_()
+
+        assert output_mask is not None
+        assert topk_order is not None
+        if active_width == 0:
+            return output_indices, output_mask
 
         logical_indices = torch.arange(
             max_num_items,
@@ -2244,24 +2518,25 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             sentinel,
         )
 
-        packed_indices = torch.topk(
+        packed_indices = output_indices[..., :active_width]
+        packed_order = topk_order[..., :active_width]
+        torch.topk(
             candidates,
-            k=output_width,
+            k=active_width,
             dim=-1,
             largest=False,
             sorted=True,
-        ).values
+            out=(packed_indices, packed_order),
+        )
 
-        packed_mask = packed_indices < max_num_items
+        packed_mask = output_mask[..., :active_width]
+        torch.lt(packed_indices, max_num_items, out=packed_mask)
         packed_indices.clamp_(
             min=0,
             max=max_num_items - 1,
         )
 
-        return (
-            packed_indices.contiguous(),
-            packed_mask.contiguous(),
-        )
+        return output_indices, output_mask
 
     @staticmethod
     def _sum_selected_scores(
@@ -2290,63 +2565,55 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         )
         return selected_scores.sum(dim=2)
 
-    def _get_selection_output_workspace(
+    def _get_selection_plan_step(
         self,
         layer_name: str,
+        plan_slot: int,
         view: RetroSpecResidentBatchView,
         batch_size: int,
         num_kv_heads: int,
         head_size: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> _SelectionOutputWorkspace:
-        if device.type != "cuda":
-            raise ValueError("Selection output workspace requires CUDA")
+    ) -> tuple[
+        RetroSpecTokenSelectionPlan,
+        _SelectionStepWorkspace,
+        _SelectionPlanTable,
+    ]:
+        if not 0 <= plan_slot < self.num_speculative_tokens:
+            raise ValueError("plan_slot is outside the speculative range")
 
         sparse_retrieval_width, sparse_estimation_width, expanded_retrieval_width = (
             self._maximum_zone_widths(view.max_num_clusters)
+        )
+        primary_exact_width = min(
+            self.max_model_len,
+            max(self.prefill_segment_size_tokens, self.generation_update_interval)
+            + (self.num_recent_blocks + 1) * self.block_size,
         )
         max_access_width = max(
             sparse_retrieval_width,
             self._maximum_first_draft_warmup_width(view.max_num_clusters),
         )
-        self.cluster_store.reserve_resident_access_ring(
-            device,
-            batch_size * num_kv_heads * max_access_width,
-        )
-        self.cluster_store.reserve_verification_resolve_workspace(
-            device,
-            batch_size
-            * self.num_speculative_tokens
-            * num_kv_heads
-            * expanded_retrieval_width,
-        )
-        next_cursor = self._selection_output_workspace_cursors.get(layer_name, 0)
-        # A proposal may contain several sparse-verification rounds. Only the
-        # current round's plans remain live, so recycle the fixed speculative
-        # slots instead of growing the workspace or rejecting a later round.
-        cursor = next_cursor % self.num_speculative_tokens
-
-        layer_workspaces = self._selection_output_workspaces.setdefault(layer_name, [])
-        if cursor == len(layer_workspaces):
-            layer_workspaces.append(
-                _SelectionOutputWorkspace.allocate(
-                    batch_size=batch_size,
-                    num_kv_heads=num_kv_heads,
-                    sparse_retrieval_width=sparse_retrieval_width,
-                    expanded_retrieval_width=expanded_retrieval_width,
-                    sparse_estimation_width=sparse_estimation_width,
-                    max_pages_per_cluster=view.max_pages_per_cluster,
-                    head_size=head_size,
-                    dtype=dtype,
-                    device=device,
-                )
+        if device.type == "cuda":
+            self.cluster_store.reserve_resident_access_ring(
+                device,
+                batch_size * num_kv_heads * max_access_width,
+            )
+            self.cluster_store.reserve_verification_resolve_workspace(
+                device,
+                batch_size
+                * self.num_speculative_tokens
+                * num_kv_heads
+                * expanded_retrieval_width,
             )
 
-        workspace = layer_workspaces[cursor]
-        if not workspace.matches(
+        table = self._selection_plan_tables.get(layer_name)
+        matches = table is not None and table.matches(
+            num_steps=self.num_speculative_tokens,
             batch_size=batch_size,
             num_kv_heads=num_kv_heads,
+            primary_exact_width=primary_exact_width,
             sparse_retrieval_width=sparse_retrieval_width,
             expanded_retrieval_width=expanded_retrieval_width,
             sparse_estimation_width=sparse_estimation_width,
@@ -2354,10 +2621,21 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             head_size=head_size,
             dtype=dtype,
             device=device,
-        ):
-            workspace = _SelectionOutputWorkspace.allocate(
-                batch_size=batch_size,
+        )
+        if not matches:
+            if layer_name in self._selection_plan_written_layers:
+                raise RuntimeError(
+                    "Selection-plan shape changed during an active proposal"
+                )
+            batch_capacity = batch_size
+            if table is not None:
+                batch_capacity = max(batch_capacity, table.batch_capacity)
+            table = _SelectionPlanTable.allocate(
+                layer_name=layer_name,
+                num_steps=self.num_speculative_tokens,
+                batch_capacity=batch_capacity,
                 num_kv_heads=num_kv_heads,
+                primary_exact_width=primary_exact_width,
                 sparse_retrieval_width=sparse_retrieval_width,
                 expanded_retrieval_width=expanded_retrieval_width,
                 sparse_estimation_width=sparse_estimation_width,
@@ -2366,10 +2644,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 dtype=dtype,
                 device=device,
             )
-            layer_workspaces[cursor] = workspace
+            self._selection_plan_tables[layer_name] = table
 
-        self._selection_output_workspace_cursors[layer_name] = next_cursor + 1
-        return workspace
+        assert table is not None
+        plan, workspace = table.step(plan_slot, batch_size)
+        return plan, workspace, table
 
     @staticmethod
     def _build_resident_exact_cluster_selection(
@@ -2546,6 +2825,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     def _make_plan(
         self,
         layer_name: str,
+        plan_slot: int,
+        active_mask: torch.Tensor,
         forced_exact_mask: torch.Tensor,
         cluster_zones: _PackedClusterZones,
         sparse_attn: torch.Tensor,
@@ -2554,156 +2835,202 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         num_kv_heads: int,
         head_size: int,
         dtype: torch.dtype,
-    ) -> tuple[RetroSpecTokenSelectionPlan, _SelectionOutputWorkspace | None]:
-        output_workspace = None
-        if forced_exact_mask.device.type == "cuda":
-            output_workspace = self._get_selection_output_workspace(
-                layer_name=layer_name,
-                view=view,
-                batch_size=forced_exact_mask.shape[0],
-                num_kv_heads=num_kv_heads,
-                head_size=head_size,
-                dtype=dtype,
-                device=forced_exact_mask.device,
-            )
+    ) -> tuple[RetroSpecTokenSelectionPlan, _SelectionStepWorkspace]:
+        plan, output_workspace, table = self._get_selection_plan_step(
+            layer_name=layer_name,
+            plan_slot=plan_slot,
+            view=view,
+            batch_size=forced_exact_mask.shape[0],
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+            device=forced_exact_mask.device,
+        )
 
         per_head_forced_exact = forced_exact_mask.unsqueeze(1).expand(
             -1,
             num_kv_heads,
             -1,
         )
-
-        # With an up-to-date segmented index, the exact primary zone consists
-        # of the sink block, an incomplete segment, recent blocks and the
-        # current partial block. This expression is a synchronization-free
-        # upper bound for that union.
-        max_unindexed_segment_tokens = max(
-            self.prefill_segment_size_tokens,
-            self.generation_update_interval,
-        )
-        max_primary_exact_tokens = min(
-            forced_exact_mask.shape[1],
-            max_unindexed_segment_tokens
-            + (self.num_recent_blocks + 1) * self.block_size,
-        )
-
-        (
-            primary_exact_token_indices,
-            primary_exact_token_mask,
-        ) = self._pack_bounded_mask_indices(
+        self._pack_bounded_mask_indices(
             per_head_forced_exact,
-            max_primary_exact_tokens,
+            plan.primary_exact_token_indices.shape[-1],
+            plan.primary_exact_token_indices,
+            plan.primary_exact_token_mask,
+            table.primary_topk_order[: forced_exact_mask.shape[0]],
         )
 
-        (
-            sparse_exact_cluster_ids,
-            sparse_exact_page_ids,
-            sparse_exact_page_token_counts,
-        ) = self._build_resident_exact_cluster_selection(
+        self._build_resident_exact_cluster_selection(
             view,
             cluster_zones.sparse_retrieval_indices,
             cluster_zones.sparse_retrieval_mask,
-            None
-            if output_workspace is None
-            else output_workspace.sparse_exact_cluster_ids,
-            None
-            if output_workspace is None
-            else output_workspace.sparse_exact_page_ids,
-            None
-            if output_workspace is None
-            else output_workspace.sparse_exact_page_token_counts,
+            plan.sparse_exact_cluster_ids,
+            plan.sparse_exact_page_ids,
+            plan.sparse_exact_page_token_counts,
         )
 
-        (
-            expanded_exact_cluster_ids,
-            expanded_exact_page_ids,
-            expanded_exact_page_token_counts,
-        ) = self._build_resident_exact_cluster_selection(
+        self._build_resident_exact_cluster_selection(
             view,
             cluster_zones.expanded_retrieval_indices,
             cluster_zones.expanded_retrieval_mask,
-            None
-            if output_workspace is None
-            else output_workspace.expanded_exact_cluster_ids,
-            None
-            if output_workspace is None
-            else output_workspace.expanded_exact_page_ids,
-            None
-            if output_workspace is None
-            else output_workspace.expanded_exact_page_token_counts,
+            plan.expanded_exact_cluster_ids,
+            plan.expanded_exact_page_ids,
+            plan.expanded_exact_page_token_counts,
         )
 
-        sparse_estimation_keys = None
-        sparse_estimation_values = None
-        sparse_estimation_token_counts = None
-        if output_workspace is not None:
-            sparse_width = output_workspace.sparse_estimation_width
-            sparse_estimation_keys = output_workspace.draft_estimation_keys[
-                :, :, :sparse_width
-            ]
-            sparse_estimation_values = output_workspace.draft_estimation_values[
-                :, :, :sparse_width
-            ]
-            sparse_estimation_token_counts = (
-                output_workspace.draft_estimation_token_counts[:, :, :sparse_width]
-            )
-
-        (
-            sparse_estimation_keys,
-            sparse_estimation_values,
-            sparse_estimation_token_counts,
-        ) = self._build_resident_estimation_selection(
+        self._build_resident_estimation_selection(
             view,
             cluster_zones.sparse_estimation_indices,
             cluster_zones.sparse_estimation_mask,
             head_size,
             dtype,
-            sparse_estimation_keys,
-            sparse_estimation_values,
-            sparse_estimation_token_counts,
+            plan.sparse_estimation_keys,
+            plan.sparse_estimation_values,
+            plan.sparse_estimation_token_counts,
         )
-        (
-            expanded_estimation_keys,
-            expanded_estimation_values,
-            expanded_estimation_token_counts,
-        ) = self._build_resident_estimation_selection(
+        self._build_resident_estimation_selection(
             view,
             cluster_zones.expanded_estimation_indices,
             cluster_zones.expanded_estimation_mask,
             head_size,
             dtype,
-            None
-            if output_workspace is None
-            else output_workspace.expanded_estimation_keys,
-            None
-            if output_workspace is None
-            else output_workspace.expanded_estimation_values,
-            None
-            if output_workspace is None
-            else output_workspace.expanded_estimation_token_counts,
+            plan.expanded_estimation_keys,
+            plan.expanded_estimation_values,
+            plan.expanded_estimation_token_counts,
         )
 
-        return (
-            RetroSpecTokenSelectionPlan(
-                layer_name=layer_name,
-                primary_exact_token_indices=primary_exact_token_indices,
-                primary_exact_token_mask=primary_exact_token_mask,
-                sparse_exact_cluster_ids=sparse_exact_cluster_ids,
-                sparse_exact_page_ids=sparse_exact_page_ids,
-                sparse_exact_page_token_counts=sparse_exact_page_token_counts,
-                sparse_estimation_keys=sparse_estimation_keys,
-                sparse_estimation_values=sparse_estimation_values,
-                sparse_estimation_token_counts=sparse_estimation_token_counts,
-                expanded_exact_cluster_ids=expanded_exact_cluster_ids,
-                expanded_exact_page_ids=expanded_exact_page_ids,
-                expanded_exact_page_token_counts=expanded_exact_page_token_counts,
-                expanded_estimation_keys=expanded_estimation_keys,
-                expanded_estimation_values=expanded_estimation_values,
-                expanded_estimation_token_counts=expanded_estimation_token_counts,
-                sparse_attn=sparse_attn,
-                expanded_attn=expanded_attn,
+        plan.sparse_attn.copy_(sparse_attn)
+        plan.expanded_attn.copy_(expanded_attn)
+        table.valid_rows[plan_slot, : active_mask.shape[0]].copy_(active_mask)
+        self._selection_plan_written_layers.add(layer_name)
+        return plan, output_workspace
+
+    def get_selection_plan(
+        self, layer_name: str, step_index: int
+    ) -> RetroSpecTokenSelectionPlan:
+        table = self._selection_plan_tables.get(layer_name)
+        if table is None:
+            raise RuntimeError(f"No draft selection plan for layer {layer_name!r}")
+        plan, _ = table.step(step_index, len(self._proposal_request_ids))
+        return plan
+
+    def prepare_parallel_plan_workspace(self, pair_capacity: int) -> None:
+        if pair_capacity <= 0:
+            raise ValueError("Parallel plan capacity must be positive")
+        if not self._selection_plan_written_layers:
+            return
+
+        tables = tuple(
+            self._selection_plan_tables[layer_name]
+            for layer_name in self._selection_plan_written_layers
+        )
+        workspace = self._parallel_plan_workspace
+        if workspace is None or any(
+            not workspace.matches(table, pair_capacity) for table in tables
+        ):
+            self._parallel_plan_workspace = _ParallelPlanWorkspace.allocate(
+                tables, pair_capacity
+            )
+
+    def gather_parallel_plan(
+        self,
+        layer_name: str,
+        request_indices: torch.Tensor,
+        token_indices: torch.Tensor,
+    ) -> RetroSpecTokenSelectionPlan:
+        table = self._selection_plan_tables.get(layer_name)
+        workspace = self._parallel_plan_workspace
+        if table is None:
+            raise RuntimeError(
+                f"No draft selection plan exists for layer {layer_name!r}"
+            )
+        if workspace is None:
+            raise RuntimeError("Parallel plan workspace was not prepared")
+        if request_indices.shape != token_indices.shape:
+            raise ValueError("Parallel plan indices must have equal shapes")
+        if request_indices.device != table.valid_rows.device:
+            raise ValueError("Parallel request indices use the wrong device")
+        if token_indices.device != table.valid_rows.device:
+            raise ValueError("Parallel token indices use the wrong device")
+
+        num_pairs = request_indices.numel()
+        if num_pairs > workspace.linear_indices.shape[0]:
+            raise ValueError("Parallel plan exceeds the prepared workspace")
+
+        linear_indices = workspace.linear_indices[:num_pairs]
+        linear_indices.copy_(token_indices)
+        linear_indices.mul_(table.batch_capacity)
+        linear_indices.add_(request_indices)
+
+        valid_rows = workspace.valid_rows[:num_pairs]
+        torch.index_select(table.valid_rows.view(-1), 0, linear_indices, out=valid_rows)
+        torch._assert_async(
+            valid_rows.all(),
+            f"A draft selection plan is missing for layer {layer_name!r}",
+        )
+
+        def gather(source: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+            tail_slices = tuple(slice(0, size) for size in source.shape[2:])
+            destination = output[(slice(0, num_pairs), *tail_slices)]
+            torch.index_select(source.flatten(0, 1), 0, linear_indices, out=destination)
+            return destination
+
+        output = workspace.plan
+        sparse_width = table.sparse_estimation_width
+        return RetroSpecTokenSelectionPlan(
+            layer_name=layer_name,
+            primary_exact_token_indices=gather(
+                table.primary_exact_token_indices,
+                output.primary_exact_token_indices,
             ),
-            output_workspace,
+            primary_exact_token_mask=gather(
+                table.primary_exact_token_mask, output.primary_exact_token_mask
+            ),
+            sparse_exact_cluster_ids=gather(
+                table.sparse_exact_cluster_ids, output.sparse_exact_cluster_ids
+            ),
+            sparse_exact_page_ids=gather(
+                table.sparse_exact_page_ids, output.sparse_exact_page_ids
+            ),
+            sparse_exact_page_token_counts=gather(
+                table.sparse_exact_page_token_counts,
+                output.sparse_exact_page_token_counts,
+            ),
+            sparse_estimation_keys=gather(
+                table.draft_estimation_keys[:, :, :, :sparse_width],
+                output.sparse_estimation_keys,
+            ),
+            sparse_estimation_values=gather(
+                table.draft_estimation_values[:, :, :, :sparse_width],
+                output.sparse_estimation_values,
+            ),
+            sparse_estimation_token_counts=gather(
+                table.draft_estimation_token_counts[:, :, :, :sparse_width],
+                output.sparse_estimation_token_counts,
+            ),
+            expanded_exact_cluster_ids=gather(
+                table.expanded_exact_cluster_ids,
+                output.expanded_exact_cluster_ids,
+            ),
+            expanded_exact_page_ids=gather(
+                table.expanded_exact_page_ids, output.expanded_exact_page_ids
+            ),
+            expanded_exact_page_token_counts=gather(
+                table.expanded_exact_page_token_counts,
+                output.expanded_exact_page_token_counts,
+            ),
+            expanded_estimation_keys=gather(
+                table.expanded_estimation_keys, output.expanded_estimation_keys
+            ),
+            expanded_estimation_values=gather(
+                table.expanded_estimation_values, output.expanded_estimation_values
+            ),
+            expanded_estimation_token_counts=gather(
+                table.expanded_estimation_token_counts,
+                output.expanded_estimation_token_counts,
+            ),
+            sparse_attn=gather(table.sparse_attn, output.sparse_attn),
+            expanded_attn=gather(table.expanded_attn, output.expanded_attn),
         )
 
     def _gather_selected_tokens(
@@ -2753,7 +3080,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     def _materialize_draft_selection(
         self,
         plan: RetroSpecTokenSelectionPlan,
-        output_workspace: _SelectionOutputWorkspace | None,
+        output_workspace: _SelectionStepWorkspace | None,
         view: RetroSpecResidentBatchView,
         cluster_zones: _PackedClusterZones,
         cluster_scores: torch.Tensor,
@@ -3335,6 +3662,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         active_mask: torch.Tensor,
         scale: float,
         warm_first_draft: bool = False,
+        plan_slot: int = 0,
     ) -> RetroSpecTokenAttentionSelection:
         self._validate_inputs(
             query,
@@ -3452,6 +3780,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         with self._cuda_timer("draft_plan_build"):
             plan, output_workspace = self._make_plan(
                 layer_name=layer_name,
+                plan_slot=plan_slot,
+                active_mask=active_mask,
                 forced_exact_mask=forced_exact_mask,
                 cluster_zones=cluster_zones,
                 sparse_attn=sparse_attn,

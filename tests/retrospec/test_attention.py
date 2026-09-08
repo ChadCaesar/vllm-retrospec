@@ -35,6 +35,7 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecSegmentedTokenIndex,
     RetroSpecTokenAttentionSelection,
     RetroSpecTokenSelectionPlan,
+    _SelectionPlanTable,
 )
 
 
@@ -261,6 +262,67 @@ def make_selection(batch_size: int = 2) -> RetroSpecTokenAttentionSelection:
     )
 
 
+_TOKEN_PLAN_TENSOR_FIELDS = (
+    "primary_exact_token_indices",
+    "primary_exact_token_mask",
+    "sparse_exact_cluster_ids",
+    "sparse_exact_page_ids",
+    "sparse_exact_page_token_counts",
+    "sparse_estimation_keys",
+    "sparse_estimation_values",
+    "sparse_estimation_token_counts",
+    "expanded_exact_cluster_ids",
+    "expanded_exact_page_ids",
+    "expanded_exact_page_token_counts",
+    "expanded_estimation_keys",
+    "expanded_estimation_values",
+    "expanded_estimation_token_counts",
+    "sparse_attn",
+    "expanded_attn",
+)
+
+
+def store_token_plan(
+    index: RetroSpecSegmentedTokenIndex,
+    plan: RetroSpecTokenSelectionPlan,
+    step_index: int,
+    active_mask: torch.Tensor | None = None,
+) -> None:
+    batch_size, num_kv_heads, primary_width = plan.primary_exact_token_indices.shape
+    sparse_width = plan.sparse_exact_cluster_ids.shape[-1]
+    expanded_width = plan.expanded_exact_cluster_ids.shape[-1]
+    estimation_width = plan.sparse_estimation_keys.shape[-2]
+    max_pages_per_cluster = plan.sparse_exact_page_ids.shape[-1]
+    head_size = plan.sparse_estimation_keys.shape[-1]
+    table = index._selection_plan_tables.get(plan.layer_name)
+    if table is None:
+        table = _SelectionPlanTable.allocate(
+            layer_name=plan.layer_name,
+            num_steps=index.num_speculative_tokens,
+            batch_capacity=batch_size,
+            num_kv_heads=num_kv_heads,
+            primary_exact_width=primary_width,
+            sparse_retrieval_width=sparse_width,
+            expanded_retrieval_width=expanded_width,
+            sparse_estimation_width=estimation_width,
+            max_pages_per_cluster=max_pages_per_cluster,
+            head_size=head_size,
+            dtype=plan.sparse_estimation_keys.dtype,
+            device=plan.sparse_estimation_keys.device,
+        )
+        index._selection_plan_tables[plan.layer_name] = table
+
+    stored, _ = table.step(step_index, batch_size)
+    for field_name in _TOKEN_PLAN_TENSOR_FIELDS:
+        getattr(stored, field_name).copy_(getattr(plan, field_name))
+    if active_mask is None:
+        active_mask = torch.ones(
+            batch_size, dtype=torch.bool, device=table.valid_rows.device
+        )
+    table.valid_rows[step_index, :batch_size].copy_(active_mask)
+    index._selection_plan_written_layers.add(plan.layer_name)
+
+
 def test_proposal_context_and_step_average_attention_mass():
     controller = make_controller()
     mark_installed(controller)
@@ -375,7 +437,7 @@ def test_proposal_context_restores_state_and_plans_after_exception():
         controller.proposal_context(["request"]),
     ):
         controller.begin_step(RetroSpecAttentionMode.DRAFT, 0, torch.tensor([True]))
-        controller.selection_plans[0]["layer"] = make_plan(1)
+        controller.index._selection_plan_written_layers.add("layer")
         raise RuntimeError("model failure")
 
     assert not controller.in_proposal
@@ -383,7 +445,7 @@ def test_proposal_context_restores_state_and_plans_after_exception():
     assert not controller.step_active
     assert controller.active_mask is None
     assert controller.batch_size == 0
-    assert controller.selection_plans == [{}, {}]
+    assert not controller.index._selection_plan_written_layers
 
 
 def test_proposal_context_cannot_nest_and_step_requires_context():
@@ -1276,6 +1338,7 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
     controller.index.has_cluster_pages = Mock(return_value=True)
     selection = make_selection(batch_size=1)
     controller.index.select_segmented = Mock(return_value=selection)
+    controller.index.get_selection_plan = Mock(return_value=selection.plan)
     controller.index.materialize = Mock(return_value=selection)
     controller._run_exact_attention = Mock(
         return_value=(torch.zeros(1, 1, 1), torch.zeros(1, 1))
@@ -1336,6 +1399,7 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
         controller.end_step()
 
         controller.index.select_segmented.assert_called_once()
+        controller.index.get_selection_plan.assert_called_once_with("layer", 0)
         controller.index.materialize.assert_called_once()
         materialize_args = controller.index.materialize.call_args.args
         assert materialize_args[0] is selection.plan
@@ -1541,17 +1605,79 @@ def test_parallel_verification_gathers_segmented_token_plan_rows():
     step_zero = replace(
         make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),
         primary_exact_token_indices=torch.tensor([[[0, 1]], [[2, 3]]]),
+        primary_exact_token_mask=torch.tensor([[[True, False]], [[True, True]]]),
+        sparse_exact_cluster_ids=torch.tensor([[[10, 11]], [[12, 13]]]),
+        sparse_exact_page_ids=torch.arange(8).view(2, 1, 2, 2),
+        sparse_exact_page_token_counts=torch.arange(8, dtype=torch.int32).view(
+            2, 1, 2, 2
+        ),
+        sparse_estimation_keys=torch.tensor([[[[20.0]]], [[[21.0]]]]),
+        sparse_estimation_values=torch.tensor([[[[22.0]]], [[[23.0]]]]),
+        sparse_estimation_token_counts=torch.tensor(
+            [[[24]], [[25]]], dtype=torch.int32
+        ),
+        expanded_exact_cluster_ids=torch.tensor([[[30, 31, 32]], [[33, 34, 35]]]),
+        expanded_exact_page_ids=torch.arange(12).view(2, 1, 3, 2) + 40,
+        expanded_exact_page_token_counts=torch.arange(12, dtype=torch.int32).view(
+            2, 1, 3, 2
+        ),
+        expanded_estimation_keys=torch.tensor([[[[50.0]]], [[[51.0]]]]),
+        expanded_estimation_values=torch.tensor([[[[52.0]]], [[[53.0]]]]),
+        expanded_estimation_token_counts=torch.tensor(
+            [[[54]], [[55]]], dtype=torch.int32
+        ),
         sparse_attn=torch.tensor([0.1, 0.2]),
+        expanded_attn=torch.tensor([0.5, 0.6]),
     )
     step_one = replace(
         make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),
         primary_exact_token_indices=torch.tensor([[[4, 5]], [[6, 7]]]),
+        primary_exact_token_mask=torch.tensor([[[False, True]], [[True, False]]]),
+        sparse_exact_cluster_ids=torch.tensor([[[60, 61]], [[62, 63]]]),
+        sparse_exact_page_ids=torch.arange(8).view(2, 1, 2, 2) + 70,
+        sparse_exact_page_token_counts=torch.arange(8, dtype=torch.int32).view(
+            2, 1, 2, 2
+        )
+        + 80,
+        sparse_estimation_keys=torch.tensor([[[[90.0]]], [[[91.0]]]]),
+        sparse_estimation_values=torch.tensor([[[[92.0]]], [[[93.0]]]]),
+        sparse_estimation_token_counts=torch.tensor(
+            [[[94]], [[95]]], dtype=torch.int32
+        ),
+        expanded_exact_cluster_ids=torch.tensor([[[100, 101, 102]], [[103, 104, 105]]]),
+        expanded_exact_page_ids=torch.arange(12).view(2, 1, 3, 2) + 110,
+        expanded_exact_page_token_counts=torch.arange(12, dtype=torch.int32).view(
+            2, 1, 3, 2
+        )
+        + 120,
+        expanded_estimation_keys=torch.tensor([[[[130.0]]], [[[131.0]]]]),
+        expanded_estimation_values=torch.tensor([[[[132.0]]], [[[133.0]]]]),
+        expanded_estimation_token_counts=torch.tensor(
+            [[[134]], [[135]]], dtype=torch.int32
+        ),
         sparse_attn=torch.tensor([0.3, 0.4]),
+        expanded_attn=torch.tensor([0.7, 0.8]),
+    )
+    other_layer = replace(
+        make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),
+        layer_name="other",
+        sparse_exact_cluster_ids=torch.tensor([[[140]], [[141]]]),
+        sparse_exact_page_ids=torch.arange(6).view(2, 1, 1, 3) + 150,
+        sparse_exact_page_token_counts=torch.arange(6, dtype=torch.int32).view(
+            2, 1, 1, 3
+        ),
+        expanded_exact_cluster_ids=torch.tensor([[[160, 161]], [[162, 163]]]),
+        expanded_exact_page_ids=torch.arange(12).view(2, 1, 2, 3) + 170,
+        expanded_exact_page_token_counts=torch.arange(12, dtype=torch.int32).view(
+            2, 1, 2, 3
+        ),
     )
 
     with controller.proposal_context(["request-0", "request-1"]):
-        controller.selection_plans[0]["layer"] = step_zero
-        controller.selection_plans[1]["layer"] = step_one
+        store_token_plan(controller.index, step_zero, 0)
+        store_token_plan(controller.index, step_one, 1)
+        store_token_plan(controller.index, other_layer, 0)
+        store_token_plan(controller.index, other_layer, 1)
         controller.begin_parallel_step(
             RetroSpecAttentionMode.EXPANDED_VERIFY,
             request_indices=torch.tensor([1, 0, 1], dtype=torch.int64),
@@ -1560,13 +1686,43 @@ def test_parallel_verification_gathers_segmented_token_plan_rows():
 
         plan = controller._gather_parallel_plan("layer")
         assert isinstance(plan, RetroSpecTokenSelectionPlan)
-        assert plan.primary_exact_token_indices.tolist() == [
-            [[2, 3]],
-            [[4, 5]],
-            [[6, 7]],
+        expected_rows = ((step_zero, 1), (step_one, 0), (step_one, 1))
+        for field_name in _TOKEN_PLAN_TENSOR_FIELDS:
+            expected = torch.stack(
+                [getattr(source, field_name)[row] for source, row in expected_rows]
+            )
+            torch.testing.assert_close(getattr(plan, field_name), expected)
+        other_plan = controller._gather_parallel_plan("other")
+        assert other_plan.sparse_exact_page_ids.shape == (3, 1, 1, 3)
+        assert other_plan.expanded_exact_page_ids.shape == (3, 1, 2, 3)
+        assert other_plan.sparse_exact_page_ids.tolist() == [
+            [[[153, 154, 155]]],
+            [[[150, 151, 152]]],
+            [[[153, 154, 155]]],
         ]
-        assert plan.sparse_attn.tolist() == pytest.approx([0.2, 0.3, 0.4])
+        first_data_ptrs = tuple(
+            getattr(plan, field_name).data_ptr()
+            for field_name in _TOKEN_PLAN_TENSOR_FIELDS
+        )
 
+        controller.attention_mass_layer_count = 1
+        controller.end_step()
+
+        controller.begin_parallel_step(
+            RetroSpecAttentionMode.SPARSE_VERIFY,
+            request_indices=torch.tensor([0, 1], dtype=torch.int64),
+            token_indices=torch.tensor([1, 0], dtype=torch.int64),
+        )
+        reused = controller._gather_parallel_plan("layer")
+        reused_data_ptrs = tuple(
+            getattr(reused, field_name).data_ptr()
+            for field_name in _TOKEN_PLAN_TENSOR_FIELDS
+        )
+        assert reused_data_ptrs == first_data_ptrs
+        assert reused.primary_exact_token_indices.tolist() == [
+            [[4, 5]],
+            [[2, 3]],
+        ]
         controller.attention_mass_layer_count = 1
         controller.end_step()
 
@@ -1576,8 +1732,10 @@ def test_parallel_verification_rejects_missing_token_plan():
     mark_installed(controller)
 
     with controller.proposal_context(["request"]):
-        controller.selection_plans[0]["layer"] = make_token_plan(
-            1, num_kv_heads=1, exact_width=1, estimation_width=1
+        store_token_plan(
+            controller.index,
+            make_token_plan(1, num_kv_heads=1, exact_width=1, estimation_width=1),
+            0,
         )
         controller.begin_parallel_step(
             RetroSpecAttentionMode.SPARSE_VERIFY,

@@ -564,7 +564,7 @@ def test_cluster_selection_workspace_is_reused_and_resized():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_selection_output_workspace_recycles_across_draft_rounds():
+def test_selection_plan_table_uses_stable_draft_step_views():
     index = RetroSpecSegmentedTokenIndex(
         block_size=16,
         num_speculative_tokens=2,
@@ -579,20 +579,25 @@ def test_selection_output_workspace_recycles_across_draft_rounds():
     device = torch.device("cuda", torch.cuda.current_device())
     view = make_empty_resident_view(2, 8, device)
     workspaces = [
-        index._get_selection_output_workspace(
+        index._get_selection_plan_step(
             "layer",
+            step_index,
             view,
             batch_size=2,
             num_kv_heads=2,
             head_size=64,
             dtype=torch.float16,
             device=device,
-        )
-        for _ in range(3)
+        )[1]
+        for step_index in (0, 1, 0)
     ]
 
-    assert workspaces[0] is not workspaces[1]
-    assert workspaces[2] is workspaces[0]
+    assert workspaces[0].draft_estimation_keys.data_ptr() != (
+        workspaces[1].draft_estimation_keys.data_ptr()
+    )
+    assert workspaces[2].draft_estimation_keys.data_ptr() == (
+        workspaces[0].draft_estimation_keys.data_ptr()
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
