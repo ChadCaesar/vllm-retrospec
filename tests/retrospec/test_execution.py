@@ -8,6 +8,7 @@ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.spec_decode.retrospec.execution import (
     EXACT_ATTENTION_PARTITION_SIZE,
     RetroSpecCompactKVSource,
+    RetroSpecEstimationKVSource,
     RetroSpecExactAttentionWorkspace,
     RetroSpecExactKVSource,
     RetroSpecExactPageKVSource,
@@ -67,13 +68,19 @@ def _materialize_head(
     source: RetroSpecExactKVSource,
     request_idx: int,
     kv_head_idx: int,
+    metadata_row_idx: int | None = None,
+    resolved_page_row_idx: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     primary = source.primary
+    if metadata_row_idx is None:
+        metadata_row_idx = request_idx
+    if resolved_page_row_idx is None:
+        resolved_page_row_idx = request_idx
     keys = []
     values = []
     for logical_idx, selected in zip(
-        primary.token_indices[request_idx, kv_head_idx].tolist(),
-        primary.token_mask[request_idx, kv_head_idx].tolist(),
+        primary.token_indices[metadata_row_idx, kv_head_idx].tolist(),
+        primary.token_mask[metadata_row_idx, kv_head_idx].tolist(),
     ):
         if not selected:
             continue
@@ -82,24 +89,24 @@ def _materialize_head(
         keys.append(primary.key_cache[physical_block, block_offset, kv_head_idx])
         values.append(primary.value_cache[physical_block, block_offset, kv_head_idx])
 
-    page_counts = source.page_token_counts[request_idx, kv_head_idx].reshape(-1)
+    page_counts = source.page_token_counts[metadata_row_idx, kv_head_idx].reshape(-1)
     for page_slot, token_count in enumerate(page_counts.tolist()):
         page_source = None
         page_id = -1
         if source.resident_pages is not None:
             candidate = int(
-                source.resident_pages.page_ids[request_idx, kv_head_idx].reshape(-1)[
-                    page_slot
-                ]
+                source.resident_pages.page_ids[
+                    resolved_page_row_idx, kv_head_idx
+                ].reshape(-1)[page_slot]
             )
             if candidate >= 0:
                 page_source = source.resident_pages
                 page_id = candidate
         if page_source is None and source.staging_pages is not None:
             candidate = int(
-                source.staging_pages.page_ids[request_idx, kv_head_idx].reshape(-1)[
-                    page_slot
-                ]
+                source.staging_pages.page_ids[
+                    resolved_page_row_idx, kv_head_idx
+                ].reshape(-1)[page_slot]
             )
             if candidate >= 0:
                 page_source = source.staging_pages
@@ -148,6 +155,71 @@ def _reference_attention(
             ).to(query.dtype)
             lse[query_head_idx, query_idx] = torch.logsumexp(logits, dim=0)
     return output, lse
+
+
+def _reference_proposal_attention(
+    source: RetroSpecExactKVSource,
+    estimation: RetroSpecEstimationKVSource,
+    query: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    num_queries, num_query_heads, _ = query.shape
+    num_kv_heads = source.primary.key_cache.shape[2]
+    queries_per_kv_head = num_query_heads // num_kv_heads
+    output = torch.zeros_like(query)
+
+    for query_idx in range(num_queries):
+        metadata_row_idx = (
+            query_idx
+            if source.plan_row_indices is None
+            else int(source.plan_row_indices[query_idx])
+        )
+        estimation_row_idx = (
+            query_idx
+            if estimation.plan_row_indices is None
+            else int(estimation.plan_row_indices[query_idx])
+        )
+        for query_head_idx in range(num_query_heads):
+            kv_head_idx = query_head_idx // queries_per_kv_head
+            exact_keys, exact_values = _materialize_head(
+                source,
+                query_idx,
+                kv_head_idx,
+                metadata_row_idx=metadata_row_idx,
+                resolved_page_row_idx=query_idx,
+            )
+            counts = estimation.token_counts[estimation_row_idx, kv_head_idx]
+            valid_estimation = counts > 0
+            estimation_keys = estimation.keys[
+                estimation_row_idx, kv_head_idx, valid_estimation
+            ]
+            estimation_values = estimation.values[
+                estimation_row_idx, kv_head_idx, valid_estimation
+            ]
+
+            query_vector = query[query_idx, query_head_idx].float()
+            logits = []
+            values = []
+            if exact_keys.numel():
+                logits.append(torch.mv(exact_keys.float(), query_vector) * scale)
+                values.append(exact_values.float())
+            if estimation_keys.numel():
+                estimation_logits = (
+                    torch.mv(estimation_keys.float(), query_vector) * scale
+                )
+                estimation_logits += torch.log(counts[valid_estimation].float())
+                logits.append(estimation_logits)
+                values.append(estimation_values.float())
+            if not logits:
+                continue
+
+            combined_logits = torch.cat(logits)
+            combined_values = torch.cat(values)
+            output[query_idx, query_head_idx] = torch.mv(
+                combined_values.t(), torch.softmax(combined_logits, dim=0)
+            ).to(query.dtype)
+
+    return output
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -234,6 +306,328 @@ def test_multi_source_exact_attention_matches_reference_on_cuda():
 
     torch.testing.assert_close(output, expected_output, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(lse, expected_lse, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("query_dtype", "estimation_dtype"),
+    [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+    ],
+)
+def test_fused_proposal_attention_matches_multi_source_reference(
+    query_dtype: torch.dtype, estimation_dtype: torch.dtype
+):
+    device = torch.device("cuda")
+    torch.manual_seed(41)
+    page_size = 4
+    batch_size = 2
+    num_kv_heads = 2
+    num_query_heads = 4
+    num_vectors = 35
+    head_size = 64
+    scale = head_size**-0.5
+
+    key_cache = torch.randn(
+        8,
+        page_size,
+        num_kv_heads,
+        head_size,
+        dtype=query_dtype,
+        device=device,
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.tensor(
+        [[2, 0, 1, 3], [4, 6, 5, 7]], dtype=torch.int32, device=device
+    )
+    token_indices = torch.tensor(
+        [
+            [[0, 3, 7, 10], [1, 4, 8, 11]],
+            [[0, 2, 5, 9], [1, 3, 6, 10]],
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    token_mask = torch.tensor(
+        [
+            [[True, False, True, True], [True, True, False, True]],
+            [[True, True, False, True], [False, True, True, True]],
+        ],
+        device=device,
+    )
+    page_counts = torch.tensor(
+        [
+            [[[4, 2]], [[3, 1]]],
+            [[[1, 4]], [[2, 3]]],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    resident_keys = torch.randn(
+        4, page_size, head_size, dtype=query_dtype, device=device
+    )
+    resident_values = torch.randn_like(resident_keys)
+    staging_keys = torch.randn_like(resident_keys)
+    staging_values = torch.randn_like(resident_keys)
+    resident_ids = torch.tensor(
+        [[[[0, -1]], [[1, -1]]], [[[2, -1]], [[3, -1]]]],
+        dtype=torch.int64,
+        device=device,
+    )
+    staging_ids = torch.tensor(
+        [[[[-1, 0]], [[-1, 1]]], [[[-1, 2]], [[-1, 3]]]],
+        dtype=torch.int64,
+        device=device,
+    )
+    source = _make_source(
+        key_cache,
+        value_cache,
+        block_table,
+        token_indices,
+        token_mask,
+        page_counts,
+        resident_pages=RetroSpecExactPageKVSource(
+            resident_keys, resident_values, resident_ids
+        ),
+        staging_pages=RetroSpecExactPageKVSource(
+            staging_keys, staging_values, staging_ids
+        ),
+    )
+    estimation = RetroSpecEstimationKVSource(
+        keys=torch.randn(
+            batch_size,
+            num_kv_heads,
+            num_vectors,
+            head_size,
+            dtype=estimation_dtype,
+            device=device,
+        ),
+        values=torch.randn(
+            batch_size,
+            num_kv_heads,
+            num_vectors,
+            head_size,
+            dtype=estimation_dtype,
+            device=device,
+        ),
+        token_counts=torch.randint(
+            0,
+            9,
+            (batch_size, num_kv_heads, num_vectors),
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
+    estimation.token_counts[0, 1].zero_()
+    query = torch.randn(
+        batch_size,
+        num_query_heads,
+        head_size,
+        dtype=query_dtype,
+        device=device,
+    )
+    output = torch.empty_like(query)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, batch_size, 1)
+
+    result = workspace.run_proposal(source, estimation, query, scale, output)
+    expected = _reference_proposal_attention(source, estimation, query, scale)
+    torch.cuda.synchronize()
+
+    assert result.data_ptr() == output.data_ptr()
+    assert workspace._output is not None
+    assert result.data_ptr() != workspace._output.data_ptr()
+    torch.testing.assert_close(result, expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_proposal_attention_indexes_persistent_rows():
+    device = torch.device("cuda")
+    torch.manual_seed(43)
+    page_size = 4
+    num_queries = 3
+    num_table_rows = 6
+    num_kv_heads = 2
+    num_query_heads = 4
+    num_vectors = 19
+    head_size = 64
+    scale = head_size**-0.5
+
+    key_cache = torch.randn(
+        6,
+        page_size,
+        num_kv_heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.tensor(
+        [[0, 1], [2, 3], [4, 5]], dtype=torch.int32, device=device
+    )
+    table_token_indices = torch.randint(
+        0,
+        8,
+        (num_table_rows, num_kv_heads, 5),
+        dtype=torch.int64,
+        device=device,
+    )
+    table_token_mask = torch.rand(num_table_rows, num_kv_heads, 5, device=device) > 0.25
+    table_page_counts = torch.empty(
+        num_table_rows, num_kv_heads, 0, 0, dtype=torch.int32, device=device
+    )
+    plan_rows = torch.tensor([5, 1, 4], dtype=torch.int64, device=device)
+    indexed_source = _make_source(
+        key_cache,
+        value_cache,
+        block_table,
+        table_token_indices,
+        table_token_mask,
+        table_page_counts,
+        plan_row_indices=plan_rows,
+    )
+    gathered_source = _make_source(
+        key_cache,
+        value_cache,
+        block_table,
+        table_token_indices.index_select(0, plan_rows),
+        table_token_mask.index_select(0, plan_rows),
+        table_page_counts.index_select(0, plan_rows),
+    )
+
+    table_keys = torch.randn(
+        num_table_rows,
+        num_kv_heads,
+        num_vectors,
+        head_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    table_values = torch.randn_like(table_keys)
+    table_counts = torch.randint(
+        0,
+        8,
+        (num_table_rows, num_kv_heads, num_vectors),
+        dtype=torch.int32,
+        device=device,
+    )
+    indexed_estimation = RetroSpecEstimationKVSource(
+        table_keys, table_values, table_counts, plan_rows
+    )
+    gathered_estimation = RetroSpecEstimationKVSource(
+        table_keys.index_select(0, plan_rows),
+        table_values.index_select(0, plan_rows),
+        table_counts.index_select(0, plan_rows),
+    )
+    query = torch.randn(
+        num_queries,
+        num_query_heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    workspace = RetroSpecExactAttentionWorkspace(page_size, num_queries, 1)
+    indexed_output = torch.empty_like(query)
+    gathered_output = torch.empty_like(query)
+
+    workspace.run_proposal(
+        indexed_source, indexed_estimation, query, scale, indexed_output
+    )
+    indexed_output = indexed_output.clone()
+    workspace.run_proposal(
+        gathered_source, gathered_estimation, query, scale, gathered_output
+    )
+    expected = _reference_proposal_attention(
+        indexed_source, indexed_estimation, query, scale
+    )
+
+    torch.testing.assert_close(indexed_output, gathered_output, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(indexed_output, expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_proposal_attention_handles_empty_exact_and_estimation_sources():
+    device = torch.device("cuda")
+    page_size = 4
+    head_size = 64
+    key_cache = torch.empty(
+        1, page_size, 2, head_size, dtype=torch.bfloat16, device=device
+    )
+    source = _make_source(
+        key_cache,
+        key_cache.clone(),
+        torch.zeros(2, 1, dtype=torch.int32, device=device),
+        torch.empty(2, 2, 0, dtype=torch.int64, device=device),
+        torch.empty(2, 2, 0, dtype=torch.bool, device=device),
+        torch.empty(2, 2, 0, 0, dtype=torch.int32, device=device),
+    )
+    keys = torch.zeros(2, 2, 2, head_size, dtype=torch.bfloat16, device=device)
+    values = torch.zeros_like(keys)
+    values[0, 0, 0].fill_(2.0)
+    values[0, 0, 1].fill_(4.0)
+    values[0, 1, 0].fill_(10.0)
+    values[0, 1, 1].fill_(20.0)
+    counts = torch.tensor(
+        [[[1, 3], [3, 1]], [[0, 0], [0, 0]]],
+        dtype=torch.int32,
+        device=device,
+    )
+    estimation = RetroSpecEstimationKVSource(keys, values, counts)
+    query = torch.zeros(2, 4, head_size, dtype=torch.bfloat16, device=device)
+    output = torch.full_like(query, 99.0)
+
+    RetroSpecExactAttentionWorkspace(page_size, 2, 1).run_proposal(
+        source, estimation, query, 1.0, output
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        output[0, :, 0].float(),
+        torch.tensor([3.5, 3.5, 12.5, 12.5], device=device),
+    )
+    assert not output[1].any()
+    assert torch.isfinite(output).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_proposal_attention_reduces_multiple_exact_partitions():
+    device = torch.device("cuda")
+    torch.manual_seed(47)
+    page_size = 16
+    head_size = 64
+    num_tokens = EXACT_ATTENTION_PARTITION_SIZE + 37
+    num_blocks = (num_tokens + page_size - 1) // page_size
+    key_cache = torch.randn(
+        num_blocks,
+        page_size,
+        1,
+        head_size,
+        dtype=torch.float16,
+        device=device,
+    )
+    value_cache = torch.randn_like(key_cache)
+    source = _make_source(
+        key_cache,
+        value_cache,
+        torch.arange(num_blocks, dtype=torch.int32, device=device).view(1, -1),
+        torch.arange(num_tokens, dtype=torch.int64, device=device).view(1, 1, -1),
+        torch.ones(1, 1, num_tokens, dtype=torch.bool, device=device),
+        torch.empty(1, 1, 0, 0, dtype=torch.int32, device=device),
+    )
+    estimation = RetroSpecEstimationKVSource(
+        torch.randn(1, 1, 19, head_size, dtype=torch.float16, device=device),
+        torch.randn(1, 1, 19, head_size, dtype=torch.float16, device=device),
+        torch.randint(0, 8, (1, 1, 19), dtype=torch.int32, device=device),
+    )
+    query = torch.randn(1, 2, head_size, dtype=torch.float16, device=device)
+    output = torch.empty_like(query)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, 1, 4)
+
+    workspace.run_proposal(source, estimation, query, head_size**-0.5, output)
+    expected = _reference_proposal_attention(source, estimation, query, head_size**-0.5)
+
+    torch.testing.assert_close(output, expected, atol=3e-2, rtol=3e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

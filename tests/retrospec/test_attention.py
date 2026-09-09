@@ -27,6 +27,7 @@ from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecVerificationMissAdmission,
 )
 from vllm.v1.spec_decode.retrospec.execution import (
+    RetroSpecEstimationKVSource,
     RetroSpecExactKVSource,
 )
 from vllm.v1.spec_decode.retrospec.index import RetroSpecAttentionLevel
@@ -1331,6 +1332,88 @@ def test_exact_attention_resolves_resident_and_staging_pages(
     assert staging_source.key_pages is staging_keys
     assert staging_source.value_pages is staging_values
     assert staging_source.ready_event is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_proposal_attention_releases_pages_before_miss_admission():
+    controller = make_controller(cache_ratio=0.5)
+    controller.mode = RetroSpecAttentionMode.SPARSE_VERIFY
+
+    device = torch.device("cuda")
+    plan = make_token_plan(1, num_kv_heads=1, exact_width=0, estimation_width=2)
+    selection = RetroSpecTokenAttentionSelection(
+        exact_cluster_ids=plan.sparse_exact_cluster_ids.to(device),
+        exact_page_ids=plan.sparse_exact_page_ids.to(device),
+        exact_page_token_counts=plan.sparse_exact_page_token_counts.to(device),
+        exact_token_counts=torch.zeros(1, 1, dtype=torch.int32, device=device),
+        estimation_keys=plan.sparse_estimation_keys.to(device),
+        estimation_values=plan.sparse_estimation_values.to(device),
+        estimation_token_counts=plan.sparse_estimation_token_counts.to(device),
+        attention_mass=plan.sparse_attn.to(device),
+        plan=plan,
+        resolved_pages=None,
+    )
+    source = cast(RetroSpecExactKVSource, object())
+    call_order: list[str] = []
+    read_lease = SimpleNamespace(
+        release=Mock(side_effect=lambda: call_order.append("release"))
+    )
+    miss_admission = object()
+    resolved_pages = SimpleNamespace(
+        read_lease=read_lease,
+        miss_admission=miss_admission,
+    )
+    controller._resolve_exact_kv_source = Mock(return_value=(source, resolved_pages))
+    run_proposal = Mock(side_effect=lambda **_: call_order.append("attention"))
+    controller.exact_attention_workspace = SimpleNamespace(run_proposal=run_proposal)
+    controller.index.cluster_store.admit_verification_misses = Mock(
+        side_effect=lambda *_: call_order.append("admit")
+    )
+
+    query = torch.zeros(1, 1, 1, dtype=torch.float16, device=device)
+    key_cache = torch.zeros(1, 2, 1, 1, dtype=torch.float16, device=device)
+    value_cache = key_cache.clone()
+    output = torch.empty_like(query)
+    metadata = cast(
+        FlashAttentionMetadata,
+        SimpleNamespace(
+            block_table=torch.zeros(1, 1, dtype=torch.int32, device=device)
+        ),
+    )
+
+    result = controller._run_fused_proposal_attention(
+        cast(FlashAttentionImpl, SimpleNamespace(scale=0.5)),
+        query,
+        key_cache,
+        value_cache,
+        metadata,
+        selection,
+        output,
+    )
+
+    assert result is output
+    controller._resolve_exact_kv_source.assert_called_once_with(
+        selection=selection,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=metadata.block_table,
+    )
+    run_proposal.assert_called_once()
+    proposal_args = run_proposal.call_args.kwargs
+    assert proposal_args["source"] is source
+    assert proposal_args["query"] is query
+    assert proposal_args["scale"] == 0.5
+    assert proposal_args["output"] is output
+    estimation = proposal_args["estimation"]
+    assert isinstance(estimation, RetroSpecEstimationKVSource)
+    assert estimation.keys is selection.estimation_keys
+    assert estimation.values is selection.estimation_values
+    assert estimation.token_counts is selection.estimation_token_counts
+    assert estimation.plan_row_indices is None
+    controller.index.cluster_store.admit_verification_misses.assert_called_once_with(
+        miss_admission
+    )
+    assert call_order == ["attention", "release", "admit"]
 
 
 def test_verification_reuses_draft_selection_plan_without_reranking():

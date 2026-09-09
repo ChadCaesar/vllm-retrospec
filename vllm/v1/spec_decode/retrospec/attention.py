@@ -27,6 +27,7 @@ from .cluster_store import (
 )
 from .execution import (
     RetroSpecCompactKVSource,
+    RetroSpecEstimationKVSource,
     RetroSpecExactAttentionWorkspace,
     RetroSpecExactKVSource,
     RetroSpecExactPageKVSource,
@@ -41,7 +42,6 @@ from .segmented_index import (
     RetroSpecTokenAttentionSelection,
 )
 from .selection_kernels import add_indexed_values
-from .weighted_attention import merge_weighted_estimation
 
 RetroSpecSelection = (
     RetroSpecTokenAttentionSelection | RetroSpecIndexedTokenAttentionSelection
@@ -1249,6 +1249,77 @@ class RetroSpecSparseAttention:
 
         return exact_output
 
+    def _run_fused_proposal_attention(
+        self,
+        impl: FlashAttentionImpl,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        selection: RetroSpecSelection,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        stage_name = {
+            RetroSpecAttentionMode.DRAFT: "draft",
+            RetroSpecAttentionMode.SPARSE_VERIFY: "sparse_verify",
+            RetroSpecAttentionMode.EXPANDED_VERIFY: "expanded_verify",
+        }[self.mode]
+        with (
+            self.performance_stats.cpu_timer(f"{stage_name}_page_resolve_wall"),
+            self.performance_stats.cuda_timer(f"{stage_name}_page_resolve"),
+        ):
+            source, resolved_pages = self._resolve_exact_kv_source(
+                selection=selection,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=attn_metadata.block_table,
+            )
+
+        estimation_keys, estimation_values, estimation_token_counts = (
+            self._get_grouped_estimation(selection)
+        )
+        plan_row_indices = (
+            selection.plan_row_indices
+            if isinstance(selection, RetroSpecIndexedTokenAttentionSelection)
+            else None
+        )
+        estimation = RetroSpecEstimationKVSource(
+            keys=estimation_keys,
+            values=estimation_values,
+            token_counts=estimation_token_counts,
+            plan_row_indices=plan_row_indices,
+        )
+
+        try:
+            with self.performance_stats.cuda_timer(f"{stage_name}_fused_attention"):
+                self.exact_attention_workspace.run_proposal(
+                    source=source,
+                    estimation=estimation,
+                    query=query,
+                    scale=impl.scale,
+                    output=output,
+                )
+        finally:
+            if resolved_pages is not None and resolved_pages.read_lease is not None:
+                resolved_pages.read_lease.release()
+
+        if (
+            self.mode
+            in (
+                RetroSpecAttentionMode.SPARSE_VERIFY,
+                RetroSpecAttentionMode.EXPANDED_VERIFY,
+            )
+            and resolved_pages is not None
+        ):
+            with self.performance_stats.cpu_timer(
+                f"{stage_name}_resident_admit_submit"
+            ):
+                self.index.cluster_store.admit_verification_misses(
+                    resolved_pages.miss_admission
+                )
+
+        return output
+
     @staticmethod
     def _get_grouped_estimation(
         selection: RetroSpecSelection,
@@ -1369,57 +1440,38 @@ class RetroSpecSparseAttention:
                         attn_metadata.block_table,
                     )
 
-        exact_output, exact_lse = self._run_exact_attention(
-            impl,
-            query,
-            key_cache,
-            value_cache,
-            attn_metadata,
-            selection,
-        )
-
-        can_use_fused_estimation = query.device.type == "cuda" and query.dtype in (
-            torch.float16,
-            torch.bfloat16,
-        )
         stage_name = {
             RetroSpecAttentionMode.DRAFT: "draft",
             RetroSpecAttentionMode.SPARSE_VERIFY: "sparse_verify",
             RetroSpecAttentionMode.EXPANDED_VERIFY: "expanded_verify",
         }[self.mode]
-
-        with self.performance_stats.cuda_timer(f"{stage_name}_estimation_merge"):
-            if can_use_fused_estimation:
-                (
-                    estimation_keys,
-                    estimation_values,
-                    estimation_token_counts,
-                ) = self._get_grouped_estimation(selection)
-
-                merge_weighted_estimation(
-                    output=output[:num_actual_tokens],
-                    query=query,
-                    estimation_keys=estimation_keys,
-                    estimation_values=estimation_values,
-                    estimation_token_counts=estimation_token_counts,
-                    exact_output=exact_output,
-                    exact_lse=exact_lse,
-                    scale=impl.scale,
-                    plan_row_indices=(
-                        selection.plan_row_indices
-                        if isinstance(
-                            selection, RetroSpecIndexedTokenAttentionSelection
-                        )
-                        else None
-                    ),
-                )
-            else:
+        can_use_fused_proposal = query.device.type == "cuda" and query.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        )
+        if can_use_fused_proposal:
+            self._run_fused_proposal_attention(
+                impl=impl,
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                attn_metadata=attn_metadata,
+                selection=selection,
+                output=output[:num_actual_tokens],
+            )
+        else:
+            exact_output, exact_lse = self._run_exact_attention(
+                impl,
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                selection,
+            )
+            with self.performance_stats.cuda_timer(f"{stage_name}_estimation_merge"):
                 estimation_output, estimation_lse = self._run_estimation_attention(
-                    impl,
-                    query,
-                    selection,
+                    impl, query, selection
                 )
-
                 merge_attn_states(
                     output[:num_actual_tokens],
                     exact_output,

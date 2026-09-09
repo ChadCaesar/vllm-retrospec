@@ -50,6 +50,16 @@ class RetroSpecExactKVSource:
 
 
 @dataclass(frozen=True)
+class RetroSpecEstimationKVSource:
+    """Weighted cluster summaries consumed by fused proposal attention."""
+
+    keys: torch.Tensor
+    values: torch.Tensor
+    token_counts: torch.Tensor
+    plan_row_indices: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
 class RetroSpecCompactKVSource:
     """Token-contiguous clustered KV staged for full verification."""
 
@@ -398,6 +408,173 @@ def _reduce_exact_partitions_kernel(
         global_sum > 0.0, safe_global_max + tl.log(global_sum), float("-inf")
     )
     tl.store(output_lse + lse_offset, lse)
+
+
+@triton.jit
+def _reduce_proposal_partitions_kernel(
+    query,
+    plan_row_indices,
+    estimation_keys,
+    estimation_values,
+    estimation_token_counts,
+    partial_output,
+    partial_max,
+    partial_sum,
+    output,
+    query_stride_0,
+    query_stride_1,
+    query_stride_2,
+    key_stride_0,
+    key_stride_1,
+    key_stride_2,
+    key_stride_3,
+    value_stride_0,
+    value_stride_1,
+    value_stride_2,
+    value_stride_3,
+    count_stride_0,
+    count_stride_1,
+    count_stride_2,
+    partial_output_stride_0,
+    partial_output_stride_1,
+    partial_output_stride_2,
+    partial_output_stride_3,
+    stats_stride_0,
+    stats_stride_1,
+    stats_stride_2,
+    output_stride_0,
+    output_stride_1,
+    output_stride_2,
+    scale,
+    num_partitions,
+    num_estimation_vectors,
+    USE_PLAN_ROWS: tl.constexpr,
+    QUERIES_PER_KV_HEAD: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    query_head_idx = tl.program_id(1)
+    kv_head_idx = query_head_idx // QUERIES_PER_KV_HEAD
+
+    estimation_row_idx = query_idx
+    if USE_PLAN_ROWS:
+        estimation_row_idx = tl.load(plan_row_indices + query_idx)
+
+    dimension_offsets = tl.arange(0, BLOCK_D)
+    dimension_mask = dimension_offsets < HEAD_SIZE
+    query_offsets = (
+        query_idx * query_stride_0
+        + query_head_idx * query_stride_1
+        + dimension_offsets * query_stride_2
+    )
+    query_vector = tl.load(query + query_offsets, mask=dimension_mask, other=0.0).to(
+        tl.float32
+    )
+
+    global_max = float("-inf")
+    for partition_idx in tl.range(0, num_partitions):
+        stats_offset = (
+            query_idx * stats_stride_0
+            + query_head_idx * stats_stride_1
+            + partition_idx * stats_stride_2
+        )
+        partition_max = tl.load(partial_max + stats_offset)
+        global_max = tl.maximum(global_max, partition_max)
+
+    safe_global_max = tl.where(global_max == float("-inf"), 0.0, global_max)
+    running_sum = 0.0
+    accumulator = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for partition_idx in tl.range(0, num_partitions):
+        stats_offset = (
+            query_idx * stats_stride_0
+            + query_head_idx * stats_stride_1
+            + partition_idx * stats_stride_2
+        )
+        partition_max = tl.load(partial_max + stats_offset)
+        partition_sum = tl.load(partial_sum + stats_offset)
+        partition_weight = tl.where(
+            partition_sum > 0.0,
+            partition_sum * tl.exp(partition_max - safe_global_max),
+            0.0,
+        )
+        partial_offsets = (
+            query_idx * partial_output_stride_0
+            + query_head_idx * partial_output_stride_1
+            + partition_idx * partial_output_stride_2
+            + dimension_offsets * partial_output_stride_3
+        )
+        partition_output = tl.load(
+            partial_output + partial_offsets, mask=dimension_mask, other=0.0
+        ).to(tl.float32)
+        accumulator += partition_weight * partition_output
+        running_sum += partition_weight
+
+    running_max = tl.where(running_sum > 0.0, global_max, float("-inf"))
+    for vector_start in tl.range(0, num_estimation_vectors, BLOCK_M):
+        vector_offsets = vector_start + tl.arange(0, BLOCK_M)
+        vector_mask = vector_offsets < num_estimation_vectors
+        count_offsets = (
+            estimation_row_idx * count_stride_0
+            + kv_head_idx * count_stride_1
+            + vector_offsets * count_stride_2
+        )
+        token_counts = tl.load(
+            estimation_token_counts + count_offsets,
+            mask=vector_mask,
+            other=0,
+        )
+        valid_vectors = vector_mask & (token_counts > 0)
+
+        key_offsets = (
+            estimation_row_idx * key_stride_0
+            + kv_head_idx * key_stride_1
+            + vector_offsets[:, None] * key_stride_2
+            + dimension_offsets[None, :] * key_stride_3
+        )
+        key_vectors = tl.load(
+            estimation_keys + key_offsets,
+            mask=valid_vectors[:, None] & dimension_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        logits = tl.sum(key_vectors * query_vector[None, :], axis=1) * scale
+        logits += tl.log(tl.maximum(token_counts.to(tl.float32), 1.0))
+        logits = tl.where(valid_vectors, logits, float("-inf"))
+
+        block_max = tl.max(logits, axis=0)
+        new_max = tl.maximum(running_max, block_max)
+        safe_new_max = tl.where(new_max == float("-inf"), 0.0, new_max)
+        old_scale = tl.where(running_sum > 0.0, tl.exp(running_max - safe_new_max), 0.0)
+        probabilities = tl.where(valid_vectors, tl.exp(logits - safe_new_max), 0.0)
+
+        value_offsets = (
+            estimation_row_idx * value_stride_0
+            + kv_head_idx * value_stride_1
+            + vector_offsets[:, None] * value_stride_2
+            + dimension_offsets[None, :] * value_stride_3
+        )
+        value_vectors = tl.load(
+            estimation_values + value_offsets,
+            mask=valid_vectors[:, None] & dimension_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        accumulator *= old_scale
+        accumulator += tl.sum(probabilities[:, None] * value_vectors, axis=0)
+        running_sum = running_sum * old_scale + tl.sum(probabilities, axis=0)
+        running_max = tl.where(running_sum > 0.0, new_max, float("-inf"))
+
+    normalized_output = tl.where(
+        running_sum > 0.0,
+        accumulator / tl.maximum(running_sum, 1.0),
+        0.0,
+    )
+    output_offsets = (
+        query_idx * output_stride_0
+        + query_head_idx * output_stride_1
+        + dimension_offsets * output_stride_2
+    )
+    tl.store(output + output_offsets, normalized_output, mask=dimension_mask)
 
 
 @triton.jit
@@ -975,6 +1152,56 @@ class RetroSpecExactAttentionWorkspace:
 
         return num_kv_heads, max_primary_tokens, max_page_slots
 
+    def _validate_estimation_source(
+        self,
+        source: RetroSpecEstimationKVSource,
+        query: torch.Tensor,
+        num_kv_heads: int,
+    ) -> int:
+        if source.keys.shape != source.values.shape:
+            raise ValueError("Estimation key and value shapes must match")
+        if source.keys.ndim != 4:
+            raise ValueError(
+                "Estimation KV must have shape [rows, num_kv_heads, vectors, head_size]"
+            )
+        if source.token_counts.shape != source.keys.shape[:3]:
+            raise ValueError("Estimation token counts do not match estimation KV")
+        if source.keys.shape[1] != num_kv_heads:
+            raise ValueError("Estimation KV-head count does not match exact KV")
+        if source.keys.shape[3] != query.shape[2]:
+            raise ValueError("Estimation head size does not match query")
+        if query.shape[1] % num_kv_heads != 0:
+            raise ValueError("Query heads must be divisible by KV heads")
+
+        if source.keys.dtype != source.values.dtype:
+            raise ValueError("Estimation keys and values must have the same dtype")
+        if source.keys.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise ValueError("Estimation KV must use a floating-point dtype")
+        if source.token_counts.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Estimation token counts must be integral")
+
+        plan_row_indices = source.plan_row_indices
+        if plan_row_indices is None:
+            if source.keys.shape[0] != query.shape[0]:
+                raise ValueError("Estimation rows must match query rows")
+        else:
+            if plan_row_indices.shape != (query.shape[0],):
+                raise ValueError("Plan rows must contain one entry per query")
+            if plan_row_indices.dtype not in (torch.int32, torch.int64):
+                raise ValueError("Plan rows must be integral")
+
+        tensors = [source.keys, source.values, source.token_counts]
+        if plan_row_indices is not None:
+            tensors.append(plan_row_indices)
+        if any(tensor.device != query.device for tensor in tensors):
+            raise ValueError("Estimation tensors must use the query device")
+
+        return source.keys.shape[2]
+
     def run_parallel_full_verification(
         self,
         source: RetroSpecFullVerificationKVSource,
@@ -1240,17 +1467,16 @@ class RetroSpecExactAttentionWorkspace:
         )
         return cluster_output, cluster_lse, native_output, native_lse
 
-    def run(
+    def _launch_exact_partitions(
         self,
         source: RetroSpecExactKVSource,
         query: torch.Tensor,
         scale: float,
-        request_indices: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run exact attention without materializing a contiguous KV copy."""
-        num_kv_heads, max_primary_tokens, max_page_slots = self._validate_source(
-            source, query, request_indices
-        )
+        request_indices: torch.Tensor | None,
+        num_kv_heads: int,
+        max_primary_tokens: int,
+        max_page_slots: int,
+    ) -> int:
         num_queries, num_query_heads, head_size = query.shape
         num_source_tokens = max_primary_tokens + max_page_slots * self.page_size
         num_partitions = triton.cdiv(
@@ -1261,16 +1487,8 @@ class RetroSpecExactAttentionWorkspace:
         assert self._partial_output is not None
         assert self._partial_max is not None
         assert self._partial_sum is not None
-        assert self._output is not None
-        assert self._output_lse is not None
-
-        output = self._output[:num_queries]
-        num_output_lse_elements = num_query_heads * num_queries
-        output_lse = self._output_lse[:num_output_lse_elements].view(
-            num_query_heads, num_queries
-        )
         if num_queries == 0:
-            return output, output_lse
+            return num_partitions
 
         primary = source.primary
         current_stream = torch.cuda.current_stream(query.device)
@@ -1308,11 +1526,7 @@ class RetroSpecExactAttentionWorkspace:
         block_d = triton.next_power_of_2(head_size)
 
         _multi_source_exact_partition_kernel[
-            (
-                num_queries,
-                num_query_heads,
-                num_partitions,
-            )
+            (num_queries, num_query_heads, num_partitions)
         ](
             query,
             request_mapping,
@@ -1379,7 +1593,45 @@ class RetroSpecExactAttentionWorkspace:
             HAS_RESIDENT=resident is not None,
             HAS_STAGING=staging is not None,
         )
+        return num_partitions
 
+    def run(
+        self,
+        source: RetroSpecExactKVSource,
+        query: torch.Tensor,
+        scale: float,
+        request_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run exact attention without materializing a contiguous KV copy."""
+        num_kv_heads, max_primary_tokens, max_page_slots = self._validate_source(
+            source, query, request_indices
+        )
+        num_queries, num_query_heads, head_size = query.shape
+        num_partitions = self._launch_exact_partitions(
+            source,
+            query,
+            scale,
+            request_indices,
+            num_kv_heads,
+            max_primary_tokens,
+            max_page_slots,
+        )
+
+        assert self._partial_output is not None
+        assert self._partial_max is not None
+        assert self._partial_sum is not None
+        assert self._output is not None
+        assert self._output_lse is not None
+
+        output = self._output[:num_queries]
+        num_output_lse_elements = num_query_heads * num_queries
+        output_lse = self._output_lse[:num_output_lse_elements].view(
+            num_query_heads, num_queries
+        )
+        if num_queries == 0:
+            return output, output_lse
+
+        block_d = triton.next_power_of_2(head_size)
         _reduce_exact_partitions_kernel[(num_queries, num_query_heads)](
             self._partial_output,
             self._partial_max,
@@ -1403,3 +1655,94 @@ class RetroSpecExactAttentionWorkspace:
             BLOCK_D=block_d,
         )
         return output, output_lse
+
+    def run_proposal(
+        self,
+        source: RetroSpecExactKVSource,
+        estimation: RetroSpecEstimationKVSource,
+        query: torch.Tensor,
+        scale: float,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run fused exact and weighted-estimation proposal attention."""
+        num_kv_heads, max_primary_tokens, max_page_slots = self._validate_source(
+            source, query, request_indices=None
+        )
+        num_estimation_vectors = self._validate_estimation_source(
+            estimation, query, num_kv_heads
+        )
+        if output.shape != query.shape:
+            raise ValueError("Proposal output shape must match query")
+        if output.dtype != query.dtype:
+            raise ValueError("Proposal output dtype must match query")
+        if output.device != query.device:
+            raise ValueError("Proposal output must use the query device")
+
+        num_queries, num_query_heads, head_size = query.shape
+        num_partitions = self._launch_exact_partitions(
+            source,
+            query,
+            scale,
+            None,
+            num_kv_heads,
+            max_primary_tokens,
+            max_page_slots,
+        )
+        if num_queries == 0:
+            return output
+
+        assert self._partial_output is not None
+        assert self._partial_max is not None
+        assert self._partial_sum is not None
+
+        plan_row_mapping = (
+            estimation.keys
+            if estimation.plan_row_indices is None
+            else estimation.plan_row_indices
+        )
+        block_d = triton.next_power_of_2(head_size)
+        _reduce_proposal_partitions_kernel[(num_queries, num_query_heads)](
+            query,
+            plan_row_mapping,
+            estimation.keys,
+            estimation.values,
+            estimation.token_counts,
+            self._partial_output,
+            self._partial_max,
+            self._partial_sum,
+            output,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            estimation.keys.stride(0),
+            estimation.keys.stride(1),
+            estimation.keys.stride(2),
+            estimation.keys.stride(3),
+            estimation.values.stride(0),
+            estimation.values.stride(1),
+            estimation.values.stride(2),
+            estimation.values.stride(3),
+            estimation.token_counts.stride(0),
+            estimation.token_counts.stride(1),
+            estimation.token_counts.stride(2),
+            self._partial_output.stride(0),
+            self._partial_output.stride(1),
+            self._partial_output.stride(2),
+            self._partial_output.stride(3),
+            self._partial_max.stride(0),
+            self._partial_max.stride(1),
+            self._partial_max.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            scale,
+            num_partitions,
+            num_estimation_vectors,
+            USE_PLAN_ROWS=estimation.plan_row_indices is not None,
+            QUERIES_PER_KV_HEAD=num_query_heads // num_kv_heads,
+            HEAD_SIZE=head_size,
+            BLOCK_M=16,
+            BLOCK_D=block_d,
+            num_warps=4,
+        )
+        return output
