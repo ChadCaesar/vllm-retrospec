@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -121,6 +121,12 @@ class RetroSpecProposer:
         )
         self.positions = torch.zeros(
             self.max_batch_size, dtype=torch.int64, device=device
+        )
+        self._graph_input_ids = torch.zeros(
+            self.max_parallel_tokens, dtype=torch.int32, device=device
+        )
+        self._graph_positions = torch.zeros(
+            self.max_parallel_tokens, dtype=torch.int64, device=device
         )
         self._slot_mapping = torch.full(
             (self.max_batch_size,), PADDING_SLOT_ID, dtype=torch.int64, device=device
@@ -473,6 +479,104 @@ class RetroSpecProposer:
             num_rejected_tokens_gpu,
         )
 
+    def _dispatch_piecewise_cudagraph(
+        self,
+        num_tokens: int,
+        capacity: int,
+        stage_name: str,
+    ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+        eager_descriptor = BatchDescriptor(num_tokens)
+
+        if self.speculative_config.enforce_eager:
+            self.performance_stats.add_counter(f"{stage_name}_cudagraph_eager")
+            return CUDAGraphMode.NONE, eager_descriptor
+
+        # LoRA graph specialization and cross-DP graph batch coordination are
+        # intentionally left on the exact eager path in this commit.
+        if getattr(self.vllm_config, "lora_config", None) is not None:
+            self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback")
+            return CUDAGraphMode.NONE, eager_descriptor
+
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        if parallel_config is not None and parallel_config.data_parallel_size > 1:
+            self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback")
+            return CUDAGraphMode.NONE, eager_descriptor
+
+        dispatcher = getattr(self.runner, "cudagraph_dispatcher", None)
+        if dispatcher is None:
+            self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback")
+            return CUDAGraphMode.NONE, eager_descriptor
+
+        cudagraph_mode, batch_descriptor = dispatcher.dispatch(
+            num_tokens, disable_full=True
+        )
+        if (
+            cudagraph_mode != CUDAGraphMode.PIECEWISE
+            or batch_descriptor.num_tokens > capacity
+        ):
+            self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback")
+            return CUDAGraphMode.NONE, eager_descriptor
+
+        self.performance_stats.add_counter(f"{stage_name}_cudagraph_replay")
+        self.performance_stats.add_counter(
+            f"{stage_name}_cudagraph_padding_tokens",
+            batch_descriptor.num_tokens - num_tokens,
+        )
+        return cudagraph_mode, batch_descriptor
+
+    def _prepare_piecewise_model_inputs(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        slot_mapping_workspace: torch.Tensor,
+        stage_name: str,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        CUDAGraphMode,
+        BatchDescriptor,
+    ]:
+        num_tokens = input_ids.shape[0]
+        if positions.shape != (num_tokens,):
+            raise ValueError("Model positions must match the input token count")
+        if slot_mapping.shape != (num_tokens,):
+            raise ValueError("Slot mapping must match the input token count")
+
+        cudagraph_mode, batch_descriptor = self._dispatch_piecewise_cudagraph(
+            num_tokens, slot_mapping_workspace.shape[0], stage_name
+        )
+        if cudagraph_mode == CUDAGraphMode.NONE:
+            return (
+                input_ids,
+                positions,
+                slot_mapping,
+                cudagraph_mode,
+                batch_descriptor,
+            )
+
+        padded_tokens = batch_descriptor.num_tokens
+        graph_input_ids = self._graph_input_ids[:padded_tokens]
+        graph_positions = self._graph_positions[:padded_tokens]
+        graph_slot_mapping = slot_mapping_workspace[:padded_tokens]
+
+        graph_input_ids[:num_tokens].copy_(input_ids)
+        graph_positions[:num_tokens].copy_(positions)
+        graph_slot_mapping[:num_tokens].copy_(slot_mapping)
+        if padded_tokens > num_tokens:
+            graph_input_ids[num_tokens:].zero_()
+            graph_positions[num_tokens:].zero_()
+            graph_slot_mapping[num_tokens:].fill_(PADDING_SLOT_ID)
+
+        return (
+            graph_input_ids,
+            graph_positions,
+            graph_slot_mapping,
+            cudagraph_mode,
+            batch_descriptor,
+        )
+
     def _run_model_step(
         self,
         batch_size: int,
@@ -539,9 +643,6 @@ class RetroSpecProposer:
             per_layer_attn_metadata = {
                 layer_name: attn_metadata for layer_name in self.attn_layer_names
             }
-            per_layer_slot_mapping = {
-                layer_name: slot_mapping for layer_name in self.attn_layer_names
-            }
 
             self.sparse_attention.begin_step(attention_mode, step_index, runnable_mask)
 
@@ -554,20 +655,39 @@ class RetroSpecProposer:
                 input_ids[:batch_size],
                 torch.zeros_like(input_ids[:batch_size]),
             )
+            (
+                model_input_ids,
+                model_positions,
+                forward_slot_mapping,
+                cudagraph_mode,
+                batch_descriptor,
+            ) = self._prepare_piecewise_model_inputs(
+                input_ids=safe_input_ids,
+                positions=clamped_positions,
+                slot_mapping=slot_mapping,
+                slot_mapping_workspace=self._slot_mapping,
+                stage_name="draft",
+            )
+            per_layer_slot_mapping = {
+                layer_name: forward_slot_mapping for layer_name in self.attn_layer_names
+            }
 
         with (
             self.performance_stats.cuda_timer("draft_forward"),
             set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=batch_size,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                num_tokens=batch_descriptor.num_tokens,
+                cudagraph_runtime_mode=cudagraph_mode,
+                batch_descriptor=(
+                    batch_descriptor if cudagraph_mode != CUDAGraphMode.NONE else None
+                ),
                 slot_mapping=per_layer_slot_mapping,
             ),
         ):
             hidden_states = self.model(
-                input_ids=safe_input_ids,
-                positions=clamped_positions,
+                input_ids=model_input_ids,
+                positions=model_positions,
                 inputs_embeds=None,
             )
 
@@ -1046,8 +1166,21 @@ class RetroSpecProposer:
             per_layer_attn_metadata = {
                 layer_name: attn_metadata for layer_name in self.attn_layer_names
             }
+            (
+                model_input_ids,
+                model_positions,
+                forward_slot_mapping,
+                cudagraph_mode,
+                batch_descriptor,
+            ) = self._prepare_piecewise_model_inputs(
+                input_ids=input_ids,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                slot_mapping_workspace=self._verification_slot_mapping,
+                stage_name=stage_name,
+            )
             per_layer_slot_mapping = {
-                layer_name: slot_mapping for layer_name in self.attn_layer_names
+                layer_name: forward_slot_mapping for layer_name in self.attn_layer_names
             }
 
             self.sparse_attention.begin_parallel_step(
@@ -1059,14 +1192,17 @@ class RetroSpecProposer:
             set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=num_tokens,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                num_tokens=batch_descriptor.num_tokens,
+                cudagraph_runtime_mode=cudagraph_mode,
+                batch_descriptor=(
+                    batch_descriptor if cudagraph_mode != CUDAGraphMode.NONE else None
+                ),
                 slot_mapping=per_layer_slot_mapping,
             ),
         ):
             hidden_states = self.model(
-                input_ids=input_ids,
-                positions=positions,
+                input_ids=model_input_ids,
+                positions=model_positions,
                 inputs_embeds=None,
             )
 

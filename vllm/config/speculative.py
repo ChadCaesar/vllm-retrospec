@@ -683,11 +683,11 @@ class SpeculativeConfig:
                 "num_speculative_tokens"
             )
 
-        if self.enforce_eager is False:
-            raise ValueError(
-                "RetroSpec currently requires speculative_config.enforce_eager=True"
-            )
-        self.enforce_eager = True
+        if self.enforce_eager is None:
+            if self.target_model_config is None:
+                self.enforce_eager = True
+            else:
+                self.enforce_eager = self.target_model_config.enforce_eager
 
         parallel_config = self.target_parallel_config
         if parallel_config is not None:

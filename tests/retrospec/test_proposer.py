@@ -10,7 +10,8 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from vllm.config import SpeculativeConfig, VllmConfig
+from vllm.config import CUDAGraphMode, SpeculativeConfig, VllmConfig
+from vllm.forward_context import BatchDescriptor
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -170,6 +171,95 @@ def test_retrospec_proposer_initialization():
     assert proposer.state.device == device
     assert proposer.attn_metadata_builder is None
     assert proposer.attn_layer_names == []
+
+
+def test_piecewise_model_inputs_preserve_eager_views():
+    dispatcher = Mock()
+    proposer = RetroSpecProposer(
+        make_vllm_config(),
+        torch.device("cpu"),
+        make_runner(cudagraph_dispatcher=dispatcher),
+    )
+    input_ids = torch.tensor([3, 4], dtype=torch.int32)
+    positions = torch.tensor([7, 8], dtype=torch.int64)
+    slot_mapping = proposer._slot_mapping[:2]
+    slot_mapping.copy_(torch.tensor([11, 12]))
+
+    result = proposer._prepare_piecewise_model_inputs(
+        input_ids,
+        positions,
+        slot_mapping,
+        proposer._slot_mapping,
+        "draft",
+    )
+
+    assert result[0] is input_ids
+    assert result[1] is positions
+    assert result[2] is slot_mapping
+    assert result[3] == CUDAGraphMode.NONE
+    assert result[4] == BatchDescriptor(2)
+    dispatcher.dispatch.assert_not_called()
+
+
+def test_piecewise_model_inputs_pad_persistent_graph_workspace():
+    dispatcher = Mock(
+        dispatch=Mock(return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4)))
+    )
+    proposer = RetroSpecProposer(
+        make_vllm_config(enforce_eager=False),
+        torch.device("cpu"),
+        make_runner(cudagraph_dispatcher=dispatcher),
+    )
+    input_ids = torch.tensor([3, 4, 5], dtype=torch.int32)
+    positions = torch.tensor([7, 8, 9], dtype=torch.int64)
+    slot_mapping = proposer._slot_mapping[:3]
+    slot_mapping.copy_(torch.tensor([11, 12, 13]))
+
+    result = proposer._prepare_piecewise_model_inputs(
+        input_ids,
+        positions,
+        slot_mapping,
+        proposer._slot_mapping,
+        "draft",
+    )
+
+    graph_input_ids, graph_positions, graph_slots, mode, descriptor = result
+    assert graph_input_ids.data_ptr() == proposer._graph_input_ids.data_ptr()
+    assert graph_positions.data_ptr() == proposer._graph_positions.data_ptr()
+    assert graph_input_ids.tolist() == [3, 4, 5, 0]
+    assert graph_positions.tolist() == [7, 8, 9, 0]
+    assert graph_slots.tolist() == [11, 12, 13, -1]
+    assert mode == CUDAGraphMode.PIECEWISE
+    assert descriptor == BatchDescriptor(4)
+    dispatcher.dispatch.assert_called_once_with(3, disable_full=True)
+
+
+def test_piecewise_model_inputs_fall_back_when_bucket_exceeds_capacity():
+    dispatcher = Mock(
+        dispatch=Mock(return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(16)))
+    )
+    proposer = RetroSpecProposer(
+        make_vllm_config(enforce_eager=False),
+        torch.device("cpu"),
+        make_runner(cudagraph_dispatcher=dispatcher),
+    )
+    input_ids = torch.tensor([3, 4, 5], dtype=torch.int32)
+    positions = torch.tensor([7, 8, 9], dtype=torch.int64)
+    slot_mapping = proposer._slot_mapping[:3]
+
+    result = proposer._prepare_piecewise_model_inputs(
+        input_ids,
+        positions,
+        slot_mapping,
+        proposer._slot_mapping,
+        "draft",
+    )
+
+    assert result[0] is input_ids
+    assert result[1] is positions
+    assert result[2] is slot_mapping
+    assert result[3] == CUDAGraphMode.NONE
+    assert result[4] == BatchDescriptor(3)
 
 
 def test_retrospec_proposer_loads_target_model():
@@ -645,6 +735,86 @@ def test_model_step_sanitizes_input_ids_for_inactive_rows(monkeypatch):
         attention_mode=RetroSpecAttentionMode.SPARSE_VERIFY,
         compute_margin=False,
     )
+
+
+def test_model_step_replays_padded_piecewise_graph_without_padding_policy_rows(
+    monkeypatch,
+):
+    dispatcher = Mock(
+        dispatch=Mock(return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4)))
+    )
+    proposer = RetroSpecProposer(
+        make_vllm_config(enforce_eager=False),
+        torch.device("cpu"),
+        make_runner(cudagraph_dispatcher=dispatcher),
+    )
+    common_attn_metadata = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([3, 3], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=2,
+        max_query_len=1,
+        max_seq_len=3,
+        block_table_tensor=torch.tensor([[0], [1]], dtype=torch.int32),
+        slot_mapping=torch.tensor([0, 4], dtype=torch.int64),
+    )
+
+    class FakeBuilder:
+        def build_for_drafting(self, metadata, draft_index):
+            assert metadata.num_actual_tokens == 2
+            assert metadata.slot_mapping.shape == (2,)
+            return SimpleNamespace()
+
+    class FakeModel(torch.nn.Module):
+        def forward(self, input_ids, positions, inputs_embeds):
+            assert input_ids.tolist() == [7, 0, 0, 0]
+            assert positions.tolist() == [3, 0, 0, 0]
+            return torch.zeros((4, 4))
+
+        def compute_logits(self, hidden_states):
+            assert hidden_states.shape == (2, 4)
+            return torch.zeros((2, 2))
+
+    forward_context_kwargs: list[dict[str, Any]] = []
+
+    def fake_forward_context(*args, **kwargs):
+        forward_context_kwargs.append(kwargs)
+        return nullcontext()
+
+    proposer.model = FakeModel()
+    proposer.attn_layer_names = ["model.layers.0.self_attn.attn"]
+    proposer.attn_metadata_builder = cast(Any, FakeBuilder())
+    proposer.runner.sampler = lambda **kwargs: SimpleNamespace(
+        sampled_token_ids=torch.ones(2, 1, dtype=torch.int32)
+    )
+    proposer.sparse_attention.begin_step = Mock()
+    proposer.sparse_attention.end_step = Mock(return_value=torch.ones(2))
+    monkeypatch.setattr(
+        "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
+        fake_forward_context,
+    )
+
+    proposer._run_model_step(
+        batch_size=2,
+        step_index=1,
+        input_ids=torch.tensor([7, -1], dtype=torch.int32),
+        positions=torch.tensor([3, 3], dtype=torch.int64),
+        active_mask=torch.tensor([True, False]),
+        common_attn_metadata=common_attn_metadata,
+        sampling_metadata=make_sampling_metadata(all_greedy=True),
+        attention_mode=RetroSpecAttentionMode.DRAFT,
+        compute_margin=False,
+    )
+
+    context = forward_context_kwargs[0]
+    assert context["num_tokens"] == 4
+    assert context["cudagraph_runtime_mode"] == CUDAGraphMode.PIECEWISE
+    assert context["batch_descriptor"] == BatchDescriptor(4)
+    slot_mapping = context["slot_mapping"]["model.layers.0.self_attn.attn"]
+    assert slot_mapping.tolist() == [3, -1, -1, -1]
+    active_mask = proposer.sparse_attention.begin_step.call_args.args[2]
+    assert active_mask.tolist() == [True, False]
 
 
 def test_propose_stops_requests_independently_on_hit_attention(monkeypatch):
@@ -1612,3 +1782,82 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     assert torch.equal(begin_args[1], torch.tensor([1, 0, 1], dtype=torch.int64))
     assert torch.equal(begin_args[2], torch.tensor([0, 1, 1], dtype=torch.int64))
     proposer.sparse_attention.end_step.assert_called_once_with()
+
+
+def test_parallel_verification_replays_padded_piecewise_graph(monkeypatch):
+    dispatcher = Mock(
+        dispatch=Mock(return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4)))
+    )
+    proposer = RetroSpecProposer(
+        make_vllm_config(enforce_eager=False),
+        torch.device("cpu"),
+        make_runner(cudagraph_dispatcher=dispatcher),
+    )
+    common_attn_metadata = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([4, 6], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=2,
+        max_query_len=1,
+        max_seq_len=6,
+        block_table_tensor=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        slot_mapping=torch.tensor([3, 13], dtype=torch.int64),
+    )
+    proposer.proposal_start_positions[:2].copy_(torch.tensor([3, 5]))
+    proposer.proposal_input_ids[:2].copy_(torch.tensor([7, 8]))
+    proposer._draft_token_ids[:2, :2].copy_(torch.tensor([[10, 20], [11, 21]]))
+
+    class FakeBuilder:
+        def build_for_drafting(self, metadata, draft_index):
+            assert metadata.num_actual_tokens == 3
+            assert metadata.slot_mapping.tolist() == [13, 4, 14]
+            return SimpleNamespace()
+
+    class FakeModel(torch.nn.Module):
+        def forward(self, input_ids, positions, inputs_embeds):
+            assert input_ids.tolist() == [8, 10, 11, 0]
+            assert positions.tolist() == [5, 4, 6, 0]
+            return torch.zeros((4, 4))
+
+        def compute_logits(self, hidden_states):
+            assert hidden_states.shape == (3, 4)
+            return torch.tensor([[0.0, 2.0], [3.0, 1.0], [0.0, 4.0]])
+
+    forward_context_kwargs: list[dict[str, Any]] = []
+
+    def fake_forward_context(*args, **kwargs):
+        forward_context_kwargs.append(kwargs)
+        return nullcontext()
+
+    proposer.model = FakeModel()
+    proposer.attn_layer_names = ["model.layers.0.self_attn.attn"]
+    proposer.attn_metadata_builder = cast(Any, FakeBuilder())
+    proposer.sparse_attention.begin_parallel_step = Mock()
+    proposer.sparse_attention.end_step = Mock(return_value=torch.ones(3))
+    monkeypatch.setattr(
+        "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
+        fake_forward_context,
+    )
+
+    result = proposer._run_parallel_verification(
+        batch_size=2,
+        request_indices=torch.tensor([1, 0, 1], dtype=torch.int64),
+        token_indices=torch.tensor([0, 1, 1], dtype=torch.int64),
+        common_attn_metadata=common_attn_metadata,
+        sampling_metadata=make_sampling_metadata(all_greedy=True),
+        attention_mode=RetroSpecAttentionMode.EXPANDED_VERIFY,
+    )
+
+    assert result.request_indices.tolist() == [1, 0, 1]
+    assert result.token_indices.tolist() == [0, 1, 1]
+    assert result.token_ids.tolist() == [1, 0, 1]
+    context = forward_context_kwargs[0]
+    assert context["num_tokens"] == 4
+    assert context["cudagraph_runtime_mode"] == CUDAGraphMode.PIECEWISE
+    assert context["batch_descriptor"] == BatchDescriptor(4)
+    slot_mapping = context["slot_mapping"]["model.layers.0.self_attn.attn"]
+    assert slot_mapping.tolist() == [13, 4, 14, -1]
+    begin_args = proposer.sparse_attention.begin_parallel_step.call_args.args
+    assert torch.equal(begin_args[1], torch.tensor([1, 0, 1], dtype=torch.int64))
+    assert torch.equal(begin_args[2], torch.tensor([0, 1, 1], dtype=torch.int64))

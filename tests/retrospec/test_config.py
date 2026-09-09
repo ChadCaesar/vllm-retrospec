@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -98,9 +99,19 @@ def test_retrospec_expanded_budget():
         )
 
 
-def test_retrospec_requires_eager():
-    with pytest.raises(ValueError, match="enforce_eager"):
-        make_retrospec_config(enforce_eager=False)
+def test_retrospec_accepts_piecewise_cudagraph_execution():
+    config = make_retrospec_config(enforce_eager=False)
+
+    assert config.enforce_eager is False
+
+
+@pytest.mark.parametrize("target_enforce_eager", [False, True])
+def test_retrospec_inherits_target_enforce_eager(target_enforce_eager: bool):
+    target_model_config = SimpleNamespace(enforce_eager=target_enforce_eager)
+
+    config = make_retrospec_config(target_model_config=target_model_config)
+
+    assert config.enforce_eager is target_enforce_eager
 
 
 @pytest.mark.parametrize(
