@@ -27,6 +27,9 @@ from vllm.v1.spec_decode.retrospec.capacity import (
 )
 from vllm.v1.spec_decode.retrospec.workspace import (
     exact_attention_partition_capacity,
+    exact_attention_primary_token_capacity,
+    exact_attention_query_capacity,
+    exact_attention_source_token_capacity,
     exact_attention_workspace_size_bytes,
 )
 
@@ -168,8 +171,8 @@ def test_native_working_set_is_capped_by_max_model_len():
 def test_exact_attention_capacity_includes_cluster_page_fragmentation():
     config = make_capacity_config(max_model_len=65536)
 
-    assert get_retrospec_exact_attention_source_token_capacity(config, 16) == 130976
-    assert get_retrospec_exact_attention_partition_capacity(config, 16) == 128
+    assert get_retrospec_exact_attention_source_token_capacity(config, 16) == 139168
+    assert get_retrospec_exact_attention_partition_capacity(config, 16) == 256
 
 
 def test_exact_attention_capacity_covers_32k_to_64k_boundary():
@@ -180,8 +183,80 @@ def test_exact_attention_capacity_covers_32k_to_64k_boundary():
         make_capacity_config(max_model_len=65536), 16
     )
 
-    assert capacity_32k == 64
-    assert capacity_64k == 128
+    assert capacity_32k == 128
+    assert capacity_64k == 256
+
+
+def test_exact_attention_capacity_covers_fixed_primary_plan_width():
+    config = make_capacity_config(
+        max_model_len=8192,
+        retrospec_index_segment_size=1024,
+        retrospec_index_update_interval=1024,
+        num_speculative_tokens=16,
+        retrospec_retrieval_ratio=0.25,
+    )
+
+    assert get_retrospec_exact_attention_source_token_capacity(config, 16) == 17360
+    assert get_retrospec_exact_attention_partition_capacity(config, 16) == 32
+
+
+def test_exact_attention_capacity_helpers_match_runtime_layout():
+    primary_capacity = exact_attention_primary_token_capacity(
+        max_model_len=8192,
+        prefill_segment_size=1024,
+        generation_update_interval=1024,
+        num_speculative_tokens=16,
+        block_size=16,
+    )
+    source_capacity = exact_attention_source_token_capacity(
+        primary_capacity,
+        cluster_page_slot_capacity=1025,
+        page_size=16,
+    )
+
+    assert primary_capacity == 1072
+    assert source_capacity == 17472
+    assert exact_attention_partition_capacity(source_capacity) == 32
+    assert exact_attention_query_capacity(8, 64) == 520
+
+
+@pytest.mark.parametrize(
+    ("helper", "args", "message"),
+    [
+        (
+            exact_attention_primary_token_capacity,
+            (0, 1024, 1024, 16, 16),
+            "max_model_len must be positive",
+        ),
+        (
+            exact_attention_query_capacity,
+            (0, 16),
+            "max_num_seqs must be positive",
+        ),
+        (
+            exact_attention_source_token_capacity,
+            (-1, 0, 16),
+            "primary_token_capacity must be non-negative",
+        ),
+        (
+            exact_attention_source_token_capacity,
+            (0, -1, 16),
+            "cluster_page_slot_capacity must be non-negative",
+        ),
+        (
+            exact_attention_source_token_capacity,
+            (0, 0, 0),
+            "page_size must be positive",
+        ),
+    ],
+)
+def test_exact_attention_capacity_helpers_reject_invalid_dimensions(
+    helper: Any,
+    args: tuple[int, ...],
+    message: str,
+):
+    with pytest.raises(ValueError, match=message):
+        helper(*args)
 
 
 def test_exact_attention_workspace_size_matches_tensor_layout():
@@ -197,6 +272,7 @@ def test_exact_attention_workspace_size_matches_tensor_layout():
         + 1024 * 8 * 128 * 2 * 4
         + 2 * 1024 * 8 * 64 * 2
         + 2 * 1024 * 8 * 4
+        + 1024 * 8 * (64 * 2 + 2 * 4)
     )
 
     assert workspace_bytes == expected_bytes
@@ -224,7 +300,7 @@ def test_capacity_reserves_null_block_and_auxiliary_buffers():
     assert capacity.total_memory_bytes > capacity.native_memory_bytes
 
 
-def test_capacity_does_not_preallocate_for_max_num_seqs():
+def test_capacity_scales_only_shared_verification_workspace_with_max_num_seqs():
     single = build_retrospec_long_context_capacity(
         make_capacity_config(max_num_seqs=1), make_kv_cache_specs()
     )
@@ -232,7 +308,10 @@ def test_capacity_does_not_preallocate_for_max_num_seqs():
         make_capacity_config(max_num_seqs=2), make_kv_cache_specs()
     )
 
-    assert multiple == single
+    assert multiple.native_working_set_tokens == single.native_working_set_tokens
+    assert multiple.native_num_blocks == single.native_num_blocks
+    assert multiple.native_memory_bytes == single.native_memory_bytes
+    assert multiple.auxiliary_memory_bytes > single.auxiliary_memory_bytes
 
 
 def test_capacity_caps_persistent_index_reservation_at_gpu_index_budget():

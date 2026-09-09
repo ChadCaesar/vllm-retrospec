@@ -42,6 +42,7 @@ from .selection_kernels import (
     gather_resident_estimation,
     gather_resident_exact_pages,
 )
+from .workspace import exact_attention_primary_token_capacity
 
 
 @dataclass(frozen=True)
@@ -2548,10 +2549,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         sparse_retrieval_width, sparse_estimation_width, expanded_retrieval_width = (
             self._maximum_zone_widths(view.max_num_clusters)
         )
-        primary_exact_width = min(
-            self.max_model_len,
-            max(self.prefill_segment_size_tokens, self.generation_update_interval)
-            + (self.num_recent_blocks + 1) * self.block_size,
+        primary_exact_width = exact_attention_primary_token_capacity(
+            max_model_len=self.max_model_len,
+            prefill_segment_size=self.prefill_segment_size_tokens,
+            generation_update_interval=self.generation_update_interval,
+            num_speculative_tokens=self.num_speculative_tokens,
+            block_size=self.block_size,
         )
         max_access_width = max(
             sparse_retrieval_width,

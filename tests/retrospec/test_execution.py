@@ -36,6 +36,59 @@ def test_exact_attention_workspace_rejects_invalid_capacity():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_exact_attention_workspace_covers_fixed_primary_and_page_slots():
+    device = torch.device("cuda")
+    page_size = 16
+    head_size = 64
+    max_primary_tokens = 1024
+    max_page_slots = 1025
+
+    key_cache = torch.randn(
+        1, page_size, 1, head_size, dtype=torch.float16, device=device
+    )
+    value_cache = torch.randn_like(key_cache)
+    token_indices = torch.zeros(
+        1, 1, max_primary_tokens, dtype=torch.int64, device=device
+    )
+    token_mask = torch.zeros_like(token_indices, dtype=torch.bool)
+    token_mask[..., 0] = True
+    page_token_counts = torch.zeros(
+        1, 1, 1, max_page_slots, dtype=torch.int32, device=device
+    )
+    page_ids = torch.full_like(page_token_counts, -1, dtype=torch.int64)
+    source = _make_source(
+        key_cache,
+        value_cache,
+        torch.zeros(1, 1, dtype=torch.int32, device=device),
+        token_indices,
+        token_mask,
+        page_token_counts,
+        resident_pages=RetroSpecExactPageKVSource(
+            key_pages=key_cache[:, :, 0],
+            value_pages=value_cache[:, :, 0],
+            page_ids=page_ids,
+        ),
+    )
+    query = torch.randn(1, 1, head_size, dtype=torch.float16, device=device)
+
+    workspace = RetroSpecExactAttentionWorkspace(page_size, 1, 32)
+    output, _ = workspace.run(source, query, 0.125)
+
+    assert output.shape == query.shape
+    assert workspace._partial_output is not None
+    assert workspace._partial_output.shape[2] == 32
+
+    undersized_workspace = RetroSpecExactAttentionWorkspace(page_size, 1, 16)
+    wave_output, wave_lse = undersized_workspace.run(source, query, 0.125)
+
+    torch.testing.assert_close(wave_output, output)
+    assert undersized_workspace._accumulated_output is not None
+    assert undersized_workspace._partial_output is not None
+    assert undersized_workspace._partial_output.shape[2] == 16
+    assert torch.isfinite(wave_lse).all()
+
+
 def _make_source(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -591,7 +644,7 @@ def test_fused_proposal_attention_handles_empty_exact_and_estimation_sources():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_fused_proposal_attention_reduces_multiple_exact_partitions():
+def test_fused_proposal_attention_accumulates_exact_partition_waves():
     device = torch.device("cuda")
     torch.manual_seed(47)
     page_size = 16
@@ -622,12 +675,13 @@ def test_fused_proposal_attention_reduces_multiple_exact_partitions():
     )
     query = torch.randn(1, 2, head_size, dtype=torch.float16, device=device)
     output = torch.empty_like(query)
-    workspace = RetroSpecExactAttentionWorkspace(page_size, 1, 4)
+    workspace = RetroSpecExactAttentionWorkspace(page_size, 1, 1)
 
     workspace.run_proposal(source, estimation, query, head_size**-0.5, output)
     expected = _reference_proposal_attention(source, estimation, query, head_size**-0.5)
 
     torch.testing.assert_close(output, expected, atol=3e-2, rtol=3e-2)
+    assert workspace._accumulated_output is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -750,9 +804,13 @@ def test_exact_attention_reduces_multiple_partitions_and_reuses_workspace():
     assert second_output.data_ptr() == output.data_ptr()
 
     undersized_workspace = RetroSpecExactAttentionWorkspace(page_size, 2, 1)
-    with pytest.raises(RuntimeError, match="planned workspace capacity"):
-        undersized_workspace.run(source, query, 0.125)
-    assert undersized_workspace._partial_output is None
+    wave_output, wave_lse = undersized_workspace.run(source, query, 0.125)
+
+    torch.testing.assert_close(wave_output, expected[0], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(wave_lse, expected[1], atol=3e-3, rtol=3e-3)
+    assert undersized_workspace._partial_output is not None
+    assert undersized_workspace._partial_output.shape[2] == 1
+    assert undersized_workspace._accumulated_output is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

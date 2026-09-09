@@ -7,7 +7,10 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-from .workspace import EXACT_ATTENTION_PARTITION_SIZE
+from .workspace import (
+    EXACT_ATTENTION_PARTITION_SIZE,
+    exact_attention_source_token_capacity,
+)
 
 _EXACT_ATTENTION_BLOCK_TOKENS = 64
 _PARALLEL_FULL_BLOCK_QUERIES = 16
@@ -132,6 +135,7 @@ def _multi_source_exact_partition_kernel(
     stats_stride_1,
     stats_stride_2,
     scale,
+    source_partition_offset,
     NUM_KV_HEADS: tl.constexpr,
     QUERIES_PER_KV_HEAD: tl.constexpr,
     MAX_PRIMARY_TOKENS: tl.constexpr,
@@ -173,7 +177,7 @@ def _multi_source_exact_partition_kernel(
     running_max = float("-inf")
     running_sum = 0.0
     running_output = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    partition_start = partition_idx * PARTITION_SIZE
+    partition_start = (source_partition_offset + partition_idx) * PARTITION_SIZE
 
     for chunk_start in tl.range(0, PARTITION_SIZE, BLOCK_TOKENS):
         token_offsets = partition_start + chunk_start + tl.arange(0, BLOCK_TOKENS)
@@ -328,6 +332,117 @@ def _multi_source_exact_partition_kernel(
     tl.store(partial_output + output_offsets, normalized_output, mask=dimension_mask)
     tl.store(partial_max + stats_offset, running_max)
     tl.store(partial_sum + stats_offset, running_sum)
+
+
+@triton.jit
+def _accumulate_exact_partition_wave_kernel(
+    partial_output,
+    partial_max,
+    partial_sum,
+    accumulated_output,
+    accumulated_max,
+    accumulated_sum,
+    partial_output_stride_0,
+    partial_output_stride_1,
+    partial_output_stride_2,
+    partial_output_stride_3,
+    partial_stats_stride_0,
+    partial_stats_stride_1,
+    partial_stats_stride_2,
+    accumulated_output_stride_0,
+    accumulated_output_stride_1,
+    accumulated_output_stride_3,
+    accumulated_stats_stride_0,
+    accumulated_stats_stride_1,
+    accumulated_stats_stride_2,
+    num_partitions,
+    RESET: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    query_head_idx = tl.program_id(1)
+    dimension_offsets = tl.arange(0, BLOCK_D)
+    dimension_mask = dimension_offsets < HEAD_SIZE
+
+    accumulated_stats_offset = (
+        query_idx * accumulated_stats_stride_0
+        + query_head_idx * accumulated_stats_stride_1
+    )
+    previous_max = float("-inf")
+    previous_sum = 0.0
+    previous_output = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    if not RESET:
+        previous_max = tl.load(accumulated_max + accumulated_stats_offset)
+        previous_sum = tl.load(accumulated_sum + accumulated_stats_offset)
+        accumulated_output_offsets = (
+            query_idx * accumulated_output_stride_0
+            + query_head_idx * accumulated_output_stride_1
+            + dimension_offsets * accumulated_output_stride_3
+        )
+        previous_output = tl.load(
+            accumulated_output + accumulated_output_offsets,
+            mask=dimension_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+    global_max = previous_max
+    for partition_idx in tl.range(0, num_partitions):
+        stats_offset = (
+            query_idx * partial_stats_stride_0
+            + query_head_idx * partial_stats_stride_1
+            + partition_idx * partial_stats_stride_2
+        )
+        global_max = tl.maximum(global_max, tl.load(partial_max + stats_offset))
+
+    safe_global_max = tl.where(global_max == float("-inf"), 0.0, global_max)
+    global_sum = tl.where(
+        previous_sum > 0.0,
+        previous_sum * tl.exp(previous_max - safe_global_max),
+        0.0,
+    )
+    global_output = global_sum * previous_output
+    for partition_idx in tl.range(0, num_partitions):
+        stats_offset = (
+            query_idx * partial_stats_stride_0
+            + query_head_idx * partial_stats_stride_1
+            + partition_idx * partial_stats_stride_2
+        )
+        partition_max = tl.load(partial_max + stats_offset)
+        partition_sum = tl.load(partial_sum + stats_offset)
+        partition_weight = tl.where(
+            partition_sum > 0.0,
+            partition_sum * tl.exp(partition_max - safe_global_max),
+            0.0,
+        )
+        partial_offsets = (
+            query_idx * partial_output_stride_0
+            + query_head_idx * partial_output_stride_1
+            + partition_idx * partial_output_stride_2
+            + dimension_offsets * partial_output_stride_3
+        )
+        partition_output = tl.load(
+            partial_output + partial_offsets, mask=dimension_mask, other=0.0
+        ).to(tl.float32)
+        global_output += partition_weight * partition_output
+        global_sum += partition_weight
+
+    normalized_output = tl.where(global_sum > 0.0, global_output / global_sum, 0.0)
+    accumulated_output_offsets = (
+        query_idx * accumulated_output_stride_0
+        + query_head_idx * accumulated_output_stride_1
+        + dimension_offsets * accumulated_output_stride_3
+    )
+    tl.store(
+        accumulated_output + accumulated_output_offsets,
+        normalized_output,
+        mask=dimension_mask,
+    )
+    tl.store(
+        accumulated_max + accumulated_stats_offset,
+        tl.where(global_sum > 0.0, global_max, float("-inf")),
+    )
+    tl.store(accumulated_sum + accumulated_stats_offset, global_sum)
 
 
 @triton.jit
@@ -944,6 +1059,9 @@ class RetroSpecExactAttentionWorkspace:
         self._partial_output: torch.Tensor | None = None
         self._partial_max: torch.Tensor | None = None
         self._partial_sum: torch.Tensor | None = None
+        self._accumulated_output: torch.Tensor | None = None
+        self._accumulated_max: torch.Tensor | None = None
+        self._accumulated_sum: torch.Tensor | None = None
         self._output: torch.Tensor | None = None
         self._output_lse: torch.Tensor | None = None
         self._secondary_output: torch.Tensor | None = None
@@ -974,18 +1092,7 @@ class RetroSpecExactAttentionWorkspace:
         self._secondary_output_lse = torch.empty_like(output_lse)
         self._configuration = configuration
 
-    def _ensure_workspace(
-        self,
-        query: torch.Tensor,
-        required_partitions: int,
-    ) -> None:
-        if required_partitions > self._partition_capacity:
-            raise RuntimeError(
-                "Exact-attention source exceeds the planned workspace capacity: "
-                f"required {required_partitions} partitions, but the capacity "
-                f"planner reserved {self._partition_capacity}"
-            )
-
+    def _ensure_workspace(self, query: torch.Tensor) -> None:
         self._ensure_output_workspace(query)
         if self._partial_output is not None:
             return
@@ -1005,6 +1112,20 @@ class RetroSpecExactAttentionWorkspace:
             stats_shape, dtype=torch.float32, device=query.device
         )
         self._partial_sum = torch.empty_like(self._partial_max)
+        accumulated_shape = (
+            self.max_num_queries,
+            num_query_heads,
+            1,
+            head_size,
+        )
+        accumulated_stats_shape = accumulated_shape[:-1]
+        self._accumulated_output = torch.empty(
+            accumulated_shape, dtype=query.dtype, device=query.device
+        )
+        self._accumulated_max = torch.empty(
+            accumulated_stats_shape, dtype=torch.float32, device=query.device
+        )
+        self._accumulated_sum = torch.empty_like(self._accumulated_max)
 
     def _validate_source(
         self,
@@ -1295,7 +1416,7 @@ class RetroSpecExactAttentionWorkspace:
 
         num_queries, num_query_heads, head_size = query.shape
         num_splits = min(_PARALLEL_FULL_NUM_SPLITS, self._partition_capacity)
-        self._ensure_workspace(query, num_splits)
+        self._ensure_workspace(query)
         assert self._partial_output is not None
         assert self._partial_max is not None
         assert self._partial_sum is not None
@@ -1476,19 +1597,31 @@ class RetroSpecExactAttentionWorkspace:
         num_kv_heads: int,
         max_primary_tokens: int,
         max_page_slots: int,
-    ) -> int:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         num_queries, num_query_heads, head_size = query.shape
-        num_source_tokens = max_primary_tokens + max_page_slots * self.page_size
-        num_partitions = triton.cdiv(
-            max(num_source_tokens, 1), EXACT_ATTENTION_PARTITION_SIZE
+        num_source_tokens = exact_attention_source_token_capacity(
+            max_primary_tokens,
+            max_page_slots,
+            self.page_size,
         )
-        self._ensure_workspace(query, num_partitions)
+        total_partitions = triton.cdiv(
+            num_source_tokens, EXACT_ATTENTION_PARTITION_SIZE
+        )
+        self._ensure_workspace(query)
 
         assert self._partial_output is not None
         assert self._partial_max is not None
         assert self._partial_sum is not None
+        assert self._accumulated_output is not None
+        assert self._accumulated_max is not None
+        assert self._accumulated_sum is not None
         if num_queries == 0:
-            return num_partitions
+            return (
+                self._partial_output,
+                self._partial_max,
+                self._partial_sum,
+                min(total_partitions, self._partition_capacity),
+            )
 
         primary = source.primary
         current_stream = torch.cuda.current_stream(query.device)
@@ -1525,75 +1658,124 @@ class RetroSpecExactAttentionWorkspace:
         )
         block_d = triton.next_power_of_2(head_size)
 
-        _multi_source_exact_partition_kernel[
-            (num_queries, num_query_heads, num_partitions)
-        ](
-            query,
-            request_mapping,
-            plan_row_mapping,
-            primary.key_cache,
-            primary.value_cache,
-            primary.block_table,
-            primary.token_indices,
-            primary.token_mask,
-            source.page_token_counts,
-            resident_page_ids,
-            resident_key_pages,
-            resident_value_pages,
-            staging_page_ids,
-            staging_key_pages,
-            staging_value_pages,
-            self._partial_output,
-            self._partial_max,
-            self._partial_sum,
-            query.stride(0),
-            query.stride(1),
-            query.stride(2),
-            primary.key_cache.stride(0),
-            primary.key_cache.stride(1),
-            primary.key_cache.stride(2),
-            primary.key_cache.stride(3),
-            primary.value_cache.stride(0),
-            primary.value_cache.stride(1),
-            primary.value_cache.stride(2),
-            primary.value_cache.stride(3),
-            primary.block_table.stride(0),
-            primary.block_table.stride(1),
-            resident_key_pages.stride(0),
-            resident_key_pages.stride(1),
-            resident_key_pages.stride(2),
-            resident_value_pages.stride(0),
-            resident_value_pages.stride(1),
-            resident_value_pages.stride(2),
-            staging_key_pages.stride(0),
-            staging_key_pages.stride(1),
-            staging_key_pages.stride(2),
-            staging_value_pages.stride(0),
-            staging_value_pages.stride(1),
-            staging_value_pages.stride(2),
-            self._partial_output.stride(0),
-            self._partial_output.stride(1),
-            self._partial_output.stride(2),
-            self._partial_output.stride(3),
-            self._partial_max.stride(0),
-            self._partial_max.stride(1),
-            self._partial_max.stride(2),
-            scale,
-            NUM_KV_HEADS=num_kv_heads,
-            QUERIES_PER_KV_HEAD=num_query_heads // num_kv_heads,
-            MAX_PRIMARY_TOKENS=max_primary_tokens,
-            MAX_PAGE_SLOTS=max_page_slots,
-            PAGE_SIZE=self.page_size,
-            HEAD_SIZE=head_size,
-            BLOCK_D=block_d,
-            PARTITION_SIZE=EXACT_ATTENTION_PARTITION_SIZE,
-            BLOCK_TOKENS=_EXACT_ATTENTION_BLOCK_TOKENS,
-            IDENTITY_REQUESTS=request_indices is None,
-            USE_PLAN_ROWS=source.plan_row_indices is not None,
-            HAS_RESIDENT=resident is not None,
-            HAS_STAGING=staging is not None,
+        partition_start = 0
+        wave_index = 0
+        while partition_start < total_partitions:
+            wave_partitions = min(
+                self._partition_capacity,
+                total_partitions - partition_start,
+            )
+            _multi_source_exact_partition_kernel[
+                (num_queries, num_query_heads, wave_partitions)
+            ](
+                query,
+                request_mapping,
+                plan_row_mapping,
+                primary.key_cache,
+                primary.value_cache,
+                primary.block_table,
+                primary.token_indices,
+                primary.token_mask,
+                source.page_token_counts,
+                resident_page_ids,
+                resident_key_pages,
+                resident_value_pages,
+                staging_page_ids,
+                staging_key_pages,
+                staging_value_pages,
+                self._partial_output,
+                self._partial_max,
+                self._partial_sum,
+                query.stride(0),
+                query.stride(1),
+                query.stride(2),
+                primary.key_cache.stride(0),
+                primary.key_cache.stride(1),
+                primary.key_cache.stride(2),
+                primary.key_cache.stride(3),
+                primary.value_cache.stride(0),
+                primary.value_cache.stride(1),
+                primary.value_cache.stride(2),
+                primary.value_cache.stride(3),
+                primary.block_table.stride(0),
+                primary.block_table.stride(1),
+                resident_key_pages.stride(0),
+                resident_key_pages.stride(1),
+                resident_key_pages.stride(2),
+                resident_value_pages.stride(0),
+                resident_value_pages.stride(1),
+                resident_value_pages.stride(2),
+                staging_key_pages.stride(0),
+                staging_key_pages.stride(1),
+                staging_key_pages.stride(2),
+                staging_value_pages.stride(0),
+                staging_value_pages.stride(1),
+                staging_value_pages.stride(2),
+                self._partial_output.stride(0),
+                self._partial_output.stride(1),
+                self._partial_output.stride(2),
+                self._partial_output.stride(3),
+                self._partial_max.stride(0),
+                self._partial_max.stride(1),
+                self._partial_max.stride(2),
+                scale,
+                partition_start,
+                NUM_KV_HEADS=num_kv_heads,
+                QUERIES_PER_KV_HEAD=num_query_heads // num_kv_heads,
+                MAX_PRIMARY_TOKENS=max_primary_tokens,
+                MAX_PAGE_SLOTS=max_page_slots,
+                PAGE_SIZE=self.page_size,
+                HEAD_SIZE=head_size,
+                BLOCK_D=block_d,
+                PARTITION_SIZE=EXACT_ATTENTION_PARTITION_SIZE,
+                BLOCK_TOKENS=_EXACT_ATTENTION_BLOCK_TOKENS,
+                IDENTITY_REQUESTS=request_indices is None,
+                USE_PLAN_ROWS=source.plan_row_indices is not None,
+                HAS_RESIDENT=resident is not None,
+                HAS_STAGING=staging is not None,
+            )
+            partition_start += wave_partitions
+            if total_partitions <= self._partition_capacity:
+                return (
+                    self._partial_output,
+                    self._partial_max,
+                    self._partial_sum,
+                    wave_partitions,
+                )
+
+            _accumulate_exact_partition_wave_kernel[(num_queries, num_query_heads)](
+                self._partial_output,
+                self._partial_max,
+                self._partial_sum,
+                self._accumulated_output,
+                self._accumulated_max,
+                self._accumulated_sum,
+                self._partial_output.stride(0),
+                self._partial_output.stride(1),
+                self._partial_output.stride(2),
+                self._partial_output.stride(3),
+                self._partial_max.stride(0),
+                self._partial_max.stride(1),
+                self._partial_max.stride(2),
+                self._accumulated_output.stride(0),
+                self._accumulated_output.stride(1),
+                self._accumulated_output.stride(3),
+                self._accumulated_max.stride(0),
+                self._accumulated_max.stride(1),
+                self._accumulated_max.stride(2),
+                wave_partitions,
+                RESET=wave_index == 0,
+                HEAD_SIZE=head_size,
+                BLOCK_D=block_d,
+            )
+            wave_index += 1
+
+        return (
+            self._accumulated_output,
+            self._accumulated_max,
+            self._accumulated_sum,
+            1,
         )
-        return num_partitions
 
     def run(
         self,
@@ -1607,19 +1789,18 @@ class RetroSpecExactAttentionWorkspace:
             source, query, request_indices
         )
         num_queries, num_query_heads, head_size = query.shape
-        num_partitions = self._launch_exact_partitions(
-            source,
-            query,
-            scale,
-            request_indices,
-            num_kv_heads,
-            max_primary_tokens,
-            max_page_slots,
+        partial_output, partial_max, partial_sum, num_partitions = (
+            self._launch_exact_partitions(
+                source,
+                query,
+                scale,
+                request_indices,
+                num_kv_heads,
+                max_primary_tokens,
+                max_page_slots,
+            )
         )
 
-        assert self._partial_output is not None
-        assert self._partial_max is not None
-        assert self._partial_sum is not None
         assert self._output is not None
         assert self._output_lse is not None
 
@@ -1633,18 +1814,18 @@ class RetroSpecExactAttentionWorkspace:
 
         block_d = triton.next_power_of_2(head_size)
         _reduce_exact_partitions_kernel[(num_queries, num_query_heads)](
-            self._partial_output,
-            self._partial_max,
-            self._partial_sum,
+            partial_output,
+            partial_max,
+            partial_sum,
             output,
             output_lse,
-            self._partial_output.stride(0),
-            self._partial_output.stride(1),
-            self._partial_output.stride(2),
-            self._partial_output.stride(3),
-            self._partial_max.stride(0),
-            self._partial_max.stride(1),
-            self._partial_max.stride(2),
+            partial_output.stride(0),
+            partial_output.stride(1),
+            partial_output.stride(2),
+            partial_output.stride(3),
+            partial_max.stride(0),
+            partial_max.stride(1),
+            partial_max.stride(2),
             output.stride(0),
             output.stride(1),
             output.stride(2),
@@ -1679,21 +1860,19 @@ class RetroSpecExactAttentionWorkspace:
             raise ValueError("Proposal output must use the query device")
 
         num_queries, num_query_heads, head_size = query.shape
-        num_partitions = self._launch_exact_partitions(
-            source,
-            query,
-            scale,
-            None,
-            num_kv_heads,
-            max_primary_tokens,
-            max_page_slots,
+        partial_output, partial_max, partial_sum, num_partitions = (
+            self._launch_exact_partitions(
+                source,
+                query,
+                scale,
+                None,
+                num_kv_heads,
+                max_primary_tokens,
+                max_page_slots,
+            )
         )
         if num_queries == 0:
             return output
-
-        assert self._partial_output is not None
-        assert self._partial_max is not None
-        assert self._partial_sum is not None
 
         plan_row_mapping = (
             estimation.keys
@@ -1707,9 +1886,9 @@ class RetroSpecExactAttentionWorkspace:
             estimation.keys,
             estimation.values,
             estimation.token_counts,
-            self._partial_output,
-            self._partial_max,
-            self._partial_sum,
+            partial_output,
+            partial_max,
+            partial_sum,
             output,
             query.stride(0),
             query.stride(1),
@@ -1725,13 +1904,13 @@ class RetroSpecExactAttentionWorkspace:
             estimation.token_counts.stride(0),
             estimation.token_counts.stride(1),
             estimation.token_counts.stride(2),
-            self._partial_output.stride(0),
-            self._partial_output.stride(1),
-            self._partial_output.stride(2),
-            self._partial_output.stride(3),
-            self._partial_max.stride(0),
-            self._partial_max.stride(1),
-            self._partial_max.stride(2),
+            partial_output.stride(0),
+            partial_output.stride(1),
+            partial_output.stride(2),
+            partial_output.stride(3),
+            partial_max.stride(0),
+            partial_max.stride(1),
+            partial_max.stride(2),
             output.stride(0),
             output.stride(1),
             output.stride(2),

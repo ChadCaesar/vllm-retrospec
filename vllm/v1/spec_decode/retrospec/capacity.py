@@ -13,6 +13,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from .cluster_scoring import RESIDENT_CLUSTER_SCORE_TILE_SIZE
 from .workspace import (
     exact_attention_partition_capacity,
+    exact_attention_primary_token_capacity,
+    exact_attention_query_capacity,
+    exact_attention_source_token_capacity,
     exact_attention_workspace_size_bytes,
 )
 
@@ -136,6 +139,8 @@ def get_retrospec_exact_attention_source_token_capacity(
     config = vllm_config.speculative_config
     if config is None or config.method != "retrospec":
         raise ValueError("RetroSpec capacity requires a RetroSpec configuration")
+    if config.num_speculative_tokens is None:
+        raise ValueError("RetroSpec requires num_speculative_tokens")
 
     indexed_tokens = _get_indexed_token_capacity(vllm_config, block_size)
     tokens_per_cluster = config.retrospec_blocks_per_cluster * block_size
@@ -144,12 +149,22 @@ def get_retrospec_exact_attention_source_token_capacity(
     # Every cluster may leave one partially occupied page. The first term
     # covers the indexed tokens and the second bounds cluster tail pages.
     max_cluster_pages = cdiv(indexed_tokens, block_size) + num_clusters
-    max_cluster_token_slots = max_cluster_pages * block_size
 
-    # At maximum index coverage, the remaining logical context is native KV.
-    max_model_len = vllm_config.model_config.max_model_len
-    max_primary_tokens = max_model_len - indexed_tokens
-    return max(max_primary_tokens + max_cluster_token_slots, 1)
+    # The plan table retains a fixed primary width even after most of those
+    # slots become masked by later index publication. Capacity must describe
+    # that physical metadata layout rather than only its valid logical suffix.
+    max_primary_tokens = exact_attention_primary_token_capacity(
+        max_model_len=vllm_config.model_config.max_model_len,
+        prefill_segment_size=config.retrospec_index_segment_size,
+        generation_update_interval=config.retrospec_index_update_interval,
+        num_speculative_tokens=config.num_speculative_tokens,
+        block_size=block_size,
+    )
+    return exact_attention_source_token_capacity(
+        max_primary_tokens,
+        max_cluster_pages,
+        block_size,
+    )
 
 
 def get_retrospec_exact_attention_partition_capacity(
@@ -275,7 +290,10 @@ def build_retrospec_long_context_capacity(
     )
     head_size = attention_specs[0].head_size
     query_dtype_bytes = get_dtype_size(attention_specs[0].dtype)
-    max_parallel_queries = scheduler_config.max_num_batched_tokens
+    max_parallel_queries = exact_attention_query_capacity(
+        scheduler_config.max_num_seqs,
+        config.num_speculative_tokens,
+    )
     max_exact_partitions = get_retrospec_exact_attention_partition_capacity(
         vllm_config, block_size
     )

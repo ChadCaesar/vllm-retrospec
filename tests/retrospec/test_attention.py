@@ -148,16 +148,16 @@ def test_exact_attention_workspace_covers_mixed_verification_batch():
     controller = make_controller()
 
     assert controller.max_parallel_tokens == 8
-    assert controller.max_verification_tokens == 32
-    assert controller.exact_attention_workspace.max_num_queries == 32
+    assert controller.max_verification_tokens == 12
+    assert controller.exact_attention_workspace.max_num_queries == 12
 
 
-def test_exact_attention_workspace_uses_scheduler_token_budget():
+def test_exact_attention_workspace_uses_proposal_query_capacity():
     controller = make_controller(max_num_seqs=8, max_num_batched_tokens=4)
 
     assert controller.max_parallel_tokens == 16
-    assert controller.max_verification_tokens == 4
-    assert controller.exact_attention_workspace.max_num_queries == 4
+    assert controller.max_verification_tokens == 24
+    assert controller.exact_attention_workspace.max_num_queries == 24
 
 
 def test_segmented_attention_shares_enabled_performance_stats():

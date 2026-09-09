@@ -42,6 +42,7 @@ from .segmented_index import (
     RetroSpecTokenAttentionSelection,
 )
 from .selection_kernels import add_indexed_values
+from .workspace import exact_attention_query_capacity
 
 RetroSpecSelection = (
     RetroSpecTokenAttentionSelection | RetroSpecIndexedTokenAttentionSelection
@@ -136,10 +137,8 @@ class RetroSpecSparseAttention:
         self.block_size = block_size
         self.num_speculative_tokens = config.num_speculative_tokens
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
-        self.max_verification_tokens = getattr(
-            vllm_config.scheduler_config,
-            "max_num_batched_tokens",
-            self.max_parallel_tokens,
+        self.max_verification_tokens = exact_attention_query_capacity(
+            self.max_batch_size, self.num_speculative_tokens
         )
 
         self.performance_stats = RetroSpecPerformanceStats(
