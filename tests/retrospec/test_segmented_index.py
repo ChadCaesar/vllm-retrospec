@@ -229,7 +229,6 @@ def test_draft_materialization_skips_resident_lookup_without_arena():
         output_workspace=None,
         view=make_empty_resident_view(1, 1, device),
         cluster_zones=Mock(),
-        cluster_scores=torch.empty(1, 1, 1, device=device),
         has_clusters=torch.zeros(1, 1, dtype=torch.bool, device=device),
         head_size=1,
         dtype=torch.float32,
@@ -732,11 +731,10 @@ def test_compact_cluster_zones_match_full_mask_selection(
         ]
     )
 
-    ranking_scores = cluster_scores.masked_fill(~cluster_mask, float("-inf"))
+    selection_scores = cluster_scores.masked_fill(~cluster_mask, float("-inf"))
     candidate_counts = cluster_mask.sum(dim=2, dtype=torch.int32)
     zones = index._select_cluster_zones(
-        cluster_scores,
-        ranking_scores,
+        selection_scores,
         candidate_counts,
         make_empty_resident_view(2, 7, cluster_scores.device),
     )
@@ -764,14 +762,22 @@ def test_compact_cluster_zones_match_full_mask_selection(
                 )
 
     sparse_mass = index._sum_selected_scores(
-        cluster_scores,
-        zones.sparse_retrieval_indices,
+        zones.sparse_retrieval_scores,
         zones.sparse_retrieval_mask,
     )
     expected_sparse_mass = (
         cluster_scores * expected_zones[0].view_as(cluster_mask)
     ).sum(dim=2)
     torch.testing.assert_close(sparse_mass, expected_sparse_mass)
+
+    expanded_mass = index._sum_selected_scores(
+        zones.expanded_retrieval_scores,
+        zones.expanded_retrieval_mask,
+    )
+    expected_expanded_mass = (
+        cluster_scores * expected_zones[2].view_as(cluster_mask)
+    ).sum(dim=2)
+    torch.testing.assert_close(expanded_mass, expected_expanded_mass)
 
 
 def test_bounded_mask_packing_uses_fixed_width_and_preserves_valid_indices():

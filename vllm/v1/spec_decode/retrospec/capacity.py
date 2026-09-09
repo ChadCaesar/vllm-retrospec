@@ -10,6 +10,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 
+from .cluster_scoring import RESIDENT_CLUSTER_SCORE_TILE_SIZE
 from .workspace import (
     exact_attention_partition_capacity,
     exact_attention_workspace_size_bytes,
@@ -312,10 +313,6 @@ def build_retrospec_long_context_capacity(
 
     max_kv_heads = max(spec.num_kv_heads for spec in attention_specs)
 
-    # Float logits/scores plus top-k values and indices, shared across layers.
-    selection_workspace_bytes = total_resident_clusters * (
-        4 * num_query_heads + 24 * max_kv_heads
-    )
     max_retrieval_clusters = min(
         ceil(num_clusters_per_request * config.retrospec_retrieval_ratio),
         num_clusters_per_request,
@@ -325,9 +322,39 @@ def build_retrospec_long_context_capacity(
         ceil(num_clusters_per_request * estimation_ratio),
         num_clusters_per_request - max_retrieval_clusters,
     )
+    max_total_compute_clusters = max_retrieval_clusters + max_estimation_clusters
+    max_warmup_clusters = min(
+        max_retrieval_clusters
+        * getattr(config, "retrospec_first_draft_warmup_multiplier", 4),
+        num_clusters_per_request,
+    )
+    max_ranked_clusters = max(max_total_compute_clusters, max_warmup_clusters)
+
+    # Resident scoring retains one probability score per cluster, bounded
+    # top-k outputs and small per-query-group tile statistics. It does not
+    # materialize grouped logits or a duplicate ranking tensor.
+    selection_num_tiles = cdiv(
+        num_clusters_per_request, RESIDENT_CLUSTER_SCORE_TILE_SIZE
+    )
+    selection_score_bytes = total_resident_clusters * max_kv_heads * 4
+    selection_topk_bytes = (
+        planning_requests * max_kv_heads * max_ranked_clusters * (4 + 8)
+    )
+    selection_tile_bytes = (
+        planning_requests
+        * selection_num_tiles
+        * (num_query_heads * (4 + 4) + max_kv_heads * 4)
+    )
+    selection_row_bytes = planning_requests * (num_query_heads * 4 + max_kv_heads * 4)
+    selection_workspace_bytes = (
+        selection_score_bytes
+        + selection_topk_bytes
+        + selection_tile_bytes
+        + selection_row_bytes
+    )
     max_expanded_clusters = min(
         max_retrieval_clusters * 2,
-        max_retrieval_clusters + max_estimation_clusters,
+        max_total_compute_clusters,
     )
     verification_record_capacity = (
         planning_requests
