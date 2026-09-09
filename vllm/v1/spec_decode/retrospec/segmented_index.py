@@ -38,6 +38,7 @@ from .performance import RetroSpecPerformanceStats
 from .pinned_memory import RetroSpecPinnedMemoryManager
 from .resident_cache import RetroSpecResidentReadLease
 from .selection_kernels import (
+    emit_ranked_selection_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
 )
@@ -2103,6 +2104,39 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         candidate_counts = cluster_mask.sum(dim=2, dtype=torch.int32)
         return scores, candidate_counts, None
 
+    def _rank_cluster_scores(
+        self,
+        cluster_scores: torch.Tensor,
+        workspace: _ClusterSelectionWorkspace,
+        warmup_enabled: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rank into the fixed CUDA workspace without allocating zone tensors."""
+        if cluster_scores is not workspace.scores:
+            raise ValueError("Workspace scores do not match cluster scores")
+
+        num_clusters = cluster_scores.shape[2]
+        max_retrieval, max_estimation, _ = self._maximum_zone_widths(num_clusters)
+        ranking_width = max_retrieval + max_estimation
+        if warmup_enabled:
+            ranking_width = max(
+                ranking_width,
+                self._maximum_first_draft_warmup_width(num_clusters),
+            )
+        if workspace.topk_indices.shape[2] < ranking_width:
+            raise ValueError("Workspace top-k capacity is too small")
+
+        ranked_values = workspace.topk_values[:, :, :ranking_width]
+        ranked_indices = workspace.topk_indices[:, :, :ranking_width]
+        torch.topk(
+            workspace.scores,
+            k=ranking_width,
+            dim=2,
+            largest=True,
+            sorted=True,
+            out=(ranked_values, ranked_indices),
+        )
+        return ranked_values, ranked_indices
+
     @staticmethod
     def _slice_rank_range(
         ranked_indices: torch.Tensor,
@@ -2144,6 +2178,79 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             selected_indices.contiguous(),
             selected_mask.contiguous(),
         )
+
+    def _select_first_draft_warmup(
+        self,
+        ranked_indices: torch.Tensor,
+        candidate_counts: torch.Tensor,
+        view: RetroSpecResidentBatchView,
+        first_draft_warmup_mask: torch.Tensor,
+        warmup_page_budgets: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the exceptional one-shot first-draft warmup rank prefix."""
+        batch_size, num_kv_heads = candidate_counts.shape
+        if first_draft_warmup_mask.shape != (batch_size,):
+            raise ValueError("First-draft warmup mask has an unexpected shape")
+        if warmup_page_budgets.shape != (batch_size, num_kv_heads):
+            raise ValueError("First-draft page budgets have an unexpected shape")
+        if first_draft_warmup_mask.device != ranked_indices.device:
+            raise ValueError("First-draft warmup mask must use the rank device")
+        if warmup_page_budgets.device != ranked_indices.device:
+            raise ValueError("First-draft page budgets must use the rank device")
+
+        num_clusters = view.max_num_clusters
+        max_retrieval, _, _ = self._maximum_zone_widths(num_clusters)
+        max_warmup = self._maximum_first_draft_warmup_width(num_clusters)
+        counts = candidate_counts.to(torch.int64)
+        retrieval_counts = torch.ceil(counts.float() * self.retrieval_ratio).to(
+            torch.int64
+        )
+        retrieval_counts = torch.minimum(retrieval_counts, counts)
+        warmup_counts = torch.minimum(
+            retrieval_counts * self.first_draft_warmup_multiplier,
+            counts,
+        )
+        zero_counts = torch.zeros_like(retrieval_counts)
+        warmup_indices, warmup_mask = self._slice_rank_range(
+            ranked_indices,
+            zero_counts,
+            warmup_counts,
+            max_warmup,
+        )
+
+        if view.arena is None or max_warmup == 0 or max_retrieval == 0:
+            warmup_mask.zero_()
+            return warmup_indices, warmup_mask
+
+        arena = view.arena
+        safe_slots = view.request_slot_ids.clamp_min(0)
+        request_cluster_offsets = arena.cluster_offsets.index_select(0, safe_slots)
+        local_cluster_indices = torch.arange(
+            view.max_num_clusters,
+            dtype=torch.int64,
+            device=view.request_slot_ids.device,
+        )
+        absolute_cluster_indices = (
+            request_cluster_offsets[:, None, None]
+            + local_cluster_indices[None, None, :]
+        )
+        absolute_cluster_indices.clamp_(
+            min=0, max=arena.cluster_page_counts.shape[1] - 1
+        )
+        head_indices = torch.arange(
+            arena.cluster_page_counts.shape[0],
+            dtype=torch.int64,
+            device=view.request_slot_ids.device,
+        )[None, :, None]
+        cluster_page_counts = arena.cluster_page_counts[
+            head_indices, absolute_cluster_indices
+        ]
+        ranked_page_counts = cluster_page_counts.gather(2, warmup_indices)
+        cumulative_pages = ranked_page_counts.cumsum(dim=2)
+        warmup_mask &= cumulative_pages <= warmup_page_budgets.unsqueeze(-1)
+        warmup_mask &= first_draft_warmup_mask[:, None, None]
+        warmup_mask &= view.request_slot_ids[:, None, None] >= 0
+        return warmup_indices, warmup_mask
 
     def _select_cluster_zones(
         self,
@@ -2293,62 +2400,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         else:
             assert first_draft_warmup_mask is not None
             assert warmup_page_budgets is not None
-            warmup_counts = torch.minimum(
-                retrieval_counts * self.first_draft_warmup_multiplier,
-                candidate_counts,
-            )
             (
                 first_draft_warmup_indices,
                 first_draft_warmup_cluster_mask,
-            ) = self._slice_rank_range(
+            ) = self._select_first_draft_warmup(
                 ranked_indices,
-                zero_counts,
-                warmup_counts,
-                max_warmup,
+                candidate_counts,
+                view,
+                first_draft_warmup_mask,
+                warmup_page_budgets,
             )
-
-            if view.arena is None or max_warmup == 0:
-                first_draft_warmup_cluster_mask.zero_()
-            else:
-                arena = view.arena
-                safe_slots = view.request_slot_ids.clamp_min(0)
-                request_cluster_offsets = arena.cluster_offsets.index_select(
-                    0, safe_slots
-                )
-                local_cluster_indices = torch.arange(
-                    view.max_num_clusters,
-                    dtype=torch.int64,
-                    device=view.request_slot_ids.device,
-                )
-                absolute_cluster_indices = (
-                    request_cluster_offsets[:, None, None]
-                    + local_cluster_indices[None, None, :]
-                )
-                absolute_cluster_indices.clamp_(
-                    min=0, max=arena.cluster_page_counts.shape[1] - 1
-                )
-                head_indices = torch.arange(
-                    arena.cluster_page_counts.shape[0],
-                    dtype=torch.int64,
-                    device=view.request_slot_ids.device,
-                )[None, :, None]
-                cluster_page_counts = arena.cluster_page_counts[
-                    head_indices, absolute_cluster_indices
-                ]
-                ranked_page_counts = cluster_page_counts.gather(
-                    2,
-                    first_draft_warmup_indices,
-                )
-                cumulative_pages = ranked_page_counts.cumsum(dim=2)
-                first_draft_warmup_cluster_mask &= (
-                    cumulative_pages <= warmup_page_budgets.unsqueeze(-1)
-                )
-                first_draft_warmup_cluster_mask &= first_draft_warmup_mask[
-                    :, None, None
-                ]
-                first_draft_warmup_cluster_mask &= (
-                    view.request_slot_ids[:, None, None] >= 0
-                )
 
         return _PackedClusterZones(
             sparse_retrieval_indices=sparse_retrieval_indices,
@@ -2723,7 +2784,55 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         return keys, values, counts
 
-    def _make_plan(
+    def _prepare_plan_step(
+        self,
+        layer_name: str,
+        plan_slot: int,
+        active_mask: torch.Tensor,
+        forced_exact_mask: torch.Tensor,
+        view: RetroSpecResidentBatchView,
+        num_kv_heads: int,
+        head_size: int,
+        dtype: torch.dtype,
+    ) -> tuple[
+        RetroSpecTokenSelectionPlan,
+        _SelectionStepWorkspace,
+        _SelectionPlanTable,
+    ]:
+        plan, output_workspace, table = self._get_selection_plan_step(
+            layer_name=layer_name,
+            plan_slot=plan_slot,
+            view=view,
+            batch_size=forced_exact_mask.shape[0],
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+            device=forced_exact_mask.device,
+        )
+
+        per_head_forced_exact = forced_exact_mask.unsqueeze(1).expand(
+            -1, num_kv_heads, -1
+        )
+        self._pack_bounded_mask_indices(
+            per_head_forced_exact,
+            plan.primary_exact_token_indices.shape[-1],
+            plan.primary_exact_token_indices,
+            plan.primary_exact_token_mask,
+            table.primary_topk_order[: forced_exact_mask.shape[0]],
+        )
+        return plan, output_workspace, table
+
+    def _publish_plan_step(
+        self,
+        layer_name: str,
+        plan_slot: int,
+        active_mask: torch.Tensor,
+        table: _SelectionPlanTable,
+    ) -> None:
+        table.valid_rows[plan_slot, : active_mask.shape[0]].copy_(active_mask)
+        self._selection_plan_written_layers.add(layer_name)
+
+    def _make_reference_plan(
         self,
         layer_name: str,
         plan_slot: int,
@@ -2737,28 +2846,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         head_size: int,
         dtype: torch.dtype,
     ) -> tuple[RetroSpecTokenSelectionPlan, _SelectionStepWorkspace]:
-        plan, output_workspace, table = self._get_selection_plan_step(
+        plan, output_workspace, table = self._prepare_plan_step(
             layer_name=layer_name,
             plan_slot=plan_slot,
+            active_mask=active_mask,
+            forced_exact_mask=forced_exact_mask,
             view=view,
-            batch_size=forced_exact_mask.shape[0],
             num_kv_heads=num_kv_heads,
             head_size=head_size,
             dtype=dtype,
-            device=forced_exact_mask.device,
-        )
-
-        per_head_forced_exact = forced_exact_mask.unsqueeze(1).expand(
-            -1,
-            num_kv_heads,
-            -1,
-        )
-        self._pack_bounded_mask_indices(
-            per_head_forced_exact,
-            plan.primary_exact_token_indices.shape[-1],
-            plan.primary_exact_token_indices,
-            plan.primary_exact_token_mask,
-            table.primary_topk_order[: forced_exact_mask.shape[0]],
         )
 
         self._build_resident_exact_cluster_selection(
@@ -2802,9 +2898,66 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         plan.sparse_attn.copy_(sparse_attn)
         plan.expanded_attn.copy_(expanded_attn)
-        table.valid_rows[plan_slot, : active_mask.shape[0]].copy_(active_mask)
-        self._selection_plan_written_layers.add(layer_name)
+        self._publish_plan_step(layer_name, plan_slot, active_mask, table)
         return plan, output_workspace
+
+    def _emit_cuda_plan(
+        self,
+        plan: RetroSpecTokenSelectionPlan,
+        output_workspace: _SelectionStepWorkspace,
+        table: _SelectionPlanTable,
+        plan_slot: int,
+        active_mask: torch.Tensor,
+        ranked_values: torch.Tensor,
+        ranked_indices: torch.Tensor,
+        candidate_counts: torch.Tensor,
+        view: RetroSpecResidentBatchView,
+    ) -> None:
+        arena = view.arena
+        if arena is None:
+            raise RuntimeError("CUDA plan emission requires a resident arena")
+
+        emit_ranked_selection_plan(
+            ranked_values=ranked_values,
+            ranked_indices=ranked_indices,
+            candidate_counts=candidate_counts,
+            cluster_keys=arena.cluster_keys,
+            cluster_values=arena.cluster_values,
+            cluster_token_counts=arena.cluster_token_counts,
+            cluster_ids=arena.cluster_ids,
+            cluster_page_starts=arena.cluster_page_starts,
+            cluster_page_counts=arena.cluster_page_counts,
+            page_ids=arena.page_ids,
+            page_token_counts=arena.page_token_counts,
+            cluster_offsets=arena.cluster_offsets,
+            page_offsets=arena.page_offsets,
+            request_slot_ids=view.request_slot_ids,
+            active_mask=active_mask,
+            retrieval_ratio=self.retrieval_ratio,
+            estimation_ratio=self.estimation_ratio,
+            sparse_exact_cluster_ids=plan.sparse_exact_cluster_ids,
+            sparse_exact_page_ids=plan.sparse_exact_page_ids,
+            sparse_exact_page_token_counts=plan.sparse_exact_page_token_counts,
+            expanded_exact_cluster_ids=plan.expanded_exact_cluster_ids,
+            expanded_exact_page_ids=plan.expanded_exact_page_ids,
+            expanded_exact_page_token_counts=(plan.expanded_exact_page_token_counts),
+            draft_estimation_keys=output_workspace.draft_estimation_keys,
+            draft_estimation_values=output_workspace.draft_estimation_values,
+            draft_estimation_token_counts=(
+                output_workspace.draft_estimation_token_counts
+            ),
+            expanded_estimation_keys=plan.expanded_estimation_keys,
+            expanded_estimation_values=plan.expanded_estimation_values,
+            expanded_estimation_token_counts=(plan.expanded_estimation_token_counts),
+            sparse_attn=plan.sparse_attn,
+            expanded_attn=plan.expanded_attn,
+        )
+        self._publish_plan_step(
+            plan.layer_name,
+            plan_slot,
+            active_mask,
+            table,
+        )
 
     def get_selection_plan(
         self, layer_name: str, step_index: int
@@ -2995,11 +3148,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         plan: RetroSpecTokenSelectionPlan,
         output_workspace: _SelectionStepWorkspace | None,
         view: RetroSpecResidentBatchView,
-        cluster_zones: _PackedClusterZones,
         has_clusters: torch.Tensor,
-        head_size: int,
-        dtype: torch.dtype,
         active_mask: torch.Tensor,
+        sparse_retrieval_scores: torch.Tensor | None = None,
         prefetch_cluster_ids: torch.Tensor | None = None,
         prefetch_access_kinds: torch.Tensor | None = None,
     ) -> RetroSpecTokenAttentionSelection:
@@ -3015,6 +3166,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             )
         if output_workspace is None:
             raise RuntimeError("CUDA draft selection requires an output workspace")
+        if sparse_retrieval_scores is None:
+            raise RuntimeError("CUDA draft selection requires ranked retrieval scores")
 
         resolved_pages = self.cluster_store.resolve_draft_cluster_blocks(
             layer_name=plan.layer_name,
@@ -3030,12 +3183,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         if resolved_pages.read_lease is not None:
             self._proposal_read_leases.append(resolved_pages.read_lease)
 
-        hit_cluster_mask = (
-            cluster_zones.sparse_retrieval_mask & resolved_pages.hit_cluster_mask
-        )
-        miss_cluster_mask = (
-            cluster_zones.sparse_retrieval_mask & resolved_pages.miss_cluster_mask
-        )
+        selected_cluster_mask = plan.sparse_exact_cluster_ids >= 0
+        hit_cluster_mask = selected_cluster_mask & resolved_pages.hit_cluster_mask
+        miss_cluster_mask = selected_cluster_mask & resolved_pages.miss_cluster_mask
 
         draft_exact_page_token_counts = output_workspace.draft_exact_page_token_counts
         draft_exact_page_token_counts.copy_(plan.sparse_exact_page_token_counts)
@@ -3049,26 +3199,21 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         estimation_keys = output_workspace.draft_estimation_keys
         estimation_values = output_workspace.draft_estimation_values
         estimation_token_counts = output_workspace.draft_estimation_token_counts
-        self._build_resident_estimation_selection(
-            view,
-            cluster_zones.sparse_retrieval_indices,
-            miss_cluster_mask,
-            head_size,
-            dtype,
-            estimation_keys[:, :, sparse_width : sparse_width + retrieval_width],
-            estimation_values[:, :, sparse_width : sparse_width + retrieval_width],
-            estimation_token_counts[
-                :, :, sparse_width : sparse_width + retrieval_width
-            ],
+        retrieval_fallback_counts = estimation_token_counts[
+            :, :, sparse_width : sparse_width + retrieval_width
+        ]
+        retrieval_fallback_counts.masked_fill_(
+            ~miss_cluster_mask,
+            0,
         )
 
         hit_attn_by_head = self._sum_selected_scores(
-            cluster_zones.sparse_retrieval_scores,
+            sparse_retrieval_scores[:, :, :retrieval_width],
             hit_cluster_mask,
         )
 
         hit_gate_ready_by_head = (
-            cluster_zones.sparse_retrieval_mask & resolved_pages.hit_gate_ready_mask
+            selected_cluster_mask & resolved_pages.hit_gate_ready_mask
         ).any(dim=2)
         use_hit_attn = has_clusters & hit_gate_ready_by_head
         hit_attn_by_head = torch.where(
@@ -3637,75 +3782,126 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 query, view, scale, num_kv_heads
             )
 
-        with self._cuda_timer("draft_cluster_topk"):
-            cluster_zones = self._select_cluster_zones(
-                cluster_scores,
-                candidate_counts,
-                view=view,
-                first_draft_warmup_mask=first_draft_warmup_mask,
-                warmup_page_budgets=warmup_page_budgets,
-                workspace=workspace,
+        direct_cuda_plan = workspace is not None and view.arena is not None
+        ranked_values = None
+        ranked_indices = None
+        cluster_zones = None
+        if direct_cuda_plan:
+            with self._cuda_timer("draft_plan_prepare"):
+                plan, output_workspace, table = self._prepare_plan_step(
+                    layer_name=layer_name,
+                    plan_slot=plan_slot,
+                    active_mask=active_mask,
+                    forced_exact_mask=forced_exact_mask,
+                    view=view,
+                    num_kv_heads=num_kv_heads,
+                    head_size=key_cache.shape[3],
+                    dtype=key_cache.dtype,
+                )
+            with self._cuda_timer("draft_cluster_topk"):
+                ranked_values, ranked_indices = self._rank_cluster_scores(
+                    cluster_scores,
+                    workspace,
+                    warmup_enabled=first_draft_warmup_mask is not None,
+                )
+            with self._cuda_timer("draft_plan_build"):
+                self._emit_cuda_plan(
+                    plan=plan,
+                    output_workspace=output_workspace,
+                    table=table,
+                    plan_slot=plan_slot,
+                    active_mask=active_mask,
+                    ranked_values=ranked_values,
+                    ranked_indices=ranked_indices,
+                    candidate_counts=candidate_counts,
+                    view=view,
+                )
+        else:
+            with self._cuda_timer("draft_cluster_topk"):
+                cluster_zones = self._select_cluster_zones(
+                    cluster_scores,
+                    candidate_counts,
+                    view=view,
+                    first_draft_warmup_mask=first_draft_warmup_mask,
+                    warmup_page_budgets=warmup_page_budgets,
+                    workspace=workspace,
+                )
+
+            sparse_attn_by_head = self._sum_selected_scores(
+                cluster_zones.sparse_retrieval_scores,
+                cluster_zones.sparse_retrieval_mask,
+            )
+            expanded_attn_by_head = self._sum_selected_scores(
+                cluster_zones.expanded_retrieval_scores,
+                cluster_zones.expanded_retrieval_mask,
+            )
+            has_clusters_by_head = candidate_counts > 0
+            sparse_attn_by_head = torch.where(
+                has_clusters_by_head,
+                sparse_attn_by_head,
+                torch.ones_like(sparse_attn_by_head),
+            )
+            expanded_attn_by_head = torch.where(
+                has_clusters_by_head,
+                expanded_attn_by_head,
+                torch.ones_like(expanded_attn_by_head),
+            )
+            sparse_attn = sparse_attn_by_head.mean(dim=1)
+            expanded_attn = expanded_attn_by_head.mean(dim=1)
+            sparse_attn = torch.where(
+                active_mask,
+                sparse_attn,
+                torch.ones_like(sparse_attn),
+            )
+            expanded_attn = torch.where(
+                active_mask,
+                expanded_attn,
+                torch.ones_like(expanded_attn),
             )
 
-        sparse_attn_by_head = self._sum_selected_scores(
-            cluster_zones.sparse_retrieval_scores,
-            cluster_zones.sparse_retrieval_mask,
-        )
-        expanded_attn_by_head = self._sum_selected_scores(
-            cluster_zones.expanded_retrieval_scores,
-            cluster_zones.expanded_retrieval_mask,
-        )
+            with self._cuda_timer("draft_plan_build"):
+                plan, output_workspace = self._make_reference_plan(
+                    layer_name=layer_name,
+                    plan_slot=plan_slot,
+                    active_mask=active_mask,
+                    forced_exact_mask=forced_exact_mask,
+                    cluster_zones=cluster_zones,
+                    sparse_attn=sparse_attn,
+                    expanded_attn=expanded_attn,
+                    view=view,
+                    num_kv_heads=num_kv_heads,
+                    head_size=key_cache.shape[3],
+                    dtype=key_cache.dtype,
+                )
 
         has_clusters = candidate_counts > 0
-        sparse_attn_by_head = torch.where(
-            has_clusters,
-            sparse_attn_by_head,
-            torch.ones_like(sparse_attn_by_head),
-        )
-        expanded_attn_by_head = torch.where(
-            has_clusters,
-            expanded_attn_by_head,
-            torch.ones_like(expanded_attn_by_head),
-        )
-
-        sparse_attn = sparse_attn_by_head.mean(dim=1)
-        expanded_attn = expanded_attn_by_head.mean(dim=1)
-
-        sparse_attn = torch.where(
-            active_mask,
-            sparse_attn,
-            torch.ones_like(sparse_attn),
-        )
-        expanded_attn = torch.where(
-            active_mask,
-            expanded_attn,
-            torch.ones_like(expanded_attn),
-        )
-
-        with self._cuda_timer("draft_plan_build"):
-            plan, output_workspace = self._make_plan(
-                layer_name=layer_name,
-                plan_slot=plan_slot,
-                active_mask=active_mask,
-                forced_exact_mask=forced_exact_mask,
-                cluster_zones=cluster_zones,
-                sparse_attn=sparse_attn,
-                expanded_attn=expanded_attn,
-                view=view,
-                num_kv_heads=num_kv_heads,
-                head_size=key_cache.shape[3],
-                dtype=key_cache.dtype,
-            )
+        warmup_indices = None
+        warmup_mask = None
+        if first_draft_warmup_mask is not None:
+            assert warmup_page_budgets is not None
+            if ranked_indices is not None:
+                warmup_indices, warmup_mask = self._select_first_draft_warmup(
+                    ranked_indices,
+                    candidate_counts,
+                    view,
+                    first_draft_warmup_mask,
+                    warmup_page_budgets,
+                )
+            else:
+                assert cluster_zones is not None
+                warmup_indices = cluster_zones.first_draft_warmup_indices
+                warmup_mask = cluster_zones.first_draft_warmup_mask
 
         prefetch_cluster_ids = None
         prefetch_access_kinds = None
-        if first_draft_warmup_mask is not None:
+        if warmup_indices is not None:
+            assert warmup_mask is not None
             with self._cuda_timer("draft_first_warmup_resolve"):
                 warmup_cluster_ids, warmup_page_ids, _ = (
                     self._build_resident_exact_cluster_selection(
                         view,
-                        cluster_zones.first_draft_warmup_indices,
-                        cluster_zones.first_draft_warmup_mask,
+                        warmup_indices,
+                        warmup_mask,
                     )
                 )
                 warmup_access = self.cluster_store.resolve_draft_cluster_blocks(
@@ -3732,16 +3928,21 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 prefetch_cluster_ids = warmup_cluster_ids
                 prefetch_access_kinds = warmup_access.access_kinds
 
+        sparse_retrieval_scores = (
+            ranked_values
+            if ranked_values is not None
+            else cluster_zones.sparse_retrieval_scores
+            if cluster_zones is not None
+            else None
+        )
         with self._cuda_timer("draft_plan_materialize"):
             selection = self._materialize_draft_selection(
                 plan=plan,
                 output_workspace=output_workspace,
                 view=view,
-                cluster_zones=cluster_zones,
                 has_clusters=has_clusters,
-                head_size=key_cache.shape[3],
-                dtype=key_cache.dtype,
                 active_mask=active_mask,
+                sparse_retrieval_scores=sparse_retrieval_scores,
                 prefetch_cluster_ids=prefetch_cluster_ids,
                 prefetch_access_kinds=prefetch_access_kinds,
             )

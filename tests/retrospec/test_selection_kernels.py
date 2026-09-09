@@ -12,6 +12,7 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 )
 from vllm.v1.spec_decode.retrospec.selection_kernels import (
     add_indexed_values,
+    emit_ranked_selection_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
 )
@@ -295,6 +296,338 @@ def test_gather_resident_exact_pages_matches_request_slot_reference():
     torch.testing.assert_close(output_cluster_ids, expected_cluster_ids)
     torch.testing.assert_close(output_page_ids, expected_page_ids)
     torch.testing.assert_close(output_page_counts, expected_page_counts)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_emit_ranked_selection_plan_matches_request_head_reference():
+    device = torch.device("cuda")
+    num_slots, batch_size = 3, 4
+    num_kv_heads, num_clusters, head_size = 2, 5, 3
+    max_pages = 2
+    sparse_width, estimation_width, expanded_width = 2, 2, 4
+    retrieval_ratio, estimation_ratio = 0.4, 0.4
+
+    cluster_capacity = num_slots * num_clusters
+    cluster_offsets = torch.arange(
+        0,
+        cluster_capacity,
+        num_clusters,
+        dtype=torch.int64,
+        device=device,
+    )
+    cluster_ids = torch.empty(
+        num_kv_heads, cluster_capacity, dtype=torch.int64, device=device
+    )
+    cluster_keys = torch.empty(
+        num_kv_heads,
+        cluster_capacity,
+        head_size,
+        dtype=torch.float32,
+        device=device,
+    )
+    cluster_values = torch.empty_like(cluster_keys)
+    cluster_token_counts = torch.empty(
+        num_kv_heads, cluster_capacity, dtype=torch.int32, device=device
+    )
+    cluster_page_starts = torch.empty_like(cluster_ids)
+    cluster_page_counts = torch.empty_like(cluster_ids, dtype=torch.int32)
+
+    page_capacity = cluster_capacity * max_pages
+    page_offsets = torch.arange(
+        0,
+        page_capacity,
+        num_clusters * max_pages,
+        dtype=torch.int64,
+        device=device,
+    )
+    page_ids = torch.empty(
+        num_kv_heads, page_capacity, dtype=torch.int64, device=device
+    )
+    page_token_counts = torch.empty_like(page_ids, dtype=torch.int32)
+
+    for slot in range(num_slots):
+        cluster_start = int(cluster_offsets[slot])
+        page_start = int(page_offsets[slot])
+        for head in range(num_kv_heads):
+            for cluster in range(num_clusters):
+                absolute_cluster = cluster_start + cluster
+                cluster_ids[head, absolute_cluster] = slot * 100 + head * 10 + cluster
+                cluster_keys[head, absolute_cluster] = torch.tensor(
+                    [slot, head, cluster], dtype=torch.float32, device=device
+                )
+                cluster_values[head, absolute_cluster] = (
+                    cluster_keys[head, absolute_cluster] + 1000
+                )
+                cluster_token_counts[head, absolute_cluster] = cluster + 1
+                cluster_page_starts[head, absolute_cluster] = cluster * max_pages
+                num_pages = 1 + (cluster % max_pages)
+                cluster_page_counts[head, absolute_cluster] = num_pages
+                for page in range(max_pages):
+                    absolute_page = page_start + cluster * max_pages + page
+                    page_ids[head, absolute_page] = (
+                        slot * 1000 + head * 100 + cluster * 10 + page
+                    )
+                    page_token_counts[head, absolute_page] = page + 1
+
+    ranked_indices = torch.tensor(
+        [
+            [[4, 1, 3, 0], [2, 4, 1, 0]],
+            [[1, 3, 0, 4], [4, 0, 2, 3]],
+            [[0, 1, 2, 3], [3, 2, 1, 0]],
+            [[2, 0, 4, 1], [1, 3, 0, 2]],
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    ranked_values = torch.tensor(
+        [
+            [[0.40, 0.30, 0.20, 0.10], [0.70, 0.20, 0.08, 0.02]],
+            [[0.60, 0.25, 0.10, 0.05], [0.45, 0.30, 0.15, 0.10]],
+            [[0.40, 0.30, 0.20, 0.10], [0.40, 0.30, 0.20, 0.10]],
+            [[0.40, 0.30, 0.20, 0.10], [0.40, 0.30, 0.20, 0.10]],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    ranked_indices = torch.cat(
+        (ranked_indices, torch.zeros_like(ranked_indices[:, :, :2])), dim=2
+    )[:, :, :4]
+    ranked_values = torch.cat(
+        (ranked_values, torch.zeros_like(ranked_values[:, :, :2])), dim=2
+    )[:, :, :4]
+    assert not ranked_indices.is_contiguous()
+    assert not ranked_values.is_contiguous()
+    candidate_counts = torch.tensor(
+        [[5, 0], [2, 4], [5, 5], [3, 3]],
+        dtype=torch.int32,
+        device=device,
+    )
+    request_slot_ids = torch.tensor([2, 0, -1, 1], device=device)
+    active_mask = torch.tensor([True, True, True, False], device=device)
+
+    sparse_cluster_ids = torch.full(
+        (batch_size, num_kv_heads, sparse_width),
+        777,
+        dtype=torch.int64,
+        device=device,
+    )
+    sparse_page_ids = torch.full(
+        (batch_size, num_kv_heads, sparse_width, max_pages),
+        777,
+        dtype=torch.int64,
+        device=device,
+    )
+    sparse_page_counts = torch.full_like(sparse_page_ids, 777, dtype=torch.int32)
+    expanded_cluster_ids = torch.full(
+        (batch_size, num_kv_heads, expanded_width),
+        777,
+        dtype=torch.int64,
+        device=device,
+    )
+    expanded_page_ids = torch.full(
+        (batch_size, num_kv_heads, expanded_width, max_pages),
+        777,
+        dtype=torch.int64,
+        device=device,
+    )
+    expanded_page_counts = torch.full_like(expanded_page_ids, 777, dtype=torch.int32)
+    draft_width = estimation_width + sparse_width
+    draft_keys = torch.full(
+        (batch_size, num_kv_heads, draft_width, head_size),
+        777,
+        dtype=torch.float32,
+        device=device,
+    )
+    draft_values = torch.full_like(draft_keys, 777)
+    draft_counts = torch.full(
+        (batch_size, num_kv_heads, draft_width),
+        777,
+        dtype=torch.int32,
+        device=device,
+    )
+    expanded_keys = torch.full(
+        (batch_size, num_kv_heads, estimation_width, head_size),
+        777,
+        dtype=torch.float32,
+        device=device,
+    )
+    expanded_values = torch.full_like(expanded_keys, 777)
+    expanded_counts = torch.full(
+        (batch_size, num_kv_heads, estimation_width),
+        777,
+        dtype=torch.int32,
+        device=device,
+    )
+    sparse_attn = torch.full((batch_size,), 777.0, device=device)
+    expanded_attn = torch.full((batch_size,), 777.0, device=device)
+
+    emit_ranked_selection_plan(
+        ranked_values=ranked_values,
+        ranked_indices=ranked_indices,
+        candidate_counts=candidate_counts,
+        cluster_keys=cluster_keys,
+        cluster_values=cluster_values,
+        cluster_token_counts=cluster_token_counts,
+        cluster_ids=cluster_ids,
+        cluster_page_starts=cluster_page_starts,
+        cluster_page_counts=cluster_page_counts,
+        page_ids=page_ids,
+        page_token_counts=page_token_counts,
+        cluster_offsets=cluster_offsets,
+        page_offsets=page_offsets,
+        request_slot_ids=request_slot_ids,
+        active_mask=active_mask,
+        retrieval_ratio=retrieval_ratio,
+        estimation_ratio=estimation_ratio,
+        sparse_exact_cluster_ids=sparse_cluster_ids,
+        sparse_exact_page_ids=sparse_page_ids,
+        sparse_exact_page_token_counts=sparse_page_counts,
+        expanded_exact_cluster_ids=expanded_cluster_ids,
+        expanded_exact_page_ids=expanded_page_ids,
+        expanded_exact_page_token_counts=expanded_page_counts,
+        draft_estimation_keys=draft_keys,
+        draft_estimation_values=draft_values,
+        draft_estimation_token_counts=draft_counts,
+        expanded_estimation_keys=expanded_keys,
+        expanded_estimation_values=expanded_values,
+        expanded_estimation_token_counts=expanded_counts,
+        sparse_attn=sparse_attn,
+        expanded_attn=expanded_attn,
+    )
+
+    expected_sparse_ids = torch.full_like(sparse_cluster_ids, -1)
+    expected_sparse_page_ids = torch.full_like(sparse_page_ids, -1)
+    expected_sparse_page_counts = torch.zeros_like(sparse_page_counts)
+    expected_expanded_ids = torch.full_like(expanded_cluster_ids, -1)
+    expected_expanded_page_ids = torch.full_like(expanded_page_ids, -1)
+    expected_expanded_page_counts = torch.zeros_like(expanded_page_counts)
+    expected_draft_keys = torch.zeros_like(draft_keys)
+    expected_draft_values = torch.zeros_like(draft_values)
+    expected_draft_counts = torch.zeros_like(draft_counts)
+    expected_expanded_keys = torch.zeros_like(expanded_keys)
+    expected_expanded_values = torch.zeros_like(expanded_values)
+    expected_expanded_counts = torch.zeros_like(expanded_counts)
+    expected_sparse_attn = torch.ones_like(sparse_attn)
+    expected_expanded_attn = torch.ones_like(expanded_attn)
+
+    for batch in range(batch_size):
+        slot = int(request_slot_ids[batch])
+        if not bool(active_mask[batch]) or slot < 0:
+            continue
+        sparse_mass = 0.0
+        expanded_mass = 0.0
+        for head in range(num_kv_heads):
+            count = int(candidate_counts[batch, head])
+            retrieval_count = min(
+                int(torch.ceil(torch.tensor(count * retrieval_ratio))), count
+            )
+            estimation_count = min(
+                int(torch.ceil(torch.tensor(count * estimation_ratio))),
+                count - retrieval_count,
+            )
+            total_count = retrieval_count + estimation_count
+            expanded_count = min(2 * retrieval_count, total_count)
+            sparse_mass += (
+                float(ranked_values[batch, head, :retrieval_count].sum())
+                if count
+                else 1.0
+            )
+            expanded_mass += (
+                float(ranked_values[batch, head, :expanded_count].sum())
+                if count
+                else 1.0
+            )
+
+            for output_idx in range(retrieval_count):
+                cluster = int(ranked_indices[batch, head, output_idx])
+                absolute_cluster = int(cluster_offsets[slot]) + cluster
+                expected_sparse_ids[batch, head, output_idx] = cluster_ids[
+                    head, absolute_cluster
+                ]
+                fallback_idx = estimation_width + output_idx
+                expected_draft_keys[batch, head, fallback_idx] = cluster_keys[
+                    head, absolute_cluster
+                ]
+                expected_draft_values[batch, head, fallback_idx] = cluster_values[
+                    head, absolute_cluster
+                ]
+                expected_draft_counts[batch, head, fallback_idx] = cluster_token_counts[
+                    head, absolute_cluster
+                ]
+                num_pages = int(cluster_page_counts[head, absolute_cluster])
+                page_start = int(page_offsets[slot]) + int(
+                    cluster_page_starts[head, absolute_cluster]
+                )
+                expected_sparse_page_ids[batch, head, output_idx, :num_pages] = (
+                    page_ids[head, page_start : page_start + num_pages]
+                )
+                expected_sparse_page_counts[batch, head, output_idx, :num_pages] = (
+                    page_token_counts[head, page_start : page_start + num_pages]
+                )
+
+            for output_idx in range(estimation_count):
+                rank = retrieval_count + output_idx
+                cluster = int(ranked_indices[batch, head, rank])
+                absolute_cluster = int(cluster_offsets[slot]) + cluster
+                expected_draft_keys[batch, head, output_idx] = cluster_keys[
+                    head, absolute_cluster
+                ]
+                expected_draft_values[batch, head, output_idx] = cluster_values[
+                    head, absolute_cluster
+                ]
+                expected_draft_counts[batch, head, output_idx] = cluster_token_counts[
+                    head, absolute_cluster
+                ]
+
+            for output_idx in range(expanded_count):
+                cluster = int(ranked_indices[batch, head, output_idx])
+                absolute_cluster = int(cluster_offsets[slot]) + cluster
+                expected_expanded_ids[batch, head, output_idx] = cluster_ids[
+                    head, absolute_cluster
+                ]
+                num_pages = int(cluster_page_counts[head, absolute_cluster])
+                page_start = int(page_offsets[slot]) + int(
+                    cluster_page_starts[head, absolute_cluster]
+                )
+                expected_expanded_page_ids[batch, head, output_idx, :num_pages] = (
+                    page_ids[head, page_start : page_start + num_pages]
+                )
+                expected_expanded_page_counts[batch, head, output_idx, :num_pages] = (
+                    page_token_counts[head, page_start : page_start + num_pages]
+                )
+
+            for output_idx in range(total_count - expanded_count):
+                rank = expanded_count + output_idx
+                cluster = int(ranked_indices[batch, head, rank])
+                absolute_cluster = int(cluster_offsets[slot]) + cluster
+                expected_expanded_keys[batch, head, output_idx] = cluster_keys[
+                    head, absolute_cluster
+                ]
+                expected_expanded_values[batch, head, output_idx] = cluster_values[
+                    head, absolute_cluster
+                ]
+                expected_expanded_counts[batch, head, output_idx] = (
+                    cluster_token_counts[head, absolute_cluster]
+                )
+
+        expected_sparse_attn[batch] = sparse_mass / num_kv_heads
+        expected_expanded_attn[batch] = expanded_mass / num_kv_heads
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(sparse_cluster_ids, expected_sparse_ids)
+    torch.testing.assert_close(sparse_page_ids, expected_sparse_page_ids)
+    torch.testing.assert_close(sparse_page_counts, expected_sparse_page_counts)
+    torch.testing.assert_close(expanded_cluster_ids, expected_expanded_ids)
+    torch.testing.assert_close(expanded_page_ids, expected_expanded_page_ids)
+    torch.testing.assert_close(expanded_page_counts, expected_expanded_page_counts)
+    torch.testing.assert_close(draft_keys, expected_draft_keys)
+    torch.testing.assert_close(draft_values, expected_draft_values)
+    torch.testing.assert_close(draft_counts, expected_draft_counts)
+    torch.testing.assert_close(expanded_keys, expected_expanded_keys)
+    torch.testing.assert_close(expanded_values, expected_expanded_values)
+    torch.testing.assert_close(expanded_counts, expected_expanded_counts)
+    torch.testing.assert_close(sparse_attn, expected_sparse_attn)
+    torch.testing.assert_close(expanded_attn, expected_expanded_attn)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

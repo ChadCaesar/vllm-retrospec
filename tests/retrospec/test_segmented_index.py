@@ -228,10 +228,7 @@ def test_draft_materialization_skips_resident_lookup_without_arena():
         plan=plan,
         output_workspace=None,
         view=make_empty_resident_view(1, 1, device),
-        cluster_zones=Mock(),
         has_clusters=torch.zeros(1, 1, dtype=torch.bool, device=device),
-        head_size=1,
-        dtype=torch.float32,
         active_mask=torch.ones(1, dtype=torch.bool, device=device),
     )
 
@@ -2090,17 +2087,29 @@ def test_segmented_index_builds_and_selects_on_cuda():
 
     index.begin_proposal(["request"])
     try:
-        selection = index.select_segmented(
-            request_ids=["request"],
-            layer_name="layer",
-            query=torch.ones(1, 1, 1, device=device, dtype=torch.bfloat16),
-            key_cache=keys,
-            value_cache=values,
-            block_table=block_table,
-            seq_lens=torch.tensor([10], dtype=torch.int32, device=device),
-            active_mask=torch.tensor([True], device=device),
-            scale=1.0,
-        )
+        with (
+            patch.object(
+                index,
+                "_select_cluster_zones",
+                side_effect=AssertionError("CUDA path constructed packed zones"),
+            ),
+            patch.object(
+                index,
+                "_make_reference_plan",
+                side_effect=AssertionError("CUDA path used the reference plan"),
+            ),
+        ):
+            selection = index.select_segmented(
+                request_ids=["request"],
+                layer_name="layer",
+                query=torch.ones(1, 1, 1, device=device, dtype=torch.bfloat16),
+                key_cache=keys,
+                value_cache=values,
+                block_table=block_table,
+                seq_lens=torch.tensor([10], dtype=torch.int32, device=device),
+                active_mask=torch.tensor([True], device=device),
+                scale=1.0,
+            )
         torch.cuda.synchronize()
     finally:
         index.end_proposal()
