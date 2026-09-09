@@ -978,6 +978,67 @@ def test_verification_compaction_reuses_fixed_output(device):
         ),
     ],
 )
+def test_dynamic_draft_control_skips_empty_columns_and_reuses_workspace(device):
+    if device.type == "cuda":
+        device = torch.device("cuda", torch.cuda.current_device())
+    proposer = RetroSpecProposer(make_vllm_config(), device, make_runner())
+    proposer.state.begin_batch(
+        4,
+        torch.tensor([True, True, True, False], device=device),
+    )
+    proposer.state.set_pending_counts(
+        torch.tensor([2, 0, 1, 0], dtype=torch.int32, device=device)
+    )
+    proposer.state.add_draft_counts(
+        torch.tensor([4, 4, 4, 0], dtype=torch.int32, device=device)
+    )
+    proposer.positions[:4].copy_(
+        torch.tensor([1, 1, 15, 1], dtype=torch.int64, device=device)
+    )
+
+    round_mask, round_starts = proposer._begin_draft_round(4)
+
+    assert round_mask.data_ptr() == proposer._draft_round_mask.data_ptr()
+    assert round_starts.data_ptr() == proposer._draft_round_start_counts.data_ptr()
+    assert round_mask.tolist() == [True, True, False, False]
+    assert round_starts.tolist() == [2, 0, 1, 0]
+    assert proposer.state.draft_counts.tolist() == [0, 0, 0, 0]
+
+    token_index, step_mask = proposer._prepare_next_draft_step(
+        4, round_mask, round_starts
+    )
+    assert token_index == 0
+    assert step_mask.data_ptr() == proposer._draft_stage_mask.data_ptr()
+    assert step_mask.tolist() == [False, True, False, False]
+
+    proposer.state.add_draft_counts(step_mask.to(torch.int32))
+    proposer.state.set_stage(step_mask, RetroSpecStage.FULL_VERIFY)
+    token_index, step_mask = proposer._prepare_next_draft_step(
+        4, round_mask, round_starts
+    )
+    assert token_index == 2
+    assert step_mask.tolist() == [True, False, False, False]
+
+    proposer.state.set_stage(step_mask, RetroSpecStage.FULL_VERIFY)
+    token_index, step_mask = proposer._prepare_next_draft_step(
+        4, round_mask, round_starts
+    )
+    assert token_index == proposer.num_speculative_tokens
+    assert not step_mask.any()
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        torch.device("cpu"),
+        pytest.param(
+            torch.device("cuda"),
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is required"
+            ),
+        ),
+    ],
+)
 def test_parallel_sampling_uses_one_raw_argmax_for_plain_greedy(device):
     sampler = Mock()
     proposer = RetroSpecProposer(
@@ -1350,7 +1411,7 @@ def test_sparse_token_change_is_corrected_and_truncates_prefix(monkeypatch):
     ):
         observed_modes.append(attention_mode)
         if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
-            token_ids = [11, 20, 30]
+            token_ids = [11, 99, 98]
         else:
             token_ids = [11]
         return make_parallel_verification_output(
@@ -1371,7 +1432,7 @@ def test_sparse_token_change_is_corrected_and_truncates_prefix(monkeypatch):
 
     assert verification.verified_counts.tolist() == [1]
     assert not verification.require_full.any()
-    assert proposer._draft_token_ids[0, 0].item() == 11
+    assert proposer._draft_token_ids[0, :3].tolist() == [11, 20, 30]
     assert observed_modes == [
         RetroSpecAttentionMode.SPARSE_VERIFY,
         RetroSpecAttentionMode.EXPANDED_VERIFY,
@@ -1395,6 +1456,12 @@ def test_expanded_verification_passes_or_stops_requests_independently(
         torch.tensor([3, 3], dtype=torch.int32),
     )
     observed_rows: list[tuple[RetroSpecAttentionMode, list[int], list[int]]] = []
+    compaction_lengths: list[int] = []
+    compact_mask_indices = proposer._compact_mask_indices
+
+    def track_compaction(mask, output):
+        compaction_lengths.append(mask.shape[0])
+        return compact_mask_indices(mask, output)
 
     def fake_run_parallel_verification(
         batch_size,
@@ -1424,6 +1491,7 @@ def test_expanded_verification_passes_or_stops_requests_independently(
         "_run_parallel_verification",
         fake_run_parallel_verification,
     )
+    monkeypatch.setattr(proposer, "_compact_mask_indices", track_compaction)
     verification = proposer._verify_draft_tokens(
         2,
         torch.zeros(2, dtype=torch.int32),
@@ -1437,6 +1505,7 @@ def test_expanded_verification_passes_or_stops_requests_independently(
         (RetroSpecAttentionMode.SPARSE_VERIFY, [0, 0, 0, 1, 1, 1], [0, 1, 2, 0, 1, 2]),
         (RetroSpecAttentionMode.EXPANDED_VERIFY, [0, 1], [0, 0]),
     ]
+    assert compaction_lengths == [8, 2]
     assert proposer.state.stage.tolist() == [
         int(RetroSpecStage.DRAFT),
         int(RetroSpecStage.FULL_VERIFY),

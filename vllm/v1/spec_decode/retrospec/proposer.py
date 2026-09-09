@@ -158,6 +158,24 @@ class RetroSpecProposer:
             self.num_speculative_tokens, dtype=torch.int64, device=device
         )
 
+        # Fixed-capacity GPU proposal-control workspace. These tensors store
+        # only request-level state and do not scale with context length.
+        self._draft_round_start_counts = torch.empty(
+            self.max_batch_size, dtype=torch.int32, device=device
+        )
+        self._draft_next_token_indices = torch.empty(
+            self.max_batch_size, dtype=torch.int32, device=device
+        )
+        self._draft_round_mask = torch.zeros(
+            self.max_batch_size, dtype=torch.bool, device=device
+        )
+        self._draft_runnable_mask = torch.zeros(
+            self.max_batch_size, dtype=torch.bool, device=device
+        )
+        self._draft_stage_mask = torch.zeros(
+            self.max_batch_size, dtype=torch.bool, device=device
+        )
+
         # Fixed-capacity verification control workspace. Model execution still
         # uses only the compact valid prefix, so inactive pair slots do not
         # replicate long-context block tables or enter the target model.
@@ -194,7 +212,16 @@ class RetroSpecProposer:
         self._verification_first_boundaries = torch.empty(
             self.max_batch_size, dtype=torch.int64, device=device
         )
-        self._verification_boundary_requests = torch.empty(
+        self._verification_safe_boundaries = torch.empty(
+            self.max_batch_size, dtype=torch.int64, device=device
+        )
+        self._verification_boundary_mask = torch.zeros(
+            self.max_batch_size, dtype=torch.bool, device=device
+        )
+        self._verification_run_expanded = torch.zeros(
+            self.max_batch_size, dtype=torch.bool, device=device
+        )
+        self._verification_expanded_requests = torch.empty(
             self.max_batch_size, dtype=torch.int64, device=device
         )
         self._verification_expanded_indices = torch.empty(
@@ -739,6 +766,84 @@ class RetroSpecProposer:
             attention_mode=RetroSpecAttentionMode.DRAFT,
             compute_margin=(self.policy.draft_margin_threshold is not None),
         )
+
+    def _begin_draft_round(
+        self,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare one dynamic draft round without reading state on CPU."""
+        if not 0 <= batch_size <= self.max_batch_size:
+            raise ValueError("batch_size exceeds the proposal workspace capacity")
+
+        round_start_counts = self._draft_round_start_counts[:batch_size]
+        round_start_counts.copy_(self.state.pending_counts)
+
+        draft_round_mask = self._draft_round_mask[:batch_size]
+        torch.eq(
+            self.state.stage,
+            int(RetroSpecStage.DRAFT),
+            out=draft_round_mask,
+        )
+        draft_round_mask.logical_and_(self.state.active_mask)
+        draft_round_mask.logical_and_(
+            self.state.pending_counts < self.policy.pending_limit
+        )
+        draft_round_mask.logical_and_(
+            self.positions[:batch_size] < self.max_model_len - 1
+        )
+
+        # Draft counts describe only tokens generated during this round.
+        self.state.reset_draft_counts(self.state.active_mask)
+        return draft_round_mask, round_start_counts
+
+    def _prepare_next_draft_step(
+        self,
+        batch_size: int,
+        draft_round_mask: torch.Tensor,
+        round_start_counts: torch.Tensor,
+    ) -> tuple[int, torch.Tensor]:
+        """Return the next real draft column and its GPU request mask.
+
+        ``num_speculative_tokens`` is the no-work sentinel. Only the selected
+        column crosses to the host because Python must dispatch the matching
+        target-model forward.
+        """
+        if draft_round_mask.shape != (batch_size,):
+            raise ValueError("draft_round_mask must match the proposal batch")
+        if round_start_counts.shape != (batch_size,):
+            raise ValueError("round_start_counts must match the proposal batch")
+
+        draft_stage_mask = self._draft_stage_mask[:batch_size]
+        if batch_size == 0:
+            return self.num_speculative_tokens, draft_stage_mask.zero_()
+
+        next_token_indices = self._draft_next_token_indices[:batch_size]
+        torch.add(
+            round_start_counts,
+            self.state.draft_counts,
+            out=next_token_indices,
+        )
+
+        runnable_mask = self._draft_runnable_mask[:batch_size]
+        runnable_mask.copy_(draft_round_mask)
+        runnable_mask.logical_and_(self.state.active_mask)
+        runnable_mask.logical_and_(self.state.stage == int(RetroSpecStage.DRAFT))
+        runnable_mask.logical_and_(next_token_indices < self.policy.pending_limit)
+        runnable_mask.logical_and_(self.positions[:batch_size] < self.max_model_len - 1)
+
+        next_token_indices.masked_fill_(
+            ~runnable_mask,
+            self.num_speculative_tokens,
+        )
+        token_index = int(next_token_indices.amin().item())
+
+        if token_index >= self.num_speculative_tokens:
+            draft_stage_mask.zero_()
+            return token_index, draft_stage_mask
+
+        torch.eq(next_token_indices, token_index, out=draft_stage_mask)
+        draft_stage_mask.logical_and_(runnable_mask)
+        return token_index, draft_stage_mask
 
     def _compact_mask_indices(
         self,
@@ -1341,16 +1446,17 @@ class RetroSpecProposer:
             0, sparse.request_indices
         )
         accepted_mask = flat_indices <= request_boundary_indices
-        accepted_flat_indices = self._compact_mask_indices(
+
+        # Avoid compacting the accepted prefix. Accepted rows receive sparse
+        # verification tokens, while the rejected suffix keeps its draft token.
+        corrected_token_ids = torch.where(
             accepted_mask,
-            self._verification_compact_indices,
+            sparse.token_ids,
+            expected_token_ids,
         )
-        accepted_requests = sparse.request_indices.index_select(
-            0, accepted_flat_indices
+        self._draft_token_ids[sparse.request_indices, sparse.token_indices] = (
+            corrected_token_ids
         )
-        accepted_tokens = sparse.token_indices.index_select(0, accepted_flat_indices)
-        accepted_token_ids = sparse.token_ids.index_select(0, accepted_flat_indices)
-        self._draft_token_ids[accepted_requests, accepted_tokens] = accepted_token_ids
 
         verified_counts = self._verification_verified_counts[:batch_size]
         verified_counts.zero_()
@@ -1360,49 +1466,59 @@ class RetroSpecProposer:
             accepted_mask.to(draft_counts.dtype),
         )
 
-        boundary_request_mask = first_boundary_indices < num_pairs
-        boundary_requests = self._compact_mask_indices(
-            boundary_request_mask,
-            self._verification_boundary_requests,
+        # Requests without a boundary use num_pairs as a sentinel. Clamp it
+        # before gathering, then mask the gathered value back out.
+        boundary_request_mask = self._verification_boundary_mask[:batch_size]
+        torch.lt(
+            first_boundary_indices,
+            num_pairs,
+            out=boundary_request_mask,
         )
-        boundary_flat_indices = first_boundary_indices.index_select(
-            0, boundary_requests
+
+        safe_boundary_indices = self._verification_safe_boundaries[:batch_size]
+        torch.clamp(
+            first_boundary_indices,
+            max=num_pairs - 1,
+            out=safe_boundary_indices,
         )
 
         require_full = self._verification_require_full[:batch_size]
-        require_full.zero_()
-        sparse_boundary_require_full = sparse_decision.require_full.index_select(
-            0, boundary_flat_indices
-        )
-        require_full.index_copy_(
+        torch.index_select(
+            sparse_decision.require_full,
             0,
-            boundary_requests,
-            sparse_boundary_require_full,
+            safe_boundary_indices,
+            out=require_full,
         )
+        require_full.logical_and_(boundary_request_mask)
 
-        sparse_boundary_require_expanded = (
-            sparse_decision.require_expanded.index_select(0, boundary_flat_indices)
+        run_expanded = self._verification_run_expanded[:batch_size]
+        torch.index_select(
+            sparse_decision.require_expanded,
+            0,
+            safe_boundary_indices,
+            out=run_expanded,
         )
-        run_expanded = sparse_boundary_require_expanded & ~sparse_boundary_require_full
-        expanded_boundary_offsets = self._compact_mask_indices(
+        run_expanded.logical_and_(boundary_request_mask)
+        run_expanded.masked_fill_(require_full, False)
+
+        # Expanded verification changes the number of target-model rows, so
+        # only this request-level subset still needs a host-visible length.
+        expanded_request_indices = self._compact_mask_indices(
             run_expanded,
-            self._verification_compact_indices,
+            self._verification_expanded_requests,
         )
         expanded_sparse_indices = self._verification_expanded_indices[
-            : expanded_boundary_offsets.shape[0]
+            : expanded_request_indices.shape[0]
         ]
         torch.index_select(
-            boundary_flat_indices,
+            safe_boundary_indices,
             0,
-            expanded_boundary_offsets,
+            expanded_request_indices,
             out=expanded_sparse_indices,
         )
         self.performance_stats.stop_cuda_timer(sparse_boundary_timer)
 
         if expanded_sparse_indices.numel() > 0:
-            expanded_request_indices = sparse.request_indices.index_select(
-                0, expanded_sparse_indices
-            )
             expanded_token_indices = sparse.token_indices.index_select(
                 0, expanded_sparse_indices
             )
@@ -1410,9 +1526,7 @@ class RetroSpecProposer:
                 "expanded_verify_tokens",
                 expanded_request_indices.numel(),
             )
-            expanded_request_mask = torch.zeros_like(self.state.active_mask)
-            expanded_request_mask.scatter_(0, expanded_request_indices, True)
-            self.state.set_stage(expanded_request_mask, RetroSpecStage.EXPANDED_VERIFY)
+            self.state.set_stage(run_expanded, RetroSpecStage.EXPANDED_VERIFY)
 
             expanded = self._run_parallel_verification(
                 batch_size,
@@ -1528,13 +1642,15 @@ class RetroSpecProposer:
 
         with self.sparse_attention.proposal_context(request_ids):
             while True:
-                draft_round_mask = (
-                    self.state.active_mask
-                    & (self.state.stage == int(RetroSpecStage.DRAFT))
-                    & (self.state.pending_counts < self.policy.pending_limit)
-                    & (self.positions[:batch_size] < self.max_model_len - 1)
+                draft_round_mask, round_start_counts = self._begin_draft_round(
+                    batch_size
                 )
-                if not draft_round_mask.any().item():
+                token_index, draft_stage_mask = self._prepare_next_draft_step(
+                    batch_size,
+                    draft_round_mask,
+                    round_start_counts,
+                )
+                if token_index >= self.num_speculative_tokens:
                     break
 
                 self.performance_stats.add_gpu_counter(
@@ -1542,26 +1658,7 @@ class RetroSpecProposer:
                     draft_round_mask,
                 )
 
-                # Append this round after the existing pending prefix.
-                round_start_counts = self.state.pending_counts.clone()
-
-                # Draft counts are local to this round.
-                self.state.reset_draft_counts(self.state.active_mask)
-
-                for token_index in range(self.num_speculative_tokens):
-                    next_token_indices = round_start_counts + self.state.draft_counts
-
-                    draft_stage_mask = (
-                        draft_round_mask
-                        & self.state.active_mask
-                        & (self.state.stage == int(RetroSpecStage.DRAFT))
-                        & (next_token_indices == token_index)
-                        & (next_token_indices < self.policy.pending_limit)
-                        & (self.positions[:batch_size] < self.max_model_len - 1)
-                    )
-                    if not draft_stage_mask.any().item():
-                        continue
-
+                while token_index < self.num_speculative_tokens:
                     sampled_token_ids, draft_margin, hit_attn = self._run_draft_step(
                         batch_size,
                         token_index,
@@ -1630,6 +1727,12 @@ class RetroSpecProposer:
                         )
                     )
 
+                    token_index, draft_stage_mask = self._prepare_next_draft_step(
+                        batch_size,
+                        draft_round_mask,
+                        round_start_counts,
+                    )
+
                 verification = self._verify_draft_tokens(
                     batch_size,
                     round_start_counts,
@@ -1673,8 +1776,7 @@ class RetroSpecProposer:
                 self.state.set_stage(require_full, RetroSpecStage.FULL_VERIFY)
 
                 empty_round = draft_round_mask & (self.state.pending_counts == 0)
-                if empty_round.any().item():
-                    self.state.finish_requests(empty_round)
+                self.state.finish_requests(empty_round)
 
                 # Continue drafting from the final token in the pending prefix.
                 safe_last_indices = (self.state.pending_counts - 1).clamp(
