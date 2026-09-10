@@ -42,6 +42,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("retrospec_gather_compact_kv", torch::kCPU,
            &retrospec_gather_compact_kv);
 
+  ops.def(
+      "retrospec_order_prefetch_misses("
+      "Tensor[] cluster_id_records, Tensor[] position_records, "
+      "Tensor[] count_records, int[] num_groups, int[] num_ranks) "
+      "-> (Tensor[], Tensor)");
+  ops.impl("retrospec_order_prefetch_misses", torch::kCPU,
+           &retrospec_order_prefetch_misses);
+
   // Attention ops
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.

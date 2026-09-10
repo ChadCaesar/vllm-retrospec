@@ -39,6 +39,23 @@ def retrospec_gather_compact_kv(
     )
 
 
+def retrospec_order_prefetch_misses(
+    cluster_id_records: tuple[torch.Tensor, ...],
+    position_records: tuple[torch.Tensor, ...],
+    count_records: tuple[torch.Tensor, ...],
+    num_groups: tuple[int, ...],
+    num_ranks: tuple[int, ...],
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    ordered_ids, raw_counts = torch.ops._C.retrospec_order_prefetch_misses(
+        cluster_id_records,
+        position_records,
+        count_records,
+        num_groups,
+        num_ranks,
+    )
+    return tuple(ordered_ids), raw_counts
+
+
 if TYPE_CHECKING:
 
     def register_fake(fn):

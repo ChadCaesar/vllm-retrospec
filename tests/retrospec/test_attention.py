@@ -1676,6 +1676,7 @@ def test_draft_end_step_submits_one_cross_layer_prefetch_wave():
     )
     controller.index.complete_first_draft_warmup = Mock()
     controller.index.submit_sparse_verification_prefetch_wave = Mock(return_value=True)
+    controller.index.flush_sparse_verification_prefetch = Mock()
 
     with controller.proposal_context(["request"]):
         controller.begin_step(RetroSpecAttentionMode.DRAFT, 0, torch.tensor([True]))
@@ -1687,6 +1688,7 @@ def test_draft_end_step_submits_one_cross_layer_prefetch_wave():
     controller.index.submit_sparse_verification_prefetch_wave.assert_called_once_with(
         records
     )
+    controller.index.flush_sparse_verification_prefetch.assert_called_once_with()
     assert not controller._resident_prefetch_wave
 
 

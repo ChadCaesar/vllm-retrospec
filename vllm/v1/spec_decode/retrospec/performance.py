@@ -277,16 +277,19 @@ class RetroSpecPerformanceStats:
         resident_misses = counters.get("resident_cluster_misses", 0)
         verification_hits = counters.get("verification_resident_hits", 0)
         verification_misses = counters.get("verification_resident_misses", 0)
-        prefetch_submitted = counters.get("prefetch_submitted", 0)
-        prefetch_dropped = counters.get("prefetch_dropped", 0)
         prefetch_waves = counters.get("prefetch_waves_submitted", 0)
+        prefetch_coalesced = counters.get("prefetch_waves_coalesced", 0)
+        prefetch_backpressured = counters.get("prefetch_backpressure_waits", 0)
+        prefetch_wave_opportunities = prefetch_waves + prefetch_coalesced
 
         logger.info(
             "RetroSpec performance over %.2fs: counters={%s}; peaks={%s}; "
             "derived={draft_tokens/request=%.2f, expanded/sparse=%.3f, "
             "full/request=%.3f, resident_hit_rate=%.3f, "
             "verification_hit_rate=%.3f, "
-            "prefetch_drop_rate=%.3f, prefetch_records/wave=%.2f}; "
+            "prefetch_coalesce_rate=%.3f, "
+            "prefetch_backpressure_rate=%.3f, "
+            "prefetch_records/wave=%.2f}; "
             "cpu_avg={%s}; cuda_avg={%s}",
             elapsed_seconds,
             self._format_counters(counters),
@@ -300,9 +303,10 @@ class RetroSpecPerformanceStats:
                 verification_hits + verification_misses,
             ),
             self._ratio(
-                prefetch_dropped,
-                prefetch_submitted + prefetch_dropped,
+                prefetch_coalesced,
+                prefetch_wave_opportunities,
             ),
+            self._ratio(prefetch_backpressured, prefetch_waves),
             self._ratio(counters.get("prefetch_wave_records", 0), prefetch_waves),
             self._format_times(cpu_times),
             self._format_times(cuda_times),

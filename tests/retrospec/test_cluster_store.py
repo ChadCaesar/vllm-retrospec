@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+from concurrent.futures import Future
 from unittest.mock import Mock
 
 import pytest
@@ -1201,21 +1202,102 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
     )
 
 
-def test_resident_prefetch_compaction_preserves_rank_priority_and_miss():
-    store = RetroSpecClusterPageStore(page_size=2)
-    record = cluster_store_module._StagedResidentPrefetchRecord(
-        layer_name="layer",
-        miss_cluster_ids_cpu=torch.tensor([10, 11, 10, -1], dtype=torch.int64),
-        miss_positions_cpu=torch.tensor([4, 1, 4, 0], dtype=torch.int64),
-        miss_count_cpu=torch.tensor([3], dtype=torch.int32),
-        num_groups=2,
-        num_ranks=3,
+def test_resident_prefetch_native_batch_preserves_rank_priority_and_miss():
+    ordered_ids, raw_counts = ops.retrospec_order_prefetch_misses(
+        (
+            torch.tensor([10, 11, 10, -1], dtype=torch.int64),
+            torch.tensor([20, 21, -1], dtype=torch.int64),
+        ),
+        (
+            torch.tensor([4, 1, 4, -1], dtype=torch.int64),
+            torch.tensor([3, 0, -1], dtype=torch.int64),
+        ),
+        (
+            torch.tensor([3], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+        ),
+        (2, 2),
+        (3, 2),
     )
 
-    cluster_ids, miss_count = store._ordered_resident_prefetch_misses(record)
+    assert tuple(record.tolist() for record in ordered_ids) == ([11, 10], [21, 20])
+    assert raw_counts.tolist() == [3, 2]
 
-    assert cluster_ids.tolist() == [11, 10]
-    assert miss_count == 3
+
+def test_resident_prefetch_native_batch_ignores_unused_suffix():
+    ordered_ids, raw_counts = ops.retrospec_order_prefetch_misses(
+        (torch.tensor([-1, -1], dtype=torch.int64),),
+        (torch.tensor([-1, -1], dtype=torch.int64),),
+        (torch.tensor([0], dtype=torch.int32),),
+        (1,),
+        (2,),
+    )
+
+    assert ordered_ids[0].numel() == 0
+    assert raw_counts.tolist() == [0]
+
+
+def test_resident_prefetch_native_batch_rejects_invalid_prefix():
+    with pytest.raises(RuntimeError, match="count exceeds"):
+        ops.retrospec_order_prefetch_misses(
+            (torch.tensor([10], dtype=torch.int64),),
+            (torch.tensor([0], dtype=torch.int64),),
+            (torch.tensor([2], dtype=torch.int32),),
+            (1,),
+            (1,),
+        )
+
+
+@pytest.mark.parametrize(
+    ("cluster_id", "position", "error"),
+    (
+        (-1, 0, "invalid cluster handle"),
+        (10, -1, "outside its layout"),
+        (10, 1, "outside its layout"),
+    ),
+)
+def test_resident_prefetch_native_batch_rejects_invalid_commands(
+    cluster_id: int, position: int, error: str
+):
+    with pytest.raises(RuntimeError, match=error):
+        ops.retrospec_order_prefetch_misses(
+            (torch.tensor([cluster_id], dtype=torch.int64),),
+            (torch.tensor([position], dtype=torch.int64),),
+            (torch.tensor([1], dtype=torch.int32),),
+            (1,),
+            (1,),
+        )
+
+
+def test_resident_prefetch_bounded_wait_is_device_local():
+    store = RetroSpecClusterPageStore(page_size=2)
+    device_0 = torch.device("cuda:0")
+    device_1 = torch.device("cuda:1")
+    future_0: Future[None] = Future()
+    future_1: Future[None] = Future()
+    future_0.set_result(None)
+    future_1.set_result(None)
+    store._resident_prefetch_futures.extend(
+        (
+            cluster_store_module._ResidentPrefetchWaveFuture(
+                device=device_0,
+                layer_names=frozenset(("layer-0",)),
+                future=future_0,
+            ),
+            cluster_store_module._ResidentPrefetchWaveFuture(
+                device=device_1,
+                layer_names=frozenset(("layer-1",)),
+                future=future_1,
+            ),
+        )
+    )
+
+    assert store._wait_for_one_resident_prefetch(device_1)
+    assert tuple(wave.device for wave in store._resident_prefetch_futures) == (
+        device_0,
+    )
+    assert store._wait_for_one_resident_prefetch(device_0)
+    assert not store._resident_prefetch_futures
     store.close()
 
 
@@ -1285,6 +1367,104 @@ def test_resident_prefetch_wave_batches_layers_and_waits_once():
     store.wait_for_resident_prefetches(("second",))
     assert stats._cpu_counters["prefetch_waited_waves"] == 1
     store.close()
+    store.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA pinned memory is required for resident-prefetch backpressure",
+)
+def test_resident_prefetch_coalesces_latest_wave_and_applies_bounded_backpressure():
+    device = torch.device("cuda", torch.cuda.current_device())
+    stats = RetroSpecPerformanceStats(device=device, log_interval_seconds=60.0)
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        pin_memory=True,
+        cache_ratio=0.5,
+        performance_stats=stats,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    cluster_ids = table.cluster_ids.to(device).reshape(-1)
+    metadata = get_block_metadata(store, table, device=device)
+    with torch.inference_mode():
+        store.resolve_cluster_blocks(
+            "layer",
+            table.cluster_ids.to(device),
+            metadata.page_ids,
+            mode="resident_only",
+        )
+
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    backpressure_started = threading.Event()
+    original_finish = store._finish_resident_prefetch_wave
+    original_wait = store._wait_for_one_resident_prefetch
+
+    def blocking_finish(staged):
+        worker_started.set()
+        assert release_worker.wait(timeout=10.0)
+        original_finish(staged)
+
+    def observed_wait(target_device):
+        backpressure_started.set()
+        return original_wait(target_device)
+
+    store._finish_resident_prefetch_wave = blocking_finish
+    store._wait_for_one_resident_prefetch = observed_wait
+
+    def make_record(offset: int) -> RetroSpecResidentPrefetchInput:
+        return RetroSpecResidentPrefetchInput(
+            layer_name="layer",
+            miss_cluster_ids=torch.roll(cluster_ids, offset),
+            miss_positions=torch.arange(
+                cluster_ids.numel(), dtype=torch.int64, device=device
+            ),
+            miss_count=torch.tensor(
+                [cluster_ids.numel()], dtype=torch.int32, device=device
+            ),
+            num_groups=table.cluster_ids.shape[0],
+            num_ranks=table.cluster_ids.shape[1],
+        )
+
+    assert store.prefetch_resident_cluster_wave((make_record(0),))
+    assert worker_started.wait(timeout=10.0)
+    assert store.prefetch_resident_cluster_wave((make_record(1),))
+    assert store.prefetch_resident_cluster_wave((make_record(2),))
+    assert store.prefetch_resident_cluster_wave((make_record(3),))
+    assert len(store._resident_prefetch_deferred) == 1
+
+    flush_error: list[BaseException] = []
+
+    def flush() -> None:
+        try:
+            store.flush_resident_prefetch_commands()
+        except BaseException as error:
+            flush_error.append(error)
+
+    flush_thread = threading.Thread(target=flush)
+    flush_thread.start()
+    assert backpressure_started.wait(timeout=10.0)
+    release_worker.set()
+    flush_thread.join(timeout=10.0)
+    assert not flush_thread.is_alive()
+    assert not flush_error
+
+    store.wait_for_resident_prefetches()
+    assert not store._resident_prefetch_deferred
+    assert stats._cpu_counters["prefetch_waves_submitted"] == 3
+    assert stats._cpu_counters["prefetch_waves_deferred"] == 2
+    assert stats._cpu_counters["prefetch_waves_coalesced"] == 1
+    assert stats._cpu_counters["prefetch_records_superseded"] == 1
+    assert stats._cpu_counters["prefetch_backpressure_waits"] == 1
+    assert "prefetch_dropped" not in stats._cpu_counters
     store.close()
 
 

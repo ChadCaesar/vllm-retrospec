@@ -147,6 +147,15 @@ def test_sparse_verification_prefetch_forwards_compact_gpu_misses():
     assert records[0].num_ranks == 2
 
 
+def test_sparse_verification_prefetch_flushes_cluster_store_commands():
+    index = make_index(cache_ratio=0.5, pin_memory=True)
+    index.cluster_store.flush_resident_prefetch_commands = Mock()
+
+    index.flush_sparse_verification_prefetch()
+
+    index.cluster_store.flush_resident_prefetch_commands.assert_called_once_with()
+
+
 def test_sparse_verification_prefetch_skips_empty_access_record():
     index = make_index(cache_ratio=0.5, pin_memory=True)
     selection = Mock(

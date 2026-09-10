@@ -82,9 +82,10 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     stats.add_gpu_counter("resident_cluster_hits", torch.tensor([9]))
     stats.add_gpu_counter("resident_cluster_misses", torch.tensor([1]))
     stats.add_counter("prefetch_submitted", 3)
-    stats.add_counter("prefetch_dropped", 1)
-    stats.add_counter("prefetch_waves_submitted", 1)
-    stats.add_counter("prefetch_wave_records", 3)
+    stats.add_counter("prefetch_waves_submitted", 3)
+    stats.add_counter("prefetch_waves_coalesced", 1)
+    stats.add_counter("prefetch_backpressure_waits", 1)
+    stats.add_counter("prefetch_wave_records", 9)
     stats.add_gpu_counter("draft_round_requests", torch.tensor([1, 1]))
     stats.add_gpu_counter("draft_tokens", torch.tensor([3, 5]))
     stats.add_gpu_counter("verified_tokens", torch.tensor([2, 4]))
@@ -108,7 +109,8 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     assert "full/request=0.500" in message
     assert "resident_hit_rate=0.900" in message
     assert "verification_hit_rate=0.900" in message
-    assert "prefetch_drop_rate=0.250" in message
+    assert "prefetch_coalesce_rate=0.250" in message
+    assert "prefetch_backpressure_rate=0.333" in message
     assert "prefetch_records/wave=3.00" in message
     assert "proposal_wall=12.000ms/1" in message
 

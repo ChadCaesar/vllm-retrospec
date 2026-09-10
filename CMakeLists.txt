@@ -284,6 +284,7 @@ set(VLLM_EXT_SRC
   "csrc/cache_kernels.cu"
   "csrc/cache_kernels_fused.cu"
   "csrc/retrospec/compact_kv_gather.cpp"
+  "csrc/retrospec/resident_prefetch.cpp"
   "csrc/attention/paged_attention_v1.cu"
   "csrc/attention/paged_attention_v2.cu"
   "csrc/attention/merge_attn_states.cu"

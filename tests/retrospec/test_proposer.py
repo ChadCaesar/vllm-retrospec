@@ -1276,6 +1276,12 @@ def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch)
         "_run_parallel_verification",
         fake_run_parallel_verification,
     )
+    flush_prefetch = Mock()
+    monkeypatch.setattr(
+        proposer.sparse_attention,
+        "flush_sparse_verification_prefetch",
+        flush_prefetch,
+    )
 
     verification = proposer._verify_draft_tokens(
         1,
@@ -1285,6 +1291,7 @@ def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch)
     )
 
     assert observed_rows == [([0, 0, 0, 0], [0, 1, 2, 3])]
+    flush_prefetch.assert_called_once_with()
     assert verification.verified_counts.tolist() == [4]
     assert verification.require_full.tolist() == [True]
 

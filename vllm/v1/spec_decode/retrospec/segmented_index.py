@@ -3362,6 +3362,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     ) -> bool:
         return self.cluster_store.prefetch_resident_cluster_wave(records)
 
+    def flush_sparse_verification_prefetch(self) -> None:
+        """Submit deferred resident commands before workspace reuse."""
+        self.cluster_store.flush_resident_prefetch_commands()
+
     def prefetch_sparse_verification(
         self,
         selection: RetroSpecTokenAttentionSelection,

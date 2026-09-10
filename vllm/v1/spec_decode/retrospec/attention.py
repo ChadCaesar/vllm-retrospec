@@ -621,8 +621,11 @@ class RetroSpecSparseAttention:
             self.attention_mass_layer_count = 0
             self._resident_prefetch_wave.clear()
 
-            self.index.end_proposal()
-            self.proposal_request_ids = ()
+            try:
+                self.index.flush_sparse_verification_prefetch()
+            finally:
+                self.index.end_proposal()
+                self.proposal_request_ids = ()
 
     def begin_step(
         self,
@@ -765,6 +768,9 @@ class RetroSpecSparseAttention:
         self.attention_mass_layer_count = 0
 
         return attention_mass
+
+    def flush_sparse_verification_prefetch(self) -> None:
+        self.index.flush_sparse_verification_prefetch()
 
     def _get_indexed_selection(
         self, layer_name: str, level: RetroSpecAttentionLevel

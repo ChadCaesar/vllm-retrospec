@@ -1362,6 +1362,9 @@ class RetroSpecProposer:
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
     ) -> RetroSpecVerificationResult:
+        with self.performance_stats.cpu_timer("draft_prefetch_backpressure"):
+            self.sparse_attention.flush_sparse_verification_prefetch()
+
         draft_counts = self.state.draft_counts
         verification_active = self.state.active_mask & (draft_counts > 0)
         request_indices, token_indices = self._build_verification_pairs(

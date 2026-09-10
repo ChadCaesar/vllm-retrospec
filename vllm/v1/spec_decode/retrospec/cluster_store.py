@@ -354,9 +354,30 @@ class _StagedResidentPrefetchWave:
 
 
 @dataclass(frozen=True)
-class _ResidentPrefetchWaveFuture:
-    """Future tracked by every layer represented in one prefetch wave."""
+class _DeferredResidentPrefetchWave:
+    """Latest GPU command wave retained while the pinned ring is full."""
 
+    records: tuple[RetroSpecResidentPrefetchInput, ...]
+    source_ready_event: torch.cuda.Event
+
+
+@dataclass(frozen=True)
+class _PreparedResidentPrefetchRecord:
+    """CPU descriptors prepared for one layer's resident admission."""
+
+    layer_name: str
+    pool: "_LayerClusterPagePool"
+    resident_cache: RetroSpecResidentClusterCache
+    cluster_ids_cpu: torch.Tensor
+    page_ids_cpu: torch.Tensor
+    cluster_groups: dict[int, RetroSpecClusterGroup]
+
+
+@dataclass(frozen=True)
+class _ResidentPrefetchWaveFuture:
+    """One background wave and the CUDA device whose ring slot it owns."""
+
+    device: torch.device
     layer_names: frozenset[str]
     future: Future[None] = field(repr=False, compare=False)
 
@@ -1563,6 +1584,12 @@ class RetroSpecClusterPageStore:
         self._resident_access_record_capacity = 0
         self._resident_prefetch_wave_max_records = 1
         self._resident_prefetch_futures: deque[_ResidentPrefetchWaveFuture] = deque()
+        self._resident_prefetch_deferred: dict[
+            torch.device, _DeferredResidentPrefetchWave
+        ] = {}
+        self._resident_prefetch_last_metadata_events: dict[
+            torch.device, torch.cuda.Event
+        ] = {}
         self._resident_prefetch_lock = Lock()
         self._resident_prefetch_executor = ThreadPoolExecutor(
             max_workers=1,
@@ -3448,101 +3475,381 @@ class RetroSpecClusterPageStore:
                 self._resident_prefetch_wave_max_records,
             )
 
-    @staticmethod
-    @torch.inference_mode()
-    def _ordered_resident_prefetch_misses(
-        record: _StagedResidentPrefetchRecord,
-    ) -> tuple[torch.Tensor, int]:
-        miss_count = int(record.miss_count_cpu.item())
-        if miss_count < 0:
-            raise RuntimeError("Resident prefetch miss count must be non-negative")
-        if miss_count == 0:
-            return torch.empty(0, dtype=torch.int64), 0
-        if miss_count > record.miss_cluster_ids_cpu.numel():
-            raise RuntimeError("Resident prefetch miss count exceeds ring capacity")
-
-        cluster_ids = record.miss_cluster_ids_cpu[:miss_count]
-        positions = record.miss_positions_cpu[:miss_count]
-        if torch.any(cluster_ids < 0).item():
-            raise RuntimeError("Resident miss commands must contain valid handles")
-        max_position = record.num_groups * record.num_ranks
-        if torch.any((positions < 0) | (positions >= max_position)).item():
-            raise RuntimeError("Resident miss-command position is outside its layout")
-        group_indices = torch.div(positions, record.num_ranks, rounding_mode="floor")
-        ranks = positions % record.num_ranks
-        priorities = ranks * record.num_groups + group_indices
-        order = torch.argsort(priorities, stable=True)
-        cluster_ids = cluster_ids.index_select(0, order)
-
-        ordered_cluster_ids = list(
-            dict.fromkeys(int(cluster_id) for cluster_id in cluster_ids.tolist())
-        )
-        return torch.tensor(ordered_cluster_ids, dtype=torch.int64), miss_count
-
-    @torch.inference_mode()
-    def _process_resident_prefetch_record(
+    def _validate_resident_prefetch_wave(
         self,
-        record: _StagedResidentPrefetchRecord,
-        execution_stream: torch.cuda.Stream,
+        records: tuple[RetroSpecResidentPrefetchInput, ...],
+    ) -> torch.device:
+        layer_names = tuple(record.layer_name for record in records)
+        if len(layer_names) != len(set(layer_names)):
+            raise ValueError("Resident prefetch wave layer names must be unique")
+        if len(records) > self._resident_prefetch_wave_max_records:
+            raise ValueError("Resident prefetch wave exceeds configured capacity")
+
+        device = self._canonical_cuda_device(records[0].miss_cluster_ids.device)
+        for record in records:
+            cluster_ids = record.miss_cluster_ids
+            positions = record.miss_positions
+            count = record.miss_count
+            if cluster_ids.numel() == 0:
+                raise ValueError("Resident prefetch records must not be empty")
+            if cluster_ids.device.type != "cuda":
+                raise ValueError(
+                    "Asynchronous resident prefetch requires CUDA cluster IDs"
+                )
+            if cluster_ids.dtype not in (torch.int32, torch.int64):
+                raise ValueError("Cluster IDs must use an integral dtype")
+            if positions.shape != cluster_ids.shape:
+                raise ValueError("Resident miss positions must match cluster IDs")
+            if positions.dtype not in (torch.int32, torch.int64):
+                raise ValueError("Resident miss positions must be integral")
+            if positions.device != cluster_ids.device:
+                raise ValueError("Resident miss commands must use one device")
+            if count.shape != (1,) or count.dtype not in (
+                torch.int32,
+                torch.int64,
+            ):
+                raise ValueError("Resident miss count must be one integral value")
+            if count.device != cluster_ids.device:
+                raise ValueError("Resident miss count must use the command device")
+            if record.num_groups <= 0 or record.num_ranks <= 0:
+                raise ValueError("Resident prefetch layout must be positive")
+            if self._canonical_cuda_device(cluster_ids.device) != device:
+                raise ValueError("Resident prefetch wave must use one CUDA device")
+        return device
+
+    def _submit_resident_prefetch_wave(
+        self,
+        records: tuple[RetroSpecResidentPrefetchInput, ...],
+        slot: _PinnedSelectionSlot,
+        source_ready_event: torch.cuda.Event | None,
     ) -> None:
-        cluster_ids_cpu, miss_count = self._ordered_resident_prefetch_misses(record)
-        if cluster_ids_cpu.numel() == 0:
-            return
+        device = self._canonical_cuda_device(records[0].miss_cluster_ids.device)
+        stream = self._get_resident_prefetch_stream(device)
+        ownership_transferred = False
+        try:
+            cpu_views = slot.reserve_wave(records)
+            if source_ready_event is None:
+                stream.wait_stream(torch.cuda.current_stream(device))
+            else:
+                stream.wait_event(source_ready_event)
+
+            with torch.cuda.stream(stream):
+                for record, (cluster_ids_cpu, positions_cpu, count_cpu) in zip(
+                    records, cpu_views
+                ):
+                    cluster_ids_cpu.copy_(record.miss_cluster_ids, non_blocking=True)
+                    positions_cpu.copy_(record.miss_positions, non_blocking=True)
+                    count_cpu.copy_(record.miss_count, non_blocking=True)
+                metadata_ready_event = torch.cuda.Event()
+                metadata_ready_event.record(stream)
+
+            for record in records:
+                record.miss_cluster_ids.record_stream(stream)
+                record.miss_positions.record_stream(stream)
+                record.miss_count.record_stream(stream)
+
+            staged = _StagedResidentPrefetchWave(
+                records=tuple(
+                    _StagedResidentPrefetchRecord(
+                        layer_name=record.layer_name,
+                        miss_cluster_ids_cpu=cluster_ids_cpu,
+                        miss_positions_cpu=positions_cpu,
+                        miss_count_cpu=count_cpu,
+                        num_groups=record.num_groups,
+                        num_ranks=record.num_ranks,
+                    )
+                    for record, (
+                        cluster_ids_cpu,
+                        positions_cpu,
+                        count_cpu,
+                    ) in zip(records, cpu_views)
+                ),
+                metadata_ready_event=metadata_ready_event,
+                execution_stream=stream,
+                slot=slot,
+            )
+            future = self._resident_prefetch_executor.submit(
+                self._finish_resident_prefetch_wave, staged
+            )
+            ownership_transferred = True
+
+            with self._resident_prefetch_lock:
+                self._resident_prefetch_last_metadata_events[device] = (
+                    metadata_ready_event
+                )
+                self._resident_prefetch_futures.append(
+                    _ResidentPrefetchWaveFuture(
+                        device=device,
+                        layer_names=frozenset(record.layer_name for record in records),
+                        future=future,
+                    )
+                )
+
+            if self.performance_stats is not None:
+                self.performance_stats.add_counter("prefetch_submitted", len(records))
+                self.performance_stats.add_counter("prefetch_waves_submitted")
+                self.performance_stats.add_counter(
+                    "prefetch_wave_records", len(records)
+                )
+                self.performance_stats.add_counter(
+                    "prefetch_command_capacity",
+                    sum(record.miss_cluster_ids.numel() for record in records),
+                )
+        except BaseException:
+            if not ownership_transferred:
+                stream.synchronize()
+                self._release_resident_prefetch_slot(slot)
+            raise
+
+    def _defer_resident_prefetch_wave(
+        self,
+        device: torch.device,
+        records: tuple[RetroSpecResidentPrefetchInput, ...],
+    ) -> None:
+        source_ready_event = torch.cuda.Event()
+        source_ready_event.record(torch.cuda.current_stream(device))
+        deferred = _DeferredResidentPrefetchWave(
+            records=records, source_ready_event=source_ready_event
+        )
+        with self._resident_prefetch_lock:
+            previous = self._resident_prefetch_deferred.get(device)
+            self._resident_prefetch_deferred[device] = deferred
+
+        if self.performance_stats is not None:
+            self.performance_stats.add_counter("prefetch_waves_deferred")
+            if previous is not None:
+                self.performance_stats.add_counter("prefetch_waves_coalesced")
+                self.performance_stats.add_counter(
+                    "prefetch_records_superseded", len(previous.records)
+                )
+
+    def _wait_for_one_resident_prefetch(self, device: torch.device) -> bool:
+        selected: _ResidentPrefetchWaveFuture | None = None
+        with self._resident_prefetch_lock:
+            retained: deque[_ResidentPrefetchWaveFuture] = deque()
+            while self._resident_prefetch_futures:
+                wave = self._resident_prefetch_futures.popleft()
+                if selected is None and wave.device == device:
+                    selected = wave
+                else:
+                    retained.append(wave)
+            self._resident_prefetch_futures = retained
+
+        if selected is None:
+            return False
+
+        wait_started_at = (
+            perf_counter()
+            if self.performance_stats is not None and self.performance_stats.enabled
+            else None
+        )
+        try:
+            selected.future.result()
+        finally:
+            if self.performance_stats is not None:
+                self.performance_stats.add_counter("prefetch_backpressure_waits")
+                if wait_started_at is not None:
+                    self.performance_stats.record_cpu_time(
+                        "prefetch_backpressure_wait_wall",
+                        perf_counter() - wait_started_at,
+                    )
+        return True
+
+    def _try_submit_deferred_resident_prefetch(
+        self,
+        device: torch.device,
+        wait_for_slot: bool,
+    ) -> bool:
+        device = self._canonical_cuda_device(device)
+        while True:
+            with self._resident_prefetch_lock:
+                deferred = self._resident_prefetch_deferred.get(device)
+            if deferred is None:
+                return False
+
+            slot = self._acquire_resident_prefetch_slot(device)
+            if slot is None:
+                if not wait_for_slot:
+                    return False
+                if not self._wait_for_one_resident_prefetch(device):
+                    raise RuntimeError(
+                        "Resident prefetch ring is occupied without an in-flight "
+                        "same-device worker"
+                    )
+                continue
+
+            with self._resident_prefetch_lock:
+                current = self._resident_prefetch_deferred.get(device)
+                if current is deferred:
+                    self._resident_prefetch_deferred.pop(device)
+                else:
+                    current = None
+
+            if current is None:
+                self._release_resident_prefetch_slot(slot)
+                continue
+
+            self._submit_resident_prefetch_wave(
+                current.records, slot, current.source_ready_event
+            )
+            return True
+
+    def flush_resident_prefetch_commands(self) -> None:
+        """Submit deferred commands and seal their GPU workspace lifetime."""
+        while True:
+            with self._resident_prefetch_lock:
+                devices = tuple(self._resident_prefetch_deferred)
+            if not devices:
+                break
+            for device in devices:
+                self._try_submit_deferred_resident_prefetch(device, wait_for_slot=True)
+
+        with self._resident_prefetch_lock:
+            metadata_events = tuple(
+                self._resident_prefetch_last_metadata_events.items()
+            )
+            self._resident_prefetch_last_metadata_events.clear()
+
+        for device, metadata_event in metadata_events:
+            with torch.cuda.device(device):
+                torch.cuda.current_stream(device).wait_event(metadata_event)
+
+    @torch.inference_mode()
+    def _prepare_resident_prefetch_wave(
+        self,
+        records: tuple[_StagedResidentPrefetchRecord, ...],
+    ) -> tuple[_PreparedResidentPrefetchRecord, ...]:
+        ordered_records, raw_counts = ops.retrospec_order_prefetch_misses(
+            tuple(record.miss_cluster_ids_cpu for record in records),
+            tuple(record.miss_positions_cpu for record in records),
+            tuple(record.miss_count_cpu for record in records),
+            tuple(record.num_groups for record in records),
+            tuple(record.num_ranks for record in records),
+        )
+        raw_command_count = int(raw_counts.sum().item())
+        unique_command_count = sum(record.numel() for record in ordered_records)
 
         if self.performance_stats is not None:
             self.performance_stats.add_counter(
-                "prefetch_miss_commands", cluster_ids_cpu.numel()
+                "prefetch_miss_commands", unique_command_count
             )
             self.performance_stats.add_counter(
-                "prefetch_duplicate_misses", miss_count - cluster_ids_cpu.numel()
+                "prefetch_duplicate_misses",
+                raw_command_count - unique_command_count,
             )
 
+        prepared: list[_PreparedResidentPrefetchRecord] = []
+        stale_commands = 0
         with self._resident_state_lock:
-            pool, resident_cache = self._get_or_create_resident_cache(record.layer_name)
-            metadata = self._materialize_cluster_block_metadata_cpu(
-                record.layer_name, cluster_ids_cpu
-            )
-            selected_cluster_ids, selected_page_ids = (
-                self._select_resident_staging_prefix(
-                    pool, cluster_ids_cpu, metadata.page_ids
-                )
-            )
-            cluster_groups = self._get_cluster_groups(
-                record.layer_name, selected_cluster_ids
-            )
+            for staged, ordered_cluster_ids in zip(records, ordered_records):
+                if ordered_cluster_ids.numel() == 0:
+                    continue
 
+                pool, resident_cache = self._get_or_create_resident_cache(
+                    staged.layer_name
+                )
+                descriptors = self._cluster_block_descriptors.get(staged.layer_name, {})
+                transfer_buffer = self._get_full_verification_buffer(pool)
+                page_capacity = transfer_buffer.cpu_slot_capacity(pool)
+
+                selected_cluster_ids: list[int] = []
+                selected_descriptors: list[_ClusterBlockDescriptor] = []
+                selected_pages: set[int] = set()
+                for cluster_id in ordered_cluster_ids.tolist():
+                    descriptor = descriptors.get(cluster_id)
+                    if descriptor is None:
+                        stale_commands += 1
+                        continue
+
+                    new_pages = tuple(
+                        page_id
+                        for page_id in descriptor.page_ids
+                        if page_id not in selected_pages
+                    )
+                    if len(selected_pages) + len(new_pages) > page_capacity:
+                        break
+
+                    selected_cluster_ids.append(cluster_id)
+                    selected_descriptors.append(descriptor)
+                    selected_pages.update(new_pages)
+
+                if not selected_cluster_ids:
+                    continue
+
+                max_pages = max(
+                    len(descriptor.page_ids) for descriptor in selected_descriptors
+                )
+                cluster_ids_cpu = torch.tensor(selected_cluster_ids, dtype=torch.int64)
+                page_ids_cpu = torch.full(
+                    (len(selected_cluster_ids), max_pages),
+                    -1,
+                    dtype=torch.int64,
+                )
+                cluster_groups: dict[int, RetroSpecClusterGroup] = {}
+                for row_index, (cluster_id, descriptor) in enumerate(
+                    zip(selected_cluster_ids, selected_descriptors)
+                ):
+                    page_count = len(descriptor.page_ids)
+                    page_ids_cpu[row_index, :page_count] = torch.tensor(
+                        descriptor.page_ids, dtype=torch.int64
+                    )
+                    cluster_groups[cluster_id] = descriptor.identity.group
+
+                prepared.append(
+                    _PreparedResidentPrefetchRecord(
+                        layer_name=staged.layer_name,
+                        pool=pool,
+                        resident_cache=resident_cache,
+                        cluster_ids_cpu=cluster_ids_cpu,
+                        page_ids_cpu=page_ids_cpu,
+                        cluster_groups=cluster_groups,
+                    )
+                )
+
+        if self.performance_stats is not None and stale_commands:
+            self.performance_stats.add_counter(
+                "prefetch_stale_commands", stale_commands
+            )
+        return tuple(prepared)
+
+    @torch.inference_mode()
+    def _process_prepared_resident_prefetch(
+        self,
+        prepared: _PreparedResidentPrefetchRecord,
+        execution_stream: torch.cuda.Stream,
+    ) -> None:
         (
             source_page_ids,
             source_key_pages,
             source_value_pages,
             transfer_buffer,
             transfer_slot,
-        ) = self._stage_resident_pages(pool, selected_page_ids)
+        ) = self._stage_resident_pages(prepared.pool, prepared.page_ids_cpu)
 
         with (
             self._resident_state_lock,
-            resident_cache.mutation_guard(),
-            torch.cuda.device(pool.metadata_device),
+            prepared.resident_cache.mutation_guard(),
+            torch.cuda.device(prepared.pool.metadata_device),
         ):
             try:
-                access = resident_cache.admit_staged(
-                    cluster_ids=selected_cluster_ids,
-                    page_ids=selected_page_ids,
-                    cluster_groups=cluster_groups,
+                access = prepared.resident_cache.admit_staged(
+                    cluster_ids=prepared.cluster_ids_cpu,
+                    page_ids=prepared.page_ids_cpu,
+                    cluster_groups=prepared.cluster_groups,
                     allocated_cluster_ids=self._get_allocated_cluster_ids(
-                        record.layer_name
+                        prepared.layer_name
                     ),
-                    allocated_page_ids=pool.allocated_page_ids,
+                    allocated_page_ids=prepared.pool.allocated_page_ids,
                     staging_page_ids=source_page_ids,
                     staging_key_pages=source_key_pages,
                     staging_value_pages=source_value_pages,
-                    cluster_ids_cpu=selected_cluster_ids,
-                    page_ids_cpu=selected_page_ids,
+                    cluster_ids_cpu=prepared.cluster_ids_cpu,
+                    page_ids_cpu=prepared.page_ids_cpu,
                     mutation_stream=execution_stream,
                     lookup_after_admit=False,
                 )
             except BaseException:
-                resident_cache.synchronize_pending_copies()
+                prepared.resident_cache.synchronize_pending_copies()
                 if transfer_slot is not None:
                     transfer_buffer.release_cpu_slot(transfer_slot, None)
                 raise
@@ -3570,8 +3877,11 @@ class RetroSpecClusterPageStore:
                     perf_counter() - metadata_wait_started_at,
                 )
 
-            for record in staged.records:
-                self._process_resident_prefetch_record(record, staged.execution_stream)
+            prepared_records = self._prepare_resident_prefetch_wave(staged.records)
+            for prepared in prepared_records:
+                self._process_prepared_resident_prefetch(
+                    prepared, staged.execution_stream
+                )
             completed = True
         finally:
             if stats is not None:
@@ -3687,133 +3997,32 @@ class RetroSpecClusterPageStore:
         self,
         records: Sequence[RetroSpecResidentPrefetchInput],
     ) -> bool:
-        """Queue one draft step's cross-layer access records asynchronously."""
+        """Queue or coalesce one draft step's cross-layer miss commands."""
         if self._closed:
             raise RuntimeError("RetroSpec cluster page store is closed")
         records = tuple(records)
         if not records:
             return False
-
-        layer_names = tuple(record.layer_name for record in records)
-        if len(layer_names) != len(set(layer_names)):
-            raise ValueError("Resident prefetch wave layer names must be unique")
-        if len(records) > self._resident_prefetch_wave_max_records:
-            raise ValueError("Resident prefetch wave exceeds configured capacity")
-        self._reap_resident_prefetches(layer_names, wait=False)
-
         if not self.pin_memory:
             return False
 
-        device = records[0].miss_cluster_ids.device
-        for record in records:
-            cluster_ids = record.miss_cluster_ids
-            positions = record.miss_positions
-            count = record.miss_count
-            if cluster_ids.numel() == 0:
-                raise ValueError("Resident prefetch records must not be empty")
-            if cluster_ids.device.type != "cuda":
-                raise ValueError(
-                    "Asynchronous resident prefetch requires CUDA cluster IDs"
-                )
-            if cluster_ids.dtype not in (torch.int32, torch.int64):
-                raise ValueError("Cluster IDs must use an integral dtype")
-            if positions.shape != cluster_ids.shape:
-                raise ValueError("Resident miss positions must match cluster IDs")
-            if positions.dtype not in (torch.int32, torch.int64):
-                raise ValueError("Resident miss positions must be integral")
-            if positions.device != cluster_ids.device:
-                raise ValueError("Resident miss commands must use one device")
-            if count.shape != (1,) or count.dtype not in (torch.int32, torch.int64):
-                raise ValueError("Resident miss count must be one integral value")
-            if count.device != cluster_ids.device:
-                raise ValueError("Resident miss count must use the command device")
-            if record.num_groups <= 0 or record.num_ranks <= 0:
-                raise ValueError("Resident prefetch layout must be positive")
-            if cluster_ids.device != device:
-                raise ValueError("Resident prefetch wave must use one CUDA device")
-
+        device = self._validate_resident_prefetch_wave(records)
+        layer_names = tuple(record.layer_name for record in records)
+        self._reap_resident_prefetches(layer_names, wait=False)
+        self._try_submit_deferred_resident_prefetch(device, wait_for_slot=False)
         slot = self._acquire_resident_prefetch_slot(device)
         if slot is None:
-            if self.performance_stats is not None:
-                self.performance_stats.add_counter("prefetch_dropped", len(records))
-                self.performance_stats.add_counter("prefetch_waves_dropped")
-            return False
-
-        stream = self._get_resident_prefetch_stream(device)
-        current_stream = torch.cuda.current_stream(device)
-
-        try:
-            cpu_views = slot.reserve_wave(records)
-            stream.wait_stream(current_stream)
-
-            with torch.cuda.stream(stream):
-                for record, (cluster_ids_cpu, positions_cpu, count_cpu) in zip(
-                    records, cpu_views
-                ):
-                    cluster_ids_cpu.copy_(record.miss_cluster_ids, non_blocking=True)
-                    positions_cpu.copy_(record.miss_positions, non_blocking=True)
-                    count_cpu.copy_(record.miss_count, non_blocking=True)
-                metadata_ready_event = torch.cuda.Event()
-                metadata_ready_event.record(stream)
-
-            for record in records:
-                record.miss_cluster_ids.record_stream(stream)
-                record.miss_positions.record_stream(stream)
-                record.miss_count.record_stream(stream)
-
-            staged = _StagedResidentPrefetchWave(
-                records=tuple(
-                    _StagedResidentPrefetchRecord(
-                        layer_name=record.layer_name,
-                        miss_cluster_ids_cpu=cluster_ids_cpu,
-                        miss_positions_cpu=positions_cpu,
-                        miss_count_cpu=count_cpu,
-                        num_groups=record.num_groups,
-                        num_ranks=record.num_ranks,
-                    )
-                    for record, (cluster_ids_cpu, positions_cpu, count_cpu) in zip(
-                        records, cpu_views
-                    )
-                ),
-                metadata_ready_event=metadata_ready_event,
-                # Keep background epoch refresh and handle-table mutation off
-                # the model execution stream. Publication versions make
-                # concurrent draft lookups observe either the old or new entry.
-                execution_stream=stream,
-                slot=slot,
-            )
-            future = self._resident_prefetch_executor.submit(
-                self._finish_resident_prefetch_wave,
-                staged,
-            )
-
-            with self._resident_prefetch_lock:
-                self._resident_prefetch_futures.append(
-                    _ResidentPrefetchWaveFuture(
-                        layer_names=frozenset(layer_names), future=future
-                    )
-                )
-
-            if self.performance_stats is not None:
-                self.performance_stats.add_counter("prefetch_submitted", len(records))
-                self.performance_stats.add_counter("prefetch_waves_submitted")
-                self.performance_stats.add_counter(
-                    "prefetch_wave_records", len(records)
-                )
-                self.performance_stats.add_counter(
-                    "prefetch_command_capacity",
-                    sum(record.miss_cluster_ids.numel() for record in records),
-                )
+            self._defer_resident_prefetch_wave(device, records)
             return True
-        except BaseException:
-            stream.synchronize()
-            self._release_resident_prefetch_slot(slot)
-            raise
+
+        self._submit_resident_prefetch_wave(records, slot, source_ready_event=None)
+        return True
 
     def wait_for_resident_prefetches(
         self,
         layer_names: Sequence[str] | None = None,
     ) -> None:
+        self.flush_resident_prefetch_commands()
         self._reap_resident_prefetches(layer_names, wait=True)
 
     def synchronize_resident_prefetches(
@@ -4105,6 +4314,8 @@ class RetroSpecClusterPageStore:
                     )
                 slot.release_storage()
         self._resident_prefetch_slots.clear()
+        self._resident_prefetch_deferred.clear()
+        self._resident_prefetch_last_metadata_events.clear()
 
         for slots in self._verification_miss_slots.values():
             for slot in slots:

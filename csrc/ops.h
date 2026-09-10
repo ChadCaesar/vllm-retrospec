@@ -194,6 +194,14 @@ void retrospec_gather_compact_kv(const std::vector<torch::Tensor>& key_slabs,
                                  torch::Tensor& key_output,
                                  torch::Tensor& value_output);
 
+std::tuple<std::vector<torch::Tensor>, torch::Tensor>
+retrospec_order_prefetch_misses(
+    const std::vector<torch::Tensor>& cluster_id_records,
+    const std::vector<torch::Tensor>& position_records,
+    const std::vector<torch::Tensor>& count_records,
+    const std::vector<int64_t>& num_groups,
+    const std::vector<int64_t>& num_ranks);
+
 #ifndef USE_ROCM
 
 torch::Tensor awq_gemm(torch::Tensor _in_feats, torch::Tensor _kernel,
