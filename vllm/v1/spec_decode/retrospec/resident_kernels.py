@@ -236,6 +236,287 @@ def _finalize_compact_draft_attention_kernel(
 
 
 @triton.jit
+def _resolve_compact_verification_pages_vector_kernel(
+    selected_cluster_indices,
+    plan_row_indices,
+    request_slot_ids,
+    request_slot_generations,
+    arena_cluster_ids,
+    arena_cluster_page_starts,
+    arena_cluster_page_counts,
+    arena_page_ids,
+    arena_page_token_counts,
+    arena_cluster_offsets,
+    arena_page_offsets,
+    arena_generations,
+    table_handles,
+    table_versions,
+    table_page_counts,
+    table_page_slots,
+    table_last_access_epochs,
+    access_epoch,
+    output_resident_page_ids,
+    output_staging_page_ids,
+    output_page_token_counts,
+    output_page_counts,
+    output_selected_counts,
+    output_hit_counts,
+    output_miss_counts,
+    output_miss_handles,
+    output_miss_logical_page_ids,
+    output_miss_page_counts,
+    output_miss_page_offsets,
+    output_miss_count,
+    output_invalid_descriptor_count,
+    table_page_stride,
+    output_miss_logical_page_stride,
+    selected_stride_0,
+    selected_stride_1,
+    selected_stride_2,
+    PLAN_BATCH_CAPACITY: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    NUM_CLUSTERS: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
+    PAGE_CAPACITY: tl.constexpr,
+    ARENA_CLUSTER_CAPACITY: tl.constexpr,
+    ARENA_PAGE_CAPACITY: tl.constexpr,
+    TABLE_CAPACITY: tl.constexpr,
+    BLOCK_CLUSTERS: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,
+    BLOCK_OUTPUT_PAGES: tl.constexpr,
+):
+    row = tl.program_id(0)
+    query_idx = row // NUM_KV_HEADS
+    kv_head_idx = row % NUM_KV_HEADS
+    plan_row = tl.load(plan_row_indices + query_idx).to(tl.int64)
+    request_idx = plan_row % PLAN_BATCH_CAPACITY
+    request_slot = tl.load(request_slot_ids + request_idx).to(tl.int64)
+    expected_generation = tl.load(request_slot_generations + request_idx).to(tl.int64)
+    valid_slot = request_slot >= 0
+    safe_slot = tl.maximum(request_slot, 0)
+    actual_generation = tl.load(
+        arena_generations + safe_slot, mask=valid_slot, other=-1
+    ).to(tl.int64)
+    descriptor_valid = valid_slot & (actual_generation == expected_generation)
+
+    output_offsets = tl.arange(0, BLOCK_OUTPUT_PAGES)
+    valid_output = output_offsets < PAGE_CAPACITY
+    output_base = row * PAGE_CAPACITY
+    tl.store(
+        output_resident_page_ids + output_base + output_offsets,
+        -1,
+        mask=valid_output,
+    )
+    tl.store(
+        output_staging_page_ids + output_base + output_offsets,
+        -1,
+        mask=valid_output,
+    )
+    tl.store(
+        output_page_token_counts + output_base + output_offsets,
+        0,
+        mask=valid_output,
+    )
+
+    ranks = tl.arange(0, BLOCK_CLUSTERS)
+    valid_ranks = ranks < NUM_CLUSTERS
+    source_offsets = (
+        plan_row * selected_stride_0
+        + kv_head_idx * selected_stride_1
+        + ranks * selected_stride_2
+    )
+    local_cluster_indices = tl.load(
+        selected_cluster_indices + source_offsets, mask=valid_ranks, other=-1
+    ).to(tl.int64)
+    selected = valid_ranks & (local_cluster_indices >= 0)
+    has_selected = tl.sum(selected.to(tl.int32), axis=0) > 0
+    selected &= descriptor_valid
+
+    request_cluster_offset = tl.load(
+        arena_cluster_offsets + safe_slot, mask=descriptor_valid, other=0
+    ).to(tl.int64)
+    request_page_offset = tl.load(
+        arena_page_offsets + safe_slot, mask=descriptor_valid, other=0
+    ).to(tl.int64)
+    absolute_cluster_indices = request_cluster_offset + tl.maximum(
+        local_cluster_indices, 0
+    )
+    arena_cluster_indices = (
+        kv_head_idx * ARENA_CLUSTER_CAPACITY + absolute_cluster_indices
+    )
+    handles = tl.load(
+        arena_cluster_ids + arena_cluster_indices, mask=selected, other=-1
+    ).to(tl.int64)
+    logical_page_starts = tl.load(
+        arena_cluster_page_starts + arena_cluster_indices, mask=selected, other=0
+    ).to(tl.int64)
+    logical_page_counts = tl.load(
+        arena_cluster_page_counts + arena_cluster_indices, mask=selected, other=0
+    ).to(tl.int32)
+    selected &= (handles >= 0) & (logical_page_counts > 0)
+
+    first_buckets = handles & (TABLE_CAPACITY - 1)
+    matched_buckets = tl.full((BLOCK_CLUSTERS,), -1, tl.int64)
+    searching = selected
+    for probe in tl.range(0, 64, num_stages=1, loop_unroll_factor=1):
+        buckets = (first_buckets + probe) & (TABLE_CAPACITY - 1)
+        versions_before = tl.atomic_add(
+            table_versions + buckets, 0, mask=searching, sem="acquire"
+        )
+        stored_handles = tl.load(table_handles + buckets, mask=searching, other=-1)
+        versions_after = tl.atomic_add(
+            table_versions + buckets, 0, mask=searching, sem="acquire"
+        )
+        stable = (versions_before == versions_after) & ((versions_before & 1) == 0)
+        matched = searching & stable & (stored_handles == handles)
+        matched_buckets = tl.where(matched, buckets, matched_buckets)
+        searching &= ~matched & ~(stable & (stored_handles == -1))
+
+    found = matched_buckets >= 0
+    safe_buckets = tl.maximum(matched_buckets, 0)
+    versions_before = tl.atomic_add(
+        table_versions + safe_buckets, 0, mask=found, sem="acquire"
+    )
+    stored_handles = tl.load(table_handles + safe_buckets, mask=found, other=-1)
+    resident_page_counts = tl.load(
+        table_page_counts + safe_buckets, mask=found, other=0
+    )
+    page_offsets = tl.arange(0, BLOCK_PAGES)
+    valid_page_offsets = page_offsets < MAX_PAGES
+    resident_slots = tl.load(
+        table_page_slots
+        + safe_buckets[:, None] * table_page_stride
+        + page_offsets[None, :],
+        mask=found[:, None]
+        & valid_page_offsets[None, :]
+        & (page_offsets[None, :] < resident_page_counts[:, None])
+        & (page_offsets[None, :] < logical_page_counts[:, None]),
+        other=-1,
+    )
+    versions_after = tl.atomic_add(
+        table_versions + safe_buckets, 0, mask=found, sem="acquire"
+    )
+    resolved_page_counts = tl.sum(
+        (
+            valid_page_offsets[None, :]
+            & (page_offsets[None, :] < logical_page_counts[:, None])
+            & (resident_slots >= 0)
+        ).to(tl.int32),
+        axis=1,
+    )
+    stable_hits = (
+        selected
+        & found
+        & (stored_handles == handles)
+        & (versions_before == versions_after)
+        & ((versions_before & 1) == 0)
+        & (resident_page_counts >= logical_page_counts)
+        & (resolved_page_counts == logical_page_counts)
+    )
+
+    arena_page_indices = (
+        request_page_offset + logical_page_starts[:, None] + page_offsets[None, :]
+    )
+    arena_page_sources = kv_head_idx * ARENA_PAGE_CAPACITY + arena_page_indices
+    valid_logical_pages = (
+        selected[:, None]
+        & valid_page_offsets[None, :]
+        & (page_offsets[None, :] < logical_page_counts[:, None])
+    )
+    logical_page_ids = tl.load(
+        arena_page_ids + arena_page_sources, mask=valid_logical_pages, other=-1
+    )
+    logical_page_token_counts = tl.load(
+        arena_page_token_counts + arena_page_sources,
+        mask=valid_logical_pages,
+        other=0,
+    )
+    valid_logical_pages &= (logical_page_ids >= 0) & (logical_page_token_counts > 0)
+    valid_counts = tl.sum(valid_logical_pages.to(tl.int32), axis=1)
+    selected &= valid_counts == logical_page_counts
+    stable_hits &= selected
+    misses = selected & ~stable_hits
+
+    tl.atomic_max(
+        table_last_access_epochs + safe_buckets,
+        access_epoch,
+        mask=stable_hits,
+        sem="relaxed",
+    )
+
+    selected_page_counts = tl.where(selected, logical_page_counts, 0)
+    compact_ends = tl.cumsum(selected_page_counts, axis=0)
+    compact_starts = compact_ends - selected_page_counts
+    compact_offsets = compact_starts[:, None] + page_offsets[None, :]
+    valid_compact_pages = valid_logical_pages & (compact_offsets < PAGE_CAPACITY)
+    tl.store(
+        output_page_token_counts + output_base + compact_offsets,
+        logical_page_token_counts,
+        mask=valid_compact_pages,
+    )
+    tl.store(
+        output_resident_page_ids + output_base + compact_offsets,
+        resident_slots,
+        mask=valid_compact_pages & stable_hits[:, None],
+    )
+
+    miss_prefix = tl.cumsum(misses.to(tl.int32), axis=0)
+    num_misses = tl.sum(misses.to(tl.int32), axis=0)
+    miss_base = tl.atomic_add(output_miss_count, num_misses)
+    miss_slots = miss_base + miss_prefix - 1
+    tl.store(output_miss_handles + miss_slots, handles, mask=misses)
+    tl.store(output_miss_page_counts + miss_slots, logical_page_counts, mask=misses)
+    tl.store(
+        output_miss_page_offsets + miss_slots,
+        output_base + compact_starts,
+        mask=misses,
+    )
+    tl.store(
+        output_miss_logical_page_ids
+        + miss_slots[:, None] * output_miss_logical_page_stride
+        + page_offsets[None, :],
+        logical_page_ids,
+        mask=misses[:, None] & valid_page_offsets[None, :],
+    )
+
+    invalid_descriptor = has_selected & ~descriptor_valid
+    tl.atomic_add(
+        output_invalid_descriptor_count,
+        invalid_descriptor.to(tl.int32),
+    )
+    tl.store(output_page_counts + row, tl.sum(selected_page_counts, axis=0))
+    tl.store(output_selected_counts + row, tl.sum(selected.to(tl.int32), axis=0))
+    tl.store(output_hit_counts + row, tl.sum(stable_hits.to(tl.int32), axis=0))
+    tl.store(output_miss_counts + row, tl.sum(misses.to(tl.int32), axis=0))
+
+
+@triton.jit
+def _scatter_compact_staging_page_ids_kernel(
+    miss_output_page_offsets,
+    staging_starts,
+    page_counts,
+    output_page_ids,
+    num_misses,
+    MAX_PAGES: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,
+):
+    miss_index = tl.program_id(0)
+    valid_miss = miss_index < num_misses
+    output_start = tl.load(
+        miss_output_page_offsets + miss_index, mask=valid_miss, other=0
+    )
+    staging_start = tl.load(staging_starts + miss_index, mask=valid_miss, other=0)
+    page_count = tl.load(page_counts + miss_index, mask=valid_miss, other=0)
+    page_offsets = tl.arange(0, BLOCK_PAGES)
+    valid_page = valid_miss & (page_offsets < page_count) & (page_offsets < MAX_PAGES)
+    tl.store(
+        output_page_ids + output_start + page_offsets,
+        staging_start + page_offsets,
+        mask=valid_page,
+    )
+
+
+@triton.jit
 def _lookup_resident_handles_kernel(
     cluster_handles,
     logical_page_ids,
@@ -840,6 +1121,223 @@ def resolve_compact_draft_pages(
         output_attention,
         NUM_HEADS=num_heads,
         BLOCK_HEADS=triton.next_power_of_2(num_heads),
+    )
+
+
+def resolve_compact_verification_pages(
+    selected_cluster_indices: torch.Tensor,
+    plan_row_indices: torch.Tensor,
+    request_slot_ids: torch.Tensor,
+    request_slot_generations: torch.Tensor,
+    arena_cluster_ids: torch.Tensor,
+    arena_cluster_page_starts: torch.Tensor,
+    arena_cluster_page_counts: torch.Tensor,
+    arena_page_ids: torch.Tensor,
+    arena_page_token_counts: torch.Tensor,
+    arena_cluster_offsets: torch.Tensor,
+    arena_page_offsets: torch.Tensor,
+    arena_generations: torch.Tensor,
+    table_handles: torch.Tensor,
+    table_versions: torch.Tensor,
+    table_page_counts: torch.Tensor,
+    table_page_slots: torch.Tensor,
+    table_last_access_epochs: torch.Tensor,
+    access_epoch: int,
+    output_resident_page_ids: torch.Tensor,
+    output_staging_page_ids: torch.Tensor,
+    output_page_token_counts: torch.Tensor,
+    output_page_counts: torch.Tensor,
+    output_selected_counts: torch.Tensor,
+    output_hit_counts: torch.Tensor,
+    output_miss_counts: torch.Tensor,
+    output_miss_handles: torch.Tensor,
+    output_miss_logical_page_ids: torch.Tensor,
+    output_miss_page_counts: torch.Tensor,
+    output_miss_page_offsets: torch.Tensor,
+    output_miss_count: torch.Tensor,
+    output_invalid_descriptor_count: torch.Tensor,
+) -> None:
+    if selected_cluster_indices.device.type != "cuda":
+        raise ValueError("Compact verification resolution requires CUDA")
+    if selected_cluster_indices.ndim != 3:
+        raise ValueError("Selected clusters must have shape [rows, heads, clusters]")
+    if plan_row_indices.ndim != 1:
+        raise ValueError("Plan rows must be one-dimensional")
+    if request_slot_ids.shape != request_slot_generations.shape:
+        raise ValueError("Request slot descriptors must have equal shapes")
+    if request_slot_ids.ndim != 1:
+        raise ValueError("Request slot descriptors must be one-dimensional")
+
+    num_queries = plan_row_indices.shape[0]
+    _, num_kv_heads, num_clusters = selected_cluster_indices.shape
+    max_pages = output_miss_logical_page_ids.shape[1]
+    page_capacity = num_clusters * max_pages
+    expected_page_shape = (num_queries, num_kv_heads, page_capacity)
+    if output_resident_page_ids.shape != expected_page_shape:
+        raise ValueError("Compact resident-page output has the wrong shape")
+    if output_staging_page_ids.shape != expected_page_shape:
+        raise ValueError("Compact staging-page output has the wrong shape")
+    if output_page_token_counts.shape != expected_page_shape:
+        raise ValueError("Compact page-count metadata has the wrong shape")
+    row_shape = (num_queries, num_kv_heads)
+    for output in (
+        output_page_counts,
+        output_selected_counts,
+        output_hit_counts,
+        output_miss_counts,
+    ):
+        if output.shape != row_shape:
+            raise ValueError("Compact verification row output has the wrong shape")
+    miss_capacity = num_queries * num_kv_heads * num_clusters
+    if output_miss_handles.numel() < miss_capacity:
+        raise ValueError("Verification miss output is too small")
+    if output_miss_logical_page_ids.shape[0] < miss_capacity:
+        raise ValueError("Verification miss-page output is too small")
+    if any(
+        output.numel() < miss_capacity
+        for output in (output_miss_page_counts, output_miss_page_offsets)
+    ):
+        raise ValueError("Verification miss metadata output is too small")
+    if output_miss_count.shape != (1,):
+        raise ValueError("Verification miss count must contain one element")
+    if output_invalid_descriptor_count.shape != (1,):
+        raise ValueError("Invalid descriptor count must contain one element")
+
+    tensors = (
+        selected_cluster_indices,
+        plan_row_indices,
+        request_slot_ids,
+        request_slot_generations,
+        arena_cluster_ids,
+        arena_cluster_page_starts,
+        arena_cluster_page_counts,
+        arena_page_ids,
+        arena_page_token_counts,
+        arena_cluster_offsets,
+        arena_page_offsets,
+        arena_generations,
+        table_handles,
+        table_versions,
+        table_page_counts,
+        table_page_slots,
+        table_last_access_epochs,
+        output_resident_page_ids,
+        output_staging_page_ids,
+        output_page_token_counts,
+        output_page_counts,
+        output_selected_counts,
+        output_hit_counts,
+        output_miss_counts,
+        output_miss_handles,
+        output_miss_logical_page_ids,
+        output_miss_page_counts,
+        output_miss_page_offsets,
+        output_miss_count,
+        output_invalid_descriptor_count,
+    )
+    if any(tensor.device != selected_cluster_indices.device for tensor in tensors):
+        raise ValueError("Compact verification tensors must use one CUDA device")
+
+    output_miss_count.zero_()
+    output_invalid_descriptor_count.zero_()
+    if num_queries == 0:
+        return
+    if num_clusters == 0 or max_pages == 0:
+        output_resident_page_ids.fill_(-1)
+        output_staging_page_ids.fill_(-1)
+        output_page_token_counts.zero_()
+        output_page_counts.zero_()
+        output_selected_counts.zero_()
+        output_hit_counts.zero_()
+        output_miss_counts.zero_()
+        return
+
+    _resolve_compact_verification_pages_vector_kernel[(num_queries * num_kv_heads,)](
+        selected_cluster_indices,
+        plan_row_indices,
+        request_slot_ids,
+        request_slot_generations,
+        arena_cluster_ids,
+        arena_cluster_page_starts,
+        arena_cluster_page_counts,
+        arena_page_ids,
+        arena_page_token_counts,
+        arena_cluster_offsets,
+        arena_page_offsets,
+        arena_generations,
+        table_handles,
+        table_versions,
+        table_page_counts,
+        table_page_slots,
+        table_last_access_epochs,
+        access_epoch,
+        output_resident_page_ids,
+        output_staging_page_ids,
+        output_page_token_counts,
+        output_page_counts,
+        output_selected_counts,
+        output_hit_counts,
+        output_miss_counts,
+        output_miss_handles,
+        output_miss_logical_page_ids,
+        output_miss_page_counts,
+        output_miss_page_offsets,
+        output_miss_count,
+        output_invalid_descriptor_count,
+        table_page_slots.stride(0),
+        output_miss_logical_page_ids.stride(0),
+        selected_cluster_indices.stride(0),
+        selected_cluster_indices.stride(1),
+        selected_cluster_indices.stride(2),
+        PLAN_BATCH_CAPACITY=request_slot_ids.shape[0],
+        NUM_KV_HEADS=num_kv_heads,
+        NUM_CLUSTERS=num_clusters,
+        MAX_PAGES=max_pages,
+        PAGE_CAPACITY=page_capacity,
+        ARENA_CLUSTER_CAPACITY=arena_cluster_ids.shape[1],
+        ARENA_PAGE_CAPACITY=arena_page_ids.shape[1],
+        TABLE_CAPACITY=table_handles.numel(),
+        BLOCK_CLUSTERS=triton.next_power_of_2(num_clusters),
+        BLOCK_PAGES=triton.next_power_of_2(max_pages),
+        BLOCK_OUTPUT_PAGES=triton.next_power_of_2(page_capacity),
+    )
+
+
+def scatter_compact_staging_page_ids(
+    miss_output_page_offsets: torch.Tensor,
+    staging_starts: torch.Tensor,
+    page_counts: torch.Tensor,
+    num_misses: int,
+    max_pages: int,
+    output_page_ids: torch.Tensor,
+) -> None:
+    if output_page_ids.device.type != "cuda":
+        raise ValueError("Compact staging-page scatter requires CUDA")
+    if num_misses < 0:
+        raise ValueError("num_misses must be non-negative")
+    if max_pages <= 0 and num_misses:
+        raise ValueError("max_pages must be positive for non-empty misses")
+    if any(
+        tensor.device != output_page_ids.device
+        for tensor in (miss_output_page_offsets, staging_starts, page_counts)
+    ):
+        raise ValueError("Compact staging tensors must use one CUDA device")
+    if any(
+        tensor.numel() < num_misses
+        for tensor in (miss_output_page_offsets, staging_starts, page_counts)
+    ):
+        raise ValueError("Compact staging input does not have enough capacity")
+    if num_misses == 0:
+        return
+
+    _scatter_compact_staging_page_ids_kernel[(num_misses,)](
+        miss_output_page_offsets,
+        staging_starts,
+        page_counts,
+        output_page_ids.reshape(-1),
+        num_misses,
+        MAX_PAGES=max_pages,
+        BLOCK_PAGES=triton.next_power_of_2(max_pages),
     )
 
 

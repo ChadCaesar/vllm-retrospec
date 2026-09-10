@@ -21,6 +21,7 @@ from vllm.v1.spec_decode.retrospec.attention import (
 from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecCompactResolvedClusterPages,
     RetroSpecCompactTokenRange,
+    RetroSpecCompactVerificationResolvedPages,
     RetroSpecFullVerificationDescriptor,
     RetroSpecFullVerificationStaging,
     RetroSpecResidentPrefetchInput,
@@ -205,34 +206,21 @@ def make_token_plan(
         estimation_width,
         dtype=torch.int32,
     )
-    page_ids = torch.empty(
-        batch_size,
-        num_kv_heads,
-        0,
-        0,
-        dtype=torch.int64,
-    )
-    page_token_counts = torch.empty_like(page_ids, dtype=torch.int32)
-    cluster_ids = torch.empty(
-        batch_size,
-        num_kv_heads,
-        0,
-        dtype=torch.int64,
+    cluster_indices = torch.full(
+        (batch_size, num_kv_heads, exact_width), -1, dtype=torch.int32
     )
 
     return RetroSpecTokenSelectionPlan(
         layer_name="layer",
+        request_slot_ids=torch.arange(batch_size, dtype=torch.int64),
+        request_slot_generations=torch.zeros(batch_size, dtype=torch.int64),
         primary_exact_token_indices=exact_indices,
         primary_exact_token_mask=exact_mask,
-        sparse_exact_cluster_ids=cluster_ids,
-        sparse_exact_page_ids=page_ids,
-        sparse_exact_page_token_counts=page_token_counts,
+        sparse_exact_cluster_indices=cluster_indices,
         sparse_estimation_keys=estimation_keys,
         sparse_estimation_values=estimation_keys.clone(),
         sparse_estimation_token_counts=estimation_counts,
-        expanded_exact_cluster_ids=cluster_ids,
-        expanded_exact_page_ids=page_ids,
-        expanded_exact_page_token_counts=page_token_counts,
+        expanded_exact_cluster_indices=cluster_indices,
         expanded_estimation_keys=estimation_keys,
         expanded_estimation_values=estimation_keys.clone(),
         expanded_estimation_token_counts=estimation_counts,
@@ -250,12 +238,27 @@ def make_plan(batch_size: int, width: int = 0) -> RetroSpecTokenSelectionPlan:
     )
 
 
+def make_empty_logical_selection(
+    plan: RetroSpecTokenSelectionPlan,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, num_kv_heads = plan.sparse_exact_cluster_indices.shape[:2]
+    device = plan.sparse_exact_cluster_indices.device
+    cluster_ids = torch.empty(
+        batch_size, num_kv_heads, 0, dtype=torch.int64, device=device
+    )
+    page_ids = torch.empty(
+        batch_size, num_kv_heads, 0, 0, dtype=torch.int64, device=device
+    )
+    return cluster_ids, page_ids, torch.empty_like(page_ids, dtype=torch.int32)
+
+
 def make_selection(batch_size: int = 2) -> RetroSpecTokenAttentionSelection:
     plan = make_plan(batch_size)
+    cluster_ids, page_ids, page_token_counts = make_empty_logical_selection(plan)
     return RetroSpecTokenAttentionSelection(
-        exact_cluster_ids=plan.sparse_exact_cluster_ids,
-        exact_page_ids=plan.sparse_exact_page_ids,
-        exact_page_token_counts=plan.sparse_exact_page_token_counts,
+        exact_cluster_ids=cluster_ids,
+        exact_page_ids=page_ids,
+        exact_page_token_counts=page_token_counts,
         exact_token_counts=torch.zeros(batch_size, 1, dtype=torch.int32),
         estimation_keys=plan.sparse_estimation_keys,
         estimation_values=plan.sparse_estimation_values,
@@ -267,17 +270,15 @@ def make_selection(batch_size: int = 2) -> RetroSpecTokenAttentionSelection:
 
 
 _TOKEN_PLAN_TENSOR_FIELDS = (
+    "request_slot_ids",
+    "request_slot_generations",
     "primary_exact_token_indices",
     "primary_exact_token_mask",
-    "sparse_exact_cluster_ids",
-    "sparse_exact_page_ids",
-    "sparse_exact_page_token_counts",
+    "sparse_exact_cluster_indices",
     "sparse_estimation_keys",
     "sparse_estimation_values",
     "sparse_estimation_token_counts",
-    "expanded_exact_cluster_ids",
-    "expanded_exact_page_ids",
-    "expanded_exact_page_token_counts",
+    "expanded_exact_cluster_indices",
     "expanded_estimation_keys",
     "expanded_estimation_values",
     "expanded_estimation_token_counts",
@@ -293,10 +294,10 @@ def store_token_plan(
     active_mask: torch.Tensor | None = None,
 ) -> None:
     batch_size, num_kv_heads, primary_width = plan.primary_exact_token_indices.shape
-    sparse_width = plan.sparse_exact_cluster_ids.shape[-1]
-    expanded_width = plan.expanded_exact_cluster_ids.shape[-1]
+    sparse_width = plan.sparse_exact_cluster_indices.shape[-1]
+    expanded_width = plan.expanded_exact_cluster_indices.shape[-1]
     estimation_width = plan.sparse_estimation_keys.shape[-2]
-    max_pages_per_cluster = plan.sparse_exact_page_ids.shape[-1]
+    max_pages_per_cluster = 1
     head_size = plan.sparse_estimation_keys.shape[-1]
     table = index._selection_plan_tables.get(plan.layer_name)
     if table is None:
@@ -808,10 +809,11 @@ def test_estimation_attention_weights_centroids_by_token_count():
     controller = make_controller()
     impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
     plan = make_token_plan(2, 1, exact_width=0, estimation_width=2)
+    cluster_ids, page_ids, page_token_counts = make_empty_logical_selection(plan)
     selection = RetroSpecTokenAttentionSelection(
-        exact_cluster_ids=plan.sparse_exact_cluster_ids,
-        exact_page_ids=plan.sparse_exact_page_ids,
-        exact_page_token_counts=plan.sparse_exact_page_token_counts,
+        exact_cluster_ids=cluster_ids,
+        exact_page_ids=page_ids,
+        exact_page_token_counts=page_token_counts,
         exact_token_counts=torch.zeros(2, 1, dtype=torch.int32),
         estimation_keys=torch.zeros(2, 1, 2, 1, dtype=torch.bfloat16),
         estimation_values=torch.tensor(
@@ -874,10 +876,11 @@ def test_token_exact_attention_uses_reference_fallback_on_cpu():
         exact_width=2,
         estimation_width=0,
     )
+    cluster_ids, page_ids, page_token_counts = make_empty_logical_selection(plan)
     selection = RetroSpecTokenAttentionSelection(
-        exact_cluster_ids=plan.sparse_exact_cluster_ids,
-        exact_page_ids=plan.sparse_exact_page_ids,
-        exact_page_token_counts=plan.sparse_exact_page_token_counts,
+        exact_cluster_ids=cluster_ids,
+        exact_page_ids=page_ids,
+        exact_page_token_counts=page_token_counts,
         exact_token_counts=torch.full((1, 2), 2, dtype=torch.int32),
         estimation_keys=torch.empty(1, 2, 0, 8, dtype=torch.bfloat16),
         estimation_values=torch.empty(1, 2, 0, 8, dtype=torch.bfloat16),
@@ -946,9 +949,9 @@ def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
     base_plan = make_token_plan(1, 1, exact_width=0, estimation_width=0)
     plan = replace(
         base_plan,
-        sparse_exact_cluster_ids=cluster_ids,
-        sparse_exact_page_ids=page_ids,
-        sparse_exact_page_token_counts=page_counts,
+        sparse_exact_cluster_indices=torch.zeros(
+            1, 1, 1, dtype=torch.int32, device=device
+        ),
     )
     selection = RetroSpecTokenAttentionSelection(
         exact_cluster_ids=cluster_ids,
@@ -1114,10 +1117,11 @@ def test_token_estimation_attention_uses_per_head_cluster_sizes():
         exact_width=0,
         estimation_width=2,
     )
+    cluster_ids, page_ids, page_token_counts = make_empty_logical_selection(plan)
     selection = RetroSpecTokenAttentionSelection(
-        exact_cluster_ids=plan.sparse_exact_cluster_ids,
-        exact_page_ids=plan.sparse_exact_page_ids,
-        exact_page_token_counts=plan.sparse_exact_page_token_counts,
+        exact_cluster_ids=cluster_ids,
+        exact_page_ids=page_ids,
+        exact_page_token_counts=page_token_counts,
         exact_token_counts=torch.zeros(1, 2, dtype=torch.int32),
         estimation_keys=torch.zeros(1, 2, 2, 1, dtype=torch.bfloat16),
         estimation_values=torch.tensor(
@@ -1147,10 +1151,11 @@ def test_token_estimation_attention_uses_per_head_cluster_sizes():
 
 def test_get_grouped_estimation_keeps_token_layout():
     plan = make_token_plan(1, 2, exact_width=0, estimation_width=3)
+    cluster_ids, page_ids, page_token_counts = make_empty_logical_selection(plan)
     selection = RetroSpecTokenAttentionSelection(
-        exact_cluster_ids=plan.sparse_exact_cluster_ids,
-        exact_page_ids=plan.sparse_exact_page_ids,
-        exact_page_token_counts=plan.sparse_exact_page_token_counts,
+        exact_cluster_ids=cluster_ids,
+        exact_page_ids=page_ids,
+        exact_page_token_counts=page_token_counts,
         exact_token_counts=torch.zeros(1, 2, dtype=torch.int32),
         estimation_keys=torch.randn(1, 2, 3, 4),
         estimation_values=torch.randn(1, 2, 3, 4),
@@ -1172,7 +1177,6 @@ def test_get_grouped_estimation_keeps_token_layout():
     [
         (False, RetroSpecAttentionMode.SPARSE_VERIFY, True),
         (True, RetroSpecAttentionMode.SPARSE_VERIFY, True),
-        (True, RetroSpecAttentionMode.DRAFT, False),
     ],
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -1193,21 +1197,23 @@ def test_exact_attention_resolves_resident_and_staging_pages(
     page_counts = torch.tensor([[[[2], [1]]]], dtype=torch.int32, device=device)
     plan = RetroSpecTokenSelectionPlan(
         layer_name="layer",
+        request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
+        request_slot_generations=torch.zeros(1, dtype=torch.int64, device=device),
         primary_exact_token_indices=torch.empty(
             1, 1, 0, dtype=torch.int64, device=device
         ),
         primary_exact_token_mask=torch.empty(1, 1, 0, dtype=torch.bool, device=device),
-        sparse_exact_cluster_ids=cluster_ids,
-        sparse_exact_page_ids=page_ids,
-        sparse_exact_page_token_counts=page_counts,
+        sparse_exact_cluster_indices=torch.tensor(
+            [[[0, 1]]], dtype=torch.int32, device=device
+        ),
         sparse_estimation_keys=torch.empty(1, 1, 0, 1, device=device),
         sparse_estimation_values=torch.empty(1, 1, 0, 1, device=device),
         sparse_estimation_token_counts=torch.empty(
             1, 1, 0, dtype=torch.int32, device=device
         ),
-        expanded_exact_cluster_ids=cluster_ids,
-        expanded_exact_page_ids=page_ids,
-        expanded_exact_page_token_counts=page_counts,
+        expanded_exact_cluster_indices=torch.tensor(
+            [[[0, 1]]], dtype=torch.int32, device=device
+        ),
         expanded_estimation_keys=torch.empty(1, 1, 0, 1, device=device),
         expanded_estimation_values=torch.empty(1, 1, 0, 1, device=device),
         expanded_estimation_token_counts=torch.empty(
@@ -1301,12 +1307,13 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         controller.index.cluster_store.resolve_verification_cluster_blocks.assert_not_called()
         controller.index.cluster_store.resolve_cluster_blocks.assert_not_called()
     else:
-        controller.index.cluster_store.resolve_verification_cluster_blocks.assert_called_once_with(
+        controller.index.cluster_store.resolve_cluster_blocks.assert_called_once_with(
             layer_name="layer",
             cluster_ids=cluster_ids,
             logical_page_ids=page_ids,
+            mode="verification",
         )
-        controller.index.cluster_store.resolve_cluster_blocks.assert_not_called()
+        controller.index.cluster_store.resolve_verification_cluster_blocks.assert_not_called()
     if expect_admission:
         controller.index.cluster_store.admit_verification_misses.assert_called_once_with(
             miss_admission
@@ -1338,6 +1345,69 @@ def test_exact_attention_resolves_resident_and_staging_pages(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_indexed_verification_source_uses_compact_query_row_pages():
+    controller = make_controller(cache_ratio=0.5)
+    controller.mode = RetroSpecAttentionMode.EXPANDED_VERIFY
+    device = torch.device("cuda")
+    plan_rows = torch.tensor([1], dtype=torch.int64, device=device)
+    selection = RetroSpecIndexedTokenAttentionSelection(
+        layer_name="layer",
+        plan_row_indices=plan_rows,
+        request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
+        request_slot_generations=torch.ones(1, dtype=torch.int64, device=device),
+        primary_exact_token_indices=torch.zeros(
+            2, 1, 1, dtype=torch.int64, device=device
+        ),
+        primary_exact_token_mask=torch.ones(2, 1, 1, dtype=torch.bool, device=device),
+        exact_cluster_indices=torch.zeros(2, 1, 1, dtype=torch.int32, device=device),
+        estimation_keys=torch.empty(2, 1, 0, 1, device=device),
+        estimation_values=torch.empty(2, 1, 0, 1, device=device),
+        estimation_token_counts=torch.empty(2, 1, 0, dtype=torch.int32, device=device),
+        attention_mass=torch.ones(2, device=device),
+    )
+    resident_page_ids = torch.tensor([[[2, -1]]], dtype=torch.int64, device=device)
+    staging_page_ids = torch.tensor([[[-1, 0]]], dtype=torch.int64, device=device)
+    page_token_counts = torch.tensor([[[2, 1]]], dtype=torch.int32, device=device)
+    page_counts = torch.tensor([[2]], dtype=torch.int32, device=device)
+    resident_keys = torch.zeros(3, 2, 1, dtype=torch.float16, device=device)
+    staging_keys = torch.ones(1, 2, 1, dtype=torch.float16, device=device)
+    resolved = RetroSpecCompactVerificationResolvedPages(
+        resident_page_ids=resident_page_ids,
+        staging_page_ids=staging_page_ids,
+        page_token_counts=page_token_counts,
+        page_counts=page_counts,
+        resident_key_pages=resident_keys,
+        resident_value_pages=resident_keys.clone(),
+        staging_key_pages=staging_keys,
+        staging_value_pages=staging_keys.clone(),
+        staging_ready_event=None,
+        read_lease=cast(Any, SimpleNamespace(release=Mock())),
+    )
+    controller.index.resolve_indexed_verification_pages = Mock(return_value=resolved)
+    key_cache = torch.zeros(1, 2, 1, 1, dtype=torch.float16, device=device)
+
+    source, returned_resolved = controller._resolve_exact_kv_source(
+        selection,
+        key_cache,
+        key_cache.clone(),
+        torch.zeros(1, 1, dtype=torch.int32, device=device),
+    )
+
+    controller.index.resolve_indexed_verification_pages.assert_called_once_with(
+        selection
+    )
+    assert returned_resolved is resolved
+    assert source.plan_row_indices is plan_rows
+    assert source.page_token_counts is page_token_counts
+    assert isinstance(source.compact_pages, RetroSpecCompactExactPageTable)
+    assert source.compact_pages.page_counts is page_counts
+    assert source.resident_pages is not None
+    assert source.resident_pages.page_ids is resident_page_ids
+    assert source.staging_pages is not None
+    assert source.staging_pages.page_ids is staging_page_ids
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_draft_exact_source_preserves_compact_page_descriptor():
     controller = make_controller(cache_ratio=0.5)
     controller.mode = RetroSpecAttentionMode.DRAFT
@@ -1362,7 +1432,7 @@ def test_draft_exact_source_preserves_compact_page_descriptor():
         read_lease=cast(Any, SimpleNamespace(release=Mock())),
     )
     selection = RetroSpecTokenAttentionSelection(
-        exact_cluster_ids=plan.sparse_exact_cluster_ids.to(device),
+        exact_cluster_ids=torch.zeros(1, 1, 1, dtype=torch.int64, device=device),
         exact_page_ids=page_ids,
         exact_page_token_counts=page_token_counts,
         exact_token_counts=torch.tensor([[3]], dtype=torch.int32, device=device),
@@ -1398,10 +1468,11 @@ def test_fused_proposal_attention_releases_pages_before_miss_admission():
 
     device = torch.device("cuda")
     plan = make_token_plan(1, num_kv_heads=1, exact_width=0, estimation_width=2)
+    cluster_ids, page_ids, page_token_counts = make_empty_logical_selection(plan)
     selection = RetroSpecTokenAttentionSelection(
-        exact_cluster_ids=plan.sparse_exact_cluster_ids.to(device),
-        exact_page_ids=plan.sparse_exact_page_ids.to(device),
-        exact_page_token_counts=plan.sparse_exact_page_token_counts.to(device),
+        exact_cluster_ids=cluster_ids.to(device),
+        exact_page_ids=page_ids.to(device),
+        exact_page_token_counts=page_token_counts.to(device),
         exact_token_counts=torch.zeros(1, 1, dtype=torch.int32, device=device),
         estimation_keys=plan.sparse_estimation_keys.to(device),
         estimation_values=plan.sparse_estimation_values.to(device),
@@ -1629,10 +1700,11 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
     assert isinstance(controller.index, RetroSpecSegmentedTokenIndex)
 
     plan = make_token_plan(2, num_kv_heads=1, exact_width=0, estimation_width=0)
+    cluster_ids, page_ids, page_token_counts = make_empty_logical_selection(plan)
     selection = RetroSpecTokenAttentionSelection(
-        exact_cluster_ids=plan.sparse_exact_cluster_ids,
-        exact_page_ids=plan.sparse_exact_page_ids,
-        exact_page_token_counts=plan.sparse_exact_page_token_counts,
+        exact_cluster_ids=cluster_ids,
+        exact_page_ids=page_ids,
+        exact_page_token_counts=page_token_counts,
         exact_token_counts=torch.zeros(2, 1, dtype=torch.int32),
         estimation_keys=plan.sparse_estimation_keys,
         estimation_values=plan.sparse_estimation_values,
@@ -1755,20 +1827,16 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),
         primary_exact_token_indices=torch.tensor([[[0, 1]], [[2, 3]]]),
         primary_exact_token_mask=torch.tensor([[[True, False]], [[True, True]]]),
-        sparse_exact_cluster_ids=torch.tensor([[[10, 11]], [[12, 13]]]),
-        sparse_exact_page_ids=torch.arange(8).view(2, 1, 2, 2),
-        sparse_exact_page_token_counts=torch.arange(8, dtype=torch.int32).view(
-            2, 1, 2, 2
+        sparse_exact_cluster_indices=torch.tensor(
+            [[[10, 11]], [[12, 13]]], dtype=torch.int32
         ),
         sparse_estimation_keys=torch.tensor([[[[20.0]]], [[[21.0]]]]),
         sparse_estimation_values=torch.tensor([[[[22.0]]], [[[23.0]]]]),
         sparse_estimation_token_counts=torch.tensor(
             [[[24]], [[25]]], dtype=torch.int32
         ),
-        expanded_exact_cluster_ids=torch.tensor([[[30, 31, 32]], [[33, 34, 35]]]),
-        expanded_exact_page_ids=torch.arange(12).view(2, 1, 3, 2) + 40,
-        expanded_exact_page_token_counts=torch.arange(12, dtype=torch.int32).view(
-            2, 1, 3, 2
+        expanded_exact_cluster_indices=torch.tensor(
+            [[[30, 31, 32]], [[33, 34, 35]]], dtype=torch.int32
         ),
         expanded_estimation_keys=torch.tensor([[[[50.0]]], [[[51.0]]]]),
         expanded_estimation_values=torch.tensor([[[[52.0]]], [[[53.0]]]]),
@@ -1782,23 +1850,17 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),
         primary_exact_token_indices=torch.tensor([[[4, 5]], [[6, 7]]]),
         primary_exact_token_mask=torch.tensor([[[False, True]], [[True, False]]]),
-        sparse_exact_cluster_ids=torch.tensor([[[60, 61]], [[62, 63]]]),
-        sparse_exact_page_ids=torch.arange(8).view(2, 1, 2, 2) + 70,
-        sparse_exact_page_token_counts=torch.arange(8, dtype=torch.int32).view(
-            2, 1, 2, 2
-        )
-        + 80,
+        sparse_exact_cluster_indices=torch.tensor(
+            [[[60, 61]], [[62, 63]]], dtype=torch.int32
+        ),
         sparse_estimation_keys=torch.tensor([[[[90.0]]], [[[91.0]]]]),
         sparse_estimation_values=torch.tensor([[[[92.0]]], [[[93.0]]]]),
         sparse_estimation_token_counts=torch.tensor(
             [[[94]], [[95]]], dtype=torch.int32
         ),
-        expanded_exact_cluster_ids=torch.tensor([[[100, 101, 102]], [[103, 104, 105]]]),
-        expanded_exact_page_ids=torch.arange(12).view(2, 1, 3, 2) + 110,
-        expanded_exact_page_token_counts=torch.arange(12, dtype=torch.int32).view(
-            2, 1, 3, 2
-        )
-        + 120,
+        expanded_exact_cluster_indices=torch.tensor(
+            [[[100, 101, 102]], [[103, 104, 105]]], dtype=torch.int32
+        ),
         expanded_estimation_keys=torch.tensor([[[[130.0]]], [[[131.0]]]]),
         expanded_estimation_values=torch.tensor([[[[132.0]]], [[[133.0]]]]),
         expanded_estimation_token_counts=torch.tensor(
@@ -1810,15 +1872,11 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
     other_layer = replace(
         make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),
         layer_name="other",
-        sparse_exact_cluster_ids=torch.tensor([[[140]], [[141]]]),
-        sparse_exact_page_ids=torch.arange(6).view(2, 1, 1, 3) + 150,
-        sparse_exact_page_token_counts=torch.arange(6, dtype=torch.int32).view(
-            2, 1, 1, 3
+        sparse_exact_cluster_indices=torch.tensor(
+            [[[140]], [[141]]], dtype=torch.int32
         ),
-        expanded_exact_cluster_ids=torch.tensor([[[160, 161]], [[162, 163]]]),
-        expanded_exact_page_ids=torch.arange(12).view(2, 1, 2, 3) + 170,
-        expanded_exact_page_token_counts=torch.arange(12, dtype=torch.int32).view(
-            2, 1, 2, 3
+        expanded_exact_cluster_indices=torch.tensor(
+            [[[160, 161]], [[162, 163]]], dtype=torch.int32
         ),
     )
 
@@ -1843,9 +1901,7 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         indexed_fields = {
             "primary_exact_token_indices": table.primary_exact_token_indices,
             "primary_exact_token_mask": table.primary_exact_token_mask,
-            "exact_cluster_ids": table.expanded_exact_cluster_ids,
-            "exact_page_ids": table.expanded_exact_page_ids,
-            "exact_page_token_counts": table.expanded_exact_page_token_counts,
+            "exact_cluster_indices": table.expanded_exact_cluster_indices,
             "estimation_keys": table.expanded_estimation_keys,
             "estimation_values": table.expanded_estimation_values,
             "estimation_token_counts": table.expanded_estimation_token_counts,
@@ -1865,13 +1921,13 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         other_selection = controller._get_indexed_selection(
             "other", RetroSpecAttentionLevel.EXPANDED
         )
-        assert other_selection.exact_page_ids.shape == (4, 1, 2, 3)
-        assert other_selection.exact_page_ids.index_select(
+        assert other_selection.exact_cluster_indices.shape == (4, 1, 2)
+        assert other_selection.exact_cluster_indices.index_select(
             0, other_selection.plan_row_indices
         ).tolist() == [
-            [[[176, 177, 178], [179, 180, 181]]],
-            [[[170, 171, 172], [173, 174, 175]]],
-            [[[176, 177, 178], [179, 180, 181]]],
+            [[162, 163]],
+            [[160, 161]],
+            [[162, 163]],
         ]
         first_row_pointer = selection.plan_row_indices.data_ptr()
 

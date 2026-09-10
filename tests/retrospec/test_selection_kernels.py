@@ -405,32 +405,31 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
     request_slot_ids = torch.tensor([2, 0, -1, 1], device=device)
     active_mask = torch.tensor([True, True, True, False], device=device)
 
-    sparse_cluster_ids = torch.full(
+    sparse_cluster_indices = torch.full(
+        (batch_size, num_kv_heads, sparse_width),
+        777,
+        dtype=torch.int32,
+        device=device,
+    )
+    draft_cluster_ids = torch.full(
         (batch_size, num_kv_heads, sparse_width),
         777,
         dtype=torch.int64,
         device=device,
     )
-    sparse_page_ids = torch.full(
+    draft_page_ids = torch.full(
         (batch_size, num_kv_heads, sparse_width, max_pages),
         777,
         dtype=torch.int64,
         device=device,
     )
-    sparse_page_counts = torch.full_like(sparse_page_ids, 777, dtype=torch.int32)
-    expanded_cluster_ids = torch.full(
+    draft_page_counts = torch.full_like(draft_page_ids, 777, dtype=torch.int32)
+    expanded_cluster_indices = torch.full(
         (batch_size, num_kv_heads, expanded_width),
         777,
-        dtype=torch.int64,
+        dtype=torch.int32,
         device=device,
     )
-    expanded_page_ids = torch.full(
-        (batch_size, num_kv_heads, expanded_width, max_pages),
-        777,
-        dtype=torch.int64,
-        device=device,
-    )
-    expanded_page_counts = torch.full_like(expanded_page_ids, 777, dtype=torch.int32)
     draft_width = estimation_width + sparse_width
     draft_keys = torch.full(
         (batch_size, num_kv_heads, draft_width, head_size),
@@ -479,12 +478,11 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
         active_mask=active_mask,
         retrieval_ratio=retrieval_ratio,
         estimation_ratio=estimation_ratio,
-        sparse_exact_cluster_ids=sparse_cluster_ids,
-        sparse_exact_page_ids=sparse_page_ids,
-        sparse_exact_page_token_counts=sparse_page_counts,
-        expanded_exact_cluster_ids=expanded_cluster_ids,
-        expanded_exact_page_ids=expanded_page_ids,
-        expanded_exact_page_token_counts=expanded_page_counts,
+        sparse_exact_cluster_indices=sparse_cluster_indices,
+        expanded_exact_cluster_indices=expanded_cluster_indices,
+        draft_exact_cluster_ids=draft_cluster_ids,
+        draft_exact_page_ids=draft_page_ids,
+        draft_exact_page_token_counts=draft_page_counts,
         draft_estimation_keys=draft_keys,
         draft_estimation_values=draft_values,
         draft_estimation_token_counts=draft_counts,
@@ -495,12 +493,11 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
         expanded_attn=expanded_attn,
     )
 
-    expected_sparse_ids = torch.full_like(sparse_cluster_ids, -1)
-    expected_sparse_page_ids = torch.full_like(sparse_page_ids, -1)
-    expected_sparse_page_counts = torch.zeros_like(sparse_page_counts)
-    expected_expanded_ids = torch.full_like(expanded_cluster_ids, -1)
-    expected_expanded_page_ids = torch.full_like(expanded_page_ids, -1)
-    expected_expanded_page_counts = torch.zeros_like(expanded_page_counts)
+    expected_sparse_indices = torch.full_like(sparse_cluster_indices, -1)
+    expected_draft_ids = torch.full_like(draft_cluster_ids, -1)
+    expected_draft_page_ids = torch.full_like(draft_page_ids, -1)
+    expected_draft_page_counts = torch.zeros_like(draft_page_counts)
+    expected_expanded_indices = torch.full_like(expanded_cluster_indices, -1)
     expected_draft_keys = torch.zeros_like(draft_keys)
     expected_draft_values = torch.zeros_like(draft_values)
     expected_draft_counts = torch.zeros_like(draft_counts)
@@ -541,7 +538,8 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
             for output_idx in range(retrieval_count):
                 cluster = int(ranked_indices[batch, head, output_idx])
                 absolute_cluster = int(cluster_offsets[slot]) + cluster
-                expected_sparse_ids[batch, head, output_idx] = cluster_ids[
+                expected_sparse_indices[batch, head, output_idx] = cluster
+                expected_draft_ids[batch, head, output_idx] = cluster_ids[
                     head, absolute_cluster
                 ]
                 fallback_idx = estimation_width + output_idx
@@ -558,10 +556,10 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
                 page_start = int(page_offsets[slot]) + int(
                     cluster_page_starts[head, absolute_cluster]
                 )
-                expected_sparse_page_ids[batch, head, output_idx, :num_pages] = (
-                    page_ids[head, page_start : page_start + num_pages]
-                )
-                expected_sparse_page_counts[batch, head, output_idx, :num_pages] = (
+                expected_draft_page_ids[batch, head, output_idx, :num_pages] = page_ids[
+                    head, page_start : page_start + num_pages
+                ]
+                expected_draft_page_counts[batch, head, output_idx, :num_pages] = (
                     page_token_counts[head, page_start : page_start + num_pages]
                 )
 
@@ -581,20 +579,7 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
 
             for output_idx in range(expanded_count):
                 cluster = int(ranked_indices[batch, head, output_idx])
-                absolute_cluster = int(cluster_offsets[slot]) + cluster
-                expected_expanded_ids[batch, head, output_idx] = cluster_ids[
-                    head, absolute_cluster
-                ]
-                num_pages = int(cluster_page_counts[head, absolute_cluster])
-                page_start = int(page_offsets[slot]) + int(
-                    cluster_page_starts[head, absolute_cluster]
-                )
-                expected_expanded_page_ids[batch, head, output_idx, :num_pages] = (
-                    page_ids[head, page_start : page_start + num_pages]
-                )
-                expected_expanded_page_counts[batch, head, output_idx, :num_pages] = (
-                    page_token_counts[head, page_start : page_start + num_pages]
-                )
+                expected_expanded_indices[batch, head, output_idx] = cluster
 
             for output_idx in range(total_count - expanded_count):
                 rank = expanded_count + output_idx
@@ -614,12 +599,11 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
         expected_expanded_attn[batch] = expanded_mass / num_kv_heads
 
     torch.cuda.synchronize()
-    torch.testing.assert_close(sparse_cluster_ids, expected_sparse_ids)
-    torch.testing.assert_close(sparse_page_ids, expected_sparse_page_ids)
-    torch.testing.assert_close(sparse_page_counts, expected_sparse_page_counts)
-    torch.testing.assert_close(expanded_cluster_ids, expected_expanded_ids)
-    torch.testing.assert_close(expanded_page_ids, expected_expanded_page_ids)
-    torch.testing.assert_close(expanded_page_counts, expected_expanded_page_counts)
+    torch.testing.assert_close(sparse_cluster_indices, expected_sparse_indices)
+    torch.testing.assert_close(draft_cluster_ids, expected_draft_ids)
+    torch.testing.assert_close(draft_page_ids, expected_draft_page_ids)
+    torch.testing.assert_close(draft_page_counts, expected_draft_page_counts)
+    torch.testing.assert_close(expanded_cluster_indices, expected_expanded_indices)
     torch.testing.assert_close(draft_keys, expected_draft_keys)
     torch.testing.assert_close(draft_values, expected_draft_values)
     torch.testing.assert_close(draft_counts, expected_draft_counts)

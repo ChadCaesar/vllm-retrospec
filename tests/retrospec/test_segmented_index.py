@@ -227,15 +227,11 @@ def test_draft_materialization_skips_resident_lookup_without_arena():
     index = make_index(pin_memory=True)
     plan = SimpleNamespace(
         layer_name="layer",
+        request_slot_ids=torch.full((1,), -1, dtype=torch.int64, device=device),
+        request_slot_generations=torch.zeros(1, dtype=torch.int64, device=device),
         primary_exact_token_mask=torch.ones(1, 1, 2, dtype=torch.bool, device=device),
-        sparse_exact_cluster_ids=torch.full(
-            (1, 1, 1), -1, dtype=torch.int64, device=device
-        ),
-        sparse_exact_page_ids=torch.full(
-            (1, 1, 1, 1), -1, dtype=torch.int64, device=device
-        ),
-        sparse_exact_page_token_counts=torch.zeros(
-            1, 1, 1, 1, dtype=torch.int32, device=device
+        sparse_exact_cluster_indices=torch.full(
+            (1, 1, 1), -1, dtype=torch.int32, device=device
         ),
         sparse_estimation_keys=torch.empty(1, 1, 0, 1, device=device),
         sparse_estimation_values=torch.empty(1, 1, 0, 1, device=device),
@@ -246,13 +242,17 @@ def test_draft_materialization_skips_resident_lookup_without_arena():
     )
     index.cluster_store.resolve_draft_cluster_blocks = Mock()
 
-    selection = index._materialize_draft_selection(
-        plan=plan,
-        output_workspace=None,
-        view=make_empty_resident_view(1, 1, device),
-        has_clusters=torch.zeros(1, 1, dtype=torch.bool, device=device),
-        active_mask=torch.ones(1, dtype=torch.bool, device=device),
-    )
+    index.begin_proposal(["request"])
+    try:
+        selection = index._materialize_draft_selection(
+            plan=plan,
+            output_workspace=None,
+            view=make_empty_resident_view(1, 1, device),
+            has_clusters=torch.zeros(1, 1, dtype=torch.bool, device=device),
+            active_mask=torch.ones(1, dtype=torch.bool, device=device),
+        )
+    finally:
+        index.end_proposal()
 
     assert selection.resolved_pages is None
     assert selection.exact_token_counts.tolist() == [[2]]
@@ -2080,12 +2080,13 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     assert cold.hit_attn.item() == pytest.approx(1.0)
     assert not cold.resolved_pages.hit_gate_ready.any()
     assert not cold.exact_page_token_counts.any()
-    assert cold.plan.sparse_exact_page_token_counts.sum().item() == 2
+    table = index._selection_plan_tables["layer"]
+    assert table.draft_exact_page_token_counts.sum().item() == 2
 
     index.cluster_store.admit_resident_clusters(
         "layer",
-        cold.plan.sparse_exact_cluster_ids,
-        cold.plan.sparse_exact_page_ids,
+        table.draft_exact_cluster_ids,
+        table.draft_exact_page_ids,
     )
     index.cluster_store.get_resident_page_storage("layer")
     torch.cuda.current_stream().synchronize()

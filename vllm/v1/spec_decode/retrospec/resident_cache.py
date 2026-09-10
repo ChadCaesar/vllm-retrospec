@@ -13,6 +13,7 @@ from .cluster_identity import RetroSpecClusterGroup
 from .resident_kernels import (
     lookup_resident_handles,
     resolve_compact_draft_pages,
+    resolve_compact_verification_pages,
     update_resident_handles,
 )
 
@@ -67,6 +68,26 @@ class RetroSpecCompactResidentPageAccess:
     miss_cluster_counts: torch.Tensor
     hit_gate_ready: torch.Tensor
     access_kinds: torch.Tensor | None
+    read_lease: "RetroSpecResidentReadLease"
+
+
+@dataclass(frozen=True)
+class RetroSpecCompactVerificationPageAccess:
+    """Query-row compact resident pages and miss commands for verification."""
+
+    resident_page_ids: torch.Tensor
+    staging_page_ids: torch.Tensor
+    page_token_counts: torch.Tensor
+    page_counts: torch.Tensor
+    selected_cluster_counts: torch.Tensor
+    hit_cluster_counts: torch.Tensor
+    miss_cluster_counts: torch.Tensor
+    miss_cluster_ids: torch.Tensor
+    miss_logical_page_ids: torch.Tensor
+    miss_page_counts: torch.Tensor
+    miss_output_page_offsets: torch.Tensor
+    miss_count: torch.Tensor
+    invalid_descriptor_count: torch.Tensor
     read_lease: "RetroSpecResidentReadLease"
 
 
@@ -1280,6 +1301,97 @@ class RetroSpecResidentClusterCache:
             miss_cluster_counts=miss_cluster_counts,
             hit_gate_ready=hit_gate_ready,
             access_kinds=None,
+            read_lease=RetroSpecResidentReadLease(self._gpu_access_lock),
+        )
+
+    def lookup_compact_verification_gpu(
+        self,
+        selected_cluster_indices: torch.Tensor,
+        plan_row_indices: torch.Tensor,
+        request_slot_ids: torch.Tensor,
+        request_slot_generations: torch.Tensor,
+        arena_cluster_ids: torch.Tensor,
+        arena_cluster_page_starts: torch.Tensor,
+        arena_cluster_page_counts: torch.Tensor,
+        arena_page_ids: torch.Tensor,
+        arena_page_token_counts: torch.Tensor,
+        arena_cluster_offsets: torch.Tensor,
+        arena_page_offsets: torch.Tensor,
+        arena_generations: torch.Tensor,
+        resident_page_ids: torch.Tensor,
+        staging_page_ids: torch.Tensor,
+        page_token_counts: torch.Tensor,
+        page_counts: torch.Tensor,
+        selected_cluster_counts: torch.Tensor,
+        hit_cluster_counts: torch.Tensor,
+        miss_cluster_counts: torch.Tensor,
+        miss_cluster_ids: torch.Tensor,
+        miss_logical_page_ids: torch.Tensor,
+        miss_page_counts: torch.Tensor,
+        miss_output_page_offsets: torch.Tensor,
+        miss_count: torch.Tensor,
+        invalid_descriptor_count: torch.Tensor,
+    ) -> RetroSpecCompactVerificationPageAccess:
+        """Resolve verification selections directly from the resident arena."""
+        if selected_cluster_indices.device != self.device:
+            raise ValueError("Compact verification lookup uses the wrong device")
+
+        self._gpu_access_lock.acquire()
+        try:
+            self._ensure_handle_table(miss_logical_page_ids.shape[1])
+            access_epoch = self._next_access_epoch
+            self._next_access_epoch += 1
+            resolve_compact_verification_pages(
+                selected_cluster_indices=selected_cluster_indices,
+                plan_row_indices=plan_row_indices,
+                request_slot_ids=request_slot_ids,
+                request_slot_generations=request_slot_generations,
+                arena_cluster_ids=arena_cluster_ids,
+                arena_cluster_page_starts=arena_cluster_page_starts,
+                arena_cluster_page_counts=arena_cluster_page_counts,
+                arena_page_ids=arena_page_ids,
+                arena_page_token_counts=arena_page_token_counts,
+                arena_cluster_offsets=arena_cluster_offsets,
+                arena_page_offsets=arena_page_offsets,
+                arena_generations=arena_generations,
+                table_handles=self._handle_table_handles,
+                table_versions=self._handle_table_versions,
+                table_page_counts=self._handle_table_page_counts,
+                table_page_slots=self._handle_table_page_slots,
+                table_last_access_epochs=self._handle_table_last_access_epochs,
+                access_epoch=access_epoch,
+                output_resident_page_ids=resident_page_ids,
+                output_staging_page_ids=staging_page_ids,
+                output_page_token_counts=page_token_counts,
+                output_page_counts=page_counts,
+                output_selected_counts=selected_cluster_counts,
+                output_hit_counts=hit_cluster_counts,
+                output_miss_counts=miss_cluster_counts,
+                output_miss_handles=miss_cluster_ids,
+                output_miss_logical_page_ids=miss_logical_page_ids,
+                output_miss_page_counts=miss_page_counts,
+                output_miss_page_offsets=miss_output_page_offsets,
+                output_miss_count=miss_count,
+                output_invalid_descriptor_count=invalid_descriptor_count,
+            )
+        except BaseException:
+            self._gpu_access_lock.release()
+            raise
+
+        return RetroSpecCompactVerificationPageAccess(
+            resident_page_ids=resident_page_ids,
+            staging_page_ids=staging_page_ids,
+            page_token_counts=page_token_counts,
+            page_counts=page_counts,
+            selected_cluster_counts=selected_cluster_counts,
+            hit_cluster_counts=hit_cluster_counts,
+            miss_cluster_counts=miss_cluster_counts,
+            miss_cluster_ids=miss_cluster_ids,
+            miss_logical_page_ids=miss_logical_page_ids,
+            miss_page_counts=miss_page_counts,
+            miss_output_page_offsets=miss_output_page_offsets,
+            miss_count=miss_count,
+            invalid_descriptor_count=invalid_descriptor_count,
             read_lease=RetroSpecResidentReadLease(self._gpu_access_lock),
         )
 

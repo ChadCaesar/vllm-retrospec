@@ -7,6 +7,8 @@ import torch
 from vllm.v1.spec_decode.retrospec.resident_kernels import (
     compact_resident_misses,
     lookup_resident_handles,
+    resolve_compact_verification_pages,
+    scatter_compact_staging_page_ids,
     scatter_staging_page_ids,
     update_resident_handles,
 )
@@ -294,3 +296,211 @@ def test_scatter_staging_page_ids_expands_compact_occurrences():
         [[[-1, -1, -1], [0, 1, -1], [-1, -1, -1]]],
         [[[2, -1, -1], [0, 1, -1], [-1, -1, -1]]],
     ]
+
+
+def _compact_verification_outputs(
+    num_queries: int,
+    num_kv_heads: int,
+    num_clusters: int,
+    max_pages: int,
+    miss_page_stride: int | None = None,
+) -> tuple[torch.Tensor, ...]:
+    device = torch.device("cuda")
+    page_shape = (num_queries, num_kv_heads, num_clusters * max_pages)
+    row_shape = (num_queries, num_kv_heads)
+    miss_capacity = num_queries * num_kv_heads * num_clusters
+    miss_page_stride = miss_page_stride or max_pages
+    miss_page_storage = torch.empty(
+        (miss_capacity, miss_page_stride), dtype=torch.int64, device=device
+    )
+    return (
+        torch.empty(page_shape, dtype=torch.int64, device=device),
+        torch.empty(page_shape, dtype=torch.int64, device=device),
+        torch.empty(page_shape, dtype=torch.int32, device=device),
+        torch.empty(row_shape, dtype=torch.int32, device=device),
+        torch.empty(row_shape, dtype=torch.int32, device=device),
+        torch.empty(row_shape, dtype=torch.int32, device=device),
+        torch.empty(row_shape, dtype=torch.int32, device=device),
+        torch.empty(miss_capacity, dtype=torch.int64, device=device),
+        miss_page_storage[:, :max_pages],
+        torch.empty(miss_capacity, dtype=torch.int32, device=device),
+        torch.empty(miss_capacity, dtype=torch.int64, device=device),
+        torch.empty(1, dtype=torch.int32, device=device),
+        torch.empty(1, dtype=torch.int32, device=device),
+    )
+
+
+def _resolve_compact_verification(
+    selected_cluster_indices: torch.Tensor,
+    plan_row_indices: torch.Tensor,
+    request_slot_generations: torch.Tensor,
+    table: tuple[torch.Tensor, ...],
+    miss_page_stride: int | None = None,
+) -> tuple[torch.Tensor, ...]:
+    device = selected_cluster_indices.device
+    outputs = _compact_verification_outputs(
+        plan_row_indices.numel(),
+        selected_cluster_indices.shape[1],
+        selected_cluster_indices.shape[2],
+        2,
+        miss_page_stride,
+    )
+    resolve_compact_verification_pages(
+        selected_cluster_indices=selected_cluster_indices,
+        plan_row_indices=plan_row_indices,
+        request_slot_ids=torch.tensor([0, 1], dtype=torch.int64, device=device),
+        request_slot_generations=request_slot_generations,
+        arena_cluster_ids=torch.tensor(
+            [[10, 11, 20, 21]], dtype=torch.int64, device=device
+        ),
+        arena_cluster_page_starts=torch.tensor(
+            [[0, 2, 0, 1]], dtype=torch.int64, device=device
+        ),
+        arena_cluster_page_counts=torch.tensor(
+            [[2, 1, 1, 2]], dtype=torch.int32, device=device
+        ),
+        arena_page_ids=torch.tensor(
+            [[100, 101, 102, 200, 201, 202]], dtype=torch.int64, device=device
+        ),
+        arena_page_token_counts=torch.tensor(
+            [[2, 1, 2, 2, 2, 1]], dtype=torch.int32, device=device
+        ),
+        arena_cluster_offsets=torch.tensor([0, 2], dtype=torch.int64, device=device),
+        arena_page_offsets=torch.tensor([0, 3], dtype=torch.int64, device=device),
+        arena_generations=torch.tensor([5, 7], dtype=torch.int64, device=device),
+        table_handles=table[0],
+        table_versions=table[1],
+        table_page_counts=table[2],
+        table_page_slots=table[3],
+        table_last_access_epochs=table[5],
+        access_epoch=19,
+        output_resident_page_ids=outputs[0],
+        output_staging_page_ids=outputs[1],
+        output_page_token_counts=outputs[2],
+        output_page_counts=outputs[3],
+        output_selected_counts=outputs[4],
+        output_hit_counts=outputs[5],
+        output_miss_counts=outputs[6],
+        output_miss_handles=outputs[7],
+        output_miss_logical_page_ids=outputs[8],
+        output_miss_page_counts=outputs[9],
+        output_miss_page_offsets=outputs[10],
+        output_miss_count=outputs[11],
+        output_invalid_descriptor_count=outputs[12],
+    )
+    torch.cuda.synchronize()
+    return outputs
+
+
+def test_compact_verification_resolver_preserves_ranked_pages_and_emits_misses():
+    device = torch.device("cuda")
+    table = _make_table(max_pages=2)
+    update_resident_handles(
+        bucket_ids=torch.tensor([5, 3], dtype=torch.int32, device=device),
+        cluster_handles=torch.tensor([21, 11], dtype=torch.int64, device=device),
+        page_counts=torch.tensor([2, 1], dtype=torch.int32, device=device),
+        page_slots=torch.tensor([[7, 8], [9, -1]], dtype=torch.int32, device=device),
+        hit_gate_ready=torch.ones(2, dtype=torch.bool, device=device),
+        table_handles=table[0],
+        table_versions=table[1],
+        table_page_counts=table[2],
+        table_page_slots=table[3],
+        table_hit_gate_ready=table[4],
+    )
+    selected = torch.tensor(
+        [[[1, -1]], [[0, 1]], [[0, 1]], [[1, 0]]],
+        dtype=torch.int32,
+        device=device,
+    )
+    outputs = _resolve_compact_verification(
+        selected,
+        torch.tensor([3, 0, 1], dtype=torch.int64, device=device),
+        torch.tensor([5, 7], dtype=torch.int64, device=device),
+        table,
+    )
+
+    assert outputs[0].cpu().tolist() == [
+        [[7, 8, -1, -1]],
+        [[9, -1, -1, -1]],
+        [[-1, 7, 8, -1]],
+    ]
+    assert outputs[2].cpu().tolist() == [
+        [[2, 1, 2, 0]],
+        [[2, 0, 0, 0]],
+        [[2, 2, 1, 0]],
+    ]
+    assert outputs[3].cpu().tolist() == [[3], [1], [3]]
+    assert outputs[4].cpu().tolist() == [[2], [1], [2]]
+    assert outputs[5].cpu().tolist() == [[1], [1], [1]]
+    assert outputs[6].cpu().tolist() == [[1], [0], [1]]
+    assert outputs[12].item() == 0
+
+    miss_count = int(outputs[11].item())
+    records = sorted(
+        zip(
+            outputs[10][:miss_count].cpu().tolist(),
+            outputs[7][:miss_count].cpu().tolist(),
+            outputs[9][:miss_count].cpu().tolist(),
+            outputs[8][:miss_count].cpu().tolist(),
+        )
+    )
+    assert records == [(2, 20, 1, [200, -1]), (8, 20, 1, [200, -1])]
+    assert table[5].cpu().tolist()[3:6] == [19, 0, 19]
+
+
+def test_compact_verification_resolver_honors_miss_page_row_stride():
+    device = torch.device("cuda")
+    selected = torch.tensor([[[0, 1]], [[0, 1]]], dtype=torch.int32, device=device)
+    outputs = _resolve_compact_verification(
+        selected,
+        torch.tensor([0, 1], dtype=torch.int64, device=device),
+        torch.tensor([5, 7], dtype=torch.int64, device=device),
+        _make_table(max_pages=2),
+        miss_page_stride=4,
+    )
+
+    miss_count = int(outputs[11].item())
+    records = sorted(
+        zip(
+            outputs[7][:miss_count].cpu().tolist(),
+            outputs[9][:miss_count].cpu().tolist(),
+            outputs[8][:miss_count].cpu().tolist(),
+        )
+    )
+    assert records == [
+        (10, 2, [100, 101]),
+        (11, 1, [102, -1]),
+        (20, 1, [200, -1]),
+        (21, 2, [201, 202]),
+    ]
+
+
+def test_compact_verification_resolver_reports_stale_request_generation():
+    device = torch.device("cuda")
+    selected = torch.full((2, 1, 1), -1, dtype=torch.int32, device=device)
+    selected[1, 0, 0] = 0
+    outputs = _resolve_compact_verification(
+        selected,
+        torch.tensor([0, 1], dtype=torch.int64, device=device),
+        torch.tensor([5, 6], dtype=torch.int64, device=device),
+        _make_table(max_pages=2),
+    )
+
+    assert outputs[3].cpu().tolist() == [[0], [0]]
+    assert outputs[11].item() == 0
+    assert outputs[12].item() == 1
+
+
+def test_compact_verification_staging_scatter_uses_reserved_page_offsets():
+    device = torch.device("cuda")
+    output = torch.full((2, 1, 4), -1, dtype=torch.int64, device=device)
+    scatter_compact_staging_page_ids(
+        miss_output_page_offsets=torch.tensor([2, 4], device=device),
+        staging_starts=torch.tensor([0, 3], device=device),
+        page_counts=torch.tensor([2, 1], dtype=torch.int32, device=device),
+        num_misses=2,
+        max_pages=2,
+        output_page_ids=output,
+    )
+
+    assert output.cpu().tolist() == [[[-1, -1, 0, 1]], [[3, -1, -1, -1]]]

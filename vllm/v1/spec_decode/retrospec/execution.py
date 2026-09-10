@@ -172,6 +172,9 @@ def _multi_source_exact_partition_kernel(
     if USE_PLAN_ROWS:
         metadata_row_idx = tl.load(plan_row_indices + query_idx)
         resolved_page_row_idx = query_idx
+    page_metadata_row_idx = metadata_row_idx
+    if COMPACT_PAGES:
+        page_metadata_row_idx = resolved_page_row_idx
     kv_head_idx = query_head_idx // QUERIES_PER_KV_HEAD
 
     dimension_offsets = tl.arange(0, BLOCK_D)
@@ -239,11 +242,11 @@ def _multi_source_exact_partition_kernel(
         page_valid = source_valid & (token_offsets >= MAX_PRIMARY_TOKENS)
         if COMPACT_PAGES:
             compact_count = tl.load(
-                compact_page_counts + metadata_row_idx * NUM_KV_HEADS + kv_head_idx
+                compact_page_counts + resolved_page_row_idx * NUM_KV_HEADS + kv_head_idx
             )
             page_valid &= page_slot_indices < compact_count
         page_count_offsets = (
-            metadata_row_idx * NUM_KV_HEADS + kv_head_idx
+            page_metadata_row_idx * NUM_KV_HEADS + kv_head_idx
         ) * MAX_PAGE_SLOTS + page_slot_indices
         resolved_page_offsets = (
             resolved_page_row_idx * NUM_KV_HEADS + kv_head_idx
@@ -1192,9 +1195,15 @@ class RetroSpecExactAttentionWorkspace:
             raise ValueError("Block table must have shape [batch, blocks]")
 
         metadata_rows, num_kv_heads, max_primary_tokens = primary.token_indices.shape
-        if source.page_token_counts.shape[:2] != (metadata_rows, num_kv_heads):
-            raise ValueError("Primary and page metadata batch shapes must match")
         plan_row_indices = source.plan_row_indices
+        resolved_rows = metadata_rows if plan_row_indices is None else query.shape[0]
+        expected_page_prefix = (
+            (metadata_rows, num_kv_heads)
+            if compact_pages is None
+            else (resolved_rows, num_kv_heads)
+        )
+        if source.page_token_counts.shape[:2] != expected_page_prefix:
+            raise ValueError("Exact page metadata uses the wrong row namespace")
         if plan_row_indices is None and primary.block_table.shape[0] != metadata_rows:
             raise ValueError("Block table batch size does not match exact metadata")
         if primary.key_cache.shape[2:] != (num_kv_heads, query.shape[2]):
@@ -1224,9 +1233,7 @@ class RetroSpecExactAttentionWorkspace:
             source.page_token_counts,
         ]
         if compact_pages is not None:
-            if plan_row_indices is not None:
-                raise ValueError("Compact page tables do not support indexed plan rows")
-            if compact_pages.page_counts.shape != (metadata_rows, num_kv_heads):
+            if compact_pages.page_counts.shape != expected_page_prefix:
                 raise ValueError("Compact page counts do not match page metadata")
             if compact_pages.page_counts.dtype not in (torch.int32, torch.int64):
                 raise ValueError("Compact page counts must be integral")
@@ -1266,7 +1273,7 @@ class RetroSpecExactAttentionWorkspace:
             )
 
         expected_page_shape = source.page_token_counts.shape
-        if plan_row_indices is not None:
+        if plan_row_indices is not None and compact_pages is None:
             expected_page_shape = (
                 query.shape[0],
                 *source.page_token_counts.shape[1:],

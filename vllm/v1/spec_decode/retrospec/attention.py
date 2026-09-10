@@ -23,6 +23,7 @@ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from .capacity import get_retrospec_exact_attention_partition_capacity
 from .cluster_store import (
     RetroSpecCompactResolvedClusterPages,
+    RetroSpecCompactVerificationResolvedPages,
     RetroSpecResidentPrefetchInput,
     RetroSpecResolvedClusterPages,
 )
@@ -1093,7 +1094,10 @@ class RetroSpecSparseAttention:
         block_table: torch.Tensor,
     ) -> tuple[
         RetroSpecExactKVSource,
-        RetroSpecResolvedClusterPages | RetroSpecCompactResolvedClusterPages | None,
+        RetroSpecResolvedClusterPages
+        | RetroSpecCompactResolvedClusterPages
+        | RetroSpecCompactVerificationResolvedPages
+        | None,
     ]:
         indexed = isinstance(selection, RetroSpecIndexedTokenAttentionSelection)
         if indexed:
@@ -1101,41 +1105,32 @@ class RetroSpecSparseAttention:
             primary_token_indices = selection.primary_exact_token_indices
             primary_token_mask = selection.primary_exact_token_mask
             plan_row_indices = selection.plan_row_indices
-            resolved_pages = None
+            if self.mode not in (
+                RetroSpecAttentionMode.SPARSE_VERIFY,
+                RetroSpecAttentionMode.EXPANDED_VERIFY,
+            ):
+                raise RuntimeError("Indexed plans are only valid during verification")
+            resolved_pages = self.index.resolve_indexed_verification_pages(selection)
+            if resolved_pages is None:
+                exact_page_token_counts = torch.empty(
+                    plan_row_indices.shape[0],
+                    primary_token_indices.shape[1],
+                    0,
+                    dtype=torch.int32,
+                    device=primary_token_indices.device,
+                )
+            else:
+                exact_page_token_counts = resolved_pages.page_token_counts
         else:
             layer_name = selection.plan.layer_name
             primary_token_indices = selection.plan.primary_exact_token_indices
             primary_token_mask = selection.plan.primary_exact_token_mask
             plan_row_indices = None
             resolved_pages = selection.resolved_pages
-
-        exact_cluster_ids = selection.exact_cluster_ids
-        exact_page_ids = selection.exact_page_ids
-        exact_page_token_counts = selection.exact_page_token_counts
-
-        if resolved_pages is None and exact_page_ids.numel():
-            if exact_cluster_ids.device.type == "cuda" and self.mode in (
-                RetroSpecAttentionMode.SPARSE_VERIFY,
-                RetroSpecAttentionMode.EXPANDED_VERIFY,
-            ):
-                if plan_row_indices is None:
-                    resolved_pages = (
-                        self.index.cluster_store.resolve_verification_cluster_blocks(
-                            layer_name=layer_name,
-                            cluster_ids=exact_cluster_ids,
-                            logical_page_ids=exact_page_ids,
-                        )
-                    )
-                else:
-                    resolved_pages = (
-                        self.index.cluster_store.resolve_verification_cluster_blocks(
-                            layer_name=layer_name,
-                            cluster_ids=exact_cluster_ids,
-                            logical_page_ids=exact_page_ids,
-                            plan_row_indices=plan_row_indices,
-                        )
-                    )
-            else:
+            exact_cluster_ids = selection.exact_cluster_ids
+            exact_page_ids = selection.exact_page_ids
+            exact_page_token_counts = selection.exact_page_token_counts
+            if resolved_pages is None and exact_page_ids.numel():
                 resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
                     layer_name=layer_name,
                     cluster_ids=exact_cluster_ids,
@@ -1147,12 +1142,31 @@ class RetroSpecSparseAttention:
         staging_pages = None
         compact_pages = None
         if resolved_pages is not None:
-            if isinstance(resolved_pages, RetroSpecCompactResolvedClusterPages):
-                resident_pages = RetroSpecExactPageKVSource(
-                    key_pages=resolved_pages.resident_key_pages,
-                    value_pages=resolved_pages.resident_value_pages,
-                    page_ids=resolved_pages.resident_page_ids,
-                )
+            if isinstance(
+                resolved_pages,
+                (
+                    RetroSpecCompactResolvedClusterPages,
+                    RetroSpecCompactVerificationResolvedPages,
+                ),
+            ):
+                if resolved_pages.resident_key_pages.shape[0] > 0:
+                    resident_pages = RetroSpecExactPageKVSource(
+                        key_pages=resolved_pages.resident_key_pages,
+                        value_pages=resolved_pages.resident_value_pages,
+                        page_ids=resolved_pages.resident_page_ids,
+                    )
+                if (
+                    isinstance(
+                        resolved_pages, RetroSpecCompactVerificationResolvedPages
+                    )
+                    and resolved_pages.staging_key_pages.shape[0] > 0
+                ):
+                    staging_pages = RetroSpecExactPageKVSource(
+                        key_pages=resolved_pages.staging_key_pages,
+                        value_pages=resolved_pages.staging_value_pages,
+                        page_ids=resolved_pages.staging_page_ids,
+                        ready_event=resolved_pages.staging_ready_event,
+                    )
                 compact_pages = RetroSpecCompactExactPageTable(
                     page_counts=resolved_pages.page_counts
                 )
@@ -1258,21 +1272,12 @@ class RetroSpecSparseAttention:
             if resolved_pages is not None and resolved_pages.read_lease is not None:
                 resolved_pages.read_lease.release()
 
-        if (
-            self.mode
-            in (
-                RetroSpecAttentionMode.SPARSE_VERIFY,
-                RetroSpecAttentionMode.EXPANDED_VERIFY,
-            )
-            and resolved_pages is not None
-            and not isinstance(resolved_pages, RetroSpecCompactResolvedClusterPages)
-        ):
+        miss_admission = getattr(resolved_pages, "miss_admission", None)
+        if miss_admission is not None:
             with self.performance_stats.cpu_timer(
                 f"{stage_name}_resident_admit_submit"
             ):
-                self.index.cluster_store.admit_verification_misses(
-                    resolved_pages.miss_admission
-                )
+                self.index.cluster_store.admit_verification_misses(miss_admission)
 
         return exact_output
 
@@ -1330,21 +1335,12 @@ class RetroSpecSparseAttention:
             if resolved_pages is not None and resolved_pages.read_lease is not None:
                 resolved_pages.read_lease.release()
 
-        if (
-            self.mode
-            in (
-                RetroSpecAttentionMode.SPARSE_VERIFY,
-                RetroSpecAttentionMode.EXPANDED_VERIFY,
-            )
-            and resolved_pages is not None
-            and not isinstance(resolved_pages, RetroSpecCompactResolvedClusterPages)
-        ):
+        miss_admission = getattr(resolved_pages, "miss_admission", None)
+        if miss_admission is not None:
             with self.performance_stats.cpu_timer(
                 f"{stage_name}_resident_admit_submit"
             ):
-                self.index.cluster_store.admit_verification_misses(
-                    resolved_pages.miss_admission
-                )
+                self.index.cluster_store.admit_verification_misses(miss_admission)
 
         return output
 

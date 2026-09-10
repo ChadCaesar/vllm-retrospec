@@ -21,6 +21,7 @@ from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecFullVerificationDescriptor,
     RetroSpecResidentPrefetchInput,
 )
+from vllm.v1.spec_decode.retrospec.index_residency import RetroSpecResidentLayerArena
 from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
 
 
@@ -214,6 +215,35 @@ def get_runtime_blocks(store, table, device):
         device=device,
     )
     return cluster_ids, metadata
+
+
+def make_resident_arena(
+    table, metadata, cluster_token_counts, device
+) -> RetroSpecResidentLayerArena:
+    num_kv_heads, num_clusters, max_pages = metadata.page_ids.shape
+    cluster_shape = (num_kv_heads, num_clusters, 1)
+    return RetroSpecResidentLayerArena(
+        cluster_ids=table.cluster_ids.to(device),
+        cluster_keys=torch.zeros(cluster_shape, device=device),
+        cluster_values=torch.zeros(cluster_shape, device=device),
+        cluster_token_counts=cluster_token_counts.to(device),
+        cluster_page_starts=torch.arange(
+            num_clusters, dtype=torch.int64, device=device
+        )[None, :].expand(num_kv_heads, -1)
+        * max_pages,
+        cluster_page_counts=(metadata.page_ids >= 0).sum(dim=-1, dtype=torch.int32),
+        page_ids=metadata.page_ids.flatten(1),
+        page_token_counts=metadata.page_token_counts.flatten(1),
+        cluster_offsets=torch.zeros(1, dtype=torch.int64, device=device),
+        num_clusters=torch.full((1,), num_clusters, dtype=torch.int32, device=device),
+        page_offsets=torch.zeros(1, dtype=torch.int64, device=device),
+        num_pages=torch.full(
+            (1,), num_clusters * max_pages, dtype=torch.int32, device=device
+        ),
+        generations=torch.ones(1, dtype=torch.int64, device=device),
+        indexed_starts=torch.zeros(1, dtype=torch.int64, device=device),
+        indexed_ends=torch.ones(1, dtype=torch.int64, device=device),
+    )
 
 
 def materialize_resolved_pages(resolved):
@@ -1596,10 +1626,7 @@ def test_gpu_verification_resolution_deduplicates_miss_pages_before_h2d():
         cluster_token_counts.to(device),
     )
     cluster_ids, metadata = get_runtime_blocks(store, table, device)
-    selected_cluster_ids = torch.cat((cluster_ids, cluster_ids), dim=-1).unsqueeze(0)
-    selected_page_ids = torch.cat(
-        (metadata.page_ids, metadata.page_ids), dim=-2
-    ).unsqueeze(0)
+    arena = make_resident_arena(table, metadata, cluster_token_counts, device)
 
     reference_store = RetroSpecClusterPageStore(
         page_size=2,
@@ -1625,17 +1652,28 @@ def test_gpu_verification_resolution_deduplicates_miss_pages_before_h2d():
         ).unsqueeze(0),
     )
 
-    resolved = store.resolve_verification_cluster_blocks(
-        "layer", selected_cluster_ids, selected_page_ids
+    selected_cluster_indices = (
+        torch.arange(cluster_ids.shape[-1], dtype=torch.int32, device=device)
+        .repeat(2)[None, None, :]
+        .expand(1, cluster_ids.shape[0], -1)
     )
-    assert resolved.miss_cluster_mask.all()
-    assert not resolved.hit_cluster_mask.any()
+    resolved = store.resolve_verification_cluster_blocks(
+        layer_name="layer",
+        selected_cluster_indices=selected_cluster_indices,
+        plan_row_indices=torch.zeros(1, dtype=torch.int64, device=device),
+        request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
+        request_slot_generations=torch.ones(1, dtype=torch.int64, device=device),
+        arena=arena,
+        max_pages_per_cluster=metadata.page_ids.shape[-1],
+    )
+    assert not (resolved.resident_page_ids >= 0).any()
+    assert resolved.page_counts.tolist() == [[6, 6]]
     assert resolved.miss_admission is not None
     assert resolved.miss_admission.cluster_ids_cpu.numel() == cluster_ids.numel()
     assert resolved.staging_key_pages.shape[0] == (metadata.page_ids >= 0).sum()
     assert torch.equal(
-        resolved.staging_page_ids[..., : cluster_ids.shape[-1], :],
-        resolved.staging_page_ids[..., cluster_ids.shape[-1] :, :],
+        resolved.staging_page_ids[..., :3],
+        resolved.staging_page_ids[..., 3:6],
     )
 
     reference.staging_ready_event.synchronize()
@@ -1644,9 +1682,21 @@ def test_gpu_verification_resolution_deduplicates_miss_pages_before_h2d():
         reference
     )
     resolved_keys, resolved_values, resolved_mask = materialize_resolved_pages(resolved)
-    torch.testing.assert_close(resolved_keys, reference_keys)
-    torch.testing.assert_close(resolved_values, reference_values)
-    torch.testing.assert_close(resolved_mask, reference_mask)
+    for head_index in range(cluster_ids.shape[0]):
+        reference_head_mask = reference_mask[0, head_index].flatten()
+        expected_keys = reference_keys[0, head_index].flatten(0, 1)[reference_head_mask]
+        expected_values = reference_values[0, head_index].flatten(0, 1)[
+            reference_head_mask
+        ]
+        page_count = int(resolved.page_counts[0, head_index].item())
+        torch.testing.assert_close(
+            resolved_keys[0, head_index, :page_count], expected_keys
+        )
+        torch.testing.assert_close(
+            resolved_values[0, head_index, :page_count], expected_values
+        )
+        assert resolved_mask[0, head_index, :page_count].all()
+        assert not resolved_mask[0, head_index, page_count:].any()
     if reference.read_lease is not None:
         reference.read_lease.release()
     if resolved.read_lease is not None:
@@ -1682,15 +1732,24 @@ def test_gpu_verification_resolution_all_hit_skips_staging_and_admission():
         cluster_token_counts.to(device),
     )
     cluster_ids, metadata = get_runtime_blocks(store, table, device)
+    arena = make_resident_arena(table, metadata, cluster_token_counts, device)
     selected_cluster_ids = cluster_ids.unsqueeze(0)
     selected_page_ids = metadata.page_ids.unsqueeze(0)
     store.admit_resident_clusters("layer", selected_cluster_ids, selected_page_ids)
 
     resolved = store.resolve_verification_cluster_blocks(
-        "layer", selected_cluster_ids, selected_page_ids
+        layer_name="layer",
+        selected_cluster_indices=torch.arange(
+            cluster_ids.shape[-1], dtype=torch.int32, device=device
+        )[None, None, :].expand(1, cluster_ids.shape[0], -1),
+        plan_row_indices=torch.zeros(1, dtype=torch.int64, device=device),
+        request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
+        request_slot_generations=torch.ones(1, dtype=torch.int64, device=device),
+        arena=arena,
+        max_pages_per_cluster=metadata.page_ids.shape[-1],
     )
-    assert resolved.hit_cluster_mask.all()
-    assert not resolved.miss_cluster_mask.any()
+    assert (resolved.resident_page_ids >= 0).sum().item() == 6
+    assert resolved.page_counts.tolist() == [[3, 3]]
     assert resolved.staging_key_pages.shape[0] == 0
     assert resolved.staging_value_pages.shape[0] == 0
     assert resolved.miss_admission is None
@@ -1717,40 +1776,49 @@ def test_gpu_verification_resolution_indexes_persistent_plan_rows():
         cluster_token_counts.to(device),
     )
     cluster_ids, metadata = get_runtime_blocks(store, table, device)
+    arena = make_resident_arena(table, metadata, cluster_token_counts, device)
     store.admit_resident_clusters(
         "layer", cluster_ids.unsqueeze(0), metadata.page_ids.unsqueeze(0)
     )
 
-    table_cluster_ids = torch.stack(
-        (cluster_ids, cluster_ids.flip(-1), torch.full_like(cluster_ids, -1))
+    local_indices = torch.arange(
+        cluster_ids.shape[-1], dtype=torch.int32, device=device
     )
-    table_page_ids = torch.stack(
+    table_cluster_indices = torch.stack(
         (
-            metadata.page_ids,
-            metadata.page_ids.flip(-2),
-            torch.full_like(metadata.page_ids, -1),
+            local_indices[None, :].expand(cluster_ids.shape[0], -1),
+            local_indices.flip(-1)[None, :].expand(cluster_ids.shape[0], -1),
+            torch.full_like(cluster_ids, -1, dtype=torch.int32),
         )
     )
     plan_rows = torch.tensor([1, 0, 1], dtype=torch.int64, device=device)
     indexed = store.resolve_verification_cluster_blocks(
-        "layer", table_cluster_ids, table_page_ids, plan_rows
+        layer_name="layer",
+        selected_cluster_indices=table_cluster_indices,
+        plan_row_indices=plan_rows,
+        request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
+        request_slot_generations=torch.ones(1, dtype=torch.int64, device=device),
+        arena=arena,
+        max_pages_per_cluster=metadata.page_ids.shape[-1],
     )
-    if indexed.read_lease is not None:
-        indexed.read_lease.release()
+    indexed.read_lease.release()
 
     gathered = store.resolve_verification_cluster_blocks(
-        "layer",
-        table_cluster_ids.index_select(0, plan_rows),
-        table_page_ids.index_select(0, plan_rows),
+        layer_name="layer",
+        selected_cluster_indices=table_cluster_indices.index_select(0, plan_rows),
+        plan_row_indices=torch.arange(3, dtype=torch.int64, device=device),
+        request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
+        request_slot_generations=torch.ones(1, dtype=torch.int64, device=device),
+        arena=arena,
+        max_pages_per_cluster=metadata.page_ids.shape[-1],
     )
 
     torch.testing.assert_close(indexed.resident_page_ids, gathered.resident_page_ids)
-    torch.testing.assert_close(indexed.hit_cluster_mask, gathered.hit_cluster_mask)
-    torch.testing.assert_close(indexed.miss_cluster_mask, gathered.miss_cluster_mask)
+    torch.testing.assert_close(indexed.page_token_counts, gathered.page_token_counts)
+    torch.testing.assert_close(indexed.page_counts, gathered.page_counts)
     assert indexed.miss_admission is None
     assert gathered.miss_admission is None
-    if gathered.read_lease is not None:
-        gathered.read_lease.release()
+    gathered.read_lease.release()
     store.close()
 
 

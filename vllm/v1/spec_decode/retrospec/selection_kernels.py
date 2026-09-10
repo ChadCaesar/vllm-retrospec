@@ -7,7 +7,7 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _emit_ranked_exact_plan_kernel(
+def _emit_ranked_cluster_plan_kernel(
     cluster_ids,
     cluster_page_starts,
     cluster_page_counts,
@@ -19,12 +19,11 @@ def _emit_ranked_exact_plan_kernel(
     active_mask,
     ranked_indices,
     candidate_counts,
-    sparse_cluster_ids,
-    sparse_page_ids,
-    sparse_page_token_counts,
-    expanded_cluster_ids,
-    expanded_page_ids,
-    expanded_page_token_counts,
+    sparse_cluster_indices,
+    expanded_cluster_indices,
+    draft_cluster_ids,
+    draft_page_ids,
+    draft_page_token_counts,
     CLUSTER_CAPACITY: tl.constexpr,
     PAGE_CAPACITY: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
@@ -100,7 +99,12 @@ def _emit_ranked_exact_plan_kernel(
         sparse_output_valid = rank_idx < SPARSE_WIDTH
         sparse_cluster_offset = group_offset * SPARSE_WIDTH + rank_idx
         tl.store(
-            sparse_cluster_ids + sparse_cluster_offset,
+            sparse_cluster_indices + sparse_cluster_offset,
+            tl.where(sparse_valid, local_cluster_idx, -1),
+            mask=sparse_output_valid,
+        )
+        tl.store(
+            draft_cluster_ids + sparse_cluster_offset,
             tl.where(sparse_valid, cluster_id, -1),
             mask=sparse_output_valid,
         )
@@ -109,8 +113,8 @@ def _emit_ranked_exact_plan_kernel(
         expanded_output_valid = rank_idx < EXPANDED_WIDTH
         expanded_cluster_offset = group_offset * EXPANDED_WIDTH + rank_idx
         tl.store(
-            expanded_cluster_ids + expanded_cluster_offset,
-            tl.where(expanded_valid, cluster_id, -1),
+            expanded_cluster_indices + expanded_cluster_offset,
+            tl.where(expanded_valid, local_cluster_idx, -1),
             mask=expanded_output_valid,
         )
 
@@ -119,15 +123,14 @@ def _emit_ranked_exact_plan_kernel(
         source_page_offset = kv_head_idx * PAGE_CAPACITY + source_page_idx
 
         sparse_page_valid = sparse_valid & (page_idx < num_pages)
-        expanded_page_valid = expanded_valid & (page_idx < num_pages)
         page_id = tl.load(
             page_ids + source_page_offset,
-            mask=sparse_page_valid | expanded_page_valid,
+            mask=sparse_page_valid,
             other=-1,
         ).to(tl.int64)
         page_token_count = tl.load(
             page_token_counts + source_page_offset,
-            mask=sparse_page_valid | expanded_page_valid,
+            mask=sparse_page_valid,
             other=0,
         ).to(tl.int32)
 
@@ -137,31 +140,39 @@ def _emit_ranked_exact_plan_kernel(
                 group_offset * SPARSE_WIDTH + rank_idx
             ) * MAX_PAGES + page_idx
             tl.store(
-                sparse_page_ids + sparse_page_offset,
+                draft_page_ids + sparse_page_offset,
                 tl.where(sparse_page_valid, page_id, -1),
                 mask=sparse_output_valid,
             )
             tl.store(
-                sparse_page_token_counts + sparse_page_offset,
+                draft_page_token_counts + sparse_page_offset,
                 tl.where(sparse_page_valid, page_token_count, 0),
                 mask=sparse_output_valid,
             )
 
-        if EXPANDED_WIDTH > 0:
-            expanded_output_valid = rank_idx < EXPANDED_WIDTH
-            expanded_page_offset = (
-                group_offset * EXPANDED_WIDTH + rank_idx
-            ) * MAX_PAGES + page_idx
-            tl.store(
-                expanded_page_ids + expanded_page_offset,
-                tl.where(expanded_page_valid, page_id, -1),
-                mask=expanded_output_valid,
-            )
-            tl.store(
-                expanded_page_token_counts + expanded_page_offset,
-                tl.where(expanded_page_valid, page_token_count, 0),
-                mask=expanded_output_valid,
-            )
+
+@triton.jit
+def _capture_request_descriptors_kernel(
+    request_slot_ids,
+    arena_generations,
+    output_slot_ids,
+    output_generations,
+    num_requests,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = offsets < num_requests
+    slots = tl.load(request_slot_ids + offsets, mask=valid, other=-1)
+    valid_slot = valid & (slots >= 0)
+    generations = tl.load(
+        arena_generations + tl.maximum(slots, 0), mask=valid_slot, other=-1
+    )
+    tl.store(output_slot_ids + offsets, slots, mask=valid)
+    tl.store(
+        output_generations + offsets,
+        tl.where(valid_slot, generations, -1),
+        mask=valid,
+    )
 
 
 @triton.jit
@@ -451,6 +462,44 @@ def _ranked_attention_mass_kernel(
     tl.store(expanded_attn + batch_idx, tl.where(request_valid, expanded_value, 1.0))
 
 
+def capture_request_descriptors(
+    request_slot_ids: torch.Tensor,
+    arena_generations: torch.Tensor,
+    output_slot_ids: torch.Tensor,
+    output_generations: torch.Tensor,
+) -> None:
+    if request_slot_ids.device.type != "cuda":
+        raise ValueError("Request descriptor capture requires CUDA")
+    if request_slot_ids.ndim != 1:
+        raise ValueError("Request slots must be one-dimensional")
+    if output_slot_ids.shape != request_slot_ids.shape:
+        raise ValueError("Captured request slots have the wrong shape")
+    if output_generations.shape != request_slot_ids.shape:
+        raise ValueError("Captured request generations have the wrong shape")
+    tensors = (
+        request_slot_ids,
+        arena_generations,
+        output_slot_ids,
+        output_generations,
+    )
+    if any(tensor.device != request_slot_ids.device for tensor in tensors):
+        raise ValueError("Request descriptor tensors must use one CUDA device")
+    if any(tensor.dtype not in (torch.int32, torch.int64) for tensor in tensors):
+        raise ValueError("Request descriptors must use integral tensors")
+
+    block_size = 256
+    _capture_request_descriptors_kernel[
+        (triton.cdiv(request_slot_ids.numel(), block_size),)
+    ](
+        request_slot_ids,
+        arena_generations,
+        output_slot_ids,
+        output_generations,
+        request_slot_ids.numel(),
+        BLOCK_SIZE=block_size,
+    )
+
+
 def emit_ranked_selection_plan(
     *,
     ranked_values: torch.Tensor,
@@ -470,12 +519,11 @@ def emit_ranked_selection_plan(
     active_mask: torch.Tensor,
     retrieval_ratio: float,
     estimation_ratio: float,
-    sparse_exact_cluster_ids: torch.Tensor,
-    sparse_exact_page_ids: torch.Tensor,
-    sparse_exact_page_token_counts: torch.Tensor,
-    expanded_exact_cluster_ids: torch.Tensor,
-    expanded_exact_page_ids: torch.Tensor,
-    expanded_exact_page_token_counts: torch.Tensor,
+    sparse_exact_cluster_indices: torch.Tensor,
+    expanded_exact_cluster_indices: torch.Tensor,
+    draft_exact_cluster_ids: torch.Tensor,
+    draft_exact_page_ids: torch.Tensor,
+    draft_exact_page_token_counts: torch.Tensor,
     draft_estimation_keys: torch.Tensor,
     draft_estimation_values: torch.Tensor,
     draft_estimation_token_counts: torch.Tensor,
@@ -503,15 +551,19 @@ def emit_ranked_selection_plan(
     if candidate_counts.dtype != torch.int32:
         raise ValueError("Candidate counts must use int32")
 
-    sparse_width = sparse_exact_cluster_ids.shape[2]
-    expanded_width = expanded_exact_cluster_ids.shape[2]
+    sparse_width = sparse_exact_cluster_indices.shape[2]
+    expanded_width = expanded_exact_cluster_indices.shape[2]
     estimation_width = expanded_estimation_token_counts.shape[2]
     draft_width = draft_estimation_token_counts.shape[2]
-    max_pages = sparse_exact_page_ids.shape[3]
+    max_pages = draft_exact_page_ids.shape[3]
     if draft_width != estimation_width + sparse_width:
         raise ValueError("Draft estimation workspace has an invalid width")
-    if expanded_exact_page_ids.shape[3] != max_pages:
-        raise ValueError("Sparse and expanded plans use different page widths")
+    if draft_exact_cluster_ids.shape != sparse_exact_cluster_indices.shape:
+        raise ValueError("DRAFT cluster workspace has the wrong shape")
+    if draft_exact_page_token_counts.shape != draft_exact_page_ids.shape:
+        raise ValueError("DRAFT page workspace has inconsistent shapes")
+    if draft_exact_page_ids.shape[:3] != sparse_exact_cluster_indices.shape:
+        raise ValueError("DRAFT page workspace does not match sparse clusters")
     if ranking_width < max(expanded_width, sparse_width + estimation_width):
         raise ValueError("Ranked workspace is too narrow for the selection plan")
 
@@ -531,12 +583,11 @@ def emit_ranked_selection_plan(
         page_offsets,
         request_slot_ids,
         active_mask,
-        sparse_exact_cluster_ids,
-        sparse_exact_page_ids,
-        sparse_exact_page_token_counts,
-        expanded_exact_cluster_ids,
-        expanded_exact_page_ids,
-        expanded_exact_page_token_counts,
+        sparse_exact_cluster_indices,
+        expanded_exact_cluster_indices,
+        draft_exact_cluster_ids,
+        draft_exact_page_ids,
+        draft_exact_page_token_counts,
         draft_estimation_keys,
         draft_estimation_values,
         draft_estimation_token_counts,
@@ -553,7 +604,7 @@ def emit_ranked_selection_plan(
 
     exact_width = max(sparse_width, expanded_width)
     if exact_width > 0:
-        _emit_ranked_exact_plan_kernel[(batch_size, num_kv_heads, exact_width)](
+        _emit_ranked_cluster_plan_kernel[(batch_size, num_kv_heads, exact_width)](
             cluster_ids,
             cluster_page_starts,
             cluster_page_counts,
@@ -565,12 +616,11 @@ def emit_ranked_selection_plan(
             active_mask,
             ranked_indices,
             candidate_counts,
-            sparse_exact_cluster_ids,
-            sparse_exact_page_ids,
-            sparse_exact_page_token_counts,
-            expanded_exact_cluster_ids,
-            expanded_exact_page_ids,
-            expanded_exact_page_token_counts,
+            sparse_exact_cluster_indices,
+            expanded_exact_cluster_indices,
+            draft_exact_cluster_ids,
+            draft_exact_page_ids,
+            draft_exact_page_token_counts,
             CLUSTER_CAPACITY=cluster_ids.shape[1],
             PAGE_CAPACITY=page_ids.shape[1],
             NUM_KV_HEADS=num_kv_heads,
