@@ -152,23 +152,27 @@ class _PinnedStagingSlot:
 
 @dataclass(frozen=True)
 class RetroSpecResidentPrefetchInput:
-    """One layer's GPU-produced resident access records."""
+    """One layer's GPU-compacted resident miss commands."""
 
     layer_name: str
-    cluster_ids: torch.Tensor
-    access_kinds: torch.Tensor
+    miss_cluster_ids: torch.Tensor
+    miss_positions: torch.Tensor
+    miss_count: torch.Tensor
+    num_groups: int
+    num_ranks: int
 
 
 @dataclass
 class _PinnedSelectionSlot:
-    """Reusable pinned ring slot for one asynchronous resident access wave."""
+    """Reusable pinned ring slot for compact resident miss commands."""
 
     pinned_memory: RetroSpecPinnedMemoryManager
     cluster_id_storage: torch.Tensor | None = None
-    access_kind_storage: torch.Tensor | None = None
+    position_storage: torch.Tensor | None = None
+    count_storage: torch.Tensor | None = None
     in_use: bool = False
 
-    def reserve_capacity(self, required_numel: int) -> None:
+    def reserve_capacity(self, required_numel: int, required_records: int) -> None:
         if required_numel <= 0:
             return
         if (
@@ -181,60 +185,54 @@ class _PinnedSelectionSlot:
                 torch.int64,
                 "resident-prefetch-cluster-ids",
             )
-            self.access_kind_storage = self.pinned_memory.replace(
-                self.access_kind_storage,
+        if (
+            self.position_storage is None
+            or self.position_storage.numel() < required_numel
+        ):
+            self.position_storage = self.pinned_memory.replace(
+                self.position_storage,
                 (required_numel,),
-                torch.uint8,
-                "resident-prefetch-access-kinds",
+                torch.int64,
+                "resident-prefetch-miss-positions",
             )
-
-    def reserve(
-        self,
-        cluster_ids: torch.Tensor,
-        access_kinds: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.in_use:
-            raise RuntimeError("Pinned selection slot must be acquired before use")
-        if access_kinds.shape != cluster_ids.shape:
-            raise ValueError("Resident access kinds must match cluster IDs")
-
-        required_numel = cluster_ids.numel()
-        self.reserve_capacity(required_numel)
-
-        if self.access_kind_storage is None:
-            raise RuntimeError("Resident access-kind storage is unavailable")
-        return (
-            self.cluster_id_storage[:required_numel].view(cluster_ids.shape),
-            self.access_kind_storage[:required_numel].view(access_kinds.shape),
-        )
+        if self.count_storage is None or self.count_storage.numel() < required_records:
+            self.count_storage = self.pinned_memory.replace(
+                self.count_storage,
+                (required_records,),
+                torch.int32,
+                "resident-prefetch-miss-counts",
+            )
 
     def reserve_wave(
         self,
         records: Sequence[RetroSpecResidentPrefetchInput],
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
         if not self.in_use:
             raise RuntimeError("Pinned selection slot must be acquired before use")
 
-        required_numel = sum(record.cluster_ids.numel() for record in records)
-        self.reserve_capacity(required_numel)
-        if self.cluster_id_storage is None or self.access_kind_storage is None:
-            raise RuntimeError("Resident access storage is unavailable")
+        required_numel = sum(record.miss_cluster_ids.numel() for record in records)
+        self.reserve_capacity(required_numel, len(records))
+        if (
+            self.cluster_id_storage is None
+            or self.position_storage is None
+            or self.count_storage is None
+        ):
+            raise RuntimeError("Resident miss-command storage is unavailable")
 
-        views: list[tuple[torch.Tensor, torch.Tensor]] = []
+        views: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         offset = 0
-        for record in records:
-            cluster_ids = record.cluster_ids
-            access_kinds = record.access_kinds
-            if access_kinds.shape != cluster_ids.shape:
-                raise ValueError("Resident access kinds must match cluster IDs")
+        for record_index, record in enumerate(records):
+            cluster_ids = record.miss_cluster_ids
+            positions = record.miss_positions
+            if positions.shape != cluster_ids.shape:
+                raise ValueError("Resident miss positions must match cluster IDs")
 
             next_offset = offset + cluster_ids.numel()
             views.append(
                 (
                     self.cluster_id_storage[offset:next_offset].view(cluster_ids.shape),
-                    self.access_kind_storage[offset:next_offset].view(
-                        access_kinds.shape
-                    ),
+                    self.position_storage[offset:next_offset].view(positions.shape),
+                    self.count_storage[record_index : record_index + 1],
                 )
             )
             offset = next_offset
@@ -243,9 +241,11 @@ class _PinnedSelectionSlot:
 
     def release_storage(self) -> None:
         self.pinned_memory.release(self.cluster_id_storage)
-        self.pinned_memory.release(self.access_kind_storage)
+        self.pinned_memory.release(self.position_storage)
+        self.pinned_memory.release(self.count_storage)
         self.cluster_id_storage = None
-        self.access_kind_storage = None
+        self.position_storage = None
+        self.count_storage = None
 
 
 @dataclass
@@ -333,11 +333,14 @@ class _VerificationResolveGPUArena:
 
 @dataclass(frozen=True)
 class _StagedResidentPrefetchRecord:
-    """One layer's resident access records staged in pinned CPU memory."""
+    """One layer's resident miss commands staged in pinned CPU memory."""
 
     layer_name: str
-    cluster_ids_cpu: torch.Tensor
-    access_kinds_cpu: torch.Tensor
+    miss_cluster_ids_cpu: torch.Tensor
+    miss_positions_cpu: torch.Tensor
+    miss_count_cpu: torch.Tensor
+    num_groups: int
+    num_ranks: int
 
 
 @dataclass(frozen=True)
@@ -3379,7 +3382,9 @@ class RetroSpecClusterPageStore:
             )
             for slot in slots:
                 if not slot.in_use:
-                    slot.reserve_capacity(wave_capacity)
+                    slot.reserve_capacity(
+                        wave_capacity, self._resident_prefetch_wave_max_records
+                    )
 
     def configure_resident_prefetch_wave(self, max_records: int) -> None:
         """Configure the maximum number of layer records in one draft wave."""
@@ -3397,7 +3402,9 @@ class RetroSpecClusterPageStore:
             for slots in self._resident_prefetch_slots.values():
                 for slot in slots:
                     if not slot.in_use:
-                        slot.reserve_capacity(wave_capacity)
+                        slot.reserve_capacity(
+                            wave_capacity, self._resident_prefetch_wave_max_records
+                        )
 
     def _acquire_resident_prefetch_slot(
         self,
@@ -3419,7 +3426,9 @@ class RetroSpecClusterPageStore:
             )
             for slot in slots:
                 if not slot.in_use:
-                    slot.reserve_capacity(wave_capacity)
+                    slot.reserve_capacity(
+                        wave_capacity, self._resident_prefetch_wave_max_records
+                    )
                     slot.in_use = True
                     return slot
 
@@ -3435,62 +3444,40 @@ class RetroSpecClusterPageStore:
             slot.in_use = False
             slot.reserve_capacity(
                 self._resident_access_record_capacity
-                * self._resident_prefetch_wave_max_records
+                * self._resident_prefetch_wave_max_records,
+                self._resident_prefetch_wave_max_records,
             )
 
-    def _compact_resident_prefetch_record(
-        self,
+    @staticmethod
+    @torch.inference_mode()
+    def _ordered_resident_prefetch_misses(
         record: _StagedResidentPrefetchRecord,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Deduplicate handles while preserving retrieval-rank priority."""
-        flat_cluster_ids = record.cluster_ids_cpu.reshape(-1)
-        flat_access_kinds = record.access_kinds_cpu.reshape(-1)
-        if record.cluster_ids_cpu.ndim <= 1:
-            priority_positions = range(flat_cluster_ids.numel())
-        else:
-            num_ranks = record.cluster_ids_cpu.shape[-1]
-            num_groups = flat_cluster_ids.numel() // num_ranks
-            priority_positions = (
-                group_index * num_ranks + rank
-                for rank in range(num_ranks)
-                for group_index in range(num_groups)
-            )
+    ) -> tuple[torch.Tensor, int]:
+        miss_count = int(record.miss_count_cpu.item())
+        if miss_count < 0:
+            raise RuntimeError("Resident prefetch miss count must be non-negative")
+        if miss_count == 0:
+            return torch.empty(0, dtype=torch.int64), 0
+        if miss_count > record.miss_cluster_ids_cpu.numel():
+            raise RuntimeError("Resident prefetch miss count exceeds ring capacity")
 
-        cluster_ids = flat_cluster_ids.tolist()
-        access_kinds = flat_access_kinds.tolist()
-        unique_cluster_ids: list[int] = []
-        unique_access_kinds: list[int] = []
-        positions: dict[int, int] = {}
-        candidate_count = 0
+        cluster_ids = record.miss_cluster_ids_cpu[:miss_count]
+        positions = record.miss_positions_cpu[:miss_count]
+        if torch.any(cluster_ids < 0).item():
+            raise RuntimeError("Resident miss commands must contain valid handles")
+        max_position = record.num_groups * record.num_ranks
+        if torch.any((positions < 0) | (positions >= max_position)).item():
+            raise RuntimeError("Resident miss-command position is outside its layout")
+        group_indices = torch.div(positions, record.num_ranks, rounding_mode="floor")
+        ranks = positions % record.num_ranks
+        priorities = ranks * record.num_groups + group_indices
+        order = torch.argsort(priorities, stable=True)
+        cluster_ids = cluster_ids.index_select(0, order)
 
-        for position_index in priority_positions:
-            cluster_id = cluster_ids[position_index]
-            access_kind = access_kinds[position_index]
-            if cluster_id < 0 or access_kind == 0:
-                continue
-            candidate_count += 1
-            position = positions.get(cluster_id)
-            if position is None:
-                positions[cluster_id] = len(unique_cluster_ids)
-                unique_cluster_ids.append(cluster_id)
-                unique_access_kinds.append(access_kind)
-            elif access_kind == 2:
-                unique_access_kinds[position] = 2
-
-        if self.performance_stats is not None:
-            unique_count = len(unique_cluster_ids)
-            self.performance_stats.add_counter(
-                "prefetch_candidate_clusters", candidate_count
-            )
-            self.performance_stats.add_counter("prefetch_unique_clusters", unique_count)
-            self.performance_stats.add_counter(
-                "prefetch_duplicate_clusters", candidate_count - unique_count
-            )
-
-        return (
-            torch.tensor(unique_cluster_ids, dtype=torch.int64),
-            torch.tensor(unique_access_kinds, dtype=torch.uint8),
+        ordered_cluster_ids = list(
+            dict.fromkeys(int(cluster_id) for cluster_id in cluster_ids.tolist())
         )
+        return torch.tensor(ordered_cluster_ids, dtype=torch.int64), miss_count
 
     @torch.inference_mode()
     def _process_resident_prefetch_record(
@@ -3498,33 +3485,26 @@ class RetroSpecClusterPageStore:
         record: _StagedResidentPrefetchRecord,
         execution_stream: torch.cuda.Stream,
     ) -> None:
-        cluster_ids_cpu, access_kinds_cpu = self._compact_resident_prefetch_record(
-            record
-        )
-        hit_cluster_ids = cluster_ids_cpu.masked_fill(access_kinds_cpu != 1, -1)
-        miss_cluster_ids = cluster_ids_cpu.masked_fill(access_kinds_cpu != 2, -1)
+        cluster_ids_cpu, miss_count = self._ordered_resident_prefetch_misses(record)
+        if cluster_ids_cpu.numel() == 0:
+            return
 
         if self.performance_stats is not None:
             self.performance_stats.add_counter(
-                "resident_cluster_hits", int((access_kinds_cpu == 1).sum().item())
+                "prefetch_miss_commands", cluster_ids_cpu.numel()
             )
             self.performance_stats.add_counter(
-                "resident_cluster_misses", int((access_kinds_cpu == 2).sum().item())
+                "prefetch_duplicate_misses", miss_count - cluster_ids_cpu.numel()
             )
 
         with self._resident_state_lock:
             pool, resident_cache = self._get_or_create_resident_cache(record.layer_name)
-            resident_cache.touch_cpu(hit_cluster_ids)
-
-            if not torch.any(miss_cluster_ids >= 0).item():
-                return
-
             metadata = self._materialize_cluster_block_metadata_cpu(
-                record.layer_name, miss_cluster_ids
+                record.layer_name, cluster_ids_cpu
             )
             selected_cluster_ids, selected_page_ids = (
                 self._select_resident_staging_prefix(
-                    pool, miss_cluster_ids, metadata.page_ids
+                    pool, cluster_ids_cpu, metadata.page_ids
                 )
             )
             cluster_groups = self._get_cluster_groups(
@@ -3659,14 +3639,46 @@ class RetroSpecClusterPageStore:
         access_kinds: torch.Tensor,
     ) -> bool:
         """Compatibility wrapper for a one-layer resident-prefetch wave."""
+        if self._closed:
+            raise RuntimeError("RetroSpec cluster page store is closed")
         if cluster_ids.numel() == 0:
             return False
+        if cluster_ids.ndim not in (1, 2, 3) or access_kinds.shape != cluster_ids.shape:
+            raise ValueError("Resident prefetch inputs must have equal 1D--3D shapes")
+
+        if cluster_ids.ndim == 1:
+            compact_cluster_ids = cluster_ids.view(1, 1, -1)
+            compact_access_kinds = access_kinds.view(1, 1, -1)
+        elif cluster_ids.ndim == 2:
+            compact_cluster_ids = cluster_ids.unsqueeze(0)
+            compact_access_kinds = access_kinds.unsqueeze(0)
+        else:
+            compact_cluster_ids = cluster_ids
+            compact_access_kinds = access_kinds
+
+        miss_cluster_ids = torch.empty(
+            cluster_ids.numel(), dtype=torch.int64, device=cluster_ids.device
+        )
+        miss_positions = torch.empty_like(miss_cluster_ids)
+        miss_count = torch.empty(1, dtype=torch.int32, device=cluster_ids.device)
+        compact_resident_misses(
+            cluster_handles=compact_cluster_ids,
+            miss_mask=compact_access_kinds == 2,
+            output_handles=miss_cluster_ids,
+            output_positions=miss_positions,
+            output_count=miss_count,
+        )
         return self.prefetch_resident_cluster_wave(
             (
                 RetroSpecResidentPrefetchInput(
                     layer_name=layer_name,
-                    cluster_ids=cluster_ids,
-                    access_kinds=access_kinds,
+                    miss_cluster_ids=miss_cluster_ids,
+                    miss_positions=miss_positions,
+                    miss_count=miss_count,
+                    num_groups=(
+                        compact_cluster_ids.shape[0] * compact_cluster_ids.shape[1]
+                    ),
+                    num_ranks=compact_cluster_ids.shape[2],
                 ),
             )
         )
@@ -3692,10 +3704,11 @@ class RetroSpecClusterPageStore:
         if not self.pin_memory:
             return False
 
-        device = records[0].cluster_ids.device
+        device = records[0].miss_cluster_ids.device
         for record in records:
-            cluster_ids = record.cluster_ids
-            access_kinds = record.access_kinds
+            cluster_ids = record.miss_cluster_ids
+            positions = record.miss_positions
+            count = record.miss_count
             if cluster_ids.numel() == 0:
                 raise ValueError("Resident prefetch records must not be empty")
             if cluster_ids.device.type != "cuda":
@@ -3704,12 +3717,18 @@ class RetroSpecClusterPageStore:
                 )
             if cluster_ids.dtype not in (torch.int32, torch.int64):
                 raise ValueError("Cluster IDs must use an integral dtype")
-            if access_kinds.shape != cluster_ids.shape:
-                raise ValueError("Resident access kinds must match cluster IDs")
-            if access_kinds.dtype != torch.uint8:
-                raise ValueError("Resident access kinds must use uint8")
-            if access_kinds.device != cluster_ids.device:
-                raise ValueError("Resident access records must use one device")
+            if positions.shape != cluster_ids.shape:
+                raise ValueError("Resident miss positions must match cluster IDs")
+            if positions.dtype not in (torch.int32, torch.int64):
+                raise ValueError("Resident miss positions must be integral")
+            if positions.device != cluster_ids.device:
+                raise ValueError("Resident miss commands must use one device")
+            if count.shape != (1,) or count.dtype not in (torch.int32, torch.int64):
+                raise ValueError("Resident miss count must be one integral value")
+            if count.device != cluster_ids.device:
+                raise ValueError("Resident miss count must use the command device")
+            if record.num_groups <= 0 or record.num_ranks <= 0:
+                raise ValueError("Resident prefetch layout must be positive")
             if cluster_ids.device != device:
                 raise ValueError("Resident prefetch wave must use one CUDA device")
 
@@ -3728,31 +3747,39 @@ class RetroSpecClusterPageStore:
             stream.wait_stream(current_stream)
 
             with torch.cuda.stream(stream):
-                for record, (cluster_ids_cpu, access_kinds_cpu) in zip(
+                for record, (cluster_ids_cpu, positions_cpu, count_cpu) in zip(
                     records, cpu_views
                 ):
-                    cluster_ids_cpu.copy_(record.cluster_ids, non_blocking=True)
-                    access_kinds_cpu.copy_(record.access_kinds, non_blocking=True)
+                    cluster_ids_cpu.copy_(record.miss_cluster_ids, non_blocking=True)
+                    positions_cpu.copy_(record.miss_positions, non_blocking=True)
+                    count_cpu.copy_(record.miss_count, non_blocking=True)
                 metadata_ready_event = torch.cuda.Event()
                 metadata_ready_event.record(stream)
 
             for record in records:
-                record.cluster_ids.record_stream(stream)
-                record.access_kinds.record_stream(stream)
+                record.miss_cluster_ids.record_stream(stream)
+                record.miss_positions.record_stream(stream)
+                record.miss_count.record_stream(stream)
 
             staged = _StagedResidentPrefetchWave(
                 records=tuple(
                     _StagedResidentPrefetchRecord(
                         layer_name=record.layer_name,
-                        cluster_ids_cpu=cluster_ids_cpu,
-                        access_kinds_cpu=access_kinds_cpu,
+                        miss_cluster_ids_cpu=cluster_ids_cpu,
+                        miss_positions_cpu=positions_cpu,
+                        miss_count_cpu=count_cpu,
+                        num_groups=record.num_groups,
+                        num_ranks=record.num_ranks,
                     )
-                    for record, (cluster_ids_cpu, access_kinds_cpu) in zip(
+                    for record, (cluster_ids_cpu, positions_cpu, count_cpu) in zip(
                         records, cpu_views
                     )
                 ),
                 metadata_ready_event=metadata_ready_event,
-                execution_stream=current_stream,
+                # Keep background epoch refresh and handle-table mutation off
+                # the model execution stream. Publication versions make
+                # concurrent draft lookups observe either the old or new entry.
+                execution_stream=stream,
                 slot=slot,
             )
             future = self._resident_prefetch_executor.submit(
@@ -3774,8 +3801,8 @@ class RetroSpecClusterPageStore:
                     "prefetch_wave_records", len(records)
                 )
                 self.performance_stats.add_counter(
-                    "prefetch_input_clusters",
-                    sum(record.cluster_ids.numel() for record in records),
+                    "prefetch_command_capacity",
+                    sum(record.miss_cluster_ids.numel() for record in records),
                 )
             return True
         except BaseException:
@@ -4126,6 +4153,13 @@ class RetroSpecClusterPageStore:
             hit_gate_ready_mask=hit_gate_ready_mask,
             access_kinds=access_kinds,
         )
+        if self.performance_stats is not None:
+            self.performance_stats.add_gpu_counter(
+                "resident_cluster_hits", access.hit_cluster_mask
+            )
+            self.performance_stats.add_gpu_counter(
+                "resident_cluster_misses", access.miss_cluster_mask
+            )
         return RetroSpecResolvedClusterPages(
             resident_page_ids=access.cache_page_ids,
             staging_page_ids=torch.full_like(logical_page_ids, -1),

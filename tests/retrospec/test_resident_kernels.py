@@ -28,6 +28,7 @@ def _make_table(
         torch.zeros(capacity, dtype=torch.int32, device=device),
         torch.full((capacity, max_pages), -1, dtype=torch.int32, device=device),
         torch.zeros(capacity, dtype=torch.bool, device=device),
+        torch.zeros(capacity, dtype=torch.int64, device=device),
     )
 
 
@@ -66,6 +67,8 @@ def _lookup(
         table_page_counts=table[2],
         table_page_slots=table[3],
         table_hit_gate_ready=table[4],
+        table_last_access_epochs=table[5],
+        access_epoch=7,
         output_page_slots=output_page_slots,
         output_hit_mask=output_hit_mask,
         output_miss_mask=output_miss_mask,
@@ -116,6 +119,7 @@ def test_resident_handle_lookup_returns_slots_and_gpu_access_records():
     assert outputs[2].cpu().tolist() == [[[False, False]], [[False, False]]]
     assert outputs[3].cpu().tolist() == [[[True, False]], [[False, False]]]
     assert outputs[4].cpu().tolist() == [[[1, 1]], [[0, 0]]]
+    assert table[5].cpu().tolist()[3:5] == [7, 7]
 
 
 def test_resident_handle_lookup_reports_tombstone_and_unknown_handle_as_miss():

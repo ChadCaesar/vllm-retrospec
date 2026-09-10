@@ -305,6 +305,7 @@ def store_token_plan(
             num_kv_heads=num_kv_heads,
             primary_exact_width=primary_width,
             sparse_retrieval_width=sparse_width,
+            prefetch_width=sparse_width,
             expanded_retrieval_width=expanded_width,
             sparse_estimation_width=estimation_width,
             max_pages_per_cluster=max_pages_per_cluster,
@@ -1598,8 +1599,11 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
     )
     prefetch_record = RetroSpecResidentPrefetchInput(
         layer_name="layer",
-        cluster_ids=torch.zeros(2, 1, 1, dtype=torch.int64),
-        access_kinds=torch.ones(2, 1, 1, dtype=torch.uint8),
+        miss_cluster_ids=torch.zeros(2, dtype=torch.int64),
+        miss_positions=torch.arange(2, dtype=torch.int64),
+        miss_count=torch.tensor([2], dtype=torch.int32),
+        num_groups=2,
+        num_ranks=1,
     )
     controller.index.build_sparse_verification_prefetch = Mock(
         side_effect=lambda **kwargs: call_order.append("build") or prefetch_record
@@ -1662,8 +1666,11 @@ def test_draft_end_step_submits_one_cross_layer_prefetch_wave():
     records = tuple(
         RetroSpecResidentPrefetchInput(
             layer_name=layer_name,
-            cluster_ids=torch.tensor([[[index]]], dtype=torch.int64),
-            access_kinds=torch.tensor([[[2]]], dtype=torch.uint8),
+            miss_cluster_ids=torch.tensor([index], dtype=torch.int64),
+            miss_positions=torch.zeros(1, dtype=torch.int64),
+            miss_count=torch.ones(1, dtype=torch.int32),
+            num_groups=1,
+            num_ranks=1,
         )
         for index, layer_name in enumerate(("first", "second"))
     )

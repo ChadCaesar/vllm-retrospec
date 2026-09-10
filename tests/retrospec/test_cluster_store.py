@@ -1161,13 +1161,12 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
     assert store.prefetch_resident_clusters("layer", cluster_ids, access_kinds)
     store.wait_for_resident_prefetches(("layer",))
     assert stats._cpu_counters["prefetch_submitted"] == 1
-    assert stats._cpu_counters["prefetch_input_clusters"] == cluster_ids.numel()
+    assert stats._cpu_counters["prefetch_command_capacity"] == cluster_ids.numel()
     assert stats._cpu_counters["prefetch_worker_completed"] == 1
     assert stats._cpu_counters["prefetch_reaped_tasks"] == 1
     assert stats._cpu_counters["prefetch_waited_tasks"] == 1
-    assert stats._cpu_counters["prefetch_candidate_clusters"] == 4
-    assert stats._cpu_counters["resident_cluster_hits"] == 0
-    assert stats._cpu_counters["resident_cluster_misses"] == 4
+    assert stats._cpu_counters["prefetch_miss_commands"] == 4
+    assert stats._cpu_counters["prefetch_duplicate_misses"] == 0
     assert stats._cpu_times["prefetch_metadata_wait"][1] == 1
     assert stats._cpu_times["prefetch_worker_wall"][1] == 1
     assert stats._cpu_times["prefetch_wait_wall"][1] == 1
@@ -1206,14 +1205,17 @@ def test_resident_prefetch_compaction_preserves_rank_priority_and_miss():
     store = RetroSpecClusterPageStore(page_size=2)
     record = cluster_store_module._StagedResidentPrefetchRecord(
         layer_name="layer",
-        cluster_ids_cpu=torch.tensor([[[10, 11, 12], [20, 10, -1]]], dtype=torch.int64),
-        access_kinds_cpu=torch.tensor([[[1, 2, 1], [1, 2, 2]]], dtype=torch.uint8),
+        miss_cluster_ids_cpu=torch.tensor([10, 11, 10, -1], dtype=torch.int64),
+        miss_positions_cpu=torch.tensor([4, 1, 4, 0], dtype=torch.int64),
+        miss_count_cpu=torch.tensor([3], dtype=torch.int32),
+        num_groups=2,
+        num_ranks=3,
     )
 
-    cluster_ids, access_kinds = store._compact_resident_prefetch_record(record)
+    cluster_ids, miss_count = store._ordered_resident_prefetch_misses(record)
 
-    assert cluster_ids.tolist() == [10, 20, 11, 12]
-    assert access_kinds.tolist() == [2, 1, 2, 1]
+    assert cluster_ids.tolist() == [11, 10]
+    assert miss_count == 3
     store.close()
 
 
@@ -1255,8 +1257,15 @@ def test_resident_prefetch_wave_batches_layers_and_waits_once():
         records.append(
             RetroSpecResidentPrefetchInput(
                 layer_name=layer_name,
-                cluster_ids=cluster_ids,
-                access_kinds=torch.full_like(cluster_ids, 2, dtype=torch.uint8),
+                miss_cluster_ids=cluster_ids.reshape(-1),
+                miss_positions=torch.arange(
+                    cluster_ids.numel(), dtype=torch.int64, device=device
+                ),
+                miss_count=torch.tensor(
+                    [cluster_ids.numel()], dtype=torch.int32, device=device
+                ),
+                num_groups=cluster_ids.shape[0],
+                num_ranks=cluster_ids.shape[1],
             )
         )
     stats._cpu_counters.clear()

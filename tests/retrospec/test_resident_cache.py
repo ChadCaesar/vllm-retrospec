@@ -1134,3 +1134,69 @@ def test_gpu_handle_table_tracks_resident_admission_and_invalidation():
     invalidated = lookup_gpu()
     assert invalidated.miss_cluster_mask.item()
     assert invalidated.cache_page_ids.cpu().tolist() == [[[[-1, -1]]]]
+
+
+def test_gpu_hit_epochs_refresh_group_lru_before_eviction():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=2, group_targets={group: 2})
+    backing_keys, backing_values = make_backing_pages(num_pages=3)
+    all_cluster_ids = torch.tensor([10, 11, 12], dtype=torch.int64)
+    all_page_ids = torch.tensor([[0], [1], [2]], dtype=torch.int64)
+    cluster_groups = {cluster_id: group for cluster_id in (10, 11, 12)}
+
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=all_cluster_ids[:2],
+        page_ids=all_page_ids[:2],
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+        allocated_page_ids={0, 1, 2},
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    cache.synchronize_pending_copies()
+
+    def lookup_gpu(cluster_ids: torch.Tensor, page_ids: torch.Tensor) -> None:
+        cluster_ids = cluster_ids.view(1, 1, -1).cuda()
+        page_ids = page_ids.view(1, 1, -1, 1).cuda()
+        access = cache.lookup_gpu(
+            cluster_ids=cluster_ids,
+            page_ids=page_ids,
+            active_mask=torch.ones(1, dtype=torch.bool, device="cuda"),
+            cache_page_ids=torch.empty_like(page_ids),
+            hit_cluster_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+            miss_cluster_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+            hit_gate_ready_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+            access_kinds=torch.empty_like(cluster_ids, dtype=torch.uint8),
+        )
+        assert access.read_lease is not None
+        access.read_lease.release()
+
+    # The first lookup creates the handle table. The second one makes cluster
+    # 11 newer only on the GPU; the CPU OrderedDict remains in admission order.
+    lookup_gpu(all_cluster_ids[:2], all_page_ids[:2])
+    lookup_gpu(all_cluster_ids[1:2], all_page_ids[1:2])
+    torch.cuda.synchronize()
+    assert list(cache._group_states[group].lru) == [11, 10]
+
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=all_cluster_ids[2:],
+        page_ids=all_page_ids[2:],
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+        allocated_page_ids={0, 1, 2},
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+
+    access = RetroSpecResidentClusterCache.lookup(
+        cache,
+        cluster_ids=all_cluster_ids,
+        page_ids=all_page_ids,
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+        allocated_page_ids={0, 1, 2},
+        touch=False,
+    )
+    assert access.hit_cluster_mask.tolist() == [False, True, True]

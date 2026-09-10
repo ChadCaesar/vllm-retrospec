@@ -117,14 +117,18 @@ def test_segmented_index_configures_resident_cache_ratio(
     assert index.cluster_store.cache_ratio == pytest.approx(expected_cache_ratio)
 
 
-def test_sparse_verification_prefetch_masks_inactive_draft_rows():
+def test_sparse_verification_prefetch_forwards_compact_gpu_misses():
     index = make_index(cache_ratio=0.5, pin_memory=True)
-    cluster_ids = torch.tensor([[[0, 1]], [[2, 3]]], dtype=torch.int64)
-    access_kinds = torch.ones_like(cluster_ids, dtype=torch.uint8)
+    cluster_ids = torch.tensor([0, 1, -1, -1], dtype=torch.int64)
+    positions = torch.tensor([0, 1, -1, -1], dtype=torch.int64)
+    count = torch.tensor([2], dtype=torch.int32)
     selection = Mock(
         plan=Mock(layer_name="layer"),
-        prefetch_cluster_ids=cluster_ids,
-        prefetch_access_kinds=access_kinds,
+        prefetch_miss_cluster_ids=cluster_ids,
+        prefetch_miss_positions=positions,
+        prefetch_miss_count=count,
+        prefetch_num_groups=2,
+        prefetch_num_ranks=2,
     )
     index.cluster_store.prefetch_resident_cluster_wave = Mock(return_value=True)
 
@@ -136,16 +140,22 @@ def test_sparse_verification_prefetch_masks_inactive_draft_rows():
     records = index.cluster_store.prefetch_resident_cluster_wave.call_args.args[0]
     assert len(records) == 1
     assert records[0].layer_name == "layer"
-    assert records[0].cluster_ids.tolist() == [[[0, 1]], [[2, 3]]]
-    assert records[0].access_kinds.tolist() == [[[1, 1]], [[0, 0]]]
+    assert records[0].miss_cluster_ids is cluster_ids
+    assert records[0].miss_positions is positions
+    assert records[0].miss_count is count
+    assert records[0].num_groups == 2
+    assert records[0].num_ranks == 2
 
 
 def test_sparse_verification_prefetch_skips_empty_access_record():
     index = make_index(cache_ratio=0.5, pin_memory=True)
     selection = Mock(
         plan=Mock(layer_name="layer"),
-        prefetch_cluster_ids=torch.empty((1, 1, 0), dtype=torch.int64),
-        prefetch_access_kinds=torch.empty((1, 1, 0), dtype=torch.uint8),
+        prefetch_miss_cluster_ids=torch.empty(0, dtype=torch.int64),
+        prefetch_miss_positions=torch.empty(0, dtype=torch.int64),
+        prefetch_miss_count=torch.zeros(1, dtype=torch.int32),
+        prefetch_num_groups=1,
+        prefetch_num_ranks=1,
     )
     index.cluster_store.prefetch_resident_cluster_wave = Mock()
 
@@ -157,8 +167,11 @@ def test_sparse_verification_prefetch_skips_empty_access_record():
 def test_sparse_verification_prefetch_requires_pinned_cpu_backing():
     index = make_index(pin_memory=False)
     selection = Mock(
-        prefetch_cluster_ids=torch.tensor([[[0]]]),
-        prefetch_access_kinds=torch.tensor([[[2]]], dtype=torch.uint8),
+        prefetch_miss_cluster_ids=torch.tensor([0]),
+        prefetch_miss_positions=torch.tensor([0]),
+        prefetch_miss_count=torch.tensor([1], dtype=torch.int32),
+        prefetch_num_groups=1,
+        prefetch_num_ranks=1,
     )
     index.cluster_store.prefetch_resident_cluster_wave = Mock()
 

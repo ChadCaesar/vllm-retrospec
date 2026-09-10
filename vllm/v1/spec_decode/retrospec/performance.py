@@ -42,6 +42,8 @@ class RetroSpecPerformanceStats:
         "draft_tokens",
         "verified_tokens",
         "proposed_tokens",
+        "resident_cluster_hits",
+        "resident_cluster_misses",
         "verification_lookup_clusters",
         "verification_resident_hits",
         "verification_resident_misses",

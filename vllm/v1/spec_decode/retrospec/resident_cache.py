@@ -147,6 +147,10 @@ class RetroSpecResidentClusterCache:
         self._handle_table_hit_gate_ready = torch.empty(
             0, dtype=torch.bool, device=device
         )
+        self._handle_table_last_access_epochs = torch.empty(
+            0, dtype=torch.int64, device=device
+        )
+        self._next_access_epoch = 1
         self._handle_to_bucket: dict[_ClusterId, int] = {}
         self._bucket_handles: list[int] = []
         self._handle_table_needs_rebuild = False
@@ -229,6 +233,9 @@ class RetroSpecResidentClusterCache:
         self._handle_table_hit_gate_ready = torch.zeros(
             capacity, dtype=torch.bool, device=self.device
         )
+        self._handle_table_last_access_epochs = torch.zeros(
+            capacity, dtype=torch.int64, device=self.device
+        )
         self._handle_to_bucket.clear()
         self._bucket_handles = [-1] * capacity
         self._handle_table_needs_rebuild = False
@@ -244,6 +251,9 @@ class RetroSpecResidentClusterCache:
             return
 
         self._reap_completed_copy_batches()
+        current_stream = torch.cuda.current_stream(self.device)
+        if self._handle_table_capacity and self._group_states:
+            self._refresh_group_lru_from_gpu(self._group_states.keys(), current_stream)
         self._allocate_handle_table(
             max(required_capacity, self._handle_table_capacity),
             max(max_pages_per_cluster, self._handle_table_max_pages),
@@ -259,7 +269,7 @@ class RetroSpecResidentClusterCache:
         )
         self._publish_handle_entries(
             entries,
-            torch.cuda.current_stream(self.device),
+            current_stream,
         )
 
     def _publish_handle_entries(
@@ -276,6 +286,7 @@ class RetroSpecResidentClusterCache:
         page_counts: list[int] = []
         page_slots: list[list[int]] = []
         hit_gate_ready: list[bool] = []
+        new_entry_indices: list[int] = []
 
         for cluster_id, slots, group in entries:
             bucket = self._handle_to_bucket.get(cluster_id)
@@ -286,6 +297,7 @@ class RetroSpecResidentClusterCache:
                     continue
                 self._handle_to_bucket[cluster_id] = bucket
                 self._bucket_handles[bucket] = cluster_id
+                new_entry_indices.append(len(bucket_ids))
 
             padded_slots = list(slots)
             padded_slots.extend(
@@ -300,11 +312,10 @@ class RetroSpecResidentClusterCache:
         if not cluster_ids:
             return
 
+        bucket_ids_gpu = torch.tensor(bucket_ids, dtype=torch.int32, device=self.device)
         with torch.cuda.stream(stream):
             update_resident_handles(
-                bucket_ids=torch.tensor(
-                    bucket_ids, dtype=torch.int32, device=self.device
-                ),
+                bucket_ids=bucket_ids_gpu,
                 cluster_handles=torch.tensor(
                     cluster_ids, dtype=torch.int64, device=self.device
                 ),
@@ -323,6 +334,18 @@ class RetroSpecResidentClusterCache:
                 table_page_slots=self._handle_table_page_slots,
                 table_hit_gate_ready=self._handle_table_hit_gate_ready,
             )
+            if new_entry_indices:
+                new_bucket_ids = bucket_ids_gpu.index_select(
+                    0,
+                    torch.tensor(
+                        new_entry_indices,
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                )
+                self._handle_table_last_access_epochs.index_fill_(
+                    0, new_bucket_ids.to(torch.int64), self._next_access_epoch
+                )
 
     def _erase_handle_entries(
         self,
@@ -344,11 +367,10 @@ class RetroSpecResidentClusterCache:
             return
 
         num_entries = len(bucket_ids)
+        bucket_ids_gpu = torch.tensor(bucket_ids, dtype=torch.int32, device=self.device)
         with torch.cuda.stream(stream):
             update_resident_handles(
-                bucket_ids=torch.tensor(
-                    bucket_ids, dtype=torch.int32, device=self.device
-                ),
+                bucket_ids=bucket_ids_gpu,
                 cluster_handles=torch.full(
                     (num_entries,), -2, dtype=torch.int64, device=self.device
                 ),
@@ -369,6 +391,9 @@ class RetroSpecResidentClusterCache:
                 table_page_counts=self._handle_table_page_counts,
                 table_page_slots=self._handle_table_page_slots,
                 table_hit_gate_ready=self._handle_table_hit_gate_ready,
+            )
+            self._handle_table_last_access_epochs.index_fill_(
+                0, bucket_ids_gpu.to(torch.int64), 0
             )
 
     def _refresh_group_handle_entries(
@@ -610,6 +635,59 @@ class RetroSpecResidentClusterCache:
 
         return None
 
+    def _refresh_group_lru_from_gpu(
+        self,
+        groups: Collection[RetroSpecClusterGroup],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Refresh group-local LRU order from GPU-recorded hit epochs.
+
+        This is intentionally called only when an admission or resize must
+        evict pages. Draft hits therefore remain entirely on the GPU hot path.
+        """
+        group_orders: dict[RetroSpecClusterGroup, list[_ClusterId]] = {}
+        epoch_cluster_ids: list[_ClusterId] = []
+        bucket_ids: list[int] = []
+
+        for group in tuple(groups):
+            group_state = self._group_states.get(group)
+            if group_state is None:
+                continue
+            order = list(group_state.lru)
+            group_orders[group] = order
+            for cluster_id in order:
+                bucket = self._handle_to_bucket.get(cluster_id)
+                if bucket is not None:
+                    epoch_cluster_ids.append(cluster_id)
+                    bucket_ids.append(bucket)
+
+        if not bucket_ids:
+            return
+
+        with torch.cuda.stream(stream):
+            bucket_ids_gpu = torch.tensor(
+                bucket_ids, dtype=torch.int64, device=self.device
+            )
+            epochs_cpu = self._handle_table_last_access_epochs.index_select(
+                0, bucket_ids_gpu
+            ).cpu()
+
+        epochs_by_cluster = dict(
+            zip(epoch_cluster_ids, epochs_cpu.tolist(), strict=True)
+        )
+        for group, order in group_orders.items():
+            previous_positions = {
+                cluster_id: position for position, cluster_id in enumerate(order)
+            }
+            ranked = sorted(
+                order,
+                key=lambda cluster_id: (
+                    epochs_by_cluster.get(cluster_id, 0),
+                    previous_positions[cluster_id],
+                ),
+            )
+            self._group_states[group].lru = OrderedDict.fromkeys(ranked)
+
     def _select_victim_cluster(
         self,
         protected_clusters: set[_ClusterId],
@@ -704,6 +782,11 @@ class RetroSpecResidentClusterCache:
         self._logical_capacity = capacity
         self._group_targets = new_group_targets
 
+        if self.num_resident_pages > capacity:
+            self._refresh_group_lru_from_gpu(
+                self._group_states.keys(),
+                torch.cuda.current_stream(self.device),
+            )
         while self.num_resident_pages > capacity:
             if not self._evict_oldest_unprotected(
                 protected_clusters=set(),
@@ -1060,6 +1143,8 @@ class RetroSpecResidentClusterCache:
         self._gpu_access_lock.acquire()
         try:
             self._ensure_handle_table(page_ids.shape[-1])
+            access_epoch = self._next_access_epoch
+            self._next_access_epoch += 1
             lookup_resident_handles(
                 cluster_handles=cluster_ids,
                 logical_page_ids=page_ids,
@@ -1069,6 +1154,8 @@ class RetroSpecResidentClusterCache:
                 table_page_counts=self._handle_table_page_counts,
                 table_page_slots=self._handle_table_page_slots,
                 table_hit_gate_ready=self._handle_table_hit_gate_ready,
+                table_last_access_epochs=self._handle_table_last_access_epochs,
+                access_epoch=access_epoch,
                 output_page_slots=cache_page_ids,
                 output_hit_mask=hit_cluster_mask,
                 output_miss_mask=miss_cluster_mask,
@@ -1091,20 +1178,6 @@ class RetroSpecResidentClusterCache:
             access_kinds=access_kinds,
             read_lease=RetroSpecResidentReadLease(self._gpu_access_lock),
         )
-
-    def touch_cpu(self, cluster_ids_cpu: torch.Tensor) -> None:
-        """Apply background LRU touches in retrieval-priority order."""
-        if cluster_ids_cpu.device.type != "cpu":
-            raise ValueError("Background LRU touches must reside on CPU")
-
-        cluster_ids = [
-            int(cluster_id)
-            for cluster_id in cluster_ids_cpu.reshape(-1).tolist()
-            if cluster_id >= 0
-        ]
-        for cluster_id in reversed(tuple(dict.fromkeys(cluster_ids))):
-            if cluster_id in self._cluster_to_slots:
-                self._touch_cluster(cluster_id)
 
     def _validate_source_pages(
         self,
@@ -1319,6 +1392,8 @@ class RetroSpecResidentClusterCache:
             mutation_stream.wait_event(reuse_ready_event)
 
         affected_groups = set(incoming_group_pages)
+        if self.num_resident_pages + required_page_count > self._logical_capacity:
+            self._refresh_group_lru_from_gpu(self._group_states.keys(), mutation_stream)
         while self.num_resident_pages + required_page_count > self._logical_capacity:
             if not self._evict_oldest_unprotected(
                 protected_clusters=target_cluster_set,

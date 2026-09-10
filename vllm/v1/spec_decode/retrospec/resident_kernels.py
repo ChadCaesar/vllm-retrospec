@@ -17,6 +17,8 @@ def _lookup_resident_handles_kernel(
     table_page_counts,
     table_page_slots,
     table_hit_gate_ready,
+    table_last_access_epochs,
+    access_epoch,
     output_page_slots,
     output_hit_mask,
     output_miss_mask,
@@ -144,6 +146,13 @@ def _lookup_resident_handles_kernel(
         & (page_count > 0)
     )
     miss = valid_cluster & ~stable_hit
+
+    tl.atomic_max(
+        table_last_access_epochs + safe_bucket,
+        access_epoch,
+        mask=stable_hit,
+        sem="relaxed",
+    )
 
     tl.store(
         output_page_slots
@@ -288,6 +297,8 @@ def lookup_resident_handles(
     table_page_counts: torch.Tensor,
     table_page_slots: torch.Tensor,
     table_hit_gate_ready: torch.Tensor,
+    table_last_access_epochs: torch.Tensor,
+    access_epoch: int,
     output_page_slots: torch.Tensor,
     output_hit_mask: torch.Tensor,
     output_miss_mask: torch.Tensor,
@@ -346,6 +357,14 @@ def lookup_resident_handles(
     table_capacity = table_handles.numel()
     if table_capacity & (table_capacity - 1):
         raise ValueError("Resident handle-table capacity must be a power of two")
+    if table_last_access_epochs.shape != table_handles.shape:
+        raise ValueError("Resident access epochs must match the handle table")
+    if table_last_access_epochs.dtype != torch.int64:
+        raise ValueError("Resident access epochs must use int64")
+    if table_last_access_epochs.device != table_handles.device:
+        raise ValueError("Resident access epochs must use the handle-table device")
+    if access_epoch <= 0:
+        raise ValueError("Resident access epoch must be positive")
 
     flat_handles = cluster_handles.reshape(-1)
     flat_pages = logical_page_ids.reshape(
@@ -367,6 +386,8 @@ def lookup_resident_handles(
         table_page_counts,
         table_page_slots,
         table_hit_gate_ready,
+        table_last_access_epochs,
+        access_epoch,
         flat_output_pages,
         output_hit_mask.reshape(-1),
         output_miss_mask.reshape(-1),
