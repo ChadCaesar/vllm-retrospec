@@ -7,6 +7,7 @@ import torch
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.spec_decode.retrospec.execution import (
     EXACT_ATTENTION_PARTITION_SIZE,
+    RetroSpecCompactExactPageTable,
     RetroSpecCompactKVSource,
     RetroSpecEstimationKVSource,
     RetroSpecExactAttentionWorkspace,
@@ -100,6 +101,7 @@ def _make_source(
     staging_pages: RetroSpecExactPageKVSource | None = None,
     ready_event: torch.cuda.Event | None = None,
     plan_row_indices: torch.Tensor | None = None,
+    compact_pages: RetroSpecCompactExactPageTable | None = None,
 ) -> RetroSpecExactKVSource:
     return RetroSpecExactKVSource(
         primary=RetroSpecExactPrimaryKVSource(
@@ -114,6 +116,7 @@ def _make_source(
         resident_pages=resident_pages,
         staging_pages=staging_pages,
         plan_row_indices=plan_row_indices,
+        compact_pages=compact_pages,
     )
 
 
@@ -143,6 +146,9 @@ def _materialize_head(
         values.append(primary.value_cache[physical_block, block_offset, kv_head_idx])
 
     page_counts = source.page_token_counts[metadata_row_idx, kv_head_idx].reshape(-1)
+    if source.compact_pages is not None:
+        num_pages = int(source.compact_pages.page_counts[metadata_row_idx, kv_head_idx])
+        page_counts = page_counts[:num_pages]
     for page_slot, token_count in enumerate(page_counts.tolist()):
         page_source = None
         page_id = -1
@@ -355,6 +361,71 @@ def test_multi_source_exact_attention_matches_reference_on_cuda():
 
     output, lse = workspace.run(source, query, scale=0.125)
     expected_output, expected_lse = _reference_attention(source, query, 0.125)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected_output, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compact_exact_page_table_matches_reference_on_cuda():
+    device = torch.device("cuda")
+    torch.manual_seed(73)
+    page_size = 4
+    batch_size = 2
+    num_kv_heads = 2
+    num_query_heads = 4
+    head_size = 64
+
+    key_cache = torch.randn(
+        4, page_size, num_kv_heads, head_size, dtype=torch.float16, device=device
+    )
+    value_cache = torch.randn_like(key_cache)
+    resident_keys = torch.randn(
+        8, page_size, head_size, dtype=torch.float16, device=device
+    )
+    resident_values = torch.randn_like(resident_keys)
+    compact_counts = torch.tensor([[2, 1], [3, 0]], dtype=torch.int32, device=device)
+    page_token_counts = torch.tensor(
+        [[[4, 2, 4, 4], [3, 4, 4, 4]], [[1, 4, 2, 4], [4, 4, 4, 4]]],
+        dtype=torch.int32,
+        device=device,
+    )
+    page_ids = torch.tensor(
+        [[[0, 1, 7, 7], [2, 7, 7, 7]], [[3, 4, 5, 7], [7, 7, 7, 7]]],
+        dtype=torch.int64,
+        device=device,
+    )
+    source = _make_source(
+        key_cache,
+        value_cache,
+        torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device),
+        torch.tensor(
+            [[[0, 5], [1, 4]], [[0, 6], [2, 7]]],
+            dtype=torch.int64,
+            device=device,
+        ),
+        torch.tensor(
+            [[[True, True], [True, False]], [[True, True], [False, True]]],
+            device=device,
+        ),
+        page_token_counts,
+        resident_pages=RetroSpecExactPageKVSource(
+            resident_keys, resident_values, page_ids
+        ),
+        compact_pages=RetroSpecCompactExactPageTable(page_counts=compact_counts),
+    )
+    query = torch.randn(
+        batch_size,
+        num_query_heads,
+        head_size,
+        dtype=torch.float16,
+        device=device,
+    )
+    workspace = RetroSpecExactAttentionWorkspace(page_size, batch_size, 4)
+
+    output, lse = workspace.run(source, query, scale=head_size**-0.5)
+    expected_output, expected_lse = _reference_attention(source, query, head_size**-0.5)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(output, expected_output, atol=2e-2, rtol=2e-2)

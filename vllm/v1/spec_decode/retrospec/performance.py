@@ -44,6 +44,8 @@ class RetroSpecPerformanceStats:
         "proposed_tokens",
         "resident_cluster_hits",
         "resident_cluster_misses",
+        "draft_compact_resident_pages",
+        "draft_compact_selected_clusters",
         "verification_lookup_clusters",
         "verification_resident_hits",
         "verification_resident_misses",

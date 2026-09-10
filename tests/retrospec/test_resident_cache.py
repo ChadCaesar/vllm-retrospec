@@ -1136,6 +1136,84 @@ def test_gpu_handle_table_tracks_resident_admission_and_invalidation():
     assert invalidated.cache_page_ids.cpu().tolist() == [[[[-1, -1]]]]
 
 
+def test_compact_draft_lookup_fuses_hits_misses_pages_and_attention():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=3, group_targets={group: 3})
+    backing_keys, backing_values = make_backing_pages()
+    cluster_groups = {cluster_id: group for cluster_id in (7, 8, 9)}
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=torch.tensor([7, 8]),
+        page_ids=torch.tensor([[0, 1], [2, -1]]),
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+        allocated_page_ids={0, 1, 2, 3},
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    cache.synchronize_pending_copies()
+
+    device = torch.device("cuda")
+    cluster_ids = torch.tensor([[[7, 9, 8]]], dtype=torch.int64, device=device)
+    logical_page_ids = torch.tensor(
+        [[[[0, 1], [3, -1], [2, -1]]]], dtype=torch.int64, device=device
+    )
+    logical_page_token_counts = torch.tensor(
+        [[[[2, 2], [2, 0], [1, 0]]]], dtype=torch.int32, device=device
+    )
+    retrieval_scores = torch.tensor(
+        [[[0.3, 0.2, 0.1]]], dtype=torch.float32, device=device
+    )
+    fallback_counts = torch.tensor([[[4, 2, 1]]], dtype=torch.int32, device=device)
+    row_shape = (1, 1)
+    compact_shape = (*row_shape, 6)
+    miss_cluster_ids = torch.empty(3, dtype=torch.int64, device=device)
+    miss_positions = torch.empty(3, dtype=torch.int64, device=device)
+    miss_count = torch.zeros(1, dtype=torch.int32, device=device)
+
+    access = cache.lookup_compact_draft_gpu(
+        cluster_ids=cluster_ids,
+        logical_page_ids=logical_page_ids,
+        logical_page_token_counts=logical_page_token_counts,
+        retrieval_scores=retrieval_scores,
+        active_mask=torch.ones(1, dtype=torch.bool, device=device),
+        has_clusters=torch.ones(row_shape, dtype=torch.bool, device=device),
+        fallback_token_counts=fallback_counts,
+        cache_page_ids=torch.empty(compact_shape, dtype=torch.int64, device=device),
+        page_token_counts=torch.empty(compact_shape, dtype=torch.int32, device=device),
+        page_counts=torch.empty(row_shape, dtype=torch.int32, device=device),
+        clustered_token_counts=torch.empty(row_shape, dtype=torch.int32, device=device),
+        attention_mass=torch.empty(1, dtype=torch.float32, device=device),
+        hit_attention_by_head=torch.empty(
+            row_shape, dtype=torch.float32, device=device
+        ),
+        selected_cluster_counts=torch.empty(
+            row_shape, dtype=torch.int32, device=device
+        ),
+        hit_cluster_counts=torch.empty(row_shape, dtype=torch.int32, device=device),
+        miss_cluster_counts=torch.empty(row_shape, dtype=torch.int32, device=device),
+        hit_gate_ready=torch.empty(row_shape, dtype=torch.bool, device=device),
+        miss_cluster_ids=miss_cluster_ids,
+        miss_positions=miss_positions,
+        miss_count=miss_count,
+    )
+    access.read_lease.release()
+    torch.cuda.synchronize()
+
+    assert access.page_counts.cpu().tolist() == [[3]]
+    assert access.page_token_counts[0, 0, :3].cpu().tolist() == [2, 2, 1]
+    assert access.clustered_token_counts.cpu().tolist() == [[5]]
+    assert access.selected_cluster_counts.cpu().tolist() == [[3]]
+    assert access.hit_cluster_counts.cpu().tolist() == [[2]]
+    assert access.miss_cluster_counts.cpu().tolist() == [[1]]
+    assert access.hit_gate_ready.cpu().tolist() == [[True]]
+    torch.testing.assert_close(access.attention_mass.cpu(), torch.tensor([0.4]))
+    assert fallback_counts.cpu().tolist() == [[[0, 2, 0]]]
+    assert miss_count.item() == 1
+    assert miss_cluster_ids[0].item() == 9
+    assert miss_positions[0].item() == 1
+
+
 def test_gpu_hit_epochs_refresh_group_lru_before_eviction():
     group = RetroSpecClusterGroup("request", 0)
     cache = make_cache(capacity=2, group_targets={group: 2})

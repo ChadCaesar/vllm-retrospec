@@ -22,10 +22,12 @@ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 from .capacity import get_retrospec_exact_attention_partition_capacity
 from .cluster_store import (
+    RetroSpecCompactResolvedClusterPages,
     RetroSpecResidentPrefetchInput,
     RetroSpecResolvedClusterPages,
 )
 from .execution import (
+    RetroSpecCompactExactPageTable,
     RetroSpecCompactKVSource,
     RetroSpecEstimationKVSource,
     RetroSpecExactAttentionWorkspace,
@@ -217,6 +219,7 @@ class RetroSpecSparseAttention:
         self.in_proposal = False
         self.step_active = False
         self.step_index = -1
+        self._draft_layout_generation = 0
         self.active_mask: torch.Tensor | None = None
         self.batch_size = 0
         self.parallel_request_indices: torch.Tensor | None = None
@@ -606,6 +609,7 @@ class RetroSpecSparseAttention:
         try:
             self.proposal_request_ids = request_ids
             self._resident_prefetch_wave.clear()
+            self._draft_layout_generation = 0
 
             self.in_proposal = True
             yield
@@ -654,6 +658,8 @@ class RetroSpecSparseAttention:
 
         self.mode = mode
         self.step_index = step_index
+        if mode == RetroSpecAttentionMode.DRAFT:
+            self._draft_layout_generation += 1
         self.batch_size = active_mask.shape[0]
         self.active_mask = active_mask
         self.parallel_request_indices = None
@@ -1085,7 +1091,10 @@ class RetroSpecSparseAttention:
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
-    ) -> tuple[RetroSpecExactKVSource, RetroSpecResolvedClusterPages | None]:
+    ) -> tuple[
+        RetroSpecExactKVSource,
+        RetroSpecResolvedClusterPages | RetroSpecCompactResolvedClusterPages | None,
+    ]:
         indexed = isinstance(selection, RetroSpecIndexedTokenAttentionSelection)
         if indexed:
             layer_name = selection.layer_name
@@ -1136,21 +1145,32 @@ class RetroSpecSparseAttention:
 
         resident_pages = None
         staging_pages = None
+        compact_pages = None
         if resolved_pages is not None:
-            if resolved_pages.resident_key_pages.shape[0] > 0:
+            if isinstance(resolved_pages, RetroSpecCompactResolvedClusterPages):
                 resident_pages = RetroSpecExactPageKVSource(
                     key_pages=resolved_pages.resident_key_pages,
                     value_pages=resolved_pages.resident_value_pages,
                     page_ids=resolved_pages.resident_page_ids,
-                    ready_event=resolved_pages.resident_ready_event,
                 )
-            if resolved_pages.staging_key_pages.shape[0] > 0:
-                staging_pages = RetroSpecExactPageKVSource(
-                    key_pages=resolved_pages.staging_key_pages,
-                    value_pages=resolved_pages.staging_value_pages,
-                    page_ids=resolved_pages.staging_page_ids,
-                    ready_event=resolved_pages.staging_ready_event,
+                compact_pages = RetroSpecCompactExactPageTable(
+                    page_counts=resolved_pages.page_counts
                 )
+            else:
+                if resolved_pages.resident_key_pages.shape[0] > 0:
+                    resident_pages = RetroSpecExactPageKVSource(
+                        key_pages=resolved_pages.resident_key_pages,
+                        value_pages=resolved_pages.resident_value_pages,
+                        page_ids=resolved_pages.resident_page_ids,
+                        ready_event=resolved_pages.resident_ready_event,
+                    )
+                if resolved_pages.staging_key_pages.shape[0] > 0:
+                    staging_pages = RetroSpecExactPageKVSource(
+                        key_pages=resolved_pages.staging_key_pages,
+                        value_pages=resolved_pages.staging_value_pages,
+                        page_ids=resolved_pages.staging_page_ids,
+                        ready_event=resolved_pages.staging_ready_event,
+                    )
 
         source = RetroSpecExactKVSource(
             primary=RetroSpecExactPrimaryKVSource(
@@ -1164,6 +1184,7 @@ class RetroSpecSparseAttention:
             resident_pages=resident_pages,
             staging_pages=staging_pages,
             plan_row_indices=plan_row_indices,
+            compact_pages=compact_pages,
         )
 
         return source, resolved_pages
@@ -1244,6 +1265,7 @@ class RetroSpecSparseAttention:
                 RetroSpecAttentionMode.EXPANDED_VERIFY,
             )
             and resolved_pages is not None
+            and not isinstance(resolved_pages, RetroSpecCompactResolvedClusterPages)
         ):
             with self.performance_stats.cpu_timer(
                 f"{stage_name}_resident_admit_submit"
@@ -1315,6 +1337,7 @@ class RetroSpecSparseAttention:
                 RetroSpecAttentionMode.EXPANDED_VERIFY,
             )
             and resolved_pages is not None
+            and not isinstance(resolved_pages, RetroSpecCompactResolvedClusterPages)
         ):
             with self.performance_stats.cpu_timer(
                 f"{stage_name}_resident_admit_submit"
@@ -1417,6 +1440,7 @@ class RetroSpecSparseAttention:
                     scale=impl.scale,
                     warm_first_draft=True,
                     plan_slot=self.step_index,
+                    layout_generation=self._draft_layout_generation,
                 )
         else:
             if self.mode == RetroSpecAttentionMode.SPARSE_VERIFY:

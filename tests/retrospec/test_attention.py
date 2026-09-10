@@ -19,6 +19,7 @@ from vllm.v1.spec_decode.retrospec.attention import (
     RetroSpecSparseAttention,
 )
 from vllm.v1.spec_decode.retrospec.cluster_store import (
+    RetroSpecCompactResolvedClusterPages,
     RetroSpecCompactTokenRange,
     RetroSpecFullVerificationDescriptor,
     RetroSpecFullVerificationStaging,
@@ -27,6 +28,7 @@ from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecVerificationMissAdmission,
 )
 from vllm.v1.spec_decode.retrospec.execution import (
+    RetroSpecCompactExactPageTable,
     RetroSpecEstimationKVSource,
     RetroSpecExactKVSource,
 )
@@ -1333,6 +1335,60 @@ def test_exact_attention_resolves_resident_and_staging_pages(
     assert staging_source.key_pages is staging_keys
     assert staging_source.value_pages is staging_values
     assert staging_source.ready_event is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_draft_exact_source_preserves_compact_page_descriptor():
+    controller = make_controller(cache_ratio=0.5)
+    controller.mode = RetroSpecAttentionMode.DRAFT
+    device = torch.device("cuda")
+    plan = make_token_plan(1, num_kv_heads=1, exact_width=1, estimation_width=1)
+    page_ids = torch.tensor([[[2, -1]]], dtype=torch.int64, device=device)
+    page_token_counts = torch.tensor([[[2, 0]]], dtype=torch.int32, device=device)
+    page_counts = torch.tensor([[1]], dtype=torch.int32, device=device)
+    resident_keys = torch.zeros(3, 2, 1, dtype=torch.float16, device=device)
+    resolved = RetroSpecCompactResolvedClusterPages(
+        resident_page_ids=page_ids,
+        page_token_counts=page_token_counts,
+        page_counts=page_counts,
+        clustered_token_counts=torch.tensor([[2]], dtype=torch.int32, device=device),
+        attention_mass=torch.ones(1, device=device),
+        selected_cluster_counts=torch.ones(1, 1, dtype=torch.int32, device=device),
+        hit_cluster_counts=torch.ones(1, 1, dtype=torch.int32, device=device),
+        miss_cluster_counts=torch.zeros(1, 1, dtype=torch.int32, device=device),
+        hit_gate_ready=torch.ones(1, 1, dtype=torch.bool, device=device),
+        resident_key_pages=resident_keys,
+        resident_value_pages=resident_keys.clone(),
+        read_lease=cast(Any, SimpleNamespace(release=Mock())),
+    )
+    selection = RetroSpecTokenAttentionSelection(
+        exact_cluster_ids=plan.sparse_exact_cluster_ids.to(device),
+        exact_page_ids=page_ids,
+        exact_page_token_counts=page_token_counts,
+        exact_token_counts=torch.tensor([[3]], dtype=torch.int32, device=device),
+        estimation_keys=plan.sparse_estimation_keys.to(device),
+        estimation_values=plan.sparse_estimation_values.to(device),
+        estimation_token_counts=plan.sparse_estimation_token_counts.to(device),
+        attention_mass=torch.ones(1, device=device),
+        plan=plan,
+        resolved_pages=resolved,
+    )
+    key_cache = torch.zeros(1, 2, 1, 1, dtype=torch.float16, device=device)
+
+    source, returned_resolved = controller._resolve_exact_kv_source(
+        selection,
+        key_cache,
+        key_cache.clone(),
+        torch.zeros(1, 1, dtype=torch.int32, device=device),
+    )
+
+    assert returned_resolved is resolved
+    assert source.page_token_counts is page_token_counts
+    assert isinstance(source.compact_pages, RetroSpecCompactExactPageTable)
+    assert source.compact_pages.page_counts is page_counts
+    assert source.resident_pages is not None
+    assert source.resident_pages.page_ids is page_ids
+    assert source.staging_pages is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

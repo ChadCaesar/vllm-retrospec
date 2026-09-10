@@ -653,6 +653,24 @@ class RetroSpecResolvedClusterPages:
 
 
 @dataclass(frozen=True)
+class RetroSpecCompactResolvedClusterPages:
+    """Compact row-local resident page source produced for one DRAFT layer."""
+
+    resident_page_ids: torch.Tensor
+    page_token_counts: torch.Tensor
+    page_counts: torch.Tensor
+    clustered_token_counts: torch.Tensor
+    attention_mass: torch.Tensor
+    selected_cluster_counts: torch.Tensor
+    hit_cluster_counts: torch.Tensor
+    miss_cluster_counts: torch.Tensor
+    hit_gate_ready: torch.Tensor
+    resident_key_pages: torch.Tensor
+    resident_value_pages: torch.Tensor
+    read_lease: RetroSpecResidentReadLease
+
+
+@dataclass(frozen=True)
 class RetroSpecVerificationMissAdmission:
     """Compact CPU metadata for admitting verification misses after attention."""
 
@@ -4384,6 +4402,90 @@ class RetroSpecClusterPageStore:
             resident_ready_event=None,
             staging_ready_event=None,
             access_kinds=access.access_kinds,
+            read_lease=access.read_lease,
+        )
+
+    def resolve_compact_draft_cluster_blocks(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+        logical_page_ids: torch.Tensor,
+        logical_page_token_counts: torch.Tensor,
+        retrieval_scores: torch.Tensor,
+        active_mask: torch.Tensor,
+        has_clusters: torch.Tensor,
+        fallback_token_counts: torch.Tensor,
+        cache_page_ids: torch.Tensor,
+        page_token_counts: torch.Tensor,
+        page_counts: torch.Tensor,
+        clustered_token_counts: torch.Tensor,
+        attention_mass: torch.Tensor,
+        hit_attention_by_head: torch.Tensor,
+        selected_cluster_counts: torch.Tensor,
+        hit_cluster_counts: torch.Tensor,
+        miss_cluster_counts: torch.Tensor,
+        hit_gate_ready: torch.Tensor,
+        miss_cluster_ids: torch.Tensor,
+        miss_positions: torch.Tensor,
+        miss_count: torch.Tensor,
+        emit_misses: bool = True,
+    ) -> RetroSpecCompactResolvedClusterPages:
+        """Resolve DRAFT pages into a compact GPU-only descriptor."""
+        if cluster_ids.device.type != "cuda":
+            raise ValueError("Compact draft resident lookup requires CUDA")
+
+        with self._resident_state_lock:
+            _, resident_cache = self._get_or_create_resident_cache(layer_name)
+
+        access = resident_cache.lookup_compact_draft_gpu(
+            cluster_ids=cluster_ids,
+            logical_page_ids=logical_page_ids,
+            logical_page_token_counts=logical_page_token_counts,
+            retrieval_scores=retrieval_scores,
+            active_mask=active_mask,
+            has_clusters=has_clusters,
+            fallback_token_counts=fallback_token_counts,
+            cache_page_ids=cache_page_ids,
+            page_token_counts=page_token_counts,
+            page_counts=page_counts,
+            clustered_token_counts=clustered_token_counts,
+            attention_mass=attention_mass,
+            hit_attention_by_head=hit_attention_by_head,
+            selected_cluster_counts=selected_cluster_counts,
+            hit_cluster_counts=hit_cluster_counts,
+            miss_cluster_counts=miss_cluster_counts,
+            hit_gate_ready=hit_gate_ready,
+            miss_cluster_ids=miss_cluster_ids,
+            miss_positions=miss_positions,
+            miss_count=miss_count,
+            emit_misses=emit_misses,
+        )
+        if self.performance_stats is not None:
+            self.performance_stats.add_gpu_counter(
+                "resident_cluster_hits", access.hit_cluster_counts
+            )
+            self.performance_stats.add_gpu_counter(
+                "resident_cluster_misses", access.miss_cluster_counts
+            )
+            self.performance_stats.add_gpu_counter(
+                "draft_compact_resident_pages", access.page_counts
+            )
+            self.performance_stats.add_gpu_counter(
+                "draft_compact_selected_clusters", access.selected_cluster_counts
+            )
+
+        return RetroSpecCompactResolvedClusterPages(
+            resident_page_ids=access.cache_page_ids,
+            page_token_counts=access.page_token_counts,
+            page_counts=access.page_counts,
+            clustered_token_counts=access.clustered_token_counts,
+            attention_mass=access.attention_mass,
+            selected_cluster_counts=access.selected_cluster_counts,
+            hit_cluster_counts=access.hit_cluster_counts,
+            miss_cluster_counts=access.miss_cluster_counts,
+            hit_gate_ready=access.hit_gate_ready,
+            resident_key_pages=resident_cache.key_pages,
+            resident_value_pages=resident_cache.value_pages,
             read_lease=access.read_lease,
         )
 

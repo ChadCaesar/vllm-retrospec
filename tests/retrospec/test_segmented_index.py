@@ -331,9 +331,8 @@ def test_first_draft_selection_queues_ranked_miss_after_attention():
         )
         assert index.cluster_store.num_resident_pages("layer") == 0
         assert selection.resolved_pages is not None
-        assert selection.resolved_pages.miss_cluster_mask.all()
-        assert selection.resolved_pages.resident_ready_event is None
-        assert selection.resolved_pages.read_lease is not None
+        assert selection.resolved_pages.miss_cluster_counts.sum().item() > 0
+        assert not selection.resolved_pages.page_counts.any()
         selection.resolved_pages.read_lease.release()
 
         index.prefetch_sparse_verification(
@@ -349,7 +348,7 @@ def test_first_draft_selection_queues_ranked_miss_after_attention():
     assert selection.exact_token_counts.tolist() == [[6]]
     # The first draft occupies at most half the request/head target, so the hit
     # gate stays cold-protected until later drafts fill the remaining capacity.
-    assert not selection.resolved_pages.hit_gate_ready_mask.any()
+    assert not selection.resolved_pages.hit_gate_ready.any()
 
 
 def build_index(
@@ -908,6 +907,32 @@ def test_primary_exact_capacity_covers_every_up_to_date_layout():
         forced_exact_mask |= valid_mask & ~indexed_mask
 
         assert forced_exact_mask.sum().item() <= capacity
+
+
+def test_proposal_token_layout_is_reused_only_within_one_draft_generation():
+    index = make_index()
+    block_table = torch.empty(1, 4)
+    index.begin_proposal(["request"])
+    try:
+        first = index._get_proposal_token_layout(
+            1, block_table, torch.tensor([3], dtype=torch.int32)
+        )
+        same_generation = index._get_proposal_token_layout(
+            1, block_table, torch.tensor([7], dtype=torch.int32)
+        )
+        next_generation = index._get_proposal_token_layout(
+            2, block_table, torch.tensor([7], dtype=torch.int32)
+        )
+
+        assert same_generation is first
+        assert first.valid_token_mask.sum().item() == 3
+        assert next_generation is not first
+        assert next_generation.valid_token_mask.sum().item() == 7
+    finally:
+        index.end_proposal()
+
+    assert index._proposal_token_layout is None
+    assert index._proposal_token_layout_generation == -1
 
 
 def test_segmented_index_handles_mixed_long_and_short_requests():
@@ -2053,7 +2078,7 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     assert cold.estimation_keys[0, 0, :, 0].tolist() == pytest.approx([1.0, 2.0])
     assert cold.estimation_values[0, 0, :, 0].tolist() == pytest.approx([10.0, 20.0])
     assert cold.hit_attn.item() == pytest.approx(1.0)
-    assert not cold.resolved_pages.hit_gate_ready_mask.any()
+    assert not cold.resolved_pages.hit_gate_ready.any()
     assert not cold.exact_page_token_counts.any()
     assert cold.plan.sparse_exact_page_token_counts.sum().item() == 2
 
@@ -2082,7 +2107,7 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     assert index.cluster_store.num_resident_pages("layer") == 1
     assert warm.exact_token_counts.tolist() == [[8]]
     assert warm.estimation_token_counts.tolist() == [[[2, 0]]]
-    assert warm.resolved_pages.hit_gate_ready_mask.all()
+    assert warm.resolved_pages.hit_gate_ready.all()
     assert warm.hit_attn.item() == pytest.approx(warm.plan.sparse_attn.item())
 
     assert verification.resolved_pages is None

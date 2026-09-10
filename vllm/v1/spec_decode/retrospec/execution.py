@@ -42,6 +42,13 @@ class RetroSpecExactPageKVSource:
 
 
 @dataclass(frozen=True)
+class RetroSpecCompactExactPageTable:
+    """Valid row lengths for a compact exact-page table."""
+
+    page_counts: torch.Tensor
+
+
+@dataclass(frozen=True)
 class RetroSpecExactKVSource:
     """GPU-visible descriptors for native, resident and staging exact KV."""
 
@@ -50,6 +57,7 @@ class RetroSpecExactKVSource:
     resident_pages: RetroSpecExactPageKVSource | None = None
     staging_pages: RetroSpecExactPageKVSource | None = None
     plan_row_indices: torch.Tensor | None = None
+    compact_pages: RetroSpecCompactExactPageTable | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +101,7 @@ def _multi_source_exact_partition_kernel(
     token_indices,
     token_mask,
     page_token_counts,
+    compact_page_counts,
     resident_page_ids,
     resident_key_pages,
     resident_value_pages,
@@ -149,6 +158,7 @@ def _multi_source_exact_partition_kernel(
     USE_PLAN_ROWS: tl.constexpr,
     HAS_RESIDENT: tl.constexpr,
     HAS_STAGING: tl.constexpr,
+    COMPACT_PAGES: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -227,6 +237,11 @@ def _multi_source_exact_partition_kernel(
         page_slot_indices = page_token_offsets // PAGE_SIZE
         offsets_in_page = page_token_offsets % PAGE_SIZE
         page_valid = source_valid & (token_offsets >= MAX_PRIMARY_TOKENS)
+        if COMPACT_PAGES:
+            compact_count = tl.load(
+                compact_page_counts + metadata_row_idx * NUM_KV_HEADS + kv_head_idx
+            )
+            page_valid &= page_slot_indices < compact_count
         page_count_offsets = (
             metadata_row_idx * NUM_KV_HEADS + kv_head_idx
         ) * MAX_PAGE_SLOTS + page_slot_indices
@@ -1162,9 +1177,16 @@ class RetroSpecExactAttentionWorkspace:
             )
         if primary.token_mask.dtype != torch.bool:
             raise ValueError("Primary token mask must be boolean")
-        if source.page_token_counts.ndim != 4:
+        compact_pages = source.compact_pages
+        if compact_pages is None:
+            if source.page_token_counts.ndim != 4:
+                raise ValueError(
+                    "Padded page metadata must have shape "
+                    "[batch, kv_heads, clusters, pages]"
+                )
+        elif source.page_token_counts.ndim != 3:
             raise ValueError(
-                "Page metadata must have shape [batch, kv_heads, clusters, pages]"
+                "Compact page metadata must have shape [batch, kv_heads, pages]"
             )
         if primary.block_table.ndim != 2:
             raise ValueError("Block table must have shape [batch, blocks]")
@@ -1201,6 +1223,14 @@ class RetroSpecExactAttentionWorkspace:
             primary.token_mask,
             source.page_token_counts,
         ]
+        if compact_pages is not None:
+            if plan_row_indices is not None:
+                raise ValueError("Compact page tables do not support indexed plan rows")
+            if compact_pages.page_counts.shape != (metadata_rows, num_kv_heads):
+                raise ValueError("Compact page counts do not match page metadata")
+            if compact_pages.page_counts.dtype not in (torch.int32, torch.int64):
+                raise ValueError("Compact page counts must be integral")
+            tensors.append(compact_pages.page_counts)
         if plan_row_indices is not None:
             if plan_row_indices.shape != (query.shape[0],):
                 raise ValueError("Plan rows must contain one entry per query")
@@ -1223,9 +1253,9 @@ class RetroSpecExactAttentionWorkspace:
             if request_indices.device != query.device:
                 raise ValueError("request_indices must be on the query device")
 
-        max_page_slots = (
-            source.page_token_counts.shape[2] * source.page_token_counts.shape[3]
-        )
+        max_page_slots = source.page_token_counts.shape[2]
+        if compact_pages is None:
+            max_page_slots *= source.page_token_counts.shape[3]
         if (
             max_page_slots
             and source.resident_pages is None
@@ -1636,6 +1666,11 @@ class RetroSpecExactAttentionWorkspace:
         resident = source.resident_pages
         staging = source.staging_pages
         dummy_page_ids = source.page_token_counts
+        compact_page_counts = (
+            source.page_token_counts
+            if source.compact_pages is None
+            else source.compact_pages.page_counts
+        )
         dummy_key_pages = primary.key_cache[:, :, 0, :]
         dummy_value_pages = primary.value_cache[:, :, 0, :]
         resident_page_ids = dummy_page_ids if resident is None else resident.page_ids
@@ -1677,6 +1712,7 @@ class RetroSpecExactAttentionWorkspace:
                 primary.token_indices,
                 primary.token_mask,
                 source.page_token_counts,
+                compact_page_counts,
                 resident_page_ids,
                 resident_key_pages,
                 resident_value_pages,
@@ -1733,6 +1769,7 @@ class RetroSpecExactAttentionWorkspace:
                 USE_PLAN_ROWS=source.plan_row_indices is not None,
                 HAS_RESIDENT=resident is not None,
                 HAS_STAGING=staging is not None,
+                COMPACT_PAGES=source.compact_pages is not None,
             )
             partition_start += wave_partitions
             if total_partitions <= self._partition_capacity:

@@ -1676,6 +1676,8 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
         "proposed_tokens": 4,
         "resident_cluster_hits": 0,
         "resident_cluster_misses": 0,
+        "draft_compact_resident_pages": 0,
+        "draft_compact_selected_clusters": 0,
         "verification_lookup_clusters": 0,
         "verification_resident_hits": 0,
         "verification_resident_misses": 0,
