@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import deque
+from concurrent.futures import Future
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -8,6 +11,8 @@ import pytest
 import torch
 
 from vllm.sequence import IntermediateTensors
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine.core import EngineCore
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.ray_executor import RayDistributedExecutor
 from vllm.v1.spec_decode.retrospec.pipeline import (
@@ -89,12 +94,10 @@ def make_executor_concurrency_view(executor_cls, method: str | None):
 
 
 @pytest.mark.parametrize("executor_cls", [MultiprocExecutor, RayDistributedExecutor])
-def test_retrospec_pipeline_waits_for_proposal_before_scheduling_next_batch(
-    executor_cls,
-):
+def test_retrospec_pipeline_uses_pipeline_depth(executor_cls):
     executor = make_executor_concurrency_view(executor_cls, "retrospec")
 
-    assert executor.max_concurrent_batches == 1
+    assert executor.max_concurrent_batches == 2
 
 
 @pytest.mark.parametrize("executor_cls", [MultiprocExecutor, RayDistributedExecutor])
@@ -105,6 +108,64 @@ def test_non_retrospec_pipeline_retains_pipeline_batch_concurrency(
     executor = make_executor_concurrency_view(executor_cls, method)
 
     assert executor.max_concurrent_batches == 2
+
+
+@pytest.mark.parametrize("use_retrospec_pp_batch_queue", [False, True])
+def test_engine_uses_tagged_drafts_for_retrospec_pp(
+    use_retrospec_pp_batch_queue: bool,
+):
+    engine = EngineCore.__new__(EngineCore)
+    engine.async_scheduling = False
+    engine.use_spec_decode = True
+    engine.use_retrospec_pp_batch_queue = use_retrospec_pp_batch_queue
+    engine.model_executor = Mock()
+    engine.model_executor.take_draft_token_ids.return_value = None
+    engine.scheduler = Mock()
+
+    engine.post_step(model_executed=True)
+
+    if use_retrospec_pp_batch_queue:
+        engine.model_executor.take_draft_token_ids.assert_not_called()
+    else:
+        engine.model_executor.take_draft_token_ids.assert_called_once_with()
+
+
+def test_engine_does_not_submit_empty_retrospec_pp_batch():
+    engine = EngineCore.__new__(EngineCore)
+    engine._scheduler_paused = False
+    engine.batch_queue_size = 2
+    engine.use_retrospec_pp_batch_queue = True
+    engine.is_ec_producer = False
+    engine.is_pooling_model = False
+    engine.scheduler = Mock()
+    engine.scheduler.has_requests.return_value = True
+    engine.scheduler.schedule.return_value = SchedulerOutput.make_empty()
+    expected_outputs = {0: Mock()}
+    engine.scheduler.update_from_output.return_value = expected_outputs
+    engine.model_executor = Mock()
+    engine.log_error_detail = Mock(return_value=nullcontext())
+    engine.log_iteration_details = Mock(return_value=nullcontext())
+    engine._process_aborts_queue = Mock()
+
+    completed_output = Mock()
+    completed_future = Future()
+    completed_future.set_result(completed_output)
+    completed_scheduler_output = SchedulerOutput.make_empty()
+    completed_scheduler_output.num_scheduled_tokens = {"request": 1}
+    completed_scheduler_output.total_num_scheduled_tokens = 1
+    engine.batch_queue = deque(
+        [(completed_future, completed_scheduler_output, Mock())], maxlen=2
+    )
+
+    outputs, model_executed = engine.step_with_batch_queue()
+
+    assert outputs is expected_outputs
+    assert not model_executed
+    engine.model_executor.execute_model.assert_not_called()
+    engine.model_executor.sample_tokens.assert_not_called()
+    engine.scheduler.update_from_output.assert_called_once_with(
+        completed_scheduler_output, completed_output
+    )
 
 
 def test_pipeline_stage_describes_local_layer_range():

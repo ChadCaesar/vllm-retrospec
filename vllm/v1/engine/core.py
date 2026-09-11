@@ -144,7 +144,13 @@ class EngineCore:
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
         )
-        self.use_spec_decode = vllm_config.speculative_config is not None
+        speculative_config = vllm_config.speculative_config
+        self.use_spec_decode = speculative_config is not None
+        self.use_retrospec_pp_batch_queue = (
+            speculative_config is not None
+            and speculative_config.method == "retrospec"
+            and vllm_config.parallel_config.pipeline_parallel_size > 1
+        )
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
@@ -425,7 +431,12 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if not self.async_scheduling and self.use_spec_decode and model_executed:
+        if (
+            not self.async_scheduling
+            and self.use_spec_decode
+            and model_executed
+            and not self.use_retrospec_pp_batch_queue
+        ):
             # Take the draft token ids.
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
@@ -463,41 +474,52 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
-            exec_future = self.model_executor.execute_model(
-                scheduler_output, non_block=True
+            skip_empty_retrospec_batch = (
+                self.use_retrospec_pp_batch_queue
+                and scheduler_output.total_num_scheduled_tokens == 0
+                and bool(batch_queue)
+                and not scheduler_output.finished_req_ids
+                and not scheduler_output.preempted_req_ids
+                and not scheduler_output.free_encoder_mm_hashes
+                and scheduler_output.kv_connector_metadata is None
+                and scheduler_output.ec_connector_metadata is None
             )
-            if not self.is_ec_producer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
+            if not skip_empty_retrospec_batch:
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+                if not self.is_ec_producer:
+                    model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
-            if self.is_pooling_model or not model_executed:
-                # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
-            else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
-                    )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
+                if self.is_pooling_model or not model_executed:
+                    # No sampling required (no requests scheduled).
+                    future = cast(Future[ModelRunnerOutput], exec_future)
                 else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
+                    if not scheduler_output.pending_structured_output_tokens:
+                        # We aren't waiting for any tokens, get any grammar output
+                        # and sample immediately.
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                    else:
+                        # We need to defer sampling until we have processed the model
+                        # output from the prior step.
+                        deferred_scheduler_output = scheduler_output
 
-            if not deferred_scheduler_output:
-                # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
-                if (
-                    model_executed
-                    and len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
-                ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
-                    return None, True
+                if not deferred_scheduler_output:
+                    # Add this step's future to the queue.
+                    batch_queue.appendleft((future, scheduler_output, exec_future))
+                    if (
+                        model_executed
+                        and len(batch_queue) < self.batch_queue_size
+                        and not batch_queue[-1][0].done()
+                    ):
+                        # Don't block on next worker response unless the queue is full
+                        # or there are no more requests to schedule.
+                        return None, True
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should

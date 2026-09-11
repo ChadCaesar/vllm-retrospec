@@ -15,14 +15,65 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import (
+    DraftTokenIds,
     KVCacheRetirement,
+    ModelRunnerOutput,
     RetroSpecLayerMajorPrefillCompletion,
 )
+from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.retrospec.prefill import (
     RetroSpecLayerMajorPrefillProtocol,
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+def make_retrospec_pp_scheduler(
+    *,
+    num_requests: int = 4,
+) -> tuple[Scheduler, list[Request]]:
+    speculative_config = SpeculativeConfig(
+        method="retrospec",
+        num_speculative_tokens=4,
+        retrospec_max_draft_tokens=4,
+        retrospec_index_segment_size=32,
+    )
+    scheduler = create_scheduler(
+        max_num_seqs=num_requests,
+        max_num_batched_tokens=num_requests * 8,
+        max_model_len=64,
+        pipeline_parallel_size=2,
+        speculative_config=speculative_config,
+        device_config=DeviceConfig(device="cpu"),
+    )
+    requests = create_requests(
+        num_requests=num_requests,
+        num_tokens=8,
+        req_ids=[f"request-{index}" for index in range(num_requests)],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+    return scheduler, requests
+
+
+def make_model_runner_output(
+    scheduler_output: SchedulerOutput,
+    *,
+    draft_token_ids: list[list[int]] | None = None,
+) -> ModelRunnerOutput:
+    request_ids = list(scheduler_output.num_scheduled_tokens)
+    return ModelRunnerOutput(
+        req_ids=request_ids,
+        req_id_to_index={
+            request_id: index for index, request_id in enumerate(request_ids)
+        },
+        sampled_token_ids=[[1] for _ in request_ids],
+        retrospec_draft_token_ids=(
+            DraftTokenIds(request_ids, draft_token_ids)
+            if draft_token_ids is not None
+            else None
+        ),
+    )
 
 
 def test_retrospec_reserves_speculative_lookahead_tokens():
@@ -48,6 +99,98 @@ def test_retrospec_scheduler_change_does_not_affect_ngram():
 
     assert scheduler.num_spec_tokens == 4
     assert scheduler.num_lookahead_tokens == 0
+
+
+def test_retrospec_pp_schedules_request_disjoint_batches():
+    scheduler, _ = make_retrospec_pp_scheduler()
+
+    first = scheduler.schedule()
+    second = scheduler.schedule()
+
+    first_request_ids = set(first.num_scheduled_tokens)
+    second_request_ids = set(second.num_scheduled_tokens)
+    assert len(first_request_ids) == 2
+    assert len(second_request_ids) == 2
+    assert first_request_ids.isdisjoint(second_request_ids)
+    assert first.retrospec_pp_batch_id == 0
+    assert second.retrospec_pp_batch_id == 1
+    assert scheduler._retrospec_in_flight_req_ids == (
+        first_request_ids | second_request_ids
+    )
+
+
+def test_retrospec_pp_releases_dependency_before_rescheduling_request():
+    scheduler, _ = make_retrospec_pp_scheduler()
+    first = scheduler.schedule()
+    second = scheduler.schedule()
+    first_request_ids = set(first.num_scheduled_tokens)
+    draft_token_ids = [[11, 12] for _ in first_request_ids]
+
+    scheduler.update_from_output(
+        first,
+        make_model_runner_output(first, draft_token_ids=draft_token_ids),
+    )
+    third = scheduler.schedule()
+
+    assert set(third.num_scheduled_tokens) == first_request_ids
+    assert set(third.num_scheduled_tokens).isdisjoint(second.num_scheduled_tokens)
+    assert third.retrospec_pp_batch_id == 2
+    for request_id in first_request_ids:
+        assert third.scheduled_spec_decode_tokens[request_id] == [11, 12]
+
+
+def test_retrospec_pp_rejects_out_of_order_completion():
+    scheduler, _ = make_retrospec_pp_scheduler()
+    scheduler.schedule()
+    second = scheduler.schedule()
+
+    with pytest.raises(RuntimeError, match="completed out of order"):
+        scheduler._complete_retrospec_pp_batch(second)
+
+
+@pytest.mark.parametrize("batch_index", [0, 1])
+def test_retrospec_pp_defers_abort_until_owning_batch_completes(batch_index: int):
+    scheduler, _ = make_retrospec_pp_scheduler()
+    first = scheduler.schedule()
+    second = scheduler.schedule()
+    owning_batch = (first, second)[batch_index]
+    aborted_request_id = next(iter(owning_batch.num_scheduled_tokens))
+
+    scheduler.finish_requests(aborted_request_id, RequestStatus.FINISHED_ABORTED)
+
+    assert aborted_request_id in scheduler.requests
+    assert aborted_request_id in scheduler._retrospec_deferred_finish_status
+    first_output = make_model_runner_output(first)
+    first_engine_outputs = scheduler.update_from_output(first, first_output)
+    if batch_index == 0:
+        assert aborted_request_id not in scheduler.requests
+        assert all(
+            output.request_id != aborted_request_id
+            for client_outputs in first_engine_outputs.values()
+            for output in client_outputs.outputs
+        )
+    else:
+        assert aborted_request_id in scheduler.requests
+
+    second_output = make_model_runner_output(second)
+    engine_outputs = scheduler.update_from_output(second, second_output)
+
+    assert aborted_request_id not in scheduler.requests
+    assert aborted_request_id not in scheduler._retrospec_deferred_finish_status
+    assert all(
+        output.request_id != aborted_request_id
+        for client_outputs in engine_outputs.values()
+        for output in client_outputs.outputs
+    )
+
+
+def test_retrospec_pp_protects_in_flight_requests_from_preemption():
+    scheduler, _ = make_retrospec_pp_scheduler()
+    scheduler.schedule()
+    scheduler.schedule()
+
+    assert scheduler._select_preemption_victim() is None
+    assert not scheduler.reset_prefix_cache(reset_running_requests=True)
 
 
 def test_scheduler_applies_worker_kv_cache_retirement():
@@ -209,6 +352,37 @@ def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
     assert scheduler_output.retrospec_layer_major_prefill is None
     assert len(scheduler.running) == 1
     assert len(scheduler.waiting) == 1
+
+
+def test_retrospec_pp_layer_major_prefill_blocks_pipeline_fill():
+    speculative_config = SpeculativeConfig(
+        method="retrospec",
+        num_speculative_tokens=4,
+        retrospec_max_draft_tokens=4,
+        retrospec_index_segment_size=4,
+    )
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        max_num_batched_tokens=8,
+        max_model_len=32,
+        pipeline_parallel_size=2,
+        speculative_config=speculative_config,
+        device_config=DeviceConfig(device="cpu"),
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        req_ids=["long-prefill"],
+    )[0]
+    scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    blocked = scheduler.schedule()
+
+    assert first.retrospec_layer_major_prefill is not None
+    assert first.retrospec_pp_batch_id == 0
+    assert blocked.total_num_scheduled_tokens == 0
+    assert blocked.retrospec_pp_batch_id is None
 
 
 def test_short_prompt_uses_native_chunked_prefill():

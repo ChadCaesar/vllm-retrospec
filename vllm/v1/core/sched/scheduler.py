@@ -265,6 +265,21 @@ class Scheduler(SchedulerInterface):
             else 0
         )
         self._retrospec_layer_major_prefill_req_id: str | None = None
+        self.enable_retrospec_pp_batching = (
+            speculative_config is not None
+            and speculative_config.method == "retrospec"
+            and self.parallel_config.pipeline_parallel_size > 1
+        )
+        self.retrospec_pp_depth = (
+            self.parallel_config.pipeline_parallel_size
+            if self.enable_retrospec_pp_batching
+            else 1
+        )
+        self._retrospec_next_pp_batch_id = 0
+        self._retrospec_in_flight_batches: deque[tuple[int, frozenset[str]]] = deque()
+        self._retrospec_in_flight_req_ids: set[str] = set()
+        self._retrospec_deferred_finish_status: dict[str, RequestStatus] = {}
+        self._retrospec_layer_major_prefill_in_flight_req_id: str | None = None
 
         def has_mamba_layers(kv_cache_config: KVCacheConfig) -> bool:
             return any(
@@ -396,6 +411,144 @@ class Scheduler(SchedulerInterface):
         self._retrospec_layer_major_prefill_req_id = request_id
         return request_id
 
+    def _get_retrospec_pp_request_budget(self) -> int | None:
+        if not self.enable_retrospec_pp_batching:
+            return None
+
+        free_pipeline_slots = self.retrospec_pp_depth - len(
+            self._retrospec_in_flight_batches
+        )
+        if free_pipeline_slots <= 0:
+            return 0
+
+        eligible_running = sum(
+            request.request_id not in self._retrospec_in_flight_req_ids
+            for request in self.running
+        )
+        available_running_slots = max(0, self.max_num_running_reqs - len(self.running))
+        eligible_waiting = min(len(self.waiting), available_running_slots)
+        eligible_requests = eligible_running + eligible_waiting
+        if eligible_requests == 0:
+            return 0
+
+        return cdiv(eligible_requests, free_pipeline_slots)
+
+    @staticmethod
+    def _retrospec_pp_request_budget_reached(
+        request_budget: int | None,
+        num_scheduled_requests: int,
+    ) -> bool:
+        return request_budget is not None and num_scheduled_requests >= request_budget
+
+    def _select_preemption_victim(self) -> Request | None:
+        candidates = [
+            request
+            for request in self.running
+            if request.request_id not in self._retrospec_in_flight_req_ids
+        ]
+        if not candidates:
+            return None
+
+        if self.policy == SchedulingPolicy.PRIORITY:
+            return max(
+                candidates,
+                key=lambda request: (request.priority, request.arrival_time),
+            )
+        return candidates[-1]
+
+    def _register_retrospec_pp_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        if (
+            not self.enable_retrospec_pp_batching
+            or not scheduler_output.num_scheduled_tokens
+        ):
+            return
+
+        request_ids = frozenset(scheduler_output.num_scheduled_tokens)
+        overlap = request_ids & self._retrospec_in_flight_req_ids
+        if overlap:
+            raise RuntimeError(
+                "RetroSpec PP scheduled requests with unresolved dependencies: "
+                f"{sorted(overlap)}"
+            )
+        if len(self._retrospec_in_flight_batches) >= self.retrospec_pp_depth:
+            raise RuntimeError("RetroSpec PP in-flight batch capacity exceeded")
+
+        descriptor = scheduler_output.retrospec_layer_major_prefill
+        if descriptor is not None:
+            if request_ids != frozenset((descriptor.request_id,)):
+                raise RuntimeError(
+                    "RetroSpec layer-major prefill must own an exclusive PP batch"
+                )
+            if self._retrospec_layer_major_prefill_in_flight_req_id is not None:
+                raise RuntimeError(
+                    "A RetroSpec layer-major prefill is already in flight"
+                )
+
+        batch_id = self._retrospec_next_pp_batch_id
+        self._retrospec_next_pp_batch_id += 1
+        scheduler_output.retrospec_pp_batch_id = batch_id
+        self._retrospec_in_flight_batches.append((batch_id, request_ids))
+        self._retrospec_in_flight_req_ids.update(request_ids)
+
+        if descriptor is not None:
+            self._retrospec_layer_major_prefill_in_flight_req_id = descriptor.request_id
+
+    def _complete_retrospec_pp_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        batch_id = scheduler_output.retrospec_pp_batch_id
+        if not self.enable_retrospec_pp_batching:
+            if batch_id is not None:
+                raise RuntimeError(
+                    "Received a RetroSpec PP batch ID while PP batching is disabled"
+                )
+            return
+
+        if batch_id is None:
+            if scheduler_output.num_scheduled_tokens:
+                raise RuntimeError("Non-empty RetroSpec PP output has no batch ID")
+            return
+
+        if not self._retrospec_in_flight_batches:
+            raise RuntimeError("RetroSpec PP completed an unknown batch")
+
+        expected_batch_id, expected_request_ids = self._retrospec_in_flight_batches[0]
+        request_ids = frozenset(scheduler_output.num_scheduled_tokens)
+        if batch_id != expected_batch_id:
+            raise RuntimeError(
+                "RetroSpec PP batches completed out of order: "
+                f"expected={expected_batch_id}, got={batch_id}"
+            )
+        if request_ids != expected_request_ids:
+            raise RuntimeError("RetroSpec PP batch request set changed while in flight")
+
+        self._retrospec_in_flight_batches.popleft()
+        self._retrospec_in_flight_req_ids.difference_update(request_ids)
+
+        descriptor = scheduler_output.retrospec_layer_major_prefill
+        if descriptor is not None:
+            if (
+                self._retrospec_layer_major_prefill_in_flight_req_id
+                != descriptor.request_id
+            ):
+                raise RuntimeError(
+                    "RetroSpec layer-major prefill completion is not active"
+                )
+            self._retrospec_layer_major_prefill_in_flight_req_id = None
+
+        deferred_by_status: dict[RequestStatus, list[str]] = defaultdict(list)
+        for request_id in request_ids:
+            status = self._retrospec_deferred_finish_status.pop(request_id, None)
+            if status is not None:
+                deferred_by_status[status].append(request_id)
+
+        for status, deferred_request_ids in deferred_by_status.items():
+            self._finish_requests_now(deferred_request_ids, status)
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -429,11 +582,26 @@ class Scheduler(SchedulerInterface):
         )
         layer_major_resident_start_block: int | None = None
         layer_major_num_logical_blocks: int | None = None
+        retrospec_request_budget = self._get_retrospec_pp_request_budget()
+        if self._retrospec_layer_major_prefill_in_flight_req_id is not None:
+            token_budget = 0
+        elif layer_major_prefill_req_id is not None:
+            retrospec_request_budget = 1
+        if retrospec_request_budget == 0:
+            token_budget = 0
 
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
+            if self._retrospec_pp_request_budget_reached(
+                retrospec_request_budget, len(num_scheduled_tokens)
+            ):
+                break
+
             request = self.running[req_index]
+            if request.request_id in self._retrospec_in_flight_req_ids:
+                req_index += 1
+                continue
 
             if (
                 layer_major_prefill_req_id is not None
@@ -527,34 +695,32 @@ class Scheduler(SchedulerInterface):
                         # The request can be scheduled.
                         break
 
-                    # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
+                    # The request cannot be scheduled. In-flight RetroSpec PP
+                    # requests still own their optimistic token state and KV writes.
+                    preempted_req = self._select_preemption_victim()
+                    if preempted_req is None:
+                        break
+
+                    preempted_index = self.running.index(preempted_req)
+                    self.running.remove(preempted_req)
+                    if preempted_req in scheduled_running_reqs:
+                        preempted_req_id = preempted_req.request_id
+                        scheduled_running_reqs.remove(preempted_req)
+                        token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                        req_to_new_blocks.pop(preempted_req_id)
+                        scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                        preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                            preempted_req_id, None
                         )
-                        self.running.remove(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
+                        if preempted_encoder_inputs:
+                            num_embeds_to_restore = sum(
+                                preempted_req.get_num_encoder_embeds(i)
+                                for i in preempted_encoder_inputs
                             )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
-                    else:
-                        preempted_req = self.running.pop()
+                            encoder_compute_budget += num_embeds_to_restore
+
+                    if preempted_index < req_index:
+                        req_index -= 1
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
@@ -622,6 +788,10 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
+                if self._retrospec_pp_request_budget_reached(
+                    retrospec_request_budget, len(num_scheduled_tokens)
+                ):
+                    break
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -1060,6 +1230,10 @@ class Scheduler(SchedulerInterface):
         NOTE: The request should be popped from the running queue outside of this
         method.
         """
+        if request.request_id in self._retrospec_in_flight_req_ids:
+            raise RuntimeError(
+                f"Cannot preempt in-flight RetroSpec request {request.request_id!r}"
+            )
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
@@ -1077,6 +1251,8 @@ class Scheduler(SchedulerInterface):
         self.waiting.prepend_request(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        self._register_retrospec_pp_batch(scheduler_output)
+
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
         # 1. The scheduler_output of the current step has to include the
@@ -1482,6 +1658,7 @@ class Scheduler(SchedulerInterface):
             scheduler_output,
             model_runner_output.kv_cache_retirements,
         )
+        self._complete_retrospec_pp_batch(scheduler_output)
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1645,6 +1822,10 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        retrospec_draft_token_ids = model_runner_output.retrospec_draft_token_ids
+        if retrospec_draft_token_ids is not None:
+            self.update_draft_token_ids(retrospec_draft_token_ids)
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -1906,15 +2087,35 @@ class Scheduler(SchedulerInterface):
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
         else:
-            request_ids = set(request_ids)
+            request_ids = tuple(set(request_ids))
+
+        immediate_request_ids = []
+        for request_id in request_ids:
+            request = self.requests.get(request_id)
+            if request is None or request.is_finished():
+                continue
+            if request_id in self._retrospec_in_flight_req_ids:
+                self._retrospec_deferred_finish_status[request_id] = finished_status
+            else:
+                immediate_request_ids.append(request_id)
+
+        if immediate_request_ids:
+            self._finish_requests_now(immediate_request_ids, finished_status)
+
+    def _finish_requests_now(
+        self,
+        request_ids: Iterable[str],
+        finished_status: RequestStatus,
+    ) -> None:
+        """Finish requests whose model/KV work is no longer in flight."""
 
         running_requests_to_remove = set()
         waiting_requests_to_remove = []
         valid_requests = []
 
         # First pass: collect requests to remove from queues
-        for req_id in request_ids:
-            request = self.requests.get(req_id)
+        for request_id in request_ids:
+            request = self.requests.get(request_id)
             if request is None or request.is_finished():
                 # Invalid request ID.
                 continue
@@ -1986,6 +2187,13 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        if reset_running_requests and self._retrospec_in_flight_req_ids:
+            logger.warning(
+                "Cannot reset the prefix cache while RetroSpec PP batches "
+                "are in flight."
+            )
+            return False
+
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()

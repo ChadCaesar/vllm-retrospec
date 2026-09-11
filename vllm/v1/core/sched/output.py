@@ -278,6 +278,9 @@ class SchedulerOutput:
     # Exclusive RetroSpec target-prefill execution for one request.
     retrospec_layer_major_prefill: RetroSpecLayerMajorPrefillDescriptor | None = None
 
+    # Scheduler-owned generation for dependency-aware RetroSpec PP batches.
+    retrospec_pp_batch_id: int | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

@@ -4339,12 +4339,20 @@ class GPUModelRunner(
             propose_draft_token_ids(valid_sampled_token_ids)
 
         kv_cache_retirements: list[KVCacheRetirement] = []
+        retrospec_draft_token_ids: DraftTokenIds | None = None
         retrospec_drafter = getattr(self, "drafter", None)
         if isinstance(retrospec_drafter, RetroSpecProposer):
             kv_cache_retirements = retrospec_drafter.take_kv_cache_retirements(
                 tuple(scheduler_output.num_scheduled_tokens)
             )
             self._apply_retrospec_kv_retirements(kv_cache_retirements)
+            pp_group = get_pp_group()
+            if (
+                pp_group.world_size > 1
+                and pp_group.is_last_rank
+                and get_tp_group().rank_in_group == 0
+            ):
+                retrospec_draft_token_ids = self.take_draft_token_ids()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
@@ -4375,6 +4383,7 @@ class GPUModelRunner(
                         scheduler_output
                     )
                 ),
+                retrospec_draft_token_ids=retrospec_draft_token_ids,
             )
 
         if not self.use_async_scheduling:

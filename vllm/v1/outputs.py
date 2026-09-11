@@ -221,6 +221,9 @@ class ModelRunnerOutput:
         RetroSpecLayerMajorPrefillCompletion | None
     ) = None
 
+    # RetroSpec proposal generated from this exact target batch.
+    retrospec_draft_token_ids: "DraftTokenIds | None" = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

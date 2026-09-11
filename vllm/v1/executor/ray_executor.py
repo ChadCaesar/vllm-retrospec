@@ -114,16 +114,6 @@ class RayDistributedExecutor(Executor):
         meaning that it allows PP size batches to be executed concurrently.
         """
         pp_size = self.parallel_config.pipeline_parallel_size
-        speculative_config = self.vllm_config.speculative_config
-        if (
-            pp_size > 1
-            and speculative_config is not None
-            and speculative_config.method == "retrospec"
-        ):
-            # A RetroSpec proposal is a dependency of the next scheduler step.
-            # Do not schedule ahead until PP microbatching carries proposal
-            # dependencies explicitly across in-flight batches.
-            return 1
         return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size
 
     def shutdown(self) -> None:
