@@ -14,6 +14,7 @@ from .resident_kernels import (
     lookup_resident_handles,
     resolve_compact_draft_pages,
     resolve_compact_verification_pages,
+    resolve_ranked_compact_draft_pages,
     update_resident_handles,
 )
 
@@ -1284,6 +1285,116 @@ class RetroSpecResidentClusterCache:
                 output_miss_handles=miss_cluster_ids,
                 output_miss_positions=miss_positions,
                 output_miss_count=miss_count,
+                emit_misses=emit_misses,
+            )
+        except BaseException:
+            self._gpu_access_lock.release()
+            raise
+
+        return RetroSpecCompactResidentPageAccess(
+            cache_page_ids=cache_page_ids,
+            page_token_counts=page_token_counts,
+            page_counts=page_counts,
+            clustered_token_counts=clustered_token_counts,
+            attention_mass=attention_mass,
+            selected_cluster_counts=selected_cluster_counts,
+            hit_cluster_counts=hit_cluster_counts,
+            miss_cluster_counts=miss_cluster_counts,
+            hit_gate_ready=hit_gate_ready,
+            access_kinds=None,
+            read_lease=RetroSpecResidentReadLease(self._gpu_access_lock),
+        )
+
+    def lookup_ranked_compact_draft_gpu(
+        self,
+        *,
+        ranked_values: torch.Tensor,
+        ranked_indices: torch.Tensor,
+        candidate_counts: torch.Tensor,
+        arena_cluster_ids: torch.Tensor,
+        arena_cluster_page_starts: torch.Tensor,
+        arena_cluster_page_counts: torch.Tensor,
+        arena_page_ids: torch.Tensor,
+        arena_page_token_counts: torch.Tensor,
+        arena_cluster_offsets: torch.Tensor,
+        arena_page_offsets: torch.Tensor,
+        request_slot_ids: torch.Tensor,
+        active_mask: torch.Tensor,
+        retrieval_ratio: float,
+        estimation_ratio: float,
+        max_pages_per_cluster: int,
+        fallback_token_counts: torch.Tensor,
+        sparse_cluster_indices: torch.Tensor,
+        expanded_cluster_indices: torch.Tensor,
+        cluster_handles: torch.Tensor,
+        cache_page_ids: torch.Tensor,
+        page_token_counts: torch.Tensor,
+        page_counts: torch.Tensor,
+        clustered_token_counts: torch.Tensor,
+        attention_mass: torch.Tensor,
+        hit_attention_by_head: torch.Tensor,
+        selected_cluster_counts: torch.Tensor,
+        hit_cluster_counts: torch.Tensor,
+        miss_cluster_counts: torch.Tensor,
+        hit_gate_ready: torch.Tensor,
+        miss_cluster_ids: torch.Tensor,
+        miss_positions: torch.Tensor,
+        miss_count: torch.Tensor,
+        sparse_attention: torch.Tensor,
+        expanded_attention: torch.Tensor,
+        emit_misses: bool = True,
+    ) -> RetroSpecCompactResidentPageAccess:
+        """Resolve ranked DRAFT rows without logical-page intermediates."""
+        if ranked_values.device != self.device:
+            raise ValueError("Ranked draft lookup must use the cache device")
+
+        self._gpu_access_lock.acquire()
+        try:
+            self._ensure_handle_table(max_pages_per_cluster)
+            access_epoch = self._next_access_epoch
+            self._next_access_epoch += 1
+            resolve_ranked_compact_draft_pages(
+                ranked_values=ranked_values,
+                ranked_indices=ranked_indices,
+                candidate_counts=candidate_counts,
+                arena_cluster_ids=arena_cluster_ids,
+                arena_cluster_page_starts=arena_cluster_page_starts,
+                arena_cluster_page_counts=arena_cluster_page_counts,
+                arena_page_ids=arena_page_ids,
+                arena_page_token_counts=arena_page_token_counts,
+                arena_cluster_offsets=arena_cluster_offsets,
+                arena_page_offsets=arena_page_offsets,
+                request_slot_ids=request_slot_ids,
+                active_mask=active_mask,
+                table_handles=self._handle_table_handles,
+                table_versions=self._handle_table_versions,
+                table_page_counts=self._handle_table_page_counts,
+                table_page_slots=self._handle_table_page_slots,
+                table_hit_gate_ready=self._handle_table_hit_gate_ready,
+                table_last_access_epochs=self._handle_table_last_access_epochs,
+                access_epoch=access_epoch,
+                retrieval_ratio=retrieval_ratio,
+                estimation_ratio=estimation_ratio,
+                max_pages_per_cluster=max_pages_per_cluster,
+                fallback_token_counts=fallback_token_counts,
+                sparse_cluster_indices=sparse_cluster_indices,
+                expanded_cluster_indices=expanded_cluster_indices,
+                output_cluster_handles=cluster_handles,
+                output_page_slots=cache_page_ids,
+                output_page_token_counts=page_token_counts,
+                output_page_counts=page_counts,
+                output_clustered_token_counts=clustered_token_counts,
+                output_attention=attention_mass,
+                output_hit_attention_by_head=hit_attention_by_head,
+                output_selected_counts=selected_cluster_counts,
+                output_hit_counts=hit_cluster_counts,
+                output_miss_counts=miss_cluster_counts,
+                output_gate_ready=hit_gate_ready,
+                output_miss_handles=miss_cluster_ids,
+                output_miss_positions=miss_positions,
+                output_miss_count=miss_count,
+                sparse_attention=sparse_attention,
+                expanded_attention=expanded_attention,
                 emit_misses=emit_misses,
             )
         except BaseException:

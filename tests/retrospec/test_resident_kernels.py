@@ -8,6 +8,7 @@ from vllm.v1.spec_decode.retrospec.resident_kernels import (
     compact_resident_misses,
     lookup_resident_handles,
     resolve_compact_verification_pages,
+    resolve_ranked_compact_draft_pages,
     scatter_compact_staging_page_ids,
     scatter_staging_page_ids,
     update_resident_handles,
@@ -219,6 +220,131 @@ def test_resident_handle_lookup_indexes_persistent_plan_rows():
 
     for actual, expected in zip(indexed, gathered):
         torch.testing.assert_close(actual, expected)
+
+
+def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
+    device = torch.device("cuda")
+    table = _make_table(capacity=8, max_pages=2)
+    update_resident_handles(
+        bucket_ids=torch.tensor([2], dtype=torch.int32, device=device),
+        cluster_handles=torch.tensor([10], dtype=torch.int64, device=device),
+        page_counts=torch.tensor([2], dtype=torch.int32, device=device),
+        page_slots=torch.tensor([[5, 6]], dtype=torch.int32, device=device),
+        hit_gate_ready=torch.tensor([True], device=device),
+        table_handles=table[0],
+        table_versions=table[1],
+        table_page_counts=table[2],
+        table_page_slots=table[3],
+        table_hit_gate_ready=table[4],
+    )
+
+    ranked_values = torch.tensor([[[0.6, 0.3, 0.1]], [[0.9, 0.1, 0.0]]], device=device)
+    ranked_indices = torch.tensor(
+        [[[0, 1, 2]], [[2, 1, 0]]], dtype=torch.int64, device=device
+    )
+    candidate_counts = torch.tensor([[3], [0]], dtype=torch.int32, device=device)
+    arena_cluster_ids = torch.tensor(
+        [[10, 11, 12, -1]], dtype=torch.int64, device=device
+    )
+    arena_cluster_page_starts = torch.tensor(
+        [[0, 2, 3, 0]], dtype=torch.int32, device=device
+    )
+    arena_cluster_page_counts = torch.tensor(
+        [[2, 1, 1, 0]], dtype=torch.int32, device=device
+    )
+    arena_page_ids = torch.tensor(
+        [[100, 101, 102, 103]], dtype=torch.int64, device=device
+    )
+    arena_page_token_counts = torch.tensor(
+        [[2, 1, 2, 2]], dtype=torch.int32, device=device
+    )
+
+    sparse_indices = torch.empty((2, 1, 2), dtype=torch.int32, device=device)
+    expanded_indices = torch.empty((2, 1, 3), dtype=torch.int32, device=device)
+    cluster_handles = torch.empty((2, 1, 2), dtype=torch.int64, device=device)
+    resident_page_ids = torch.empty((2, 1, 4), dtype=torch.int64, device=device)
+    page_token_counts = torch.empty_like(resident_page_ids, dtype=torch.int32)
+    row_shape = (2, 1)
+    page_counts = torch.empty(row_shape, dtype=torch.int32, device=device)
+    clustered_token_counts = torch.empty_like(page_counts)
+    hit_attention_by_head = torch.empty(row_shape, device=device)
+    selected_counts = torch.empty_like(page_counts)
+    hit_counts = torch.empty_like(page_counts)
+    miss_counts = torch.empty_like(page_counts)
+    gate_ready = torch.empty(row_shape, dtype=torch.bool, device=device)
+    miss_handles = torch.empty(4, dtype=torch.int64, device=device)
+    miss_positions = torch.empty_like(miss_handles)
+    miss_count = torch.empty(1, dtype=torch.int32, device=device)
+    fallback_counts = torch.tensor(
+        [[[3, 2]], [[7, 8]]], dtype=torch.int32, device=device
+    )
+    draft_attention = torch.empty(2, device=device)
+    sparse_attention = torch.empty(2, device=device)
+    expanded_attention = torch.empty(2, device=device)
+
+    resolve_ranked_compact_draft_pages(
+        ranked_values=ranked_values,
+        ranked_indices=ranked_indices,
+        candidate_counts=candidate_counts,
+        arena_cluster_ids=arena_cluster_ids,
+        arena_cluster_page_starts=arena_cluster_page_starts,
+        arena_cluster_page_counts=arena_cluster_page_counts,
+        arena_page_ids=arena_page_ids,
+        arena_page_token_counts=arena_page_token_counts,
+        arena_cluster_offsets=torch.tensor([0], dtype=torch.int64, device=device),
+        arena_page_offsets=torch.tensor([0], dtype=torch.int64, device=device),
+        request_slot_ids=torch.tensor([0, -1], dtype=torch.int64, device=device),
+        active_mask=torch.tensor([True, True], device=device),
+        table_handles=table[0],
+        table_versions=table[1],
+        table_page_counts=table[2],
+        table_page_slots=table[3],
+        table_hit_gate_ready=table[4],
+        table_last_access_epochs=table[5],
+        access_epoch=9,
+        retrieval_ratio=0.5,
+        estimation_ratio=0.34,
+        max_pages_per_cluster=2,
+        fallback_token_counts=fallback_counts,
+        sparse_cluster_indices=sparse_indices,
+        expanded_cluster_indices=expanded_indices,
+        output_cluster_handles=cluster_handles,
+        output_page_slots=resident_page_ids,
+        output_page_token_counts=page_token_counts,
+        output_page_counts=page_counts,
+        output_clustered_token_counts=clustered_token_counts,
+        output_attention=draft_attention,
+        output_hit_attention_by_head=hit_attention_by_head,
+        output_selected_counts=selected_counts,
+        output_hit_counts=hit_counts,
+        output_miss_counts=miss_counts,
+        output_gate_ready=gate_ready,
+        output_miss_handles=miss_handles,
+        output_miss_positions=miss_positions,
+        output_miss_count=miss_count,
+        sparse_attention=sparse_attention,
+        expanded_attention=expanded_attention,
+    )
+
+    assert sparse_indices.cpu().tolist() == [[[0, 1]], [[-1, -1]]]
+    assert expanded_indices.cpu().tolist() == [[[0, 1, 2]], [[-1, -1, -1]]]
+    assert cluster_handles.cpu().tolist() == [[[10, 11]], [[-1, -1]]]
+    assert resident_page_ids.cpu().tolist() == [[[5, 6, -1, -1]], [[-1] * 4]]
+    assert page_token_counts.cpu().tolist() == [[[2, 1, 0, 0]], [[0] * 4]]
+    assert page_counts.cpu().tolist() == [[2], [0]]
+    assert clustered_token_counts.cpu().tolist() == [[3], [0]]
+    assert selected_counts.cpu().tolist() == [[2], [0]]
+    assert hit_counts.cpu().tolist() == [[1], [0]]
+    assert miss_counts.cpu().tolist() == [[1], [0]]
+    assert gate_ready.cpu().tolist() == [[True], [False]]
+    assert fallback_counts.cpu().tolist() == [[[0, 2]], [[0, 0]]]
+    assert miss_count.item() == 1
+    assert miss_handles[0].item() == 11
+    assert miss_positions[0].item() == 1
+    torch.testing.assert_close(draft_attention.cpu(), torch.tensor([0.6, 1.0]))
+    torch.testing.assert_close(sparse_attention.cpu(), torch.tensor([0.9, 1.0]))
+    torch.testing.assert_close(expanded_attention.cpu(), torch.tensor([1.0, 1.0]))
+    assert table[5][2].item() == 9
 
 
 def test_compact_resident_misses_preserves_handles_and_flat_positions():

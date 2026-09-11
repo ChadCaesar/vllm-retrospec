@@ -258,7 +258,6 @@ def test_draft_materialization_skips_resident_lookup_without_arena():
             plan=plan,
             output_workspace=None,
             view=make_empty_resident_view(1, 1, device),
-            has_clusters=torch.zeros(1, 1, dtype=torch.bool, device=device),
             active_mask=torch.ones(1, dtype=torch.bool, device=device),
         )
     finally:
@@ -2189,6 +2188,7 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     index.begin_proposal(["request"])
     try:
         cold = index.select_segmented(**selection_kwargs)
+        cold_sparse_indices = cold.plan.sparse_exact_cluster_indices.clone()
     finally:
         index.end_proposal()
 
@@ -2212,12 +2212,27 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     assert not cold.exact_page_token_counts.any()
     scratch = index._draft_selection_scratch
     assert scratch is not None
-    assert scratch.draft_exact_page_token_counts.sum().item() == 2
+
+    index.begin_proposal(["request"])
+    try:
+        resident_view = index._gpu_index_residency.get_active_view(
+            "layer", ["request"], device
+        )
+        logical_cluster_ids, logical_page_ids, logical_page_token_counts = (
+            index._build_resident_exact_cluster_selection(
+                resident_view,
+                cold_sparse_indices.clamp_min(0),
+                cold_sparse_indices >= 0,
+            )
+        )
+    finally:
+        index.end_proposal()
+    assert logical_page_token_counts.sum().item() == 2
 
     index.cluster_store.admit_resident_clusters(
         "layer",
-        scratch.draft_exact_cluster_ids,
-        scratch.draft_exact_page_ids,
+        logical_cluster_ids,
+        logical_page_ids,
     )
     index.cluster_store.get_resident_page_storage("layer")
     torch.cuda.current_stream().synchronize()

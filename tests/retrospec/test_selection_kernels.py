@@ -12,6 +12,7 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 )
 from vllm.v1.spec_decode.retrospec.selection_kernels import (
     add_indexed_values,
+    emit_ranked_estimation_plan,
     emit_ranked_selection_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
@@ -604,6 +605,47 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_emit_ranked_estimation_plan_omits_exact_page_intermediates():
+    device = torch.device("cuda")
+    cluster_keys = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]], device=device)
+    cluster_values = cluster_keys * 10
+    cluster_counts = torch.tensor([[4, 5, 6]], dtype=torch.int32, device=device)
+    sparse_estimation = torch.empty((1, 1, 1), dtype=torch.int32, device=device)
+    expanded_estimation = torch.empty_like(sparse_estimation)
+    draft_keys = torch.empty((1, 1, 3, 2), device=device)
+    draft_values = torch.empty_like(draft_keys)
+    draft_counts = torch.empty((1, 1, 3), dtype=torch.int32, device=device)
+
+    emit_ranked_estimation_plan(
+        ranked_indices=torch.tensor([[[2, 0, 1]]], dtype=torch.int64, device=device),
+        candidate_counts=torch.tensor([[3]], dtype=torch.int32, device=device),
+        cluster_keys=cluster_keys,
+        cluster_values=cluster_values,
+        cluster_token_counts=cluster_counts,
+        cluster_offsets=torch.tensor([0], dtype=torch.int64, device=device),
+        request_slot_ids=torch.tensor([0], dtype=torch.int64, device=device),
+        active_mask=torch.tensor([True], device=device),
+        retrieval_ratio=0.34,
+        estimation_ratio=0.34,
+        sparse_exact_width=2,
+        sparse_estimation_cluster_indices=sparse_estimation,
+        expanded_estimation_cluster_indices=expanded_estimation,
+        draft_estimation_keys=draft_keys,
+        draft_estimation_values=draft_values,
+        draft_estimation_token_counts=draft_counts,
+    )
+
+    assert sparse_estimation.item() == 1
+    assert expanded_estimation.item() == -1
+    torch.testing.assert_close(
+        draft_keys.cpu(),
+        torch.tensor([[[[3.0, 4.0], [5.0, 6.0], [1.0, 2.0]]]]),
+    )
+    torch.testing.assert_close(draft_values.cpu(), draft_keys.cpu() * 10)
+    assert draft_counts.cpu().tolist() == [[[5, 6, 4]]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_selection_plan_table_uses_one_shared_draft_scratch():
     device = torch.device("cuda", torch.cuda.current_device())
     index = RetroSpecSegmentedTokenIndex(
@@ -709,10 +751,10 @@ def test_shared_draft_scratch_grows_and_returns_layer_sized_views():
     finally:
         index.end_proposal()
 
-    assert small_before_growth.draft_exact_page_ids.shape == (1, 1, 2, 1)
-    assert large.draft_exact_page_ids.shape == (1, 1, 4, 3)
-    assert small_after_growth.draft_exact_page_ids.shape == (1, 1, 2, 1)
+    assert small_before_growth.draft_compact_page_ids.shape == (1, 1, 2)
+    assert large.draft_compact_page_ids.shape == (1, 1, 12)
+    assert small_after_growth.draft_compact_page_ids.shape == (1, 1, 2)
     assert small_after_growth.draft_estimation_keys.shape == (1, 1, 3, 8)
-    assert large.draft_exact_page_ids.data_ptr() == (
-        small_after_growth.draft_exact_page_ids.data_ptr()
+    assert large.draft_compact_page_ids.data_ptr() == (
+        small_after_growth.draft_compact_page_ids.data_ptr()
     )

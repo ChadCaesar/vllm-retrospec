@@ -4585,6 +4585,113 @@ class RetroSpecClusterPageStore:
             read_lease=access.read_lease,
         )
 
+    def resolve_ranked_compact_draft_cluster_blocks(
+        self,
+        *,
+        layer_name: str,
+        ranked_values: torch.Tensor,
+        ranked_indices: torch.Tensor,
+        candidate_counts: torch.Tensor,
+        arena: RetroSpecResidentLayerArena,
+        request_slot_ids: torch.Tensor,
+        active_mask: torch.Tensor,
+        retrieval_ratio: float,
+        estimation_ratio: float,
+        max_pages_per_cluster: int,
+        fallback_token_counts: torch.Tensor,
+        sparse_cluster_indices: torch.Tensor,
+        expanded_cluster_indices: torch.Tensor,
+        cluster_handles: torch.Tensor,
+        cache_page_ids: torch.Tensor,
+        page_token_counts: torch.Tensor,
+        page_counts: torch.Tensor,
+        clustered_token_counts: torch.Tensor,
+        attention_mass: torch.Tensor,
+        hit_attention_by_head: torch.Tensor,
+        selected_cluster_counts: torch.Tensor,
+        hit_cluster_counts: torch.Tensor,
+        miss_cluster_counts: torch.Tensor,
+        hit_gate_ready: torch.Tensor,
+        miss_cluster_ids: torch.Tensor,
+        miss_positions: torch.Tensor,
+        miss_count: torch.Tensor,
+        sparse_attention: torch.Tensor,
+        expanded_attention: torch.Tensor,
+        emit_misses: bool = True,
+    ) -> RetroSpecCompactResolvedClusterPages:
+        """Resolve ranked DRAFT rows directly into compact resident pages."""
+        if ranked_values.device.type != "cuda":
+            raise ValueError("Ranked compact draft lookup requires CUDA")
+
+        with self._resident_state_lock:
+            _, resident_cache = self._get_or_create_resident_cache(layer_name)
+
+        access = resident_cache.lookup_ranked_compact_draft_gpu(
+            ranked_values=ranked_values,
+            ranked_indices=ranked_indices,
+            candidate_counts=candidate_counts,
+            arena_cluster_ids=arena.cluster_ids,
+            arena_cluster_page_starts=arena.cluster_page_starts,
+            arena_cluster_page_counts=arena.cluster_page_counts,
+            arena_page_ids=arena.page_ids,
+            arena_page_token_counts=arena.page_token_counts,
+            arena_cluster_offsets=arena.cluster_offsets,
+            arena_page_offsets=arena.page_offsets,
+            request_slot_ids=request_slot_ids,
+            active_mask=active_mask,
+            retrieval_ratio=retrieval_ratio,
+            estimation_ratio=estimation_ratio,
+            max_pages_per_cluster=max_pages_per_cluster,
+            fallback_token_counts=fallback_token_counts,
+            sparse_cluster_indices=sparse_cluster_indices,
+            expanded_cluster_indices=expanded_cluster_indices,
+            cluster_handles=cluster_handles,
+            cache_page_ids=cache_page_ids,
+            page_token_counts=page_token_counts,
+            page_counts=page_counts,
+            clustered_token_counts=clustered_token_counts,
+            attention_mass=attention_mass,
+            hit_attention_by_head=hit_attention_by_head,
+            selected_cluster_counts=selected_cluster_counts,
+            hit_cluster_counts=hit_cluster_counts,
+            miss_cluster_counts=miss_cluster_counts,
+            hit_gate_ready=hit_gate_ready,
+            miss_cluster_ids=miss_cluster_ids,
+            miss_positions=miss_positions,
+            miss_count=miss_count,
+            sparse_attention=sparse_attention,
+            expanded_attention=expanded_attention,
+            emit_misses=emit_misses,
+        )
+        if self.performance_stats is not None:
+            self.performance_stats.add_gpu_counter(
+                "resident_cluster_hits", access.hit_cluster_counts
+            )
+            self.performance_stats.add_gpu_counter(
+                "resident_cluster_misses", access.miss_cluster_counts
+            )
+            self.performance_stats.add_gpu_counter(
+                "draft_compact_resident_pages", access.page_counts
+            )
+            self.performance_stats.add_gpu_counter(
+                "draft_compact_selected_clusters", access.selected_cluster_counts
+            )
+
+        return RetroSpecCompactResolvedClusterPages(
+            resident_page_ids=access.cache_page_ids,
+            page_token_counts=access.page_token_counts,
+            page_counts=access.page_counts,
+            clustered_token_counts=access.clustered_token_counts,
+            attention_mass=access.attention_mass,
+            selected_cluster_counts=access.selected_cluster_counts,
+            hit_cluster_counts=access.hit_cluster_counts,
+            miss_cluster_counts=access.miss_cluster_counts,
+            hit_gate_ready=access.hit_gate_ready,
+            resident_key_pages=resident_cache.key_pages,
+            resident_value_pages=resident_cache.value_pages,
+            read_lease=access.read_lease,
+        )
+
     def resolve_verification_cluster_blocks(
         self,
         layer_name: str,

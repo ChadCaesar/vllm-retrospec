@@ -428,10 +428,7 @@ def build_retrospec_long_context_capacity(
             planning_requests * spec.num_kv_heads * primary_exact_width * 8
         )
         exact_descriptor_bytes = (
-            planning_requests
-            * spec.num_kv_heads
-            * max_retrieval_clusters
-            * (8 + max_pages_per_cluster * (8 + 4))
+            planning_requests * spec.num_kv_heads * max_retrieval_clusters * 8
         )
         compact_descriptor_bytes = (
             planning_requests

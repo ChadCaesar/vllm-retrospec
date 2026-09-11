@@ -479,6 +479,123 @@ def capture_request_descriptors(
     )
 
 
+def emit_ranked_estimation_plan(
+    *,
+    ranked_indices: torch.Tensor,
+    candidate_counts: torch.Tensor,
+    cluster_keys: torch.Tensor,
+    cluster_values: torch.Tensor,
+    cluster_token_counts: torch.Tensor,
+    cluster_offsets: torch.Tensor,
+    request_slot_ids: torch.Tensor,
+    active_mask: torch.Tensor,
+    retrieval_ratio: float,
+    estimation_ratio: float,
+    sparse_exact_width: int,
+    sparse_estimation_cluster_indices: torch.Tensor,
+    expanded_estimation_cluster_indices: torch.Tensor,
+    draft_estimation_keys: torch.Tensor,
+    draft_estimation_values: torch.Tensor,
+    draft_estimation_token_counts: torch.Tensor,
+) -> None:
+    """Emit estimation journals and current-DRAFT summaries from ranked rows."""
+    if ranked_indices.device.type != "cuda":
+        raise ValueError("Ranked estimation emission requires CUDA")
+    if ranked_indices.ndim != 3:
+        raise ValueError("Ranked indices must have shape [batch, heads, ranks]")
+    if ranked_indices.dtype != torch.int64:
+        raise ValueError("Ranked indices must use int64")
+
+    batch_size, num_kv_heads, ranking_width = ranked_indices.shape
+    estimation_width = sparse_estimation_cluster_indices.shape[2]
+    draft_width = draft_estimation_token_counts.shape[2]
+    head_size = cluster_keys.shape[2]
+
+    if candidate_counts.shape != (batch_size, num_kv_heads):
+        raise ValueError("Candidate counts do not match ranked indices")
+    if candidate_counts.dtype != torch.int32:
+        raise ValueError("Candidate counts must use int32")
+    if request_slot_ids.shape != (batch_size,):
+        raise ValueError("Request slots do not match ranked indices")
+    if active_mask.shape != (batch_size,):
+        raise ValueError("Active mask does not match ranked indices")
+    if draft_width != estimation_width + sparse_exact_width:
+        raise ValueError("Draft estimation workspace has an invalid width")
+    if expanded_estimation_cluster_indices.shape != (
+        batch_size,
+        num_kv_heads,
+        estimation_width,
+    ):
+        raise ValueError("Expanded estimation journal has the wrong shape")
+    if draft_estimation_keys.shape != (
+        batch_size,
+        num_kv_heads,
+        draft_width,
+        head_size,
+    ):
+        raise ValueError("Draft estimation keys have the wrong shape")
+    if draft_estimation_values.shape != draft_estimation_keys.shape:
+        raise ValueError("Draft estimation values have the wrong shape")
+    if draft_estimation_token_counts.shape != (
+        batch_size,
+        num_kv_heads,
+        draft_width,
+    ):
+        raise ValueError("Draft estimation counts have the wrong shape")
+    if ranking_width < sparse_exact_width + estimation_width:
+        raise ValueError("Ranked workspace is too narrow")
+
+    tensors = (
+        ranked_indices,
+        candidate_counts,
+        cluster_keys,
+        cluster_values,
+        cluster_token_counts,
+        cluster_offsets,
+        request_slot_ids,
+        active_mask,
+        sparse_estimation_cluster_indices,
+        expanded_estimation_cluster_indices,
+        draft_estimation_keys,
+        draft_estimation_values,
+        draft_estimation_token_counts,
+    )
+    if any(tensor.device != ranked_indices.device for tensor in tensors):
+        raise ValueError("Ranked estimation tensors must use one device")
+
+    summary_width = max(sparse_exact_width, estimation_width)
+    if summary_width == 0:
+        return
+
+    _emit_ranked_estimation_plan_kernel[(batch_size, num_kv_heads, summary_width)](
+        cluster_keys,
+        cluster_values,
+        cluster_token_counts,
+        cluster_offsets,
+        request_slot_ids,
+        active_mask,
+        ranked_indices,
+        candidate_counts,
+        sparse_estimation_cluster_indices,
+        expanded_estimation_cluster_indices,
+        draft_estimation_keys,
+        draft_estimation_values,
+        draft_estimation_token_counts,
+        CLUSTER_CAPACITY=cluster_keys.shape[1],
+        NUM_KV_HEADS=num_kv_heads,
+        RANKING_WIDTH=ranking_width,
+        SPARSE_WIDTH=sparse_exact_width,
+        ESTIMATION_WIDTH=estimation_width,
+        HEAD_SIZE=head_size,
+        BLOCK_D=triton.next_power_of_2(head_size),
+        RANKED_STRIDE_0=ranked_indices.stride(0),
+        RANKED_STRIDE_1=ranked_indices.stride(1),
+        RANKED_STRIDE_2=ranked_indices.stride(2),
+        RETRIEVAL_RATIO=retrieval_ratio,
+        ESTIMATION_RATIO=estimation_ratio,
+    )
+
+
 def emit_ranked_selection_plan(
     *,
     ranked_values: torch.Tensor,

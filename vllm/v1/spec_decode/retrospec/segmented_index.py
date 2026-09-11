@@ -42,7 +42,7 @@ from .resident_cache import RetroSpecResidentReadLease
 from .resident_kernels import compact_resident_misses
 from .selection_kernels import (
     capture_request_descriptors,
-    emit_ranked_selection_plan,
+    emit_ranked_estimation_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
 )
@@ -234,8 +234,6 @@ class _ProposalTokenLayout:
 @dataclass(frozen=True)
 class _SelectionStepWorkspace:
     draft_exact_cluster_ids: torch.Tensor
-    draft_exact_page_ids: torch.Tensor
-    draft_exact_page_token_counts: torch.Tensor
 
     draft_compact_page_ids: torch.Tensor
     draft_compact_page_token_counts: torch.Tensor
@@ -261,8 +259,6 @@ class _SelectionStepWorkspace:
 @dataclass(frozen=True)
 class _DraftSelectionScratch:
     draft_exact_cluster_ids: torch.Tensor
-    draft_exact_page_ids: torch.Tensor
-    draft_exact_page_token_counts: torch.Tensor
 
     draft_compact_page_ids: torch.Tensor
     draft_compact_page_token_counts: torch.Tensor
@@ -295,7 +291,6 @@ class _DraftSelectionScratch:
     ) -> "_DraftSelectionScratch":
         group_shape = (batch_capacity, num_kv_heads)
         cluster_shape = (*group_shape, sparse_retrieval_width)
-        page_shape = (*cluster_shape, max_pages_per_cluster)
         compact_page_shape = (
             *group_shape,
             sparse_retrieval_width * max_pages_per_cluster,
@@ -306,12 +301,6 @@ class _DraftSelectionScratch:
         return cls(
             draft_exact_cluster_ids=torch.empty(
                 cluster_shape, dtype=torch.int64, device=device
-            ),
-            draft_exact_page_ids=torch.empty(
-                page_shape, dtype=torch.int64, device=device
-            ),
-            draft_exact_page_token_counts=torch.empty(
-                page_shape, dtype=torch.int32, device=device
             ),
             draft_compact_page_ids=torch.empty(
                 compact_page_shape, dtype=torch.int64, device=device
@@ -376,7 +365,8 @@ class _DraftSelectionScratch:
             self.draft_exact_cluster_ids.shape[0] >= batch_size
             and self.draft_exact_cluster_ids.shape[1] == num_kv_heads
             and self.draft_exact_cluster_ids.shape[2] >= sparse_retrieval_width
-            and self.draft_exact_page_ids.shape[3] >= max_pages_per_cluster
+            and self.draft_compact_page_ids.shape[2]
+            >= sparse_retrieval_width * max_pages_per_cluster
             and self.draft_estimation_keys.shape[2] >= estimation_width
             and self.draft_estimation_keys.shape[3] == head_size
             and self.primary_topk_order.shape[2] >= primary_exact_width
@@ -588,7 +578,6 @@ class _SelectionPlanTable:
         compact_width = retrieval_width * max_pages
         group_shape = (batch_size, num_kv_heads)
         cluster_shape = (*group_shape, retrieval_width)
-        page_shape = (*cluster_shape, max_pages)
         compact_shape = (*group_shape, compact_width)
         estimation_shape = (*group_shape, draft_width)
 
@@ -599,10 +588,6 @@ class _SelectionPlanTable:
         return _SelectionStepWorkspace(
             draft_exact_cluster_ids=prefix_view(
                 scratch.draft_exact_cluster_ids, cluster_shape
-            ),
-            draft_exact_page_ids=prefix_view(scratch.draft_exact_page_ids, page_shape),
-            draft_exact_page_token_counts=(
-                prefix_view(scratch.draft_exact_page_token_counts, page_shape)
             ),
             draft_compact_page_ids=prefix_view(
                 scratch.draft_compact_page_ids, compact_shape
@@ -2873,11 +2858,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             old_estimation_width = (
                 scratch.draft_estimation_keys.shape[2] - old_retrieval_width
             )
+            old_compact_width = scratch.draft_compact_page_ids.shape[2]
+            old_max_pages = (
+                0
+                if old_retrieval_width == 0
+                else old_compact_width // old_retrieval_width
+            )
             sparse_retrieval_width = max(sparse_retrieval_width, old_retrieval_width)
             sparse_estimation_width = max(sparse_estimation_width, old_estimation_width)
-            max_pages_per_cluster = max(
-                max_pages_per_cluster, scratch.draft_exact_page_ids.shape[3]
-            )
+            max_pages_per_cluster = max(max_pages_per_cluster, old_max_pages)
         scratch = _DraftSelectionScratch.allocate(
             batch_capacity=batch_capacity,
             num_kv_heads=num_kv_heads,
@@ -3319,15 +3308,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             ~cluster_zones.expanded_estimation_mask, -1
         )
 
-        self._build_resident_exact_cluster_selection(
-            view,
-            cluster_zones.sparse_retrieval_indices,
-            cluster_zones.sparse_retrieval_mask,
-            output_workspace.draft_exact_cluster_ids,
-            output_workspace.draft_exact_page_ids,
-            output_workspace.draft_exact_page_token_counts,
-        )
-
         sparse_width = output_workspace.sparse_estimation_width
         self._build_resident_estimation_selection(
             view,
@@ -3345,14 +3325,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self._publish_plan_step(layer_name, plan_slot, active_mask, table)
         return plan, output_workspace
 
-    def _emit_cuda_plan(
+    def _emit_cuda_estimation_plan(
         self,
         plan: RetroSpecTokenSelectionPlan,
         output_workspace: _SelectionStepWorkspace,
         table: _SelectionPlanTable,
-        plan_slot: int,
         active_mask: torch.Tensor,
-        ranked_values: torch.Tensor,
         ranked_indices: torch.Tensor,
         candidate_counts: torch.Tensor,
         view: RetroSpecResidentBatchView,
@@ -3373,48 +3351,27 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 ],
             )
 
-        emit_ranked_selection_plan(
-            ranked_values=ranked_values,
+        emit_ranked_estimation_plan(
             ranked_indices=ranked_indices,
             candidate_counts=candidate_counts,
             cluster_keys=arena.cluster_keys,
             cluster_values=arena.cluster_values,
             cluster_token_counts=arena.cluster_token_counts,
-            cluster_ids=arena.cluster_ids,
-            cluster_page_starts=arena.cluster_page_starts,
-            cluster_page_counts=arena.cluster_page_counts,
-            page_ids=arena.page_ids,
-            page_token_counts=arena.page_token_counts,
             cluster_offsets=arena.cluster_offsets,
-            page_offsets=arena.page_offsets,
             request_slot_ids=view.request_slot_ids,
             active_mask=active_mask,
             retrieval_ratio=self.retrieval_ratio,
             estimation_ratio=self.estimation_ratio,
-            sparse_exact_cluster_indices=plan.sparse_exact_cluster_indices,
+            sparse_exact_width=output_workspace.sparse_retrieval_width,
             sparse_estimation_cluster_indices=(plan.sparse_estimation_cluster_indices),
-            expanded_exact_cluster_indices=plan.expanded_exact_cluster_indices,
             expanded_estimation_cluster_indices=(
                 plan.expanded_estimation_cluster_indices
-            ),
-            draft_exact_cluster_ids=output_workspace.draft_exact_cluster_ids,
-            draft_exact_page_ids=output_workspace.draft_exact_page_ids,
-            draft_exact_page_token_counts=(
-                output_workspace.draft_exact_page_token_counts
             ),
             draft_estimation_keys=output_workspace.draft_estimation_keys,
             draft_estimation_values=output_workspace.draft_estimation_values,
             draft_estimation_token_counts=(
                 output_workspace.draft_estimation_token_counts
             ),
-            sparse_attn=plan.sparse_attn,
-            expanded_attn=plan.expanded_attn,
-        )
-        self._publish_plan_step(
-            plan.layer_name,
-            plan_slot,
-            active_mask,
-            table,
         )
 
     def get_selection_plan(
@@ -3743,9 +3700,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         plan: RetroSpecTokenSelectionPlan,
         output_workspace: _SelectionStepWorkspace | None,
         view: RetroSpecResidentBatchView,
-        has_clusters: torch.Tensor,
         active_mask: torch.Tensor,
-        sparse_retrieval_scores: torch.Tensor | None = None,
+        ranked_values: torch.Tensor | None = None,
+        ranked_indices: torch.Tensor | None = None,
+        candidate_counts: torch.Tensor | None = None,
         prefetch_cluster_ids: torch.Tensor | None = None,
         prefetch_miss_mask: torch.Tensor | None = None,
     ) -> RetroSpecTokenAttentionSelection:
@@ -3753,15 +3711,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         if (
             view.arena is None
             or output_workspace is None
-            or output_workspace.draft_exact_page_ids.numel() == 0
-            or output_workspace.draft_exact_page_ids.device.type != "cuda"
+            or output_workspace.draft_exact_cluster_ids.device.type != "cuda"
         ):
             return self._materialize_token_selection(
                 plan,
                 RetroSpecAttentionLevel.SPARSE,
             )
-        if sparse_retrieval_scores is None:
-            raise RuntimeError("CUDA draft selection requires ranked retrieval scores")
+        if ranked_values is None or ranked_indices is None:
+            raise RuntimeError("CUDA draft selection requires ranked clusters")
+        if candidate_counts is None:
+            raise RuntimeError("CUDA draft selection requires candidate counts")
 
         sparse_width = output_workspace.sparse_estimation_width
         retrieval_width = output_workspace.sparse_retrieval_width
@@ -3772,15 +3731,21 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             :, :, sparse_width : sparse_width + retrieval_width
         ]
         normal_prefetch = prefetch_cluster_ids is None
-        resolved_pages = self.cluster_store.resolve_compact_draft_cluster_blocks(
+        resolved_pages = self.cluster_store.resolve_ranked_compact_draft_cluster_blocks(
             layer_name=plan.layer_name,
-            cluster_ids=output_workspace.draft_exact_cluster_ids,
-            logical_page_ids=output_workspace.draft_exact_page_ids,
-            logical_page_token_counts=(output_workspace.draft_exact_page_token_counts),
-            retrieval_scores=sparse_retrieval_scores[:, :, :retrieval_width],
+            ranked_values=ranked_values,
+            ranked_indices=ranked_indices,
+            candidate_counts=candidate_counts,
+            arena=view.arena,
+            request_slot_ids=view.request_slot_ids,
             active_mask=active_mask,
-            has_clusters=has_clusters,
+            retrieval_ratio=self.retrieval_ratio,
+            estimation_ratio=self.estimation_ratio,
+            max_pages_per_cluster=view.max_pages_per_cluster,
             fallback_token_counts=retrieval_fallback_counts,
+            sparse_cluster_indices=plan.sparse_exact_cluster_indices,
+            expanded_cluster_indices=plan.expanded_exact_cluster_indices,
+            cluster_handles=output_workspace.draft_exact_cluster_ids,
             cache_page_ids=output_workspace.draft_compact_page_ids,
             page_token_counts=output_workspace.draft_compact_page_token_counts,
             page_counts=output_workspace.draft_compact_page_counts,
@@ -3794,6 +3759,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             miss_cluster_ids=output_workspace.draft_prefetch_miss_cluster_ids,
             miss_positions=output_workspace.draft_prefetch_miss_positions,
             miss_count=output_workspace.draft_prefetch_miss_count,
+            sparse_attention=plan.sparse_attn,
+            expanded_attention=plan.expanded_attn,
             emit_misses=normal_prefetch,
         )
         self._proposal_read_leases.append(resolved_pages.read_lease)
@@ -4749,9 +4716,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         ranked_values = None
         ranked_indices = None
         cluster_zones = None
+        plan_table = None
         if direct_cuda_plan:
             with self._cuda_timer("draft_plan_prepare"):
-                plan, output_workspace, table = self._prepare_plan_step(
+                plan, output_workspace, plan_table = self._prepare_plan_step(
                     layer_name=layer_name,
                     plan_slot=plan_slot,
                     active_mask=active_mask,
@@ -4768,13 +4736,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     warmup_enabled=first_draft_warmup_mask is not None,
                 )
             with self._cuda_timer("draft_plan_build"):
-                self._emit_cuda_plan(
+                self._emit_cuda_estimation_plan(
                     plan=plan,
                     output_workspace=output_workspace,
-                    table=table,
-                    plan_slot=plan_slot,
+                    table=plan_table,
                     active_mask=active_mask,
-                    ranked_values=ranked_values,
                     ranked_indices=ranked_indices,
                     candidate_counts=candidate_counts,
                     view=view,
@@ -4837,7 +4803,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     dtype=key_cache.dtype,
                 )
 
-        has_clusters = candidate_counts > 0
         warmup_indices = None
         warmup_mask = None
         if first_draft_warmup_mask is not None:
@@ -4891,23 +4856,24 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 prefetch_cluster_ids = warmup_cluster_ids
                 prefetch_miss_mask = warmup_access.miss_cluster_mask
 
-        sparse_retrieval_scores = (
-            ranked_values
-            if ranked_values is not None
-            else cluster_zones.sparse_retrieval_scores
-            if cluster_zones is not None
-            else None
-        )
         with self._cuda_timer("draft_plan_materialize"):
             selection = self._materialize_draft_selection(
                 plan=plan,
                 output_workspace=output_workspace,
                 view=view,
-                has_clusters=has_clusters,
                 active_mask=active_mask,
-                sparse_retrieval_scores=sparse_retrieval_scores,
+                ranked_values=ranked_values,
+                ranked_indices=ranked_indices,
+                candidate_counts=candidate_counts,
                 prefetch_cluster_ids=prefetch_cluster_ids,
                 prefetch_miss_mask=prefetch_miss_mask,
+            )
+        if plan_table is not None:
+            self._publish_plan_step(
+                layer_name,
+                plan_slot,
+                active_mask,
+                plan_table,
             )
         return selection
 
