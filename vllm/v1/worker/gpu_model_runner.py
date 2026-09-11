@@ -4603,6 +4603,16 @@ class GPUModelRunner(
             )
 
         request_ids = self.input_batch.req_ids
+        generation_token_budgets = (
+            state.scheduler_output.retrospec_generation_token_budgets
+        )
+        if generation_token_budgets is None:
+            raise RuntimeError(
+                "RetroSpec scheduler output is missing generation-token budgets"
+            )
+        remaining_generation_tokens = [
+            generation_token_budgets.get(request_id, 0) for request_id in request_ids
+        ]
         committed_positions = [
             self.requests[request_id].num_computed_tokens for request_id in request_ids
         ]
@@ -4613,6 +4623,8 @@ class GPUModelRunner(
             sampling_metadata=self.input_batch.sampling_metadata,
             common_attn_metadata=common_attn_metadata,
             proposal_active_mask=proposal_active_mask,
+            remaining_generation_tokens=remaining_generation_tokens,
+            valid_sampled_tokens_count=valid_sampled_tokens_count,
             num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             materialize_output=get_pp_group().is_last_rank,
         )

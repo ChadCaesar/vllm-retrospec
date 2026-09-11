@@ -219,6 +219,9 @@ class Scheduler(SchedulerInterface):
         )
 
         speculative_config = vllm_config.speculative_config
+        self.is_retrospec = (
+            speculative_config is not None and speculative_config.method == "retrospec"
+        )
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
         self.retrospec_blocks_per_cluster = 1
@@ -229,7 +232,7 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
-            if speculative_config.method == "retrospec":
+            if self.is_retrospec:
                 self.num_lookahead_tokens = self.num_spec_tokens
                 self.retrospec_blocks_per_cluster = (
                     speculative_config.retrospec_blocks_per_cluster
@@ -548,6 +551,23 @@ class Scheduler(SchedulerInterface):
 
         for status, deferred_request_ids in deferred_by_status.items():
             self._finish_requests_now(deferred_request_ids, status)
+
+    def _get_retrospec_generation_token_budgets(
+        self, scheduled_req_ids: Iterable[str]
+    ) -> dict[str, int] | None:
+        if not getattr(self, "is_retrospec", False):
+            return None
+
+        budgets: dict[str, int] = {}
+        for req_id in scheduled_req_ids:
+            request = self.requests[req_id]
+            if request.sampling_params is None:
+                continue
+            budgets[req_id] = max(
+                request.max_tokens - request.num_output_tokens,
+                0,
+            )
+        return budgets
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1200,6 +1220,9 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            retrospec_generation_token_budgets=(
+                self._get_retrospec_generation_token_budgets(num_scheduled_tokens)
+            ),
             retrospec_layer_major_prefill=layer_major_prefill_descriptor,
         )
 
@@ -2004,6 +2027,17 @@ class Scheduler(SchedulerInterface):
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
+
+            # Recheck against the authoritative scheduler state after current
+            # target tokens have been committed. The GPU budget is computed
+            # before this bookkeeping step.
+            if getattr(self, "is_retrospec", False):
+                remaining_generation_tokens = max(
+                    request.max_tokens - request.num_output_tokens,
+                    0,
+                )
+                if len(spec_token_ids) > remaining_generation_tokens:
+                    spec_token_ids = spec_token_ids[:remaining_generation_tokens]
 
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):

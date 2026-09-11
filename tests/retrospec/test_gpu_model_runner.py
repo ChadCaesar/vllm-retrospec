@@ -138,7 +138,10 @@ def call_retrospec_proposal(runner: GPUModelRunner) -> list[list[int]]:
     pp_group = SimpleNamespace(is_last_rank=True)
     with patch("vllm.v1.worker.gpu_model_runner.get_pp_group", return_value=pp_group):
         return runner.propose_draft_token_ids(
-            scheduler_output=SimpleNamespace(total_num_scheduled_tokens=2),
+            scheduler_output=SimpleNamespace(
+                total_num_scheduled_tokens=2,
+                retrospec_generation_token_budgets={"prefill": 8, "decode": 3},
+            ),
             sampled_token_ids=torch.tensor([[10], [11]], dtype=torch.int32),
             sampling_metadata=SimpleNamespace(),
             hidden_states=torch.empty(0),
@@ -168,6 +171,11 @@ def test_mixed_batch_only_activates_decode_rows_for_retrospec():
     assert result == [[], [12]]
     proposal_active_mask = drafter.propose.call_args.kwargs["proposal_active_mask"]
     assert proposal_active_mask.tolist() == [False, True]
+    assert drafter.propose.call_args.kwargs["remaining_generation_tokens"] == [8, 3]
+    assert drafter.propose.call_args.kwargs["valid_sampled_tokens_count"].tolist() == [
+        1,
+        1,
+    ]
 
 
 def test_completed_prefill_rows_can_start_retrospec_proposal():
@@ -205,7 +213,10 @@ def test_nonfinal_pipeline_rank_participates_without_materializing_output():
     )
     drafter.propose.return_value = []
     state = RetroSpecPipelineProposalState(
-        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=2),
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=2,
+            retrospec_generation_token_budgets={"prefill": 8, "decode": 3},
+        ),
         spec_decode_metadata=None,
         common_attn_metadata=SimpleNamespace(),
     )

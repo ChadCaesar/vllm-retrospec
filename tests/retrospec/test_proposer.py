@@ -132,6 +132,8 @@ def run_proposal(
     request_ids: list[str] | None = None,
     committed_positions: list[int] | None = None,
     proposal_active_mask: torch.Tensor | None = None,
+    remaining_generation_tokens: list[int] | None = None,
+    valid_sampled_tokens_count: torch.Tensor | None = None,
 ) -> list[list[int]]:
     initialize_single_pipeline_stage(proposer)
     batch_size = common_attn_metadata.batch_size()
@@ -141,6 +143,10 @@ def run_proposal(
         committed_positions = common_attn_metadata.seq_lens.tolist()
     if proposal_active_mask is None:
         proposal_active_mask = torch.ones(batch_size, dtype=torch.bool)
+    if remaining_generation_tokens is None:
+        remaining_generation_tokens = [proposer.num_speculative_tokens] * batch_size
+    if valid_sampled_tokens_count is None:
+        valid_sampled_tokens_count = torch.zeros(batch_size, dtype=torch.int32)
 
     return proposer.propose(
         request_ids=request_ids,
@@ -149,6 +155,8 @@ def run_proposal(
         sampling_metadata=sampling_metadata,
         common_attn_metadata=common_attn_metadata,
         proposal_active_mask=proposal_active_mask,
+        remaining_generation_tokens=remaining_generation_tokens,
+        valid_sampled_tokens_count=valid_sampled_tokens_count,
         num_rejected_tokens_gpu=num_rejected_tokens_gpu,
     )
 
@@ -725,6 +733,44 @@ def test_propose_respects_per_request_generation_limit(monkeypatch):
     assert result == [[10], [11, 21], []]
 
 
+def test_propose_respects_per_request_output_budget(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    observed_masks: list[list[bool]] = []
+
+    def fake_run_draft_step(
+        batch_size,
+        draft_index,
+        common_attn_metadata,
+        active_mask,
+        sampling_metadata,
+    ):
+        observed_masks.append(active_mask.tolist())
+        return (
+            torch.tensor([10, 11, 12], dtype=torch.int32) + draft_index * 10,
+            None,
+            torch.ones(batch_size),
+        )
+
+    monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    mock_proposal_execution(proposer, monkeypatch)
+
+    result = run_proposal(
+        proposer,
+        torch.tensor([1, 2, 3], dtype=torch.int32),
+        make_sampling_metadata(all_greedy=True),
+        make_common_metadata([1, 1, 1]),
+        remaining_generation_tokens=[1, 3, 0],
+        valid_sampled_tokens_count=torch.tensor([1, 1, 0], dtype=torch.int32),
+    )
+
+    assert observed_masks == [[False, True, False], [False, True, False]]
+    assert result == [[], [11, 21], []]
+
+
 def test_propose_rolls_back_rejected_tokens_before_drafting(monkeypatch):
     proposer = RetroSpecProposer(
         make_vllm_config(max_model_len=6),
@@ -1048,6 +1094,32 @@ def make_parallel_verification_output(
         margin=None if margin is None else torch.tensor(margin),
         attention_mass=torch.tensor(attention_mass),
     )
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        torch.device("cpu"),
+        pytest.param(
+            torch.device("cuda"),
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is required"
+            ),
+        ),
+    ],
+)
+def test_proposal_token_budget_subtracts_target_output_and_clamps(device):
+    if device.type == "cuda":
+        device = torch.device("cuda", torch.cuda.current_device())
+    proposer = RetroSpecProposer(make_vllm_config(), device, make_runner())
+
+    budgets = proposer._prepare_proposal_token_budgets(
+        [0, 2, 9],
+        torch.tensor([1, 1, 2], dtype=torch.int32, device=device),
+    )
+
+    assert budgets.data_ptr() == proposer._proposal_token_budgets.gpu.data_ptr()
+    assert budgets.tolist() == [0, 1, 4]
 
 
 @pytest.mark.parametrize(

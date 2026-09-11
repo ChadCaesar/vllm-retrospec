@@ -274,6 +274,15 @@ class RetroSpecProposer:
             pin_memory=is_pin_memory_available(),
             with_numpy=True,
         )
+        self._proposal_token_budgets = CpuGpuBuffer(
+            self.max_batch_size,
+            dtype=torch.int32,
+            device=device,
+            pin_memory=is_pin_memory_available(),
+            with_numpy=True,
+        )
+        self._proposal_token_budgets.cpu.fill_(self.num_speculative_tokens)
+        self._proposal_token_budgets.gpu.fill_(self.num_speculative_tokens)
 
     def remove_requests(self, request_ids: Collection[str]) -> None:
         request_ids = tuple(request_ids)
@@ -652,6 +661,29 @@ class RetroSpecProposer:
             num_rejected_tokens_gpu,
         )
 
+    def _prepare_proposal_token_budgets(
+        self,
+        remaining_generation_tokens: Sequence[int],
+        valid_sampled_tokens_count: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = len(remaining_generation_tokens)
+        if batch_size > self.max_batch_size:
+            raise ValueError("proposal budget exceeds the batch workspace capacity")
+        if any(budget < 0 for budget in remaining_generation_tokens):
+            raise ValueError("remaining generation-token budgets must be non-negative")
+        if valid_sampled_tokens_count.shape != (batch_size,):
+            raise ValueError("valid_sampled_tokens_count must match the proposal batch")
+        if valid_sampled_tokens_count.device != self.device:
+            raise ValueError("valid_sampled_tokens_count must be on the model device")
+        if valid_sampled_tokens_count.dtype != torch.int32:
+            raise ValueError("valid_sampled_tokens_count must have dtype torch.int32")
+
+        self._proposal_token_budgets.np[:batch_size] = remaining_generation_tokens
+        proposal_token_budgets = self._proposal_token_budgets.copy_to_gpu(batch_size)
+        proposal_token_budgets.sub_(valid_sampled_tokens_count)
+        proposal_token_budgets.clamp_(min=0, max=self.num_speculative_tokens)
+        return proposal_token_budgets
+
     def _record_cudagraph_fallback(self, stage_name: str, reason: str) -> None:
         self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback")
         self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback_{reason}")
@@ -953,6 +985,9 @@ class RetroSpecProposer:
             self.state.pending_counts < self.policy.pending_limit
         )
         draft_round_mask.logical_and_(
+            self.state.pending_counts < self._proposal_token_budgets.gpu[:batch_size]
+        )
+        draft_round_mask.logical_and_(
             self.positions[:batch_size] < self.max_model_len - 1
         )
 
@@ -993,6 +1028,9 @@ class RetroSpecProposer:
         runnable_mask.logical_and_(self.state.active_mask)
         runnable_mask.logical_and_(self.state.stage == int(RetroSpecStage.DRAFT))
         runnable_mask.logical_and_(next_token_indices < self.policy.pending_limit)
+        runnable_mask.logical_and_(
+            next_token_indices < self._proposal_token_budgets.gpu[:batch_size]
+        )
         runnable_mask.logical_and_(self.positions[:batch_size] < self.max_model_len - 1)
 
         next_token_indices.masked_fill_(
@@ -1583,7 +1621,13 @@ class RetroSpecProposer:
             self.proposal_start_positions.index_select(0, sparse.request_indices)
             + candidate_pending_counts
         )
-        generation_limit_reached = candidate_positions >= self.max_model_len - 1
+        pair_generation_token_budgets = self._proposal_token_budgets.gpu.index_select(
+            0,
+            sparse.request_indices,
+        )
+        generation_limit_reached = (candidate_positions >= self.max_model_len - 1) | (
+            candidate_pending_counts >= pair_generation_token_budgets
+        )
         next_update_positions = (
             self.index_update_state.next_update_positions.index_select(
                 0, sparse.request_indices
@@ -1736,7 +1780,15 @@ class RetroSpecProposer:
                 self.proposal_start_positions.index_select(0, expanded.request_indices)
                 + expanded_pending_counts
             )
-            expanded_generation_limit = expanded_positions >= self.max_model_len - 1
+            expanded_generation_token_budgets = (
+                self._proposal_token_budgets.gpu.index_select(
+                    0,
+                    expanded.request_indices,
+                )
+            )
+            expanded_generation_limit = (
+                expanded_positions >= self.max_model_len - 1
+            ) | (expanded_pending_counts >= expanded_generation_token_budgets)
             expanded_index_update = expanded_positions >= (
                 self.index_update_state.next_update_positions.index_select(
                     0, expanded.request_indices
@@ -1787,6 +1839,8 @@ class RetroSpecProposer:
         sampling_metadata: SamplingMetadata,
         common_attn_metadata: CommonAttentionMetadata,
         proposal_active_mask: torch.Tensor,
+        remaining_generation_tokens: Sequence[int],
+        valid_sampled_tokens_count: torch.Tensor,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
         materialize_output: bool = True,
     ) -> list[list[int]]:
@@ -1804,13 +1858,21 @@ class RetroSpecProposer:
         if len(committed_positions) != batch_size:
             raise ValueError("committed_positions must match the proposal batch size")
 
-        self.state.begin_batch(batch_size, proposal_active_mask)
+        proposal_token_budgets = self._prepare_proposal_token_budgets(
+            remaining_generation_tokens,
+            valid_sampled_tokens_count,
+        )
+        effective_proposal_active_mask = proposal_active_mask & (
+            proposal_token_budgets > 0
+        )
+
+        self.state.begin_batch(batch_size, effective_proposal_active_mask)
         self.index_update_state.begin_batch(request_ids, committed_positions)
 
         self.performance_stats.add_counter("proposal_calls")
         self.performance_stats.add_gpu_counter(
             "proposal_requests",
-            proposal_active_mask,
+            effective_proposal_active_mask,
         )
 
         self._draft_token_ids[:batch_size].fill_(-1)
@@ -1878,7 +1940,8 @@ class RetroSpecProposer:
                     )
 
                     generation_limit_reached = draft_stage_mask & (
-                        self.positions[:batch_size] + 1 >= self.max_model_len - 1
+                        (self.positions[:batch_size] + 1 >= self.max_model_len - 1)
+                        | (projected_pending_counts >= proposal_token_budgets)
                     )
 
                     index_update_required = self.index_update_state.requires_update(
@@ -1956,6 +2019,7 @@ class RetroSpecProposer:
                     & (verification.verified_counts > 0)
                     & ~verification.require_full
                     & (self.state.pending_counts < self.policy.pending_limit)
+                    & (self.state.pending_counts < proposal_token_budgets)
                     & (self.positions[:batch_size] < self.max_model_len - 1)
                 )
 

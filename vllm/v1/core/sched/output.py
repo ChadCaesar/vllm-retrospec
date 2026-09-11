@@ -275,6 +275,11 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # req_id -> remaining output-token budget before the current target step.
+    # The budget includes tokens produced by the current target execution and
+    # is populated only for RetroSpec.
+    retrospec_generation_token_budgets: dict[str, int] | None = None
+
     # Exclusive RetroSpec target-prefill execution for one request.
     retrospec_layer_major_prefill: RetroSpecLayerMajorPrefillDescriptor | None = None
 

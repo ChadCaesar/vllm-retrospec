@@ -101,6 +101,53 @@ def test_retrospec_scheduler_change_does_not_affect_ngram():
     assert scheduler.num_lookahead_tokens == 0
 
 
+def test_retrospec_scheduler_reports_remaining_generation_budgets():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.is_retrospec = True
+    scheduler.requests = {
+        "first": SimpleNamespace(
+            sampling_params=object(),
+            max_tokens=12,
+            num_output_tokens=5,
+        ),
+        "second": SimpleNamespace(
+            sampling_params=object(),
+            max_tokens=3,
+            num_output_tokens=3,
+        ),
+        "pooling": SimpleNamespace(
+            sampling_params=None,
+            max_tokens=1,
+            num_output_tokens=0,
+        ),
+    }
+
+    budgets = scheduler._get_retrospec_generation_token_budgets(
+        ["first", "second", "pooling"]
+    )
+
+    assert budgets == {"first": 7, "second": 0}
+
+
+def test_retrospec_scheduler_trims_drafts_to_authoritative_budget():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.is_retrospec = True
+    scheduler.structured_output_manager = Mock()
+    scheduler.structured_output_manager.should_advance.return_value = False
+    request = SimpleNamespace(
+        is_finished=lambda: False,
+        is_prefill_chunk=False,
+        max_tokens=5,
+        num_output_tokens=3,
+        spec_token_ids=[],
+    )
+    scheduler.requests = {"request": request}
+
+    scheduler.update_draft_token_ids(DraftTokenIds(["request"], [[10, 11, 12, 13]]))
+
+    assert request.spec_token_ids == [10, 11]
+
+
 def test_retrospec_pp_schedules_request_disjoint_batches():
     scheduler, _ = make_retrospec_pp_scheduler()
 
@@ -329,6 +376,9 @@ def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
     scheduler_output = scheduler.schedule()
 
     assert scheduler_output.num_scheduled_tokens == {"prefill-0": 8}
+    assert scheduler_output.retrospec_generation_token_budgets == {
+        "prefill-0": requests[0].max_tokens
+    }
     assert len(scheduler.running) == 1
     assert len(scheduler.waiting) == 1
     assert scheduler_output.retrospec_layer_major_prefill == (
@@ -349,6 +399,9 @@ def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
     scheduler_output = scheduler.schedule()
 
     assert scheduler_output.num_scheduled_tokens == {"prefill-0": 1}
+    assert scheduler_output.retrospec_generation_token_budgets == {
+        "prefill-0": requests[0].max_tokens - 1
+    }
     assert scheduler_output.retrospec_layer_major_prefill is None
     assert len(scheduler.running) == 1
     assert len(scheduler.waiting) == 1
