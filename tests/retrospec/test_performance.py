@@ -86,6 +86,10 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     stats.add_counter("prefetch_waves_coalesced", 1)
     stats.add_counter("prefetch_backpressure_waits", 1)
     stats.add_counter("prefetch_wave_records", 9)
+    stats.add_counter("draft_cudagraph_replay", 3)
+    stats.add_counter("draft_cudagraph_fallback", 1)
+    stats.add_counter("sparse_verify_cudagraph_replay", 2)
+    stats.add_counter("expanded_verify_cudagraph_eager", 2)
     stats.add_gpu_counter("draft_round_requests", torch.tensor([1, 1]))
     stats.add_gpu_counter("draft_tokens", torch.tensor([3, 5]))
     stats.add_gpu_counter("verified_tokens", torch.tensor([2, 4]))
@@ -112,6 +116,9 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     assert "prefetch_coalesce_rate=0.250" in message
     assert "prefetch_backpressure_rate=0.333" in message
     assert "prefetch_records/wave=3.00" in message
+    assert "draft_graph_replay=0.750" in message
+    assert "sparse_verify_graph_replay=1.000" in message
+    assert "expanded_verify_graph_replay=0.000" in message
     assert "proposal_wall=12.000ms/1" in message
 
     assert not stats._cpu_counters

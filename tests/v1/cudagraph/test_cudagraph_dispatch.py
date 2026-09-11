@@ -73,6 +73,56 @@ def _create_vllm_config(
 
 
 class TestCudagraphDispatcher:
+    def test_named_piecewise_sizes_are_independent_from_default_padding(self):
+        comp_config = CompilationConfig(
+            cudagraph_mode="PIECEWISE",
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_capture_sizes=[17, 34],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=8)
+        dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(CUDAGraphMode.PIECEWISE)
+
+        registered = dispatcher.register_piecewise_cudagraph_sizes(
+            "retrospec_proposal", [1, 2, 4, 8, 16]
+        )
+
+        assert registered == (1, 2, 4, 8, 16)
+        assert dispatcher.has_piecewise_cudagraph_namespace("retrospec_proposal")
+        default_mode, default_descriptor = dispatcher.dispatch(3, disable_full=True)
+        named_mode, named_descriptor = dispatcher.dispatch_piecewise_cudagraph(
+            "retrospec_proposal", 3
+        )
+        assert default_mode == CUDAGraphMode.PIECEWISE
+        assert (
+            default_descriptor == BatchDescriptor(17).relax_for_mixed_batch_cudagraphs()
+        )
+        assert named_mode == CUDAGraphMode.PIECEWISE
+        assert named_descriptor == BatchDescriptor(4).relax_for_mixed_batch_cudagraphs()
+
+        piecewise_descs = dict(dispatcher.get_capture_descs())[CUDAGraphMode.PIECEWISE]
+        assert BatchDescriptor(4) in piecewise_descs
+
+    def test_named_piecewise_dispatch_rejects_missing_or_oversized_bucket(self):
+        comp_config = CompilationConfig(
+            cudagraph_mode="PIECEWISE",
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_capture_sizes=[8],
+        )
+        config = _create_vllm_config(comp_config)
+        dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(CUDAGraphMode.PIECEWISE)
+        dispatcher.register_piecewise_cudagraph_sizes("retrospec_proposal", [1, 4])
+
+        assert dispatcher.dispatch_piecewise_cudagraph("missing", 1) == (
+            CUDAGraphMode.NONE,
+            BatchDescriptor(1),
+        )
+        assert dispatcher.dispatch_piecewise_cudagraph("retrospec_proposal", 5) == (
+            CUDAGraphMode.NONE,
+            BatchDescriptor(5),
+        )
+
     @pytest.mark.parametrize(
         "cudagraph_mode_str,compilation_mode,lora_config",
         [

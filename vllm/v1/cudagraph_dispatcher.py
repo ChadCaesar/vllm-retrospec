@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from bisect import bisect_left
+from collections.abc import Collection
 from itertools import product
 
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -43,6 +45,7 @@ class CudagraphDispatcher:
             CUDAGraphMode.PIECEWISE: set(),
             CUDAGraphMode.FULL: set(),
         }
+        self._piecewise_cudagraph_sizes: dict[str, tuple[int, ...]] = {}
 
         assert (
             not self.compilation_config.cudagraph_mode.requires_piecewise_compilation()
@@ -152,6 +155,52 @@ class CudagraphDispatcher:
             f"Invalid cudagraph runtime mode for keys: {runtime_mode}"
         )
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
+
+    def register_piecewise_cudagraph_sizes(
+        self, namespace: str, capture_sizes: Collection[int]
+    ) -> tuple[int, ...]:
+        if not namespace:
+            raise ValueError("CUDA Graph namespace must not be empty")
+        if not self.keys_initialized:
+            raise RuntimeError("CUDA Graph keys must be initialized first")
+
+        sizes = tuple(sorted(set(capture_sizes)))
+        if any(size <= 0 for size in sizes):
+            raise ValueError("CUDA Graph capture sizes must be positive")
+        if not self.cudagraph_mode.has_mode(CUDAGraphMode.PIECEWISE):
+            self._piecewise_cudagraph_sizes.pop(namespace, None)
+            return ()
+
+        previous = self._piecewise_cudagraph_sizes.get(namespace)
+        if previous is not None and previous != sizes:
+            raise ValueError(
+                f"CUDA Graph namespace {namespace!r} is already registered"
+            )
+
+        self._piecewise_cudagraph_sizes[namespace] = sizes
+        for size in sizes:
+            descriptor = BatchDescriptor(size).relax_for_mixed_batch_cudagraphs()
+            self.add_cudagraph_key(CUDAGraphMode.PIECEWISE, descriptor)
+        return sizes
+
+    def has_piecewise_cudagraph_namespace(self, namespace: str) -> bool:
+        return bool(self._piecewise_cudagraph_sizes.get(namespace))
+
+    def dispatch_piecewise_cudagraph(
+        self, namespace: str, num_tokens: int
+    ) -> tuple[CUDAGraphMode, BatchDescriptor]:
+        if num_tokens <= 0:
+            raise ValueError("CUDA Graph token count must be positive")
+
+        sizes = self._piecewise_cudagraph_sizes.get(namespace, ())
+        index = bisect_left(sizes, num_tokens)
+        if index == len(sizes):
+            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+
+        descriptor = BatchDescriptor(sizes[index]).relax_for_mixed_batch_cudagraphs()
+        if descriptor not in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
+            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+        return CUDAGraphMode.PIECEWISE, descriptor
 
     def initialize_cudagraph_keys(
         self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1

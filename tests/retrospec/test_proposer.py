@@ -171,6 +171,91 @@ def test_retrospec_proposer_initialization():
     assert proposer.state.device == device
     assert proposer.attn_metadata_builder is None
     assert proposer.attn_layer_names == []
+    assert proposer._cudagraph_registration_failure == "uninitialized"
+
+
+def test_initialize_cudagraph_keys_registers_original_piecewise_buckets():
+    dispatcher = Mock()
+    dispatcher.register_piecewise_cudagraph_sizes.return_value = (
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+    )
+    dispatcher.has_piecewise_cudagraph_namespace.return_value = True
+    runner_input_ids = torch.empty(32, dtype=torch.int32)
+    runner_positions = torch.empty(32, dtype=torch.int64)
+    proposer = RetroSpecProposer(
+        make_vllm_config(enforce_eager=False),
+        torch.device("cpu"),
+        make_runner(
+            cudagraph_dispatcher=dispatcher,
+            input_ids=SimpleNamespace(gpu=runner_input_ids),
+            positions=SimpleNamespace(gpu=runner_positions),
+        ),
+    )
+
+    proposer.initialize_cudagraph_keys(
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        [1, 2, 4, 8, 16, 64],
+        32,
+    )
+
+    dispatcher.register_piecewise_cudagraph_sizes.assert_called_once_with(
+        "retrospec_proposal", {1, 2, 4, 8, 16, 32}
+    )
+    dispatcher.has_piecewise_cudagraph_namespace.assert_called_once_with(
+        "retrospec_proposal"
+    )
+    assert proposer._cudagraph_registration_failure is None
+    assert proposer._graph_input_ids.data_ptr() == runner_input_ids.data_ptr()
+    assert proposer._graph_positions.data_ptr() == runner_positions.data_ptr()
+
+
+def test_initialize_cudagraph_keys_records_piecewise_disabled():
+    dispatcher = Mock()
+    proposer = RetroSpecProposer(
+        make_vllm_config(enforce_eager=False),
+        torch.device("cpu"),
+        make_runner(cudagraph_dispatcher=dispatcher),
+    )
+
+    proposer.initialize_cudagraph_keys(CUDAGraphMode.FULL_DECODE_ONLY, [1, 2, 4], 4)
+
+    dispatcher.register_piecewise_cudagraph_sizes.assert_not_called()
+    assert proposer._cudagraph_registration_failure == "piecewise_disabled"
+
+
+def test_initialize_cudagraph_keys_skips_unsupported_data_parallelism():
+    dispatcher = Mock()
+    config = make_vllm_config(enforce_eager=False)
+    config.parallel_config = SimpleNamespace(data_parallel_size=2)
+    proposer = RetroSpecProposer(
+        config,
+        torch.device("cpu"),
+        make_runner(cudagraph_dispatcher=dispatcher),
+    )
+
+    proposer.initialize_cudagraph_keys(CUDAGraphMode.PIECEWISE, [1, 2, 4], 4)
+
+    dispatcher.register_piecewise_cudagraph_sizes.assert_not_called()
+    assert proposer._cudagraph_registration_failure == "data_parallel"
+
+
+def test_initialize_cudagraph_keys_requires_runner_input_workspace():
+    dispatcher = Mock()
+    proposer = RetroSpecProposer(
+        make_vllm_config(enforce_eager=False),
+        torch.device("cpu"),
+        make_runner(cudagraph_dispatcher=dispatcher),
+    )
+
+    proposer.initialize_cudagraph_keys(CUDAGraphMode.PIECEWISE, [1, 2, 4], 4)
+
+    dispatcher.register_piecewise_cudagraph_sizes.assert_not_called()
+    assert proposer._cudagraph_registration_failure == "missing_input_workspace"
 
 
 def test_piecewise_model_inputs_preserve_eager_views():
@@ -198,18 +283,21 @@ def test_piecewise_model_inputs_preserve_eager_views():
     assert result[2] is slot_mapping
     assert result[3] == CUDAGraphMode.NONE
     assert result[4] == BatchDescriptor(2)
-    dispatcher.dispatch.assert_not_called()
+    dispatcher.dispatch_piecewise_cudagraph.assert_not_called()
 
 
 def test_piecewise_model_inputs_pad_persistent_graph_workspace():
     dispatcher = Mock(
-        dispatch=Mock(return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4)))
+        dispatch_piecewise_cudagraph=Mock(
+            return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4))
+        )
     )
     proposer = RetroSpecProposer(
         make_vllm_config(enforce_eager=False),
         torch.device("cpu"),
         make_runner(cudagraph_dispatcher=dispatcher),
     )
+    proposer._cudagraph_registration_failure = None
     input_ids = torch.tensor([3, 4, 5], dtype=torch.int32)
     positions = torch.tensor([7, 8, 9], dtype=torch.int64)
     slot_mapping = proposer._slot_mapping[:3]
@@ -231,18 +319,23 @@ def test_piecewise_model_inputs_pad_persistent_graph_workspace():
     assert graph_slots.tolist() == [11, 12, 13, -1]
     assert mode == CUDAGraphMode.PIECEWISE
     assert descriptor == BatchDescriptor(4)
-    dispatcher.dispatch.assert_called_once_with(3, disable_full=True)
+    dispatcher.dispatch_piecewise_cudagraph.assert_called_once_with(
+        "retrospec_proposal", 3
+    )
 
 
 def test_piecewise_model_inputs_fall_back_when_bucket_exceeds_capacity():
     dispatcher = Mock(
-        dispatch=Mock(return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(16)))
+        dispatch_piecewise_cudagraph=Mock(
+            return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(16))
+        )
     )
     proposer = RetroSpecProposer(
         make_vllm_config(enforce_eager=False),
         torch.device("cpu"),
         make_runner(cudagraph_dispatcher=dispatcher),
     )
+    proposer._cudagraph_registration_failure = None
     input_ids = torch.tensor([3, 4, 5], dtype=torch.int32)
     positions = torch.tensor([7, 8, 9], dtype=torch.int64)
     slot_mapping = proposer._slot_mapping[:3]
@@ -741,13 +834,16 @@ def test_model_step_replays_padded_piecewise_graph_without_padding_policy_rows(
     monkeypatch,
 ):
     dispatcher = Mock(
-        dispatch=Mock(return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4)))
+        dispatch_piecewise_cudagraph=Mock(
+            return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4))
+        )
     )
     proposer = RetroSpecProposer(
         make_vllm_config(enforce_eager=False),
         torch.device("cpu"),
         make_runner(cudagraph_dispatcher=dispatcher),
     )
+    proposer._cudagraph_registration_failure = None
     common_attn_metadata = CommonAttentionMetadata(
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         seq_lens=torch.tensor([3, 3], dtype=torch.int32),
@@ -1866,13 +1962,16 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
 
 def test_parallel_verification_replays_padded_piecewise_graph(monkeypatch):
     dispatcher = Mock(
-        dispatch=Mock(return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4)))
+        dispatch_piecewise_cudagraph=Mock(
+            return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4))
+        )
     )
     proposer = RetroSpecProposer(
         make_vllm_config(enforce_eager=False),
         torch.device("cpu"),
         make_runner(cudagraph_dispatcher=dispatcher),
     )
+    proposer._cudagraph_registration_failure = None
     common_attn_metadata = CommonAttentionMetadata(
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),

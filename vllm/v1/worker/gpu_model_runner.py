@@ -5091,6 +5091,7 @@ class GPUModelRunner(
         self,
         num_tokens: int,
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
+        cudagraph_capture_descriptor: BatchDescriptor | None = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
         allow_microbatching: bool = True,
@@ -5114,6 +5115,9 @@ class GPUModelRunner(
                 - CUDAGraphMode.PIECEWISE: Piecewise cudagraph.
                 - CUDAGraphMode.FULL: Full cudagraph, attention metadata is
                     needed.
+            cudagraph_capture_descriptor: Exact descriptor requested by the
+                capture loop. This bypasses normal runtime bucket rounding and
+                is valid only while capturing a graph.
             force_attention: If True, always create attention metadata. Used to
                 warm up attention backend when mode is NONE.
             uniform_decode: If True, the batch is a uniform decode batch.
@@ -5211,6 +5215,15 @@ class GPUModelRunner(
                 force_num_active_loras=num_active_loras,
             )
         )
+
+        if cudagraph_capture_descriptor is not None:
+            assert is_graph_capturing, (
+                "An exact CUDA Graph descriptor may only be forced during capture"
+            )
+            assert cudagraph_capture_descriptor.num_tokens == num_tokens_unpadded, (
+                "The forced CUDA Graph descriptor must match the dummy token count"
+            )
+            batch_desc = cudagraph_capture_descriptor
 
         if cudagraph_runtime_mode is None:
             cudagraph_runtime_mode = _cudagraph_mode
@@ -5803,6 +5816,7 @@ class GPUModelRunner(
             dummy_run(
                 num_tokens,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                cudagraph_capture_descriptor=batch_desc,
                 allow_microbatching=allow_microbatching,
                 num_active_loras=num_active_loras,
                 is_graph_capturing=True,
@@ -5924,6 +5938,17 @@ class GPUModelRunner(
         Then initialize the cudagraph_dispatcher based on the resolved
         cudagraph_mode.
         """
+        retrospec_drafter = getattr(self, "drafter", None)
+        retrospec_capture_sizes: tuple[int, ...] = ()
+        retrospec_max_capture_size = 0
+        if isinstance(retrospec_drafter, RetroSpecProposer):
+            retrospec_capture_sizes = tuple(
+                self.compilation_config.cudagraph_capture_sizes or ()
+            )
+            retrospec_max_capture_size = int(
+                self.compilation_config.max_cudagraph_capture_size or 0
+            )
+
         min_cg_support = AttentionCGSupport.ALWAYS
         min_cg_backend_name = None
 
@@ -6067,6 +6092,13 @@ class GPUModelRunner(
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
             cudagraph_mode, self.uniform_decode_query_len
         )
+
+        if isinstance(retrospec_drafter, RetroSpecProposer):
+            retrospec_drafter.initialize_cudagraph_keys(
+                cudagraph_mode,
+                retrospec_capture_sizes,
+                retrospec_max_capture_size,
+            )
 
         # Initialize eagle's cudagraph dispatcher if using eagle spec decode.
         if self.speculative_config and self.speculative_config.use_eagle():

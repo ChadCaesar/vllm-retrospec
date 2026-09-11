@@ -52,6 +52,8 @@ class RetroSpecParallelVerificationOutput:
 
 
 class RetroSpecProposer:
+    _CUDAGRAPH_NAMESPACE = "retrospec_proposal"
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -100,6 +102,7 @@ class RetroSpecProposer:
         self.state = RetroSpecBatchState(self.max_batch_size, device)
         self.sparse_attention = RetroSpecSparseAttention(vllm_config, device)
         self.performance_stats = self.sparse_attention.performance_stats
+        self._cudagraph_registration_failure: str | None = "uninitialized"
         self.index_update_state = RetroSpecIndexUpdateState(
             max_batch_size=self.max_batch_size,
             update_interval=config.retrospec_index_update_interval,
@@ -367,6 +370,60 @@ class RetroSpecProposer:
         self.attn_layer_names = list(attention_layers)
         self.sparse_attention.install(attention_layers)
 
+    def initialize_cudagraph_keys(
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        capture_sizes: Sequence[int],
+        max_capture_size: int,
+    ) -> None:
+        if self.speculative_config.enforce_eager:
+            self._cudagraph_registration_failure = "eager"
+            return
+
+        dispatcher = getattr(self.runner, "cudagraph_dispatcher", None)
+        if dispatcher is None:
+            self._cudagraph_registration_failure = "missing_dispatcher"
+            return
+        if not cudagraph_mode.has_mode(CUDAGraphMode.PIECEWISE):
+            self._cudagraph_registration_failure = "piecewise_disabled"
+            return
+
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        if parallel_config is not None and parallel_config.data_parallel_size > 1:
+            self._cudagraph_registration_failure = "data_parallel"
+            return
+
+        runner_input_ids = getattr(getattr(self.runner, "input_ids", None), "gpu", None)
+        runner_positions = getattr(getattr(self.runner, "positions", None), "gpu", None)
+        if (
+            not isinstance(runner_input_ids, torch.Tensor)
+            or not isinstance(runner_positions, torch.Tensor)
+            or runner_input_ids.numel() < self.max_parallel_tokens
+            or runner_positions.numel() < self.max_parallel_tokens
+        ):
+            self._cudagraph_registration_failure = "missing_input_workspace"
+            return
+
+        self._graph_input_ids = runner_input_ids[: self.max_parallel_tokens]
+        self._graph_positions = runner_positions[: self.max_parallel_tokens]
+
+        limit = min(self.max_parallel_tokens, max_capture_size)
+        sizes = {size for size in capture_sizes if 0 < size <= limit}
+        sizes.update(
+            capacity
+            for capacity in (self.max_batch_size, self.max_parallel_tokens)
+            if 0 < capacity <= limit
+        )
+        registered = dispatcher.register_piecewise_cudagraph_sizes(
+            self._CUDAGRAPH_NAMESPACE, sizes
+        )
+        self._cudagraph_registration_failure = (
+            None
+            if registered
+            and dispatcher.has_piecewise_cudagraph_namespace(self._CUDAGRAPH_NAMESPACE)
+            else "missing_key"
+        )
+
     def _get_attention_metadata_builder(self) -> AttentionMetadataBuilder:
         if self.attn_metadata_builder is not None:
             return self.attn_metadata_builder
@@ -506,11 +563,12 @@ class RetroSpecProposer:
             num_rejected_tokens_gpu,
         )
 
+    def _record_cudagraph_fallback(self, stage_name: str, reason: str) -> None:
+        self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback")
+        self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback_{reason}")
+
     def _dispatch_piecewise_cudagraph(
-        self,
-        num_tokens: int,
-        capacity: int,
-        stage_name: str,
+        self, num_tokens: int, capacity: int, stage_name: str
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         eager_descriptor = BatchDescriptor(num_tokens)
 
@@ -518,30 +576,33 @@ class RetroSpecProposer:
             self.performance_stats.add_counter(f"{stage_name}_cudagraph_eager")
             return CUDAGraphMode.NONE, eager_descriptor
 
-        # LoRA graph specialization and cross-DP graph batch coordination are
-        # intentionally left on the exact eager path in this commit.
         if getattr(self.vllm_config, "lora_config", None) is not None:
-            self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback")
+            self._record_cudagraph_fallback(stage_name, "lora")
             return CUDAGraphMode.NONE, eager_descriptor
 
         parallel_config = getattr(self.vllm_config, "parallel_config", None)
         if parallel_config is not None and parallel_config.data_parallel_size > 1:
-            self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback")
+            self._record_cudagraph_fallback(stage_name, "data_parallel")
             return CUDAGraphMode.NONE, eager_descriptor
 
         dispatcher = getattr(self.runner, "cudagraph_dispatcher", None)
         if dispatcher is None:
-            self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback")
+            self._record_cudagraph_fallback(stage_name, "missing_dispatcher")
+            return CUDAGraphMode.NONE, eager_descriptor
+        if self._cudagraph_registration_failure is not None:
+            self._record_cudagraph_fallback(
+                stage_name, self._cudagraph_registration_failure
+            )
             return CUDAGraphMode.NONE, eager_descriptor
 
-        cudagraph_mode, batch_descriptor = dispatcher.dispatch(
-            num_tokens, disable_full=True
+        cudagraph_mode, batch_descriptor = dispatcher.dispatch_piecewise_cudagraph(
+            self._CUDAGRAPH_NAMESPACE, num_tokens
         )
-        if (
-            cudagraph_mode != CUDAGraphMode.PIECEWISE
-            or batch_descriptor.num_tokens > capacity
-        ):
-            self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback")
+        if cudagraph_mode != CUDAGraphMode.PIECEWISE:
+            self._record_cudagraph_fallback(stage_name, "missing_key")
+            return CUDAGraphMode.NONE, eager_descriptor
+        if batch_descriptor.num_tokens > capacity:
+            self._record_cudagraph_fallback(stage_name, "capacity")
             return CUDAGraphMode.NONE, eager_descriptor
 
         self.performance_stats.add_counter(f"{stage_name}_cudagraph_replay")

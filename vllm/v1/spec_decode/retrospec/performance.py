@@ -284,6 +284,12 @@ class RetroSpecPerformanceStats:
         prefetch_backpressured = counters.get("prefetch_backpressure_waits", 0)
         prefetch_wave_opportunities = prefetch_waves + prefetch_coalesced
 
+        def cudagraph_replay_rate(stage_name: str) -> float:
+            replay = counters.get(f"{stage_name}_cudagraph_replay", 0)
+            fallback = counters.get(f"{stage_name}_cudagraph_fallback", 0)
+            eager = counters.get(f"{stage_name}_cudagraph_eager", 0)
+            return self._ratio(replay, replay + fallback + eager)
+
         logger.info(
             "RetroSpec performance over %.2fs: counters={%s}; peaks={%s}; "
             "derived={draft_tokens/request=%.2f, expanded/sparse=%.3f, "
@@ -291,7 +297,10 @@ class RetroSpecPerformanceStats:
             "verification_hit_rate=%.3f, "
             "prefetch_coalesce_rate=%.3f, "
             "prefetch_backpressure_rate=%.3f, "
-            "prefetch_records/wave=%.2f}; "
+            "prefetch_records/wave=%.2f, "
+            "draft_graph_replay=%.3f, "
+            "sparse_verify_graph_replay=%.3f, "
+            "expanded_verify_graph_replay=%.3f}; "
             "cpu_avg={%s}; cuda_avg={%s}",
             elapsed_seconds,
             self._format_counters(counters),
@@ -310,6 +319,9 @@ class RetroSpecPerformanceStats:
             ),
             self._ratio(prefetch_backpressured, prefetch_waves),
             self._ratio(counters.get("prefetch_wave_records", 0), prefetch_waves),
+            cudagraph_replay_rate("draft"),
+            cudagraph_replay_rate("sparse_verify"),
+            cudagraph_replay_rate("expanded_verify"),
             self._format_times(cpu_times),
             self._format_times(cuda_times),
         )

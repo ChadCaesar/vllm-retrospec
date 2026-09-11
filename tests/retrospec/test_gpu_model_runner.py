@@ -7,10 +7,88 @@ from unittest.mock import Mock
 import numpy as np
 import torch
 
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import BatchDescriptor
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.outputs import KVCacheRetirement
 from vllm.v1.spec_decode.retrospec import RetroSpecProposer
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+
+def test_retrospec_registers_capture_sizes_before_spec_decode_rounding():
+    class FakeMetadataBuilder:
+        @classmethod
+        def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+            return AttentionCGSupport.ALWAYS
+
+    class FakeAttentionBackend:
+        @classmethod
+        def get_builder_cls(cls):
+            return FakeMetadataBuilder
+
+    compilation_config = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_capture_sizes=[1, 2, 4, 8, 16],
+        max_cudagraph_capture_size=16,
+    )
+
+    def adjust_capture_sizes(uniform_decode_query_len, tensor_parallel_size):
+        assert uniform_decode_query_len == 5
+        assert tensor_parallel_size == 1
+        compilation_config.cudagraph_capture_sizes = [5, 10, 15]
+        compilation_config.max_cudagraph_capture_size = 15
+
+    compilation_config.adjust_cudagraph_sizes_for_spec_decode = Mock(
+        side_effect=adjust_capture_sizes
+    )
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace()
+    runner.compilation_config = compilation_config
+    runner.parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    runner.uniform_decode_query_len = 5
+    runner.cudagraph_dispatcher = Mock()
+    runner.speculative_config = SimpleNamespace(use_eagle=lambda: False)
+    runner.drafter = RetroSpecProposer.__new__(RetroSpecProposer)
+    runner.drafter.initialize_cudagraph_keys = Mock()
+
+    runner._check_and_update_cudagraph_mode(
+        [{FakeAttentionBackend}],
+        [SimpleNamespace(kv_cache_spec=object())],
+    )
+
+    runner.cudagraph_dispatcher.initialize_cudagraph_keys.assert_called_once_with(
+        CUDAGraphMode.FULL_AND_PIECEWISE, 5
+    )
+    runner.drafter.initialize_cudagraph_keys.assert_called_once_with(
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        (1, 2, 4, 8, 16),
+        16,
+    )
+
+
+def test_capture_cudagraphs_forces_registered_descriptor(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.is_global_first_rank", lambda: False
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.parallel_config = SimpleNamespace(use_ubatching=False)
+    runner.compilation_config = SimpleNamespace(cudagraph_num_of_warmups=0)
+    runner.load_config = SimpleNamespace(use_tqdm_on_load=False)
+    runner.lora_config = None
+    runner._dummy_run = Mock()
+    runner.maybe_remove_all_loras = Mock()
+    descriptor = BatchDescriptor(4).relax_for_mixed_batch_cudagraphs()
+
+    runner._capture_cudagraphs([descriptor], CUDAGraphMode.PIECEWISE)
+
+    runner._dummy_run.assert_called_once()
+    call = runner._dummy_run.call_args
+    assert call.args == (4,)
+    assert call.kwargs["cudagraph_capture_descriptor"] == descriptor
+    assert call.kwargs["cudagraph_runtime_mode"] == CUDAGraphMode.PIECEWISE
+    assert call.kwargs["is_graph_capturing"] is True
 
 
 def make_retrospec_proposal_runner(
