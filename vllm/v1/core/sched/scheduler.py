@@ -254,7 +254,6 @@ class Scheduler(SchedulerInterface):
             speculative_config is not None
             and speculative_config.method == "retrospec"
             and not self.is_encoder_decoder
-            and not self.use_pp
             and self.dcp_world_size == 1
             and self.pcp_world_size == 1
             and self.connector is None

@@ -18,7 +18,9 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.retrospec import (
+    RetroSpecAttentionMassStats,
     RetroSpecAttentionMode,
+    RetroSpecPipelineStage,
     RetroSpecProposer,
 )
 from vllm.v1.spec_decode.retrospec.proposer import (
@@ -33,6 +35,17 @@ def disable_pin_memory_for_cpu_tests(monkeypatch):
     monkeypatch.setattr(
         "vllm.v1.spec_decode.retrospec.proposer.is_pin_memory_available",
         lambda: False,
+    )
+    pp_group = SimpleNamespace(
+        rank_in_group=0,
+        world_size=1,
+        is_last_rank=True,
+        last_rank=0,
+        device_group=None,
+        all_reduce=lambda tensor: tensor,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group", lambda: pp_group
     )
 
 
@@ -115,6 +128,7 @@ def run_proposal(
     committed_positions: list[int] | None = None,
     proposal_active_mask: torch.Tensor | None = None,
 ) -> list[list[int]]:
+    initialize_single_pipeline_stage(proposer)
     batch_size = common_attn_metadata.batch_size()
     if request_ids is None:
         request_ids = [f"request-{index}" for index in range(batch_size)]
@@ -132,6 +146,16 @@ def run_proposal(
         proposal_active_mask=proposal_active_mask,
         num_rejected_tokens_gpu=num_rejected_tokens_gpu,
     )
+
+
+def initialize_single_pipeline_stage(proposer: RetroSpecProposer) -> None:
+    if proposer.pipeline_stage is None:
+        num_layers = max(len(proposer.attn_layer_names), 1)
+        proposer.pipeline_stage = RetroSpecPipelineStage(0, 1, 0, num_layers)
+
+
+def attention_stats(size: int) -> RetroSpecAttentionMassStats:
+    return RetroSpecAttentionMassStats(torch.ones(size), layer_count=1)
 
 
 def mock_proposal_execution(
@@ -369,14 +393,22 @@ def test_retrospec_proposer_loads_target_model():
     proposer.sparse_attention.install = install
     attention_layer = Mock()
 
-    with patch(
-        "vllm.v1.spec_decode.retrospec.proposer.get_layers_from_vllm_config",
-        return_value={"model.layers.0.self_attn.attn": attention_layer},
+    layer_model = SimpleNamespace(start_layer=0, end_layer=1)
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.proposer.get_layers_from_vllm_config",
+            return_value={"model.layers.0.self_attn.attn": attention_layer},
+        ),
+        patch(
+            "vllm.v1.spec_decode.retrospec.proposer.resolve_retrospec_layer_model",
+            return_value=layer_model,
+        ),
     ):
         proposer.load_model(target_model)
 
     assert proposer.model is target_model
     assert proposer.attn_layer_names == ["model.layers.0.self_attn.attn"]
+    assert proposer.pipeline_stage == RetroSpecPipelineStage(0, 1, 0, 1)
     install.assert_called_once_with({"model.layers.0.self_attn.attn": attention_layer})
 
 
@@ -743,7 +775,8 @@ def test_run_draft_step_preserves_attention_seq_lens_dtype(monkeypatch):
             return SimpleNamespace()
 
     class FakeModel(torch.nn.Module):
-        def forward(self, input_ids, positions, inputs_embeds):
+        def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+            assert intermediate_tensors is None
             return torch.zeros((input_ids.shape[0], 4))
 
         def compute_logits(self, hidden_states):
@@ -756,7 +789,9 @@ def test_run_draft_step_preserves_attention_seq_lens_dtype(monkeypatch):
         sampled_token_ids=torch.tensor([[1]], dtype=torch.int32)
     )
     proposer.sparse_attention.begin_step = Mock()
-    proposer.sparse_attention.end_step = Mock(return_value=torch.ones(1))
+    proposer.sparse_attention.end_step_statistics = Mock(
+        return_value=attention_stats(1)
+    )
     proposer.input_ids[0] = 1
     proposer.positions[0] = 3
     monkeypatch.setattr(
@@ -764,6 +799,7 @@ def test_run_draft_step_preserves_attention_seq_lens_dtype(monkeypatch):
         lambda *args, **kwargs: nullcontext(),
     )
 
+    initialize_single_pipeline_stage(proposer)
     proposer._run_draft_step(
         batch_size=1,
         draft_index=0,
@@ -773,7 +809,7 @@ def test_run_draft_step_preserves_attention_seq_lens_dtype(monkeypatch):
     )
 
     proposer.sparse_attention.begin_step.assert_called_once()
-    proposer.sparse_attention.end_step.assert_called_once_with()
+    proposer.sparse_attention.end_step_statistics.assert_called_once_with()
 
 
 def test_model_step_sanitizes_input_ids_for_inactive_rows(monkeypatch):
@@ -799,7 +835,8 @@ def test_model_step_sanitizes_input_ids_for_inactive_rows(monkeypatch):
             return SimpleNamespace()
 
     class FakeModel(torch.nn.Module):
-        def forward(self, input_ids, positions, inputs_embeds):
+        def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+            assert intermediate_tensors is None
             assert input_ids.tolist() == [7, 0]
             return torch.zeros((input_ids.shape[0], 4))
 
@@ -813,12 +850,15 @@ def test_model_step_sanitizes_input_ids_for_inactive_rows(monkeypatch):
         sampled_token_ids=torch.ones(2, 1, dtype=torch.int32)
     )
     proposer.sparse_attention.begin_step = Mock()
-    proposer.sparse_attention.end_step = Mock(return_value=torch.ones(2))
+    proposer.sparse_attention.end_step_statistics = Mock(
+        return_value=attention_stats(2)
+    )
     monkeypatch.setattr(
         "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
         lambda *args, **kwargs: nullcontext(),
     )
 
+    initialize_single_pipeline_stage(proposer)
     proposer._run_model_step(
         batch_size=2,
         step_index=1,
@@ -865,7 +905,8 @@ def test_model_step_replays_padded_piecewise_graph_without_padding_policy_rows(
             return SimpleNamespace()
 
     class FakeModel(torch.nn.Module):
-        def forward(self, input_ids, positions, inputs_embeds):
+        def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+            assert intermediate_tensors is None
             assert input_ids.tolist() == [7, 0, 0, 0]
             assert positions.tolist() == [3, 0, 0, 0]
             return torch.zeros((4, 4))
@@ -887,12 +928,15 @@ def test_model_step_replays_padded_piecewise_graph_without_padding_policy_rows(
         sampled_token_ids=torch.ones(2, 1, dtype=torch.int32)
     )
     proposer.sparse_attention.begin_step = Mock()
-    proposer.sparse_attention.end_step = Mock(return_value=torch.ones(2))
+    proposer.sparse_attention.end_step_statistics = Mock(
+        return_value=attention_stats(2)
+    )
     monkeypatch.setattr(
         "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
         fake_forward_context,
     )
 
+    initialize_single_pipeline_stage(proposer)
     proposer._run_model_step(
         batch_size=2,
         step_index=1,
@@ -1544,6 +1588,61 @@ def test_sparse_token_change_is_corrected_and_truncates_prefix(monkeypatch):
     ]
 
 
+def test_expanded_verification_preserves_sparse_boundary_across_shared_workspace(
+    monkeypatch,
+):
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_sparse_margin_threshold=0.5),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    initialize_verification(
+        proposer,
+        torch.tensor([[10, -1, -1, -1]], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+    def fake_run_parallel_verification(
+        batch_size,
+        request_indices,
+        token_indices,
+        common_attn_metadata,
+        sampling_metadata,
+        attention_mode,
+    ):
+        shared_token_ids = proposer.pipeline_protocol._model_token_ids[:1]
+        if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
+            shared_token_ids.fill_(10)
+            margin = [0.1]
+        else:
+            shared_token_ids.fill_(99)
+            margin = None
+        return RetroSpecParallelVerificationOutput(
+            request_indices=request_indices,
+            token_indices=token_indices,
+            token_ids=shared_token_ids,
+            margin=None if margin is None else torch.tensor(margin),
+            attention_mass=torch.ones(1),
+        )
+
+    monkeypatch.setattr(
+        proposer,
+        "_run_parallel_verification",
+        fake_run_parallel_verification,
+    )
+
+    verification = proposer._verify_draft_tokens(
+        1,
+        torch.zeros(1, dtype=torch.int32),
+        make_common_metadata([1]),
+        make_sampling_metadata(all_greedy=True),
+    )
+
+    assert verification.verified_counts.tolist() == [1]
+    assert verification.require_full.tolist() == [True]
+    assert proposer._draft_token_ids[0, 0].item() == 99
+
+
 def test_expanded_verification_passes_or_stops_requests_independently(
     monkeypatch,
 ):
@@ -1907,7 +2006,8 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
             return SimpleNamespace()
 
     class FakeModel(torch.nn.Module):
-        def forward(self, input_ids, positions, inputs_embeds):
+        def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+            assert intermediate_tensors is None
             assert input_ids.tolist() == [8, 10, 11]
             assert positions.tolist() == [5, 4, 6]
             return torch.zeros((3, 4))
@@ -1926,12 +2026,15 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     proposer.attn_metadata_builder = cast(Any, FakeBuilder())
     proposer.runner.sampler = sample
     proposer.sparse_attention.begin_parallel_step = Mock()
-    proposer.sparse_attention.end_step = Mock(return_value=torch.ones(3))
+    proposer.sparse_attention.end_step_statistics = Mock(
+        return_value=attention_stats(3)
+    )
     monkeypatch.setattr(
         "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
         lambda *args, **kwargs: nullcontext(),
     )
 
+    initialize_single_pipeline_stage(proposer)
     result = proposer._run_parallel_verification(
         batch_size=2,
         request_indices=torch.tensor([1, 0, 1], dtype=torch.int64),
@@ -1944,12 +2047,10 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     assert result.request_indices.tolist() == [1, 0, 1]
     assert result.token_indices.tolist() == [0, 1, 1]
     assert result.token_ids.tolist() == [1, 0, 2]
-    expected_output = (
-        proposer._sparse_sampled_token_ids
-        if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY
-        else proposer._expanded_sampled_token_ids
+    assert (
+        result.token_ids.data_ptr()
+        == proposer.pipeline_protocol._model_token_ids.data_ptr()
     )
-    assert result.token_ids.data_ptr() == expected_output.data_ptr()
     assert (result.margin is not None) is expect_margin
     if result.margin is not None:
         assert result.margin.tolist() == [1.0, 2.0, 3.0]
@@ -1959,7 +2060,7 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     assert begin_args[0] == attention_mode
     assert torch.equal(begin_args[1], torch.tensor([1, 0, 1], dtype=torch.int64))
     assert torch.equal(begin_args[2], torch.tensor([0, 1, 1], dtype=torch.int64))
-    proposer.sparse_attention.end_step.assert_called_once_with()
+    proposer.sparse_attention.end_step_statistics.assert_called_once_with()
 
 
 def test_parallel_verification_replays_padded_piecewise_graph(monkeypatch):
@@ -1996,7 +2097,8 @@ def test_parallel_verification_replays_padded_piecewise_graph(monkeypatch):
             return SimpleNamespace()
 
     class FakeModel(torch.nn.Module):
-        def forward(self, input_ids, positions, inputs_embeds):
+        def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+            assert intermediate_tensors is None
             assert input_ids.tolist() == [8, 10, 11, 0]
             assert positions.tolist() == [5, 4, 6, 0]
             return torch.zeros((4, 4))
@@ -2015,12 +2117,15 @@ def test_parallel_verification_replays_padded_piecewise_graph(monkeypatch):
     proposer.attn_layer_names = ["model.layers.0.self_attn.attn"]
     proposer.attn_metadata_builder = cast(Any, FakeBuilder())
     proposer.sparse_attention.begin_parallel_step = Mock()
-    proposer.sparse_attention.end_step = Mock(return_value=torch.ones(3))
+    proposer.sparse_attention.end_step_statistics = Mock(
+        return_value=attention_stats(3)
+    )
     monkeypatch.setattr(
         "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
         fake_forward_context,
     )
 
+    initialize_single_pipeline_stage(proposer)
     result = proposer._run_parallel_verification(
         batch_size=2,
         request_indices=torch.tensor([1, 0, 1], dtype=torch.int64),

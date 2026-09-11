@@ -8,9 +8,12 @@ import pytest
 import torch
 
 from vllm.sequence import IntermediateTensors
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+from vllm.v1.executor.ray_executor import RayDistributedExecutor
 from vllm.v1.spec_decode.retrospec.pipeline import (
     RetroSpecAttentionMassStats,
     RetroSpecPipelineControlState,
+    RetroSpecPipelineModelOutput,
     RetroSpecPipelineProtocol,
     RetroSpecPipelineStage,
 )
@@ -43,9 +46,59 @@ def make_pp_group(
     )
 
 
+def make_protocol(
+    *,
+    max_batch_size: int = 4,
+    max_parallel_tokens: int = 16,
+    max_sampled_tokens: int = 5,
+) -> RetroSpecPipelineProtocol:
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            pass_config=SimpleNamespace(enable_sp=False)
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+    )
+    return RetroSpecPipelineProtocol(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        max_batch_size=max_batch_size,
+        max_parallel_tokens=max_parallel_tokens,
+        max_sampled_tokens=max_sampled_tokens,
+    )
+
+
+def make_executor_concurrency_view(executor_cls, method: str | None):
+    executor = object.__new__(executor_cls)
+    executor.parallel_config = SimpleNamespace(pipeline_parallel_size=2)
+    executor.scheduler_config = SimpleNamespace(async_scheduling=False)
+    executor.vllm_config = SimpleNamespace(
+        speculative_config=None if method is None else SimpleNamespace(method=method)
+    )
+    return executor
+
+
+@pytest.mark.parametrize("executor_cls", [MultiprocExecutor, RayDistributedExecutor])
+def test_retrospec_pipeline_waits_for_proposal_before_scheduling_next_batch(
+    executor_cls,
+):
+    executor = make_executor_concurrency_view(executor_cls, "retrospec")
+
+    assert executor.max_concurrent_batches == 1
+
+
+@pytest.mark.parametrize("executor_cls", [MultiprocExecutor, RayDistributedExecutor])
+@pytest.mark.parametrize("method", [None, "ngram"])
+def test_non_retrospec_pipeline_retains_pipeline_batch_concurrency(
+    executor_cls, method
+):
+    executor = make_executor_concurrency_view(executor_cls, method)
+
+    assert executor.max_concurrent_batches == 2
+
+
 def test_pipeline_stage_describes_local_layer_range():
     pp_group = make_pp_group(rank=1, world_size=3, is_last_rank=False)
-    protocol = RetroSpecPipelineProtocol(torch.device("cpu"), max_batch_size=4)
+    protocol = make_protocol()
     model = FakeLayerModel(start_layer=4, end_layer=7)
 
     with patch(
@@ -66,7 +119,7 @@ def test_pipeline_stage_describes_local_layer_range():
 
 
 def test_pipeline_stage_rejects_mismatched_attention_layers():
-    protocol = RetroSpecPipelineProtocol(torch.device("cpu"), max_batch_size=4)
+    protocol = make_protocol()
     model = FakeLayerModel(start_layer=2, end_layer=4)
 
     with (
@@ -80,7 +133,7 @@ def test_pipeline_stage_rejects_mismatched_attention_layers():
 
 
 def test_first_pipeline_stage_embeds_prompt_tokens():
-    protocol = RetroSpecPipelineProtocol(torch.device("cpu"), max_batch_size=4)
+    protocol = make_protocol()
     model = FakeLayerModel(start_layer=0, end_layer=2)
     stage = RetroSpecPipelineStage(0, 2, 0, 2)
     token_ids = torch.tensor([2, 4, 6], dtype=torch.int64)
@@ -100,7 +153,7 @@ def test_first_pipeline_stage_embeds_prompt_tokens():
 
 
 def test_nonfirst_pipeline_stage_consumes_and_emits_contiguous_hidden_states():
-    protocol = RetroSpecPipelineProtocol(torch.device("cpu"), max_batch_size=4)
+    protocol = make_protocol()
     model = FakeLayerModel(start_layer=2, end_layer=4)
     stage = RetroSpecPipelineStage(1, 3, 2, 4)
     hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4).T
@@ -121,7 +174,7 @@ def test_nonfirst_pipeline_stage_consumes_and_emits_contiguous_hidden_states():
 
 
 def test_attention_mass_reduction_weights_pipeline_stages_by_layer_count():
-    protocol = RetroSpecPipelineProtocol(torch.device("cpu"), max_batch_size=4)
+    protocol = make_protocol()
     pp_group = make_pp_group(rank=0, world_size=2, is_last_rank=False)
 
     def add_remote_stage(reduction: torch.Tensor) -> torch.Tensor:
@@ -148,7 +201,7 @@ def test_attention_mass_reduction_weights_pipeline_stages_by_layer_count():
 
 
 def test_final_pipeline_stage_packs_fixed_control_workspace():
-    protocol = RetroSpecPipelineProtocol(torch.device("cpu"), max_batch_size=4)
+    protocol = make_protocol()
     pp_group = make_pp_group(rank=1, world_size=2, is_last_rank=True)
     state = RetroSpecPipelineControlState(
         token_ids=torch.tensor([11, 12], dtype=torch.int32),
@@ -177,7 +230,7 @@ def test_final_pipeline_stage_packs_fixed_control_workspace():
 
 
 def test_nonfinal_pipeline_stage_receives_control_workspace():
-    protocol = RetroSpecPipelineProtocol(torch.device("cpu"), max_batch_size=4)
+    protocol = make_protocol()
     pp_group = make_pp_group(rank=0, world_size=2, is_last_rank=False)
 
     def receive_control(tensor: torch.Tensor, **_kwargs) -> None:
@@ -205,3 +258,136 @@ def test_nonfinal_pipeline_stage_receives_control_workspace():
     assert output.draft_counts.tolist() == [2, 5]
     assert output.pending_counts.tolist() == [3, 6]
     assert output.active_mask.tolist() == [True, False]
+
+
+def test_attention_mass_workspace_supports_parallel_verification_rows():
+    protocol = make_protocol(max_batch_size=2, max_parallel_tokens=8)
+    stats = RetroSpecAttentionMassStats(
+        value_sum=torch.arange(8, dtype=torch.float32),
+        layer_count=2,
+    )
+
+    with patch(
+        "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+        return_value=make_pp_group(),
+    ):
+        attention_mass = protocol.reduce_attention_mass(stats)
+
+    torch.testing.assert_close(attention_mass, stats.value_sum / 2)
+
+
+def test_final_pipeline_stage_broadcasts_padded_target_samples():
+    protocol = make_protocol(max_sampled_tokens=5)
+    pp_group = make_pp_group(rank=1, world_size=2, is_last_rank=True)
+    sampled_token_ids = torch.tensor([[11, 12, -1], [21, -1, -1]], dtype=torch.int32)
+
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+            return_value=pp_group,
+        ),
+        patch("torch.distributed.broadcast") as broadcast,
+    ):
+        output = protocol.broadcast_target_sampled_token_ids(2, sampled_token_ids)
+
+    assert broadcast.call_count == 1
+    assert output.tolist() == [
+        [11, 12, -1, -1, -1],
+        [21, -1, -1, -1, -1],
+    ]
+
+
+@pytest.mark.parametrize("compute_margin", [False, True])
+def test_final_pipeline_stage_broadcasts_model_output(compute_margin: bool):
+    protocol = make_protocol()
+    pp_group = make_pp_group(rank=1, world_size=2, is_last_rank=True)
+    token_ids = torch.tensor([31, 32, 33], dtype=torch.int32)
+    margin = torch.tensor([0.1, 0.2, 0.3]) if compute_margin else None
+
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+            return_value=pp_group,
+        ),
+        patch("torch.distributed.broadcast") as broadcast,
+    ):
+        output = protocol.broadcast_model_output(
+            num_tokens=3,
+            token_ids=token_ids,
+            margin=margin,
+            compute_margin=compute_margin,
+        )
+
+    assert isinstance(output, RetroSpecPipelineModelOutput)
+    assert output.token_ids.tolist() == [31, 32, 33]
+    if compute_margin:
+        assert output.margin is not None
+        torch.testing.assert_close(output.margin, margin)
+        assert broadcast.call_count == 2
+    else:
+        assert output.margin is None
+        assert broadcast.call_count == 1
+
+
+def test_nonfinal_pipeline_stage_receives_model_input():
+    protocol = make_protocol()
+    pp_group = make_pp_group(rank=1, world_size=3, is_last_rank=False)
+    pp_group.recv_tensor_dict = Mock(
+        return_value={
+            "hidden_states": torch.ones(3, 4),
+            "residual": torch.full((3, 4), 2.0),
+        }
+    )
+    tp_group = SimpleNamespace()
+    stage = RetroSpecPipelineStage(1, 3, 2, 4)
+
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+            return_value=pp_group,
+        ),
+        patch(
+            "vllm.v1.spec_decode.retrospec.pipeline.get_tp_group",
+            return_value=tp_group,
+        ),
+    ):
+        output = protocol.receive_model_input(stage, num_tokens=3)
+
+    assert isinstance(output, IntermediateTensors)
+    torch.testing.assert_close(output["hidden_states"], torch.ones(3, 4))
+    pp_group.recv_tensor_dict.assert_called_once_with(
+        all_gather_group=tp_group,
+        all_gather_tensors={"residual": True},
+    )
+
+
+def test_nonfinal_pipeline_stage_sends_model_output():
+    protocol = make_protocol()
+    pp_group = make_pp_group(rank=0, world_size=2, is_last_rank=False)
+    pp_group.send_tensor_dict = Mock()
+    tp_group = SimpleNamespace()
+    stage = RetroSpecPipelineStage(0, 2, 0, 2)
+    output = IntermediateTensors(
+        {
+            "hidden_states": torch.ones(3, 4),
+            "residual": torch.full((3, 4), 2.0),
+        }
+    )
+
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+            return_value=pp_group,
+        ),
+        patch(
+            "vllm.v1.spec_decode.retrospec.pipeline.get_tp_group",
+            return_value=tp_group,
+        ),
+    ):
+        protocol.send_model_output(stage, output, num_tokens=3)
+
+    pp_group.send_tensor_dict.assert_called_once_with(
+        output.tensors,
+        all_gather_group=tp_group,
+        all_gather_tensors={"residual": True},
+    )

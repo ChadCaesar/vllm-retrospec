@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -13,7 +13,10 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.outputs import KVCacheRetirement
 from vllm.v1.spec_decode.retrospec import RetroSpecProposer
 from vllm.v1.worker.block_table import BlockTable
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.gpu_model_runner import (
+    GPUModelRunner,
+    RetroSpecPipelineProposalState,
+)
 
 
 def test_retrospec_registers_capture_sizes_before_spec_decode_rounding():
@@ -103,6 +106,11 @@ def make_retrospec_proposal_runner(
         )
     )
     drafter.propose = Mock(return_value=[[], [12]])
+    drafter.pipeline_protocol = SimpleNamespace(
+        broadcast_target_sampled_token_ids=Mock(
+            side_effect=lambda _num_reqs, sampled_token_ids: sampled_token_ids
+        )
+    )
 
     runner.speculative_config = SimpleNamespace(
         method="retrospec",
@@ -112,6 +120,7 @@ def make_retrospec_proposal_runner(
     runner.input_batch = SimpleNamespace(
         num_reqs=2,
         req_ids=["prefill", "decode"],
+        sampling_metadata=SimpleNamespace(),
     )
     runner.requests = {
         "prefill": SimpleNamespace(num_computed_tokens=8),
@@ -126,17 +135,19 @@ def make_retrospec_proposal_runner(
 
 
 def call_retrospec_proposal(runner: GPUModelRunner) -> list[list[int]]:
-    return runner.propose_draft_token_ids(
-        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=2),
-        sampled_token_ids=torch.tensor([[10], [11]], dtype=torch.int32),
-        sampling_metadata=SimpleNamespace(),
-        hidden_states=torch.empty(0),
-        sample_hidden_states=torch.empty(0),
-        aux_hidden_states=None,
-        spec_decode_metadata=None,
-        common_attn_metadata=SimpleNamespace(),
-        slot_mappings=None,
-    )
+    pp_group = SimpleNamespace(is_last_rank=True)
+    with patch("vllm.v1.worker.gpu_model_runner.get_pp_group", return_value=pp_group):
+        return runner.propose_draft_token_ids(
+            scheduler_output=SimpleNamespace(total_num_scheduled_tokens=2),
+            sampled_token_ids=torch.tensor([[10], [11]], dtype=torch.int32),
+            sampling_metadata=SimpleNamespace(),
+            hidden_states=torch.empty(0),
+            sample_hidden_states=torch.empty(0),
+            aux_hidden_states=None,
+            spec_decode_metadata=None,
+            common_attn_metadata=SimpleNamespace(),
+            slot_mappings=None,
+        )
 
 
 def test_all_partial_prefill_rows_skip_retrospec_proposal():
@@ -155,7 +166,7 @@ def test_mixed_batch_only_activates_decode_rows_for_retrospec():
     result = call_retrospec_proposal(runner)
 
     assert result == [[], [12]]
-    proposal_active_mask = drafter.propose.call_args.args[-2]
+    proposal_active_mask = drafter.propose.call_args.kwargs["proposal_active_mask"]
     assert proposal_active_mask.tolist() == [False, True]
 
 
@@ -164,8 +175,73 @@ def test_completed_prefill_rows_can_start_retrospec_proposal():
 
     call_retrospec_proposal(runner)
 
-    proposal_active_mask = drafter.propose.call_args.args[-2]
+    proposal_active_mask = drafter.propose.call_args.kwargs["proposal_active_mask"]
     assert proposal_active_mask.tolist() == [True, True]
+
+
+def test_nonfinal_pipeline_rank_saves_proposal_state():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.retrospec_pipeline_proposal_state = None
+    scheduler_output = SimpleNamespace()
+    spec_decode_metadata = SimpleNamespace()
+    common_attn_metadata = SimpleNamespace()
+    pp_group = SimpleNamespace(world_size=2, is_last_rank=False)
+
+    with patch("vllm.v1.worker.gpu_model_runner.get_pp_group", return_value=pp_group):
+        runner._save_retrospec_pipeline_proposal_state(
+            scheduler_output, spec_decode_metadata, common_attn_metadata
+        )
+
+    assert runner.retrospec_pipeline_proposal_state == RetroSpecPipelineProposalState(
+        scheduler_output, spec_decode_metadata, common_attn_metadata
+    )
+
+
+def test_nonfinal_pipeline_rank_participates_without_materializing_output():
+    runner, drafter = make_retrospec_proposal_runner([False, False])
+    final_samples = torch.tensor([[10], [11]], dtype=torch.int32)
+    drafter.pipeline_protocol.broadcast_target_sampled_token_ids.return_value = (
+        final_samples
+    )
+    drafter.propose.return_value = []
+    state = RetroSpecPipelineProposalState(
+        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=2),
+        spec_decode_metadata=None,
+        common_attn_metadata=SimpleNamespace(),
+    )
+    pp_group = SimpleNamespace(is_last_rank=False)
+
+    with patch("vllm.v1.worker.gpu_model_runner.get_pp_group", return_value=pp_group):
+        result = runner._run_retrospec_pipeline_proposal(state, sampled_token_ids=None)
+
+    assert result == []
+    drafter.pipeline_protocol.broadcast_target_sampled_token_ids.assert_called_once_with(
+        2, None
+    )
+    runner._copy_valid_sampled_token_count.assert_not_called()
+    assert drafter.propose.call_args.kwargs["materialize_output"] is False
+
+
+def test_sample_tokens_consumes_nonfinal_pipeline_proposal_state():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    proposal_state = RetroSpecPipelineProposalState(
+        scheduler_output=SimpleNamespace(),
+        spec_decode_metadata=None,
+        common_attn_metadata=SimpleNamespace(),
+    )
+    runner.retrospec_pipeline_proposal_state = proposal_state
+    runner.execute_model_state = None
+    runner.kv_connector_output = None
+    runner.use_async_scheduling = False
+    runner._run_retrospec_pipeline_proposal = Mock(return_value=[])
+
+    result = runner.sample_tokens(grammar_output=None)
+
+    assert result is None
+    assert runner.retrospec_pipeline_proposal_state is None
+    runner._run_retrospec_pipeline_proposal.assert_called_once_with(
+        proposal_state, sampled_token_ids=None
+    )
 
 
 def test_list_draft_tokens_keep_proposal_request_order():

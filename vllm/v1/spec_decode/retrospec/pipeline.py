@@ -6,8 +6,14 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.distributed.parallel_state import GroupCoordinator, get_pp_group
+from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import (
+    GroupCoordinator,
+    get_pp_group,
+    get_tp_group,
+)
 from vllm.sequence import IntermediateTensors
+from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from .prefill import RetroSpecLayerModel
 
@@ -86,6 +92,14 @@ class RetroSpecPipelineControlState:
     active_mask: torch.Tensor
 
 
+@dataclass(frozen=True)
+class RetroSpecPipelineModelOutput:
+    """Model-step results broadcast by the final PP rank."""
+
+    token_ids: torch.Tensor
+    margin: torch.Tensor | None
+
+
 class RetroSpecPipelineProtocol:
     """Fixed-capacity GPU communication protocol for RetroSpec PP."""
 
@@ -97,12 +111,26 @@ class RetroSpecPipelineProtocol:
     _PENDING_COUNTS_COLUMN = 3
     _NUM_INTEGER_COLUMNS = 4
 
-    def __init__(self, device: torch.device, max_batch_size: int) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        max_batch_size: int,
+        max_parallel_tokens: int,
+        max_sampled_tokens: int,
+    ) -> None:
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be greater than zero")
+        if max_parallel_tokens < max_batch_size:
+            raise ValueError("max_parallel_tokens must be at least max_batch_size")
+        if max_sampled_tokens <= 0:
+            raise ValueError("max_sampled_tokens must be greater than zero")
 
+        self.vllm_config = vllm_config
         self.device = device
         self.max_batch_size = max_batch_size
+        self.max_parallel_tokens = max_parallel_tokens
+        self.max_sampled_tokens = max_sampled_tokens
 
         self._integer_control = torch.empty(
             (max_batch_size, self._NUM_INTEGER_COLUMNS),
@@ -110,11 +138,22 @@ class RetroSpecPipelineProtocol:
             device=device,
         )
         self._active_mask = torch.empty(max_batch_size, dtype=torch.bool, device=device)
+        self._target_sampled_token_ids = torch.empty(
+            (max_batch_size, max_sampled_tokens),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._model_token_ids = torch.empty(
+            max_parallel_tokens, dtype=torch.int32, device=device
+        )
+        self._model_margin = torch.empty(
+            max_parallel_tokens, dtype=torch.float32, device=device
+        )
 
         # The final element carries the local layer count, allowing the
         # numerator and denominator to use one PP all-reduce.
         self._attention_reduce = torch.empty(
-            max_batch_size + 1, dtype=torch.float32, device=device
+            max_parallel_tokens + 1, dtype=torch.float32, device=device
         )
 
     @property
@@ -200,14 +239,142 @@ class RetroSpecPipelineProtocol:
             {self._HIDDEN_STATES_KEY: hidden_states.contiguous()}
         )
 
+    def _proposal_all_gather_tensors(self, num_tokens: int) -> dict[str, bool]:
+        return {
+            "residual": not is_residual_scattered_for_sp(self.vllm_config, num_tokens)
+        }
+
+    def receive_model_input(
+        self,
+        stage: RetroSpecPipelineStage,
+        num_tokens: int,
+    ) -> IntermediateTensors | None:
+        if stage.is_first:
+            return None
+
+        tensor_dict = self.pp_group.recv_tensor_dict(
+            all_gather_group=get_tp_group(),
+            all_gather_tensors=self._proposal_all_gather_tensors(num_tokens),
+        )
+        if tensor_dict is None:
+            raise RuntimeError(
+                "RetroSpec PP stage did not receive intermediate tensors"
+            )
+
+        for name, tensor in tensor_dict.items():
+            if isinstance(tensor, torch.Tensor) and tensor.device != self.device:
+                raise RuntimeError(
+                    f"RetroSpec PP tensor {name!r} is on the wrong device"
+                )
+        return IntermediateTensors(tensor_dict)
+
+    def send_model_output(
+        self,
+        stage: RetroSpecPipelineStage,
+        output: IntermediateTensors,
+        num_tokens: int,
+    ) -> None:
+        if stage.is_last:
+            raise RuntimeError(
+                "The final RetroSpec PP stage must not send intermediate output"
+            )
+
+        self.pp_group.send_tensor_dict(
+            output.tensors,
+            all_gather_group=get_tp_group(),
+            all_gather_tensors=self._proposal_all_gather_tensors(num_tokens),
+        )
+
+    def broadcast_target_sampled_token_ids(
+        self,
+        batch_size: int,
+        sampled_token_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not 0 <= batch_size <= self.max_batch_size:
+            raise ValueError(f"batch_size must be in [0, {self.max_batch_size}]")
+
+        output = self._target_sampled_token_ids[:batch_size]
+        if self.pp_group.is_last_rank:
+            if sampled_token_ids is None:
+                raise RuntimeError(
+                    "The final RetroSpec PP rank must provide sampled token IDs"
+                )
+            if sampled_token_ids.ndim != 2:
+                raise ValueError("sampled_token_ids must be two-dimensional")
+            if sampled_token_ids.shape[0] != batch_size:
+                raise ValueError("sampled_token_ids must match the proposal batch size")
+            if sampled_token_ids.shape[1] > self.max_sampled_tokens:
+                raise ValueError("sampled_token_ids exceeds the pipeline workspace")
+            if sampled_token_ids.device != self.device:
+                raise ValueError("sampled_token_ids is on the wrong device")
+
+            output.fill_(-1)
+            output[:, : sampled_token_ids.shape[1]].copy_(sampled_token_ids)
+
+        if batch_size > 0 and self.pp_group.world_size > 1:
+            torch.distributed.broadcast(
+                output,
+                src=self.pp_group.last_rank,
+                group=self.pp_group.device_group,
+            )
+        return output
+
+    def broadcast_model_output(
+        self,
+        num_tokens: int,
+        token_ids: torch.Tensor | None,
+        margin: torch.Tensor | None,
+        compute_margin: bool,
+    ) -> RetroSpecPipelineModelOutput:
+        if not 0 < num_tokens <= self.max_parallel_tokens:
+            raise ValueError(f"num_tokens must be in [1, {self.max_parallel_tokens}]")
+
+        output_token_ids = self._model_token_ids[:num_tokens]
+        output_margin = self._model_margin[:num_tokens] if compute_margin else None
+
+        if self.pp_group.is_last_rank:
+            if token_ids is None or token_ids.shape != (num_tokens,):
+                raise ValueError(
+                    f"token_ids must have shape ({num_tokens},) on the final rank"
+                )
+            if token_ids.device != self.device:
+                raise ValueError("token_ids is on the wrong device")
+            output_token_ids.copy_(token_ids)
+
+            if compute_margin:
+                if margin is None or margin.shape != (num_tokens,):
+                    raise ValueError(
+                        f"margin must have shape ({num_tokens},) on the final rank"
+                    )
+                if margin.device != self.device:
+                    raise ValueError("margin is on the wrong device")
+                assert output_margin is not None
+                output_margin.copy_(margin)
+
+        if self.pp_group.world_size > 1:
+            torch.distributed.broadcast(
+                output_token_ids,
+                src=self.pp_group.last_rank,
+                group=self.pp_group.device_group,
+            )
+            if output_margin is not None:
+                torch.distributed.broadcast(
+                    output_margin,
+                    src=self.pp_group.last_rank,
+                    group=self.pp_group.device_group,
+                )
+
+        return RetroSpecPipelineModelOutput(output_token_ids, output_margin)
+
     def reduce_attention_mass(self, stats: RetroSpecAttentionMassStats) -> torch.Tensor:
         if stats.value_sum.device != self.device:
             raise ValueError("Attention-mass statistics are on the wrong device")
 
         batch_size = stats.value_sum.numel()
-        if batch_size > self.max_batch_size:
+        if batch_size > self.max_parallel_tokens:
             raise ValueError(
-                f"Attention-mass batch size {batch_size} exceeds {self.max_batch_size}"
+                "Attention-mass batch size "
+                f"{batch_size} exceeds {self.max_parallel_tokens}"
             )
 
         reduction = self._attention_reduce[: batch_size + 1]

@@ -336,6 +336,14 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+class RetroSpecPipelineProposalState(NamedTuple):
+    """State retained by non-final PP ranks until sample_tokens()."""
+
+    scheduler_output: "SchedulerOutput"
+    spec_decode_metadata: SpecDecodeMetadata | None
+    common_attn_metadata: CommonAttentionMetadata
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -726,6 +734,9 @@ class GPUModelRunner(
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
+        self.retrospec_pipeline_proposal_state: (
+            RetroSpecPipelineProposalState | None
+        ) = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.retrospec_layer_prefill_workspace: (
             RetroSpecLayerPrefillWorkspace | None
@@ -3440,15 +3451,6 @@ class GPUModelRunner(
         self.discard_request_mask.np[:1] = False
         self.discard_request_mask.copy_to_gpu(1)
 
-        if not stage.is_last:
-            return protocol.make_layer_prefill_output(stage, hidden_states)
-
-        last_hidden_state = layer_model.finalize_hidden_states(hidden_states[-1:], None)
-        del hidden_states
-        logits = self.model.compute_logits(last_hidden_state)
-        if logits is None:
-            raise RuntimeError("Layer-major prefill did not produce logits")
-
         last_prompt_position = prompt_num_tokens - 1
         last_prompt_block = last_prompt_position // workspace.block_size
         last_prompt_block_id = request_block_ids[last_prompt_block]
@@ -3464,6 +3466,20 @@ class GPUModelRunner(
         slot_mappings = {
             layer_name: common_metadata.slot_mapping for layer_name in layer_names
         }
+
+        if not stage.is_last:
+            self._save_retrospec_pipeline_proposal_state(
+                scheduler_output,
+                spec_decode_metadata=None,
+                common_attn_metadata=common_metadata,
+            )
+            return protocol.make_layer_prefill_output(stage, hidden_states)
+
+        last_hidden_state = layer_model.finalize_hidden_states(hidden_states[-1:], None)
+        del hidden_states
+        logits = self.model.compute_logits(last_hidden_state)
+        if logits is None:
+            raise RuntimeError("Layer-major prefill did not produce logits")
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -3746,6 +3762,11 @@ class GPUModelRunner(
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
+            )
+        if self.retrospec_pipeline_proposal_state is not None:
+            raise RuntimeError(
+                "State error: a RetroSpec PP proposal is still pending in "
+                "sample_tokens()."
             )
 
         RetroSpecLayerMajorPrefillProtocol.validate_scheduler_output(scheduler_output)
@@ -4089,6 +4110,12 @@ class GPUModelRunner(
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
+                    if isinstance(retrospec_drafter, RetroSpecProposer):
+                        self._save_retrospec_pipeline_proposal_state(
+                            scheduler_output,
+                            spec_decode_metadata,
+                            spec_decode_common_attn_metadata,
+                        )
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
@@ -4155,8 +4182,15 @@ class GPUModelRunner(
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        pipeline_proposal_state = self.retrospec_pipeline_proposal_state
+        self.retrospec_pipeline_proposal_state = None
 
         if self.execute_model_state is None:
+            if pipeline_proposal_state is not None:
+                self._run_retrospec_pipeline_proposal(
+                    pipeline_proposal_state, sampled_token_ids=None
+                )
+
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and get_pp_group().world_size > 1:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
@@ -4489,6 +4523,91 @@ class GPUModelRunner(
         sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
+    def _save_retrospec_pipeline_proposal_state(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        common_attn_metadata: CommonAttentionMetadata | None,
+    ) -> None:
+        pp_group = get_pp_group()
+        if (
+            pp_group.world_size == 1
+            or pp_group.is_last_rank
+            or common_attn_metadata is None
+        ):
+            return
+        if self.retrospec_pipeline_proposal_state is not None:
+            raise RuntimeError("A RetroSpec PP proposal state is already pending")
+
+        self.retrospec_pipeline_proposal_state = RetroSpecPipelineProposalState(
+            scheduler_output=scheduler_output,
+            spec_decode_metadata=spec_decode_metadata,
+            common_attn_metadata=common_attn_metadata,
+        )
+
+    def _run_retrospec_pipeline_proposal(
+        self,
+        state: RetroSpecPipelineProposalState,
+        sampled_token_ids: torch.Tensor | None,
+    ) -> list[list[int]]:
+        drafter = self.drafter
+        if not isinstance(drafter, RetroSpecProposer):
+            raise RuntimeError("RetroSpec pipeline proposal requires RetroSpecProposer")
+
+        num_reqs = self.input_batch.num_reqs
+        sampled_token_ids = (
+            drafter.pipeline_protocol.broadcast_target_sampled_token_ids(
+                num_reqs, sampled_token_ids
+            )
+        )
+
+        partial_prefill_mask = self.discard_request_mask.np[:num_reqs]
+        if bool(partial_prefill_mask.all()):
+            return [[] for _ in range(num_reqs)]
+
+        proposal_active_mask = ~self.discard_request_mask.gpu[:num_reqs]
+        common_attn_metadata = state.common_attn_metadata
+        next_token_ids, valid_sampled_tokens_count = (
+            drafter.prepare_next_token_ids_padded(
+                common_attn_metadata,
+                sampled_token_ids,
+                self.requests,
+                self.input_batch,
+                self.discard_request_mask.gpu,
+            )
+        )
+        if get_pp_group().is_last_rank:
+            self._copy_valid_sampled_token_count(
+                next_token_ids, valid_sampled_tokens_count
+            )
+
+        num_rejected_tokens_gpu = None
+        if state.spec_decode_metadata is not None:
+            (
+                common_attn_metadata,
+                _,
+                num_rejected_tokens_gpu,
+            ) = drafter.prepare_inputs_padded(
+                common_attn_metadata,
+                state.spec_decode_metadata,
+                valid_sampled_tokens_count,
+            )
+
+        request_ids = self.input_batch.req_ids
+        committed_positions = [
+            self.requests[request_id].num_computed_tokens for request_id in request_ids
+        ]
+        return drafter.propose(
+            request_ids=request_ids,
+            committed_positions=committed_positions,
+            next_token_ids=next_token_ids,
+            sampling_metadata=self.input_batch.sampling_metadata,
+            common_attn_metadata=common_attn_metadata,
+            proposal_active_mask=proposal_active_mask,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            materialize_output=get_pp_group().is_last_rank,
+        )
+
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4525,56 +4644,13 @@ class GPUModelRunner(
             assert isinstance(self.drafter, RetroSpecProposer)
             assert not spec_config.disable_padded_drafter_batch
             assert isinstance(sampled_token_ids, torch.Tensor)
-
-            num_reqs = self.input_batch.num_reqs
-            partial_prefill_mask = self.discard_request_mask.np[:num_reqs]
-
-            # Target prefill and index construction have already completed. If
-            # every request is still in partial prefill, do not enter RetroSpec.
-            if bool(partial_prefill_mask.all()):
-                return [[] for _ in range(num_reqs)]
-
-            proposal_active_mask = ~self.discard_request_mask.gpu[:num_reqs]
-
-            next_token_ids, valid_sampled_tokens_count = (
-                self.drafter.prepare_next_token_ids_padded(
-                    common_attn_metadata,
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_mask.gpu,
-                )
+            proposal_state = RetroSpecPipelineProposalState(
+                scheduler_output=scheduler_output,
+                spec_decode_metadata=spec_decode_metadata,
+                common_attn_metadata=common_attn_metadata,
             )
-            self._copy_valid_sampled_token_count(
-                next_token_ids, valid_sampled_tokens_count
-            )
-
-            num_rejected_tokens_gpu = None
-            if spec_decode_metadata is not None:
-                (
-                    common_attn_metadata,
-                    _,
-                    num_rejected_tokens_gpu,
-                ) = self.drafter.prepare_inputs_padded(
-                    common_attn_metadata,
-                    spec_decode_metadata,
-                    valid_sampled_tokens_count,
-                )
-
-            request_ids = self.input_batch.req_ids
-            committed_positions = [
-                self.requests[request_id].num_computed_tokens
-                for request_id in request_ids
-            ]
-
-            draft_token_ids = self.drafter.propose(
-                request_ids,
-                committed_positions,
-                next_token_ids,
-                sampling_metadata,
-                common_attn_metadata,
-                proposal_active_mask,
-                num_rejected_tokens_gpu,
+            draft_token_ids = self._run_retrospec_pipeline_proposal(
+                proposal_state, sampled_token_ids
             )
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)

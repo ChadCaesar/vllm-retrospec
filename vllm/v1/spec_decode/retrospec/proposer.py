@@ -13,6 +13,7 @@ import torch.nn as nn
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.model_executor.layers.attention import Attention
+from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionMetadataBuilder, CommonAttentionMetadata
@@ -30,7 +31,12 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from .attention import RetroSpecAttentionMode, RetroSpecSparseAttention
 from .decision import RetroSpecDecisionPolicy, RetroSpecMetrics
-from .pipeline import RetroSpecPipelineProtocol
+from .pipeline import (
+    RetroSpecPipelineControlState,
+    RetroSpecPipelineProtocol,
+    RetroSpecPipelineStage,
+)
+from .prefill import resolve_retrospec_layer_model
 from .state import RetroSpecBatchState, RetroSpecIndexUpdateState, RetroSpecStage
 
 if TYPE_CHECKING:
@@ -95,8 +101,13 @@ class RetroSpecProposer:
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
         self.pipeline_protocol = RetroSpecPipelineProtocol(
-            device=device, max_batch_size=self.max_batch_size
+            vllm_config=vllm_config,
+            device=device,
+            max_batch_size=self.max_batch_size,
+            max_parallel_tokens=self.max_parallel_tokens,
+            max_sampled_tokens=self.num_speculative_tokens + 1,
         )
+        self.pipeline_stage: RetroSpecPipelineStage | None = None
 
         block_size = vllm_config.cache_config.block_size
         assert block_size is not None
@@ -221,6 +232,9 @@ class RetroSpecProposer:
         )
         self._verification_safe_boundaries = torch.empty(
             self.max_batch_size, dtype=torch.int64, device=device
+        )
+        self._verification_sparse_boundary_token_ids = torch.empty(
+            self.max_batch_size, dtype=torch.int32, device=device
         )
         self._verification_boundary_mask = torch.zeros(
             self.max_batch_size, dtype=torch.bool, device=device
@@ -373,6 +387,77 @@ class RetroSpecProposer:
 
         self.attn_layer_names = list(attention_layers)
         self.sparse_attention.install(attention_layers)
+
+        layer_model = resolve_retrospec_layer_model(target_model)
+        self.pipeline_stage = self.pipeline_protocol.describe_stage(
+            layer_model, self.attn_layer_names
+        )
+
+    def _require_pipeline_stage(self) -> RetroSpecPipelineStage:
+        if self.pipeline_stage is None:
+            raise RuntimeError(
+                "RetroSpec pipeline stage is unavailable before model loading"
+            )
+        return self.pipeline_stage
+
+    def _run_pipeline_stage_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor | None:
+        if self.model is None:
+            raise RuntimeError("RetroSpec target model is not loaded")
+
+        stage = self._require_pipeline_stage()
+        intermediate_tensors = self.pipeline_protocol.receive_model_input(
+            stage, num_tokens
+        )
+        model_output = self.model(
+            input_ids=input_ids if stage.is_first else None,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=None,
+        )
+
+        if not stage.is_last:
+            if not isinstance(model_output, IntermediateTensors):
+                raise RuntimeError(
+                    "A non-final RetroSpec PP stage must return IntermediateTensors"
+                )
+            self.pipeline_protocol.send_model_output(stage, model_output, num_tokens)
+            return None
+
+        if isinstance(model_output, tuple):
+            model_output = model_output[0]
+        if not isinstance(model_output, torch.Tensor):
+            raise RuntimeError("The final RetroSpec PP stage must return hidden states")
+        return model_output
+
+    def _synchronize_pipeline_control(
+        self,
+        batch_size: int,
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        stage = self._require_pipeline_stage()
+        local_state = None
+        if stage.is_last:
+            local_state = RetroSpecPipelineControlState(
+                token_ids=token_ids,
+                stages=self.state.stage,
+                draft_counts=self.state.draft_counts,
+                pending_counts=self.state.pending_counts,
+                active_mask=self.state.active_mask,
+            )
+
+        synchronized = self.pipeline_protocol.broadcast_control_state(
+            batch_size, local_state
+        )
+        self.state.set_stages(synchronized.stages)
+        self.state.draft_counts.copy_(synchronized.draft_counts)
+        self.state.pending_counts.copy_(synchronized.pending_counts)
+        self.state.active_mask.copy_(synchronized.active_mask)
+        return synchronized.token_ids
 
     def initialize_cudagraph_keys(
         self,
@@ -777,40 +862,54 @@ class RetroSpecProposer:
                 slot_mapping=per_layer_slot_mapping,
             ),
         ):
-            hidden_states = self.model(
-                input_ids=model_input_ids,
-                positions=model_positions,
-                inputs_embeds=None,
+            hidden_states = self._run_pipeline_stage_model(
+                model_input_ids,
+                model_positions,
+                batch_descriptor.num_tokens,
             )
 
         with self.performance_stats.cuda_timer("draft_end_step"):
-            attention_mass = self.sparse_attention.end_step()
-
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
-        if not isinstance(hidden_states, torch.Tensor):
-            raise RuntimeError(
-                "RetroSpec requires the target model to return hidden states."
+            local_attention_stats = self.sparse_attention.end_step_statistics()
+            attention_mass = self.pipeline_protocol.reduce_attention_mass(
+                local_attention_stats
             )
 
-        with self.performance_stats.cuda_timer("draft_logits"):
-            logits = self.model.compute_logits(hidden_states[:batch_size])
+        stage = self._require_pipeline_stage()
+        sampled_token_ids = None
+        margin = None
+        if stage.is_last:
+            assert hidden_states is not None
+            with self.performance_stats.cuda_timer("draft_logits"):
+                logits = self.model.compute_logits(hidden_states[:batch_size])
+                if logits is None:
+                    raise RuntimeError(
+                        "The final RetroSpec PP stage did not produce logits"
+                    )
 
-            margin = None
-            if compute_margin:
-                top2_logits = torch.topk(logits.float(), k=2, dim=-1).values
-                margin = top2_logits[:, 0] - top2_logits[:, 1]
+                if compute_margin:
+                    top2_logits = torch.topk(logits.float(), k=2, dim=-1).values
+                    margin = top2_logits[:, 0] - top2_logits[:, 1]
 
-        with self.performance_stats.cuda_timer("draft_sampling"):
-            sampler_output = self.runner.sampler(
-                logits=logits, sampling_metadata=sampling_metadata
-            )
-            sampled_token_ids = sampler_output.sampled_token_ids.view(-1).to(
-                torch.int32
-            )
+            with self.performance_stats.cuda_timer("draft_sampling"):
+                sampler_output = self.runner.sampler(
+                    logits=logits, sampling_metadata=sampling_metadata
+                )
+                sampled_token_ids = sampler_output.sampled_token_ids.view(-1).to(
+                    torch.int32
+                )
 
+        pipeline_output = self.pipeline_protocol.broadcast_model_output(
+            num_tokens=batch_size,
+            token_ids=sampled_token_ids,
+            margin=margin,
+            compute_margin=compute_margin,
+        )
         self.performance_stats.stop_cuda_timer(model_timer)
-        return sampled_token_ids, margin, attention_mass
+        return (
+            pipeline_output.token_ids,
+            pipeline_output.margin,
+            attention_mass,
+        )
 
     def _run_draft_step(
         self,
@@ -1370,53 +1469,63 @@ class RetroSpecProposer:
                 slot_mapping=per_layer_slot_mapping,
             ),
         ):
-            hidden_states = self.model(
-                input_ids=model_input_ids,
-                positions=model_positions,
-                inputs_embeds=None,
+            hidden_states = self._run_pipeline_stage_model(
+                model_input_ids,
+                model_positions,
+                batch_descriptor.num_tokens,
             )
 
         with self.performance_stats.cuda_timer(f"{stage_name}_end_step"):
-            attention_mass = self.sparse_attention.end_step()
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
-        if not isinstance(hidden_states, torch.Tensor):
-            raise RuntimeError(
-                "RetroSpec requires the target model to return hidden states."
+            local_attention_stats = self.sparse_attention.end_step_statistics()
+            attention_mass = self.pipeline_protocol.reduce_attention_mass(
+                local_attention_stats
             )
-
-        with self.performance_stats.cuda_timer(f"{stage_name}_logits"):
-            logits = self.model.compute_logits(hidden_states[:num_tokens])
-            if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
-                compute_margin = self.policy.sparse_margin_threshold is not None
-            else:
-                compute_margin = self.policy.expanded_margin_threshold is not None
-
-            margin = None
-            if compute_margin:
-                top2_logits = torch.topk(logits.float(), k=2, dim=-1).values
-                margin = top2_logits[:, 0] - top2_logits[:, 1]
 
         if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
+            compute_margin = self.policy.sparse_margin_threshold is not None
             sampled_output = self._sparse_sampled_token_ids
         else:
+            compute_margin = self.policy.expanded_margin_threshold is not None
             sampled_output = self._expanded_sampled_token_ids
 
-        with self.performance_stats.cuda_timer(f"{stage_name}_sampling"):
-            token_ids = self._sample_parallel_logits(
-                batch_size,
-                logits,
-                request_indices,
-                token_indices,
-                sampling_metadata,
-                sampled_output,
-            )
+        stage = self._require_pipeline_stage()
+        token_ids = None
+        margin = None
+        if stage.is_last:
+            assert hidden_states is not None
+            with self.performance_stats.cuda_timer(f"{stage_name}_logits"):
+                logits = self.model.compute_logits(hidden_states[:num_tokens])
+                if logits is None:
+                    raise RuntimeError(
+                        "The final RetroSpec PP stage did not produce logits"
+                    )
+
+                if compute_margin:
+                    top2_logits = torch.topk(logits.float(), k=2, dim=-1).values
+                    margin = top2_logits[:, 0] - top2_logits[:, 1]
+
+            with self.performance_stats.cuda_timer(f"{stage_name}_sampling"):
+                token_ids = self._sample_parallel_logits(
+                    batch_size,
+                    logits,
+                    request_indices,
+                    token_indices,
+                    sampling_metadata,
+                    sampled_output,
+                )
+
+        pipeline_output = self.pipeline_protocol.broadcast_model_output(
+            num_tokens=num_tokens,
+            token_ids=token_ids,
+            margin=margin,
+            compute_margin=compute_margin,
+        )
         self.performance_stats.stop_cuda_timer(model_timer)
         return RetroSpecParallelVerificationOutput(
             request_indices=request_indices,
             token_indices=token_indices,
-            token_ids=token_ids,
-            margin=margin,
+            token_ids=pipeline_output.token_ids,
+            margin=pipeline_output.margin,
             attention_mass=attention_mass,
         )
 
@@ -1584,6 +1693,15 @@ class RetroSpecProposer:
             expanded_request_indices,
             out=expanded_sparse_indices,
         )
+        sparse_boundary_token_ids = self._verification_sparse_boundary_token_ids[
+            : expanded_request_indices.shape[0]
+        ]
+        torch.index_select(
+            sparse.token_ids,
+            0,
+            expanded_sparse_indices,
+            out=sparse_boundary_token_ids,
+        )
         self.performance_stats.stop_cuda_timer(sparse_boundary_timer)
 
         if expanded_sparse_indices.numel() > 0:
@@ -1606,9 +1724,6 @@ class RetroSpecProposer:
             )
             expanded_boundary_timer = self.performance_stats.start_cuda_timer(
                 "expanded_verify_boundary"
-            )
-            sparse_boundary_token_ids = sparse.token_ids.index_select(
-                0, expanded_sparse_indices
             )
             expanded_token_changed = expanded.token_ids != sparse_boundary_token_ids
             expanded_pending_counts = (expanded.token_indices + 1).to(
@@ -1670,6 +1785,7 @@ class RetroSpecProposer:
         common_attn_metadata: CommonAttentionMetadata,
         proposal_active_mask: torch.Tensor,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
+        materialize_output: bool = True,
     ) -> list[list[int]]:
         if not sampling_metadata.all_greedy:
             raise NotImplementedError(
@@ -1695,8 +1811,6 @@ class RetroSpecProposer:
         )
 
         self._draft_token_ids[:batch_size].fill_(-1)
-        self.input_ids[:batch_size].copy_(next_token_ids)
-        self.proposal_input_ids[:batch_size].copy_(next_token_ids)
 
         seq_lens = common_attn_metadata.seq_lens
         if num_rejected_tokens_gpu is not None:
@@ -1707,6 +1821,9 @@ class RetroSpecProposer:
 
         no_draft_space = self.positions[:batch_size] >= self.max_model_len - 1
         self.state.finish_requests(no_draft_space)
+        next_token_ids = self._synchronize_pipeline_control(batch_size, next_token_ids)
+        self.input_ids[:batch_size].copy_(next_token_ids)
+        self.proposal_input_ids[:batch_size].copy_(next_token_ids)
 
         with self.sparse_attention.proposal_context(request_ids):
             while True:
@@ -1779,6 +1896,9 @@ class RetroSpecProposer:
                         index_update_required=index_update_required,
                     )
                     self.state.set_stages(decision.next_stage)
+                    sampled_token_ids = self._synchronize_pipeline_control(
+                        batch_size, sampled_token_ids
+                    )
 
                     self.positions[:batch_size].add_(emitted_counts)
 
@@ -1862,6 +1982,9 @@ class RetroSpecProposer:
                     last_pending_tokens,
                     self.proposal_input_ids[:batch_size],
                 )
+                next_round_input_ids = self._synchronize_pipeline_control(
+                    batch_size, next_round_input_ids
+                )
                 self.input_ids[:batch_size].copy_(
                     torch.where(
                         can_defer_full,
@@ -1874,6 +1997,15 @@ class RetroSpecProposer:
             "proposed_tokens",
             self.state.pending_counts,
         )
+        if not materialize_output:
+            if self.performance_stats.enabled:
+                self.performance_stats.record_cpu_time(
+                    "proposal_wall",
+                    perf_counter() - proposal_started_at,
+                )
+            self.performance_stats.maybe_log()
+            return []
+
         pending_counts_cpu = self.state.pending_counts.cpu().tolist()
         pending_token_ids = self._draft_token_ids[:batch_size].cpu().tolist()
 

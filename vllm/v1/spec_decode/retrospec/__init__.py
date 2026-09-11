@@ -5,6 +5,7 @@ from .attention import RetroSpecAttentionMode, RetroSpecSparseAttention
 from .pipeline import (
     RetroSpecAttentionMassStats,
     RetroSpecPipelineControlState,
+    RetroSpecPipelineModelOutput,
     RetroSpecPipelineProtocol,
     RetroSpecPipelineStage,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "RetroSpecAttentionMassStats",
     "RetroSpecAttentionMode",
     "RetroSpecPipelineControlState",
+    "RetroSpecPipelineModelOutput",
     "RetroSpecPipelineProtocol",
     "RetroSpecPipelineStage",
     "RetroSpecProposer",

@@ -165,11 +165,12 @@ def test_retrospec_accepts_tensor_parallel_execution():
     assert config.target_parallel_config is parallel_config
 
 
-def test_retrospec_rejects_pipeline_parallel_execution():
+def test_retrospec_accepts_pipeline_parallel_execution():
     parallel_config = ParallelConfig(pipeline_parallel_size=2)
 
-    with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
-        make_retrospec_config(target_parallel_config=parallel_config)
+    config = make_retrospec_config(target_parallel_config=parallel_config)
+
+    assert config.target_parallel_config is parallel_config
 
 
 @pytest.mark.parametrize(
