@@ -30,6 +30,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from .attention import RetroSpecAttentionMode, RetroSpecSparseAttention
 from .decision import RetroSpecDecisionPolicy, RetroSpecMetrics
+from .pipeline import RetroSpecPipelineProtocol
 from .state import RetroSpecBatchState, RetroSpecIndexUpdateState, RetroSpecStage
 
 if TYPE_CHECKING:
@@ -93,6 +94,9 @@ class RetroSpecProposer:
         self.num_speculative_tokens = config.num_speculative_tokens
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
+        self.pipeline_protocol = RetroSpecPipelineProtocol(
+            device=device, max_batch_size=self.max_batch_size
+        )
 
         block_size = vllm_config.cache_config.block_size
         assert block_size is not None

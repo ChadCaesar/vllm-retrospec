@@ -450,10 +450,10 @@ class GPUModelRunner(
 
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
-        # NOTE(Jiayi): currently we put the entire draft model on
-        # the last PP rank. This is not ideal if there are many
-        # layers in the draft model.
-        if self.speculative_config and get_pp_group().is_last_rank:
+        # Other speculative methods remain last-rank-only. RetroSpec owns
+        # layer-local indexes, CPU pages, and transfer workspaces, so each PP
+        # rank must construct a proposer for its local target-model shard.
+        if self.speculative_config:
             self.drafter: (
                 NgramProposer  # noqa: F823
                 | RetroSpecProposer
@@ -462,40 +462,43 @@ class GPUModelRunner(
                 | DraftModelProposer
                 | MedusaProposer
             )
-            if self.speculative_config.method == "ngram":
-                from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-
-                self.drafter = NgramProposer(self.vllm_config)
-            elif self.speculative_config.uses_draft_model():
-                self.drafter = DraftModelProposer(
-                    vllm_config=self.vllm_config,
-                    device=self.device,
-                    runner=self,
-                )
-            elif self.speculative_config.method == "suffix":
-                self.drafter = SuffixDecodingProposer(self.vllm_config)
-            elif self.speculative_config.method == "retrospec":
+            if self.speculative_config.method == "retrospec":
                 self.drafter = RetroSpecProposer(
                     vllm_config=self.vllm_config,
                     device=self.device,
                     runner=self,
                 )
-            elif self.speculative_config.use_eagle():
-                self.drafter = EagleProposer(self.vllm_config, self.device, self)
-                if self.speculative_config.method == "eagle3":
-                    self.use_aux_hidden_state_outputs = (
-                        self.drafter.eagle3_use_aux_hidden_state
+                if get_pp_group().is_last_rank:
+                    self.rejection_sampler = RejectionSampler(self.sampler)
+            elif get_pp_group().is_last_rank:
+                if self.speculative_config.method == "ngram":
+                    from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
+                    self.drafter = NgramProposer(self.vllm_config)
+                elif self.speculative_config.uses_draft_model():
+                    self.drafter = DraftModelProposer(
+                        vllm_config=self.vllm_config,
+                        device=self.device,
+                        runner=self,
                     )
-            elif self.speculative_config.method == "medusa":
-                self.drafter = MedusaProposer(
-                    vllm_config=self.vllm_config, device=self.device
-                )
-            else:
-                raise ValueError(
-                    "Unknown speculative decoding method: "
-                    f"{self.speculative_config.method}"
-                )
-            self.rejection_sampler = RejectionSampler(self.sampler)
+                elif self.speculative_config.method == "suffix":
+                    self.drafter = SuffixDecodingProposer(self.vllm_config)
+                elif self.speculative_config.use_eagle():
+                    self.drafter = EagleProposer(self.vllm_config, self.device, self)
+                    if self.speculative_config.method == "eagle3":
+                        self.use_aux_hidden_state_outputs = (
+                            self.drafter.eagle3_use_aux_hidden_state
+                        )
+                elif self.speculative_config.method == "medusa":
+                    self.drafter = MedusaProposer(
+                        vllm_config=self.vllm_config, device=self.device
+                    )
+                else:
+                    raise ValueError(
+                        "Unknown speculative decoding method: "
+                        f"{self.speculative_config.method}"
+                    )
+                self.rejection_sampler = RejectionSampler(self.sampler)
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -3235,7 +3238,8 @@ class GPUModelRunner(
     def _execute_retrospec_layer_major_prefill(
         self,
         scheduler_output: "SchedulerOutput",
-    ) -> None:
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> IntermediateTensors | None:
         descriptor = scheduler_output.retrospec_layer_major_prefill
         if descriptor is None:
             raise RuntimeError("Missing layer-major prefill descriptor")
@@ -3248,11 +3252,11 @@ class GPUModelRunner(
             raise RuntimeError("Layer-major prefill workspace is unavailable")
 
         request = self.requests[descriptor.request_id]
-        if request.prompt_token_ids is None:
-            raise RuntimeError("Layer-major prefill requires prompt token IDs")
 
         layer_model = resolve_retrospec_layer_model(self.model)
         layer_names = drafter.attn_layer_names
+        protocol = drafter.pipeline_protocol
+        stage = protocol.describe_stage(layer_model, layer_names)
         layer_indices = tuple(range(layer_model.start_layer, layer_model.end_layer))
         if len(layer_names) != len(layer_indices):
             raise RuntimeError(
@@ -3288,13 +3292,25 @@ class GPUModelRunner(
         destination_block_ids = torch.tensor(
             destination_blocks, dtype=torch.int64, device=self.device
         )
-        prompt_token_ids = torch.tensor(
-            request.prompt_token_ids, dtype=torch.int64, device=self.device
-        )
         positions = torch.arange(
             prompt_num_tokens, dtype=torch.int64, device=self.device
         )
-        hidden_states = layer_model.embed_input_ids(prompt_token_ids)
+        prompt_token_ids: torch.Tensor | None = None
+        if stage.is_first:
+            if request.prompt_token_ids is None:
+                raise RuntimeError(
+                    "The first RetroSpec PP rank requires prompt token IDs"
+                )
+            prompt_token_ids = torch.tensor(
+                request.prompt_token_ids, dtype=torch.int64, device=self.device
+            )
+        hidden_states = protocol.prepare_layer_prefill_input(
+            stage=stage,
+            layer_model=layer_model,
+            prompt_token_ids=prompt_token_ids,
+            intermediate_tensors=intermediate_tensors,
+            prompt_num_tokens=prompt_num_tokens,
+        )
         builder = drafter.get_attention_metadata_builder()
         tile_planner = self.retrospec_layer_prefill_tile_planner
         if tile_planner is None:
@@ -3418,17 +3434,20 @@ class GPUModelRunner(
             drafter.abort_layer_major_prefill()
             raise
 
-        last_hidden_state = layer_model.finalize_hidden_states(hidden_states[-1:], None)
-        del hidden_states
-        logits = self.model.compute_logits(last_hidden_state)
-        if logits is None:
-            raise RuntimeError("Layer-major prefill did not produce logits")
-
         req_index = self.input_batch.req_id_to_index[descriptor.request_id]
         request.num_computed_tokens = prompt_num_tokens
         self.input_batch.num_computed_tokens_cpu[req_index] = prompt_num_tokens
         self.discard_request_mask.np[:1] = False
         self.discard_request_mask.copy_to_gpu(1)
+
+        if not stage.is_last:
+            return protocol.make_layer_prefill_output(stage, hidden_states)
+
+        last_hidden_state = layer_model.finalize_hidden_states(hidden_states[-1:], None)
+        del hidden_states
+        logits = self.model.compute_logits(last_hidden_state)
+        if logits is None:
+            raise RuntimeError("Layer-major prefill did not produce logits")
 
         last_prompt_position = prompt_num_tokens - 1
         last_prompt_block = last_prompt_position // workspace.block_size
@@ -3459,6 +3478,7 @@ class GPUModelRunner(
             slot_mappings=slot_mappings,
         )
         self.kv_connector_output = None
+        return None
 
     @staticmethod
     def _is_uniform_decode(
@@ -3761,7 +3781,11 @@ class GPUModelRunner(
                 RetroSpecLayerMajorPrefillProtocol.validate_cached_prompt(
                     descriptor, request.num_prompt_tokens
                 )
-                self._execute_retrospec_layer_major_prefill(scheduler_output)
+                layer_prefill_output = self._execute_retrospec_layer_major_prefill(
+                    scheduler_output, intermediate_tensors
+                )
+                if layer_prefill_output is not None:
+                    return layer_prefill_output
                 return None
 
             if has_ec_transfer() and get_ec_transfer().is_producer:

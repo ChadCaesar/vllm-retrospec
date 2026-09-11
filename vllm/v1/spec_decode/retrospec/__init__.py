@@ -2,6 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from .attention import RetroSpecAttentionMode, RetroSpecSparseAttention
+from .pipeline import (
+    RetroSpecAttentionMassStats,
+    RetroSpecPipelineControlState,
+    RetroSpecPipelineProtocol,
+    RetroSpecPipelineStage,
+)
 from .proposer import RetroSpecProposer
 
-__all__ = ["RetroSpecProposer", "RetroSpecSparseAttention", "RetroSpecAttentionMode"]
+__all__ = [
+    "RetroSpecAttentionMassStats",
+    "RetroSpecAttentionMode",
+    "RetroSpecPipelineControlState",
+    "RetroSpecPipelineProtocol",
+    "RetroSpecPipelineStage",
+    "RetroSpecProposer",
+    "RetroSpecSparseAttention",
+]

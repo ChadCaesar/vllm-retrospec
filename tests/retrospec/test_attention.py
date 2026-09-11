@@ -360,6 +360,26 @@ def test_proposal_context_and_step_average_attention_mass():
     assert controller.active_mask is None
 
 
+def test_end_step_statistics_returns_local_sum_and_layer_count():
+    controller = make_controller()
+    mark_installed(controller)
+
+    with controller.proposal_context(["request"]):
+        controller.begin_step(
+            RetroSpecAttentionMode.DRAFT, 0, torch.tensor([True, False])
+        )
+        controller.attention_mass_sum[:2].copy_(torch.tensor([1.4, 2.0]))
+        controller.attention_mass_layer_count = 2
+
+        statistics = controller.end_step_statistics()
+
+        assert statistics.value_sum.tolist() == pytest.approx([1.4, 2.0])
+        assert statistics.layer_count == 2
+        assert statistics.mean().tolist() == pytest.approx([0.7, 1.0])
+        assert controller.mode == RetroSpecAttentionMode.PASSTHROUGH
+        assert not controller.step_active
+
+
 @pytest.mark.parametrize(
     ("mode", "thresholds"),
     [

@@ -39,6 +39,7 @@ from .execution import (
 )
 from .index import RetroSpecAttentionLevel
 from .performance import RetroSpecPerformanceStats
+from .pipeline import RetroSpecAttentionMassStats
 from .segmented_index import (
     RetroSpecIndexedTokenAttentionSelection,
     RetroSpecSegmentedTokenIndex,
@@ -732,26 +733,25 @@ class RetroSpecSparseAttention:
             return self.reduce_expanded_attention_mass
         return False
 
-    def _synchronize_attention_mass(
+    def _synchronize_attention_mass_sum(
         self,
-        attention_mass: torch.Tensor,
+        attention_mass_sum: torch.Tensor,
     ) -> torch.Tensor:
         if not self._should_reduce_attention_mass():
-            return attention_mass
+            return attention_mass_sum
 
-        attention_mass = tensor_model_parallel_all_reduce(attention_mass)
-        return attention_mass / self.tensor_parallel_size
+        attention_mass_sum = tensor_model_parallel_all_reduce(attention_mass_sum)
+        return attention_mass_sum / self.tensor_parallel_size
 
-    def end_step(self) -> torch.Tensor:
+    def end_step_statistics(self) -> RetroSpecAttentionMassStats:
         if not self.step_active:
             raise RuntimeError("No RetroSpec attention step is active.")
         if self.attention_mass_layer_count == 0:
             raise RuntimeError("No attention layer ran during the RetroSpec step.")
 
-        attention_mass = (
-            self.attention_mass_sum[: self.batch_size] / self.attention_mass_layer_count
-        )
-        attention_mass = self._synchronize_attention_mass(attention_mass)
+        layer_count = self.attention_mass_layer_count
+        attention_mass_sum = self.attention_mass_sum[: self.batch_size]
+        attention_mass_sum = self._synchronize_attention_mass_sum(attention_mass_sum)
 
         if self.mode == RetroSpecAttentionMode.DRAFT:
             assert self.active_mask is not None
@@ -775,7 +775,13 @@ class RetroSpecSparseAttention:
         self.parallel_token_indices = None
         self.attention_mass_layer_count = 0
 
-        return attention_mass
+        return RetroSpecAttentionMassStats(
+            value_sum=attention_mass_sum,
+            layer_count=layer_count,
+        )
+
+    def end_step(self) -> torch.Tensor:
+        return self.end_step_statistics().mean()
 
     def flush_sparse_verification_prefetch(self) -> None:
         self.index.flush_sparse_verification_prefetch()

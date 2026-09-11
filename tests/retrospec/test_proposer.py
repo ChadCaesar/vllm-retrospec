@@ -166,6 +166,8 @@ def test_retrospec_proposer_initialization():
     assert proposer.model is None
     assert proposer.num_speculative_tokens == 4
     assert proposer.max_batch_size == 8
+    assert proposer.pipeline_protocol.max_batch_size == 8
+    assert proposer.pipeline_protocol.device == device
     assert proposer.policy.max_draft_tokens == 4
     assert proposer.state.max_batch_size == 8
     assert proposer.state.device == device
