@@ -205,6 +205,7 @@ class RetroSpecSparseAttention:
         )
 
         self.proposal_request_ids: tuple[str, ...] = ()
+        self.proposal_context_lens: tuple[int, ...] = ()
 
         self.full_verification_batch: _RetroSpecFullVerificationBatch | None = None
 
@@ -599,6 +600,7 @@ class RetroSpecSparseAttention:
     def proposal_context(
         self,
         request_ids: Sequence[str],
+        context_lens: Sequence[int] | None = None,
     ) -> Iterator[None]:
         if self.in_proposal:
             raise RuntimeError("RetroSpec proposal context cannot be nested.")
@@ -607,10 +609,19 @@ class RetroSpecSparseAttention:
                 "RetroSpec attention must be installed before proposing."
             )
         request_ids = tuple(request_ids)
+        if context_lens is None:
+            normalized_context_lens = ()
+        else:
+            normalized_context_lens = tuple(int(length) for length in context_lens)
+            if len(normalized_context_lens) != len(request_ids):
+                raise ValueError("context_lens must match request_ids")
+            if any(length < 0 for length in normalized_context_lens):
+                raise ValueError("Proposal context lengths must be non-negative")
         self.index.begin_proposal(request_ids)
 
         try:
             self.proposal_request_ids = request_ids
+            self.proposal_context_lens = normalized_context_lens
             self._resident_prefetch_wave.clear()
             self._draft_layout_generation = 0
 
@@ -633,6 +644,7 @@ class RetroSpecSparseAttention:
             finally:
                 self.index.end_proposal()
                 self.proposal_request_ids = ()
+                self.proposal_context_lens = ()
 
     def begin_step(
         self,
@@ -785,6 +797,30 @@ class RetroSpecSparseAttention:
 
     def flush_sparse_verification_prefetch(self) -> None:
         self.index.flush_sparse_verification_prefetch()
+
+    def maybe_prime_full_verification(self, num_candidate_tokens: int) -> bool:
+        """Start speculative full-verification H2D while sparse verify runs."""
+        if not self.in_proposal:
+            raise RuntimeError("Full-verification priming requires a proposal")
+        if num_candidate_tokens <= 0:
+            return False
+        if self.device.type != "cuda" or not self.index.cluster_store.pin_memory:
+            return False
+        if not self.proposal_context_lens:
+            return False
+        if max(self.proposal_context_lens) < self.index.prefill_segment_size_tokens:
+            self.performance_stats.add_counter("full_verify_prime_context_skipped")
+            return False
+
+        layer_num_kv_heads = {
+            layer_name: impl.num_kv_heads
+            for layer_name, (impl, _) in self.original_forwards.items()
+        }
+        return self.index.prime_full_verification_pipeline(
+            self.proposal_request_ids,
+            layer_num_kv_heads,
+            self.device,
+        )
 
     def _get_indexed_selection(
         self, layer_name: str, level: RetroSpecAttentionLevel

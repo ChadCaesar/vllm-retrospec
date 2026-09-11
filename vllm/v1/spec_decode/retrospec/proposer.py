@@ -1559,6 +1559,9 @@ class RetroSpecProposer:
             )
 
         self.state.set_stage(verification_active, RetroSpecStage.SPARSE_VERIFY)
+        with self.performance_stats.cpu_timer("full_verify_prime_submit"):
+            self.sparse_attention.maybe_prime_full_verification(request_indices.numel())
+
         sparse = self._run_parallel_verification(
             batch_size,
             request_indices,
@@ -1825,7 +1828,7 @@ class RetroSpecProposer:
         self.input_ids[:batch_size].copy_(next_token_ids)
         self.proposal_input_ids[:batch_size].copy_(next_token_ids)
 
-        with self.sparse_attention.proposal_context(request_ids):
+        with self.sparse_attention.proposal_context(request_ids, committed_positions):
             while True:
                 draft_round_mask, round_start_counts = self._begin_draft_round(
                     batch_size

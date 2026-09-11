@@ -746,6 +746,60 @@ def test_proposal_context_rejects_excess_residency_without_state_leak():
     assert controller.index._gpu_index_residency.active_request_ids == ()
 
 
+def test_proposal_context_validates_context_lengths_before_activation():
+    controller = make_controller()
+    mark_installed(controller)
+
+    with (
+        pytest.raises(ValueError, match="context_lens must match request_ids"),
+        controller.proposal_context(["request"], []),
+    ):
+        pass
+
+    assert not controller.in_proposal
+    assert controller.proposal_context_lens == ()
+
+
+def test_full_verification_prime_uses_long_proposal_context():
+    controller = make_controller()
+    controller.device = torch.device("cuda", 0)
+    controller.index.cluster_store.pin_memory = True
+    controller.original_forwards["layer"] = (
+        SimpleNamespace(num_kv_heads=2),
+        Mock(),
+    )
+    controller.index.prime_full_verification_pipeline = Mock(return_value=True)
+    controller.in_proposal = True
+    controller.proposal_request_ids = ("request",)
+    controller.proposal_context_lens = (controller.index.prefill_segment_size_tokens,)
+
+    assert controller.maybe_prime_full_verification(3)
+    controller.index.prime_full_verification_pipeline.assert_called_once_with(
+        ("request",), {"layer": 2}, torch.device("cuda", 0)
+    )
+
+
+def test_full_verification_prime_skips_short_or_empty_proposal():
+    controller = make_controller()
+    controller.device = torch.device("cuda", 0)
+    controller.index.cluster_store.pin_memory = True
+    controller.original_forwards["layer"] = (
+        SimpleNamespace(num_kv_heads=2),
+        Mock(),
+    )
+    controller.index.prime_full_verification_pipeline = Mock(return_value=True)
+    controller.in_proposal = True
+    controller.proposal_request_ids = ("request",)
+    controller.proposal_context_lens = (
+        controller.index.prefill_segment_size_tokens - 1,
+    )
+
+    assert not controller.maybe_prime_full_verification(3)
+    controller.proposal_context_lens = (controller.index.prefill_segment_size_tokens,)
+    assert not controller.maybe_prime_full_verification(0)
+    controller.index.prime_full_verification_pipeline.assert_not_called()
+
+
 def test_attention_reports_only_new_fully_stored_retirement_ranges():
     controller = make_controller()
     mark_installed(controller)

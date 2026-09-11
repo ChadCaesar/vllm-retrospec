@@ -1089,9 +1089,9 @@ def test_full_verification_pipeline_prefetches_next_layer():
                 {"layer.0": 1, "layer.1": 1},
                 device,
             )
-            assert index._full_verification_prefetched is not None
-            assert index._full_verification_prefetched.layer_name == "layer.0"
-            assert index._full_verification_prefetched.ticket is not None
+            assert len(index._full_verification_prefetched) == 1
+            assert index._full_verification_prefetched[0].layer_name == "layer.0"
+            assert index._full_verification_prefetched[0].ticket is not None
 
             first = index.build_full_verification_plan(
                 request_ids=["request"],
@@ -1101,9 +1101,9 @@ def test_full_verification_pipeline_prefetches_next_layer():
                 block_table=block_table,
             )
             assert first.clustered_kv is not None
-            assert index._full_verification_prefetched is not None
-            assert index._full_verification_prefetched.layer_name == "layer.1"
-            assert index._full_verification_prefetched.ticket is not None
+            assert len(index._full_verification_prefetched) == 1
+            assert index._full_verification_prefetched[0].layer_name == "layer.1"
+            assert index._full_verification_prefetched[0].ticket is not None
 
             second = index.build_full_verification_plan(
                 request_ids=["request"],
@@ -1113,7 +1113,7 @@ def test_full_verification_pipeline_prefetches_next_layer():
                 block_table=block_table,
             )
             assert second.clustered_kv is not None
-            assert index._full_verification_prefetched is None
+            assert not index._full_verification_prefetched
     finally:
         index.end_full_verification_pipeline()
         index.end_full_verification_residency()
@@ -1123,6 +1123,123 @@ def test_full_verification_pipeline_prefetches_next_layer():
     torch.cuda.current_stream(device).wait_event(first.clustered_kv.ready_event)
     torch.cuda.current_stream(device).wait_event(second.clustered_kv.ready_event)
     torch.cuda.synchronize(device)
+
+
+def test_full_verification_prime_is_adopted_and_refills_after_two_layers():
+    index = make_index()
+    tickets = [Mock() for _ in range(3)]
+    for ticket_index, ticket in enumerate(tickets):
+        ticket.ready.return_value = True
+        ticket.result.return_value = f"staging-{ticket_index}"
+    index.cluster_store.submit_full_verification_tokens = Mock(side_effect=tickets)
+
+    with patch.object(
+        index,
+        "_get_full_verification_descriptors",
+        return_value=(SimpleNamespace(num_tokens=1),),
+    ):
+        index.begin_proposal(["request"])
+        assert index.prime_full_verification_pipeline(
+            ["request"],
+            {"layer.0": 1, "layer.1": 1, "layer.2": 1},
+            torch.device("cuda", 0),
+        )
+        index.end_proposal()
+
+        index.begin_full_verification_pipeline(
+            ["request"],
+            {"layer.0": 1, "layer.1": 1, "layer.2": 1},
+            torch.device("cuda", 0),
+        )
+        assert len(index._full_verification_prefetched) == 2
+        assert index.consume_full_verification_layer("layer.0") == "staging-0"
+        assert len(index._full_verification_prefetched) == 1
+        assert index.cluster_store.submit_full_verification_tokens.call_count == 2
+
+        assert index.consume_full_verification_layer("layer.1") == "staging-1"
+        assert len(index._full_verification_prefetched) == 1
+        assert index._full_verification_prefetched[0].layer_name == "layer.2"
+        assert index.cluster_store.submit_full_verification_tokens.call_count == 3
+        assert index.consume_full_verification_layer("layer.2") == "staging-2"
+        index.end_full_verification_pipeline()
+
+    assert all(not ticket.cancel.called for ticket in tickets)
+    index.close()
+
+
+def test_full_verification_prime_revision_mismatch_is_discarded():
+    index = make_index()
+    primed_tickets = [Mock(), Mock()]
+    replacement_ticket = Mock()
+    index.cluster_store.submit_full_verification_tokens = Mock(
+        side_effect=(*primed_tickets, replacement_ticket)
+    )
+
+    with patch.object(
+        index,
+        "_get_full_verification_descriptors",
+        return_value=(SimpleNamespace(num_tokens=1),),
+    ):
+        index.begin_proposal(["request"])
+        assert index.prime_full_verification_pipeline(
+            ["request"],
+            {"layer.0": 1, "layer.1": 1},
+            torch.device("cuda", 0),
+        )
+        index.end_proposal()
+
+        index._indices["layer.0"] = {"request": index._empty_index()}
+        index.begin_full_verification_pipeline(
+            ["request"],
+            {"layer.0": 1, "layer.1": 1},
+            torch.device("cuda", 0),
+        )
+
+        assert len(index._full_verification_prefetched) == 1
+        assert index._full_verification_prefetched[0].ticket is replacement_ticket
+        index.end_full_verification_pipeline()
+
+    for ticket in primed_tickets:
+        ticket.cancel.assert_called_once_with()
+    replacement_ticket.cancel.assert_called_once_with()
+    index.close()
+
+
+def test_full_verification_prime_policy_periodically_reprobes():
+    index = make_index()
+    for _ in range(index._FULL_VERIFY_PRIME_BOOTSTRAP_OUTCOMES):
+        index._record_full_verification_prime_outcome(adopted=False)
+
+    decisions = [
+        index._should_submit_full_verification_prime()
+        for _ in range(index._FULL_VERIFY_PRIME_REPROBE_INTERVAL)
+    ]
+
+    assert decisions == [False] * 7 + [True]
+    index.close()
+
+
+def test_remove_request_drains_affected_full_verification_prime():
+    index = make_index()
+    ticket = Mock()
+    index.cluster_store.submit_full_verification_tokens = Mock(return_value=ticket)
+
+    with patch.object(
+        index,
+        "_get_full_verification_descriptors",
+        return_value=(SimpleNamespace(num_tokens=1),),
+    ):
+        index.begin_proposal(["request"])
+        assert index.prime_full_verification_pipeline(
+            ["request"], {"layer": 1}, torch.device("cuda", 0)
+        )
+        index.end_proposal()
+        index.remove_requests(["request"])
+
+    ticket.cancel.assert_called_once_with()
+    ticket.result.assert_called_once_with()
+    assert index._primed_full_verification is None
+    index.close()
 
 
 def test_full_verification_plan_handles_request_without_cluster_pages():

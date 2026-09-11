@@ -3,9 +3,11 @@
 
 from collections import deque
 from collections.abc import Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, field
 from math import ceil
+from threading import Event as ThreadEvent
 from threading import Lock, RLock
 from time import perf_counter
 from typing import Literal
@@ -777,12 +779,29 @@ class RetroSpecFullVerificationTicket:
     """One asynchronously prepared full-verification layer."""
 
     future: Future[RetroSpecFullVerificationStaging]
+    cancel_event: ThreadEvent
 
     def result(self) -> RetroSpecFullVerificationStaging:
         return self.future.result()
 
-    def cancel(self) -> bool:
-        return self.future.cancel()
+    def ready(self) -> bool:
+        if not self.future.done() or self.future.cancelled():
+            return False
+
+        try:
+            staging = self.future.result()
+        except BaseException:
+            return False
+
+        return staging.ready_event is None or staging.ready_event.query()
+
+    def cancel(self, wait: bool = False) -> bool:
+        self.cancel_event.set()
+        cancelled = self.future.cancel()
+        if wait and not cancelled:
+            with suppress(CancelledError):
+                self.future.result()
+        return cancelled
 
 
 @dataclass(frozen=True)
@@ -1426,52 +1445,58 @@ class _FullVerificationTransferBuffer:
 
     def _ensure_cpu_slots(self, dtype: torch.dtype, head_size: int) -> None:
         layout = (dtype, head_size)
-        if self._cpu_slot_layout == layout:
-            return
-        if self._cpu_slots:
-            for slot in self._cpu_slots:
-                if slot.reuse_ready_event is not None:
-                    slot.reuse_ready_event.synchronize()
-                self._pinned_memory.release(slot.key_pages)
-                self._pinned_memory.release(slot.value_pages)
+        with self._cpu_slot_lock:
+            if self._cpu_slot_layout == layout:
+                return
+            if any(slot.in_use for slot in self._cpu_slots):
+                raise RuntimeError(
+                    "Cannot change the full-verification staging layout while "
+                    "a pinned slot is active"
+                )
+            if self._cpu_slots:
+                for slot in self._cpu_slots:
+                    if slot.reuse_ready_event is not None:
+                        slot.reuse_ready_event.synchronize()
+                    self._pinned_memory.release(slot.key_pages)
+                    self._pinned_memory.release(slot.value_pages)
 
-        page_pair_bytes = 2 * self.page_size * head_size * dtype.itemsize
-        h2d_budget = self.max_pinned_memory_bytes // 2
-        self._cpu_slot_capacity = (
-            h2d_budget // self._RESIDENT_PREFETCH_RING_SIZE // page_pair_bytes
-        )
-        if self._cpu_slot_capacity == 0:
-            raise RuntimeError(
-                "retrospec_max_pinned_memory cannot hold one H2D page per ring slot"
+            page_pair_bytes = 2 * self.page_size * head_size * dtype.itemsize
+            h2d_budget = self.max_pinned_memory_bytes // 2
+            self._cpu_slot_capacity = (
+                h2d_budget // self._RESIDENT_PREFETCH_RING_SIZE // page_pair_bytes
             )
-        shape = (self._cpu_slot_capacity, self.page_size, head_size)
-        self._cpu_slots = []
-        try:
-            for _ in range(self._RESIDENT_PREFETCH_RING_SIZE):
-                key_pages = self._pinned_memory.empty(
-                    shape, dtype, "full-verification-h2d-keys"
+            if self._cpu_slot_capacity == 0:
+                raise RuntimeError(
+                    "retrospec_max_pinned_memory cannot hold one H2D page per ring slot"
                 )
-                try:
-                    value_pages = self._pinned_memory.empty(
-                        shape, dtype, "full-verification-h2d-values"
+            shape = (self._cpu_slot_capacity, self.page_size, head_size)
+            self._cpu_slots = []
+            try:
+                for _ in range(self._RESIDENT_PREFETCH_RING_SIZE):
+                    key_pages = self._pinned_memory.empty(
+                        shape, dtype, "full-verification-h2d-keys"
                     )
-                except BaseException:
-                    self._pinned_memory.release(key_pages)
-                    raise
-                self._cpu_slots.append(
-                    _PinnedPageTransferSlot(
-                        key_pages=key_pages,
-                        value_pages=value_pages,
+                    try:
+                        value_pages = self._pinned_memory.empty(
+                            shape, dtype, "full-verification-h2d-values"
+                        )
+                    except BaseException:
+                        self._pinned_memory.release(key_pages)
+                        raise
+                    self._cpu_slots.append(
+                        _PinnedPageTransferSlot(
+                            key_pages=key_pages,
+                            value_pages=value_pages,
+                        )
                     )
-                )
-        except BaseException:
-            for slot in self._cpu_slots:
-                self._pinned_memory.release(slot.key_pages)
-                self._pinned_memory.release(slot.value_pages)
-            self._cpu_slots.clear()
-            raise
-        self._cpu_slot_layout = layout
-        self._cpu_slot_cursor = 0
+            except BaseException:
+                for slot in self._cpu_slots:
+                    self._pinned_memory.release(slot.key_pages)
+                    self._pinned_memory.release(slot.value_pages)
+                self._cpu_slots.clear()
+                raise
+            self._cpu_slot_layout = layout
+            self._cpu_slot_cursor = 0
 
     def close(self) -> None:
         if self._closed:
@@ -1495,11 +1520,24 @@ class _FullVerificationTransferBuffer:
 
     def _acquire_cpu_slot(self) -> _PinnedPageTransferSlot:
         with self._cpu_slot_lock:
-            slot = self._cpu_slots[self._cpu_slot_cursor]
-            self._cpu_slot_cursor = (self._cpu_slot_cursor + 1) % len(self._cpu_slots)
-            if slot.in_use:
+            num_slots = len(self._cpu_slots)
+            if num_slots == 0:
+                raise RuntimeError(
+                    "RetroSpec pinned H2D staging ring is not initialized"
+                )
+
+            slot = None
+            for offset in range(num_slots):
+                slot_index = (self._cpu_slot_cursor + offset) % num_slots
+                candidate = self._cpu_slots[slot_index]
+                if candidate.in_use:
+                    continue
+                slot = candidate
+                self._cpu_slot_cursor = (slot_index + 1) % num_slots
+                slot.in_use = True
+                break
+            if slot is None:
                 raise RuntimeError("RetroSpec pinned H2D staging ring is exhausted")
-            slot.in_use = True
 
         if slot.reuse_ready_event is not None:
             slot.reuse_ready_event.synchronize()
@@ -1591,21 +1629,30 @@ class _FullVerificationTransferBuffer:
 
         execution_ready_event = torch.cuda.Event()
         execution_ready_event.record(torch.cuda.current_stream(self.device))
+        cancel_event = ThreadEvent()
         future = self._gather_executor.submit(
             self._stage,
             source,
             tuple(descriptors),
             execution_ready_event,
+            cancel_event,
         )
-        return RetroSpecFullVerificationTicket(future=future)
+        return RetroSpecFullVerificationTicket(
+            future=future,
+            cancel_event=cancel_event,
+        )
 
     def _stage(
         self,
         source: _FullVerificationSourceSnapshot,
         descriptors: tuple[RetroSpecFullVerificationDescriptor, ...],
         execution_ready_event: torch.cuda.Event,
+        cancel_event: ThreadEvent,
     ) -> RetroSpecFullVerificationStaging:
         """Gather compact CPU ranges and enqueue one full-layer H2D copy."""
+        if cancel_event.is_set():
+            raise CancelledError
+
         num_kv_heads = descriptors[0].num_kv_heads
         if any(descriptor.num_kv_heads != num_kv_heads for descriptor in descriptors):
             raise ValueError("Full-verification descriptors changed KV-head count")
@@ -1625,8 +1672,12 @@ class _FullVerificationTransferBuffer:
             raise RuntimeError("Full-verification compact descriptor is inconsistent")
 
         range_tables = tuple(descriptor.range_table for descriptor in descriptors)
+        if cancel_event.is_set():
+            raise CancelledError
         self._ensure_cpu_slots(source.dtype, source.head_size)
         token_capacity = self._cpu_slot_capacity * self.page_size
+        if cancel_event.is_set():
+            raise CancelledError
 
         with torch.cuda.device(self.device):
             arena = self._gpu_arenas[self._gpu_arena_cursor]
@@ -1637,6 +1688,8 @@ class _FullVerificationTransferBuffer:
 
             with torch.cuda.stream(self._transfer_stream):
                 self._transfer_stream.wait_event(execution_ready_event)
+                if cancel_event.is_set():
+                    raise CancelledError
                 self._ensure_capacity(
                     arena=arena,
                     required_tokens=num_tokens,
@@ -1663,8 +1716,14 @@ class _FullVerificationTransferBuffer:
 
             transfer_timer = None
             gather_elapsed = 0.0
+            transferred_tokens = 0
+            cancelled = False
             token_start = 0
             while token_start < num_tokens:
+                if cancel_event.is_set():
+                    cancelled = True
+                    break
+
                 chunk_tokens = min(token_capacity, num_tokens - token_start)
                 gather_started = perf_counter()
                 cpu_keys, cpu_values, cpu_slot = self._stage_cpu_token_chunk(
@@ -1675,6 +1734,11 @@ class _FullVerificationTransferBuffer:
                     chunk_tokens,
                 )
                 gather_elapsed += perf_counter() - gather_started
+                if cancel_event.is_set():
+                    self.release_cpu_slot(cpu_slot, None)
+                    cancelled = True
+                    break
+
                 token_end = token_start + chunk_tokens
 
                 try:
@@ -1701,14 +1765,21 @@ class _FullVerificationTransferBuffer:
 
                 self.release_cpu_slot(cpu_slot, chunk_ready_event)
                 token_start = token_end
+                transferred_tokens = token_end
+                if cancel_event.is_set():
+                    cancelled = True
+                    break
 
             with torch.cuda.stream(self._transfer_stream):
                 if self.performance_stats is not None:
                     transfer_bytes = (
-                        num_tokens * source.head_size * source.dtype.itemsize * 2
+                        transferred_tokens
+                        * source.head_size
+                        * source.dtype.itemsize
+                        * 2
                     )
                     self.performance_stats.add_counter(
-                        "full_verify_h2d_tokens", num_tokens
+                        "full_verify_h2d_tokens", transferred_tokens
                     )
                     self.performance_stats.add_counter(
                         "full_verify_h2d_bytes", transfer_bytes
@@ -1719,7 +1790,11 @@ class _FullVerificationTransferBuffer:
                     self.performance_stats.stop_cuda_timer(
                         transfer_timer, self._transfer_stream
                     )
-                ready_event.record(self._transfer_stream)
+                if not cancelled:
+                    ready_event.record(self._transfer_stream)
+
+        if cancelled:
+            raise CancelledError
 
         return RetroSpecFullVerificationStaging(
             key_tokens=staging_key_tokens,

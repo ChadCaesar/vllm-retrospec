@@ -3,8 +3,8 @@
 
 from collections import deque
 from collections.abc import Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass
 from math import ceil
 
@@ -172,6 +172,7 @@ class _StagedRequestLayerSegment:
 
 @dataclass
 class _RequestLayerIndex:
+    revision: int
     segments: list[_RequestLayerSegment]
     num_clusters: int
     indexed_end: int
@@ -182,6 +183,16 @@ class _RequestLayerIndex:
 class _PrefetchedFullVerificationLayer:
     layer_name: str
     ticket: RetroSpecFullVerificationTicket | None
+    primed: bool = False
+
+
+@dataclass(frozen=True)
+class _PrimedFullVerificationPipeline:
+    request_ids: tuple[str, ...]
+    layers: tuple[tuple[str, int], ...]
+    revisions: tuple[tuple[int, ...], ...]
+    device: torch.device
+    prefetched: tuple[_PrefetchedFullVerificationLayer, ...]
 
 
 @dataclass(frozen=True)
@@ -621,6 +632,12 @@ class _IndexedPlanWorkspace:
 class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     """Token-level segmented index backed by private cluster KV pages."""
 
+    _FULL_VERIFY_PRIME_DEPTH = 2
+    _FULL_VERIFY_PRIME_BOOTSTRAP_OUTCOMES = 8
+    _FULL_VERIFY_PRIME_MIN_ADOPTION_RATE = 0.5
+    _FULL_VERIFY_PRIME_EMA_ALPHA = 0.25
+    _FULL_VERIFY_PRIME_REPROBE_INTERVAL = 8
+
     def __init__(
         self,
         block_size: int,
@@ -740,6 +757,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         # layer_name -> request_id -> token-level index
         self._indices: dict[str, dict[str, _RequestLayerIndex]] = {}
+        self._full_verification_revision_counter = 1
 
         self._proposal_active = False
         self._proposal_request_ids: tuple[str, ...] = ()
@@ -782,10 +800,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self._full_verification_request_ids: tuple[str, ...] = ()
         self._full_verification_layers: tuple[tuple[str, int], ...] = ()
         self._full_verification_layer_cursor = 0
+        self._full_verification_next_layer_index = 0
         self._full_verification_device: torch.device | None = None
-        self._full_verification_prefetched: _PrefetchedFullVerificationLayer | None = (
-            None
+        self._full_verification_prefetched: deque[_PrefetchedFullVerificationLayer] = (
+            deque()
         )
+        self._primed_full_verification: _PrimedFullVerificationPipeline | None = None
+        self._full_verify_prime_outcomes = 0
+        self._full_verify_prime_adoption_ema: float | None = None
+        self._full_verify_prime_skipped_opportunities = 0
 
     def _cuda_timer(self, name: str) -> AbstractContextManager[None]:
         if self.performance_stats is None:
@@ -918,8 +941,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         return min(indexed_ends)
 
     def remove_requests(self, request_ids: Sequence[str]) -> None:
-        self.cluster_store.wait_for_resident_prefetches()
         request_ids = tuple(request_ids)
+        self._discard_primed_full_verification_for_requests(request_ids, wait=True)
+        self.cluster_store.wait_for_resident_prefetches()
         self._gpu_index_residency.invalidate_requests(request_ids)
 
         for request_id in request_ids:
@@ -952,7 +976,27 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 "Cannot prepare full verification while index updates are staged"
             )
 
+        rollbacks: list[tuple[str, str]] = []
+        for layer_name in layer_names:
+            layer_indices = self._indices.get(layer_name, {})
+            for request_id, context_len in zip(request_ids, context_lens):
+                record = layer_indices.get(request_id)
+                if (
+                    record is not None
+                    and record.segments
+                    and record.indexed_end > context_len
+                ):
+                    rollbacks.append((layer_name, request_id))
+
+        if not rollbacks:
+            return
+
+        rollback_request_ids = tuple({request_id for _, request_id in rollbacks})
+        self._discard_primed_full_verification_for_requests(
+            rollback_request_ids, wait=True
+        )
         self.cluster_store.wait_for_resident_prefetches(layer_names)
+        rollback_keys = set(rollbacks)
 
         for layer_name in layer_names:
             layer_indices = self._indices.get(layer_name)
@@ -961,13 +1005,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
             layer_changed = False
             for request_id, context_len in zip(request_ids, context_lens):
-                record = layer_indices.get(request_id)
-                if (
-                    record is None
-                    or not record.segments
-                    or record.indexed_end <= context_len
-                ):
+                if (layer_name, request_id) not in rollback_keys:
                     continue
+                record = layer_indices.get(request_id)
+                assert record is not None
 
                 self._free_record(layer_name, record)
                 layer_indices[request_id] = self._empty_index()
@@ -1120,6 +1161,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     def end_full_verification_residency(self) -> None:
         self._gpu_index_residency.deactivate()
 
+    def _allocate_full_verification_revision(self) -> int:
+        revision = self._full_verification_revision_counter
+        self._full_verification_revision_counter += 1
+        return revision
+
     def _empty_index(
         self,
         indexed_end: int | None = None,
@@ -1128,6 +1174,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             indexed_end = self.block_size
 
         return _RequestLayerIndex(
+            revision=self._allocate_full_verification_revision(),
             segments=[],
             num_clusters=0,
             indexed_end=indexed_end,
@@ -1152,9 +1199,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 self.discard_staged_updates()
         finally:
             try:
-                self.cluster_store.close()
+                if self._full_verification_pipeline_active:
+                    self.end_full_verification_pipeline()
+                self._discard_primed_full_verification(wait=True, record_outcome=False)
             finally:
-                self._gpu_index_residency.close()
+                try:
+                    self.cluster_store.close()
+                finally:
+                    self._gpu_index_residency.close()
 
         self._pinned_memory.assert_empty()
 
@@ -1355,6 +1407,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         ],
     ) -> None:
         """Atomically publish CPU records and persistent GPU index segments."""
+        changed_request_ids = tuple(
+            {staged_segment.request_id for staged_segment, _, _ in built_segments}
+        )
+        self._discard_primed_full_verification_for_requests(
+            changed_request_ids, wait=False
+        )
         pending_records: dict[tuple[str, str], _RequestLayerIndex] = {}
         resident_segments: list[RetroSpecResidentSegment] = []
 
@@ -1372,6 +1430,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     record = self._empty_index()
                 else:
                     record = _RequestLayerIndex(
+                        revision=self._allocate_full_verification_revision(),
                         segments=list(current_record.segments),
                         num_clusters=current_record.num_clusters,
                         indexed_end=current_record.indexed_end,
@@ -1606,6 +1665,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 )
 
             if record is not None and desired_end < record.indexed_end:
+                self._discard_primed_full_verification_for_requests(
+                    (request_id,), wait=True
+                )
                 self._gpu_index_residency.discard_request_layer(layer_name, request_id)
                 self._free_record(layer_name, record)
                 record = self._empty_index()
@@ -3736,15 +3798,142 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             descriptors.append(descriptor)
         return tuple(descriptors)
 
-    def _prefetch_full_verification_layer(
-        self,
-        layer_index: int,
-    ) -> _PrefetchedFullVerificationLayer:
-        if self._full_verification_device is None:
-            raise RuntimeError("Full-verification pipeline has no CUDA device")
+    @staticmethod
+    def _canonical_full_verification_device(device: torch.device) -> torch.device:
+        if device.type != "cuda":
+            raise ValueError("Full-verification pipeline requires a CUDA device")
+        if device.index is None:
+            return torch.device("cuda", torch.cuda.current_device())
+        return device
 
-        layer_name, num_kv_heads = self._full_verification_layers[layer_index]
-        request_ids = self._full_verification_request_ids
+    @staticmethod
+    def _normalize_full_verification_layers(
+        layer_num_kv_heads: Mapping[str, int],
+    ) -> tuple[tuple[str, int], ...]:
+        if not layer_num_kv_heads:
+            raise ValueError("Full-verification pipeline requires model layers")
+        layers = tuple(
+            (layer_name, int(num_kv_heads))
+            for layer_name, num_kv_heads in layer_num_kv_heads.items()
+        )
+        if any(num_kv_heads <= 0 for _, num_kv_heads in layers):
+            raise ValueError("Full-verification KV-head counts must be positive")
+        return layers
+
+    def _get_full_verification_revisions(
+        self,
+        request_ids: Sequence[str],
+        layers: Sequence[tuple[str, int]],
+    ) -> tuple[tuple[int, ...], ...]:
+        revisions: list[tuple[int, ...]] = []
+        for layer_name, _ in layers:
+            layer_indices = self._indices.get(layer_name, {})
+            revisions.append(
+                tuple(
+                    -1
+                    if (record := layer_indices.get(request_id)) is None
+                    else record.revision
+                    for request_id in request_ids
+                )
+            )
+        return tuple(revisions)
+
+    def _record_full_verification_prime_outcome(self, adopted: bool) -> None:
+        sample = 1.0 if adopted else 0.0
+        previous = self._full_verify_prime_adoption_ema
+        if previous is None:
+            self._full_verify_prime_adoption_ema = sample
+        else:
+            alpha = self._FULL_VERIFY_PRIME_EMA_ALPHA
+            self._full_verify_prime_adoption_ema = (
+                previous * (1.0 - alpha) + sample * alpha
+            )
+        self._full_verify_prime_outcomes += 1
+        if adopted:
+            self._full_verify_prime_skipped_opportunities = 0
+
+        if self.performance_stats is not None:
+            counter = (
+                "full_verify_prime_adopted"
+                if adopted
+                else "full_verify_prime_discarded"
+            )
+            self.performance_stats.add_counter(counter)
+
+    def _should_submit_full_verification_prime(self) -> bool:
+        if (
+            self._full_verify_prime_outcomes
+            < self._FULL_VERIFY_PRIME_BOOTSTRAP_OUTCOMES
+        ):
+            return True
+
+        adoption_ema = self._full_verify_prime_adoption_ema
+        if (
+            adoption_ema is None
+            or adoption_ema >= self._FULL_VERIFY_PRIME_MIN_ADOPTION_RATE
+        ):
+            self._full_verify_prime_skipped_opportunities = 0
+            return True
+
+        self._full_verify_prime_skipped_opportunities += 1
+        if (
+            self._full_verify_prime_skipped_opportunities
+            >= self._FULL_VERIFY_PRIME_REPROBE_INTERVAL
+        ):
+            self._full_verify_prime_skipped_opportunities = 0
+            return True
+
+        if self.performance_stats is not None:
+            self.performance_stats.add_counter("full_verify_prime_policy_skipped")
+        return False
+
+    @staticmethod
+    def _cancel_full_verification_prefetches(
+        prefetched: Sequence[_PrefetchedFullVerificationLayer],
+        wait: bool,
+    ) -> None:
+        tickets = tuple(
+            layer.ticket for layer in prefetched if layer.ticket is not None
+        )
+        for ticket in tickets:
+            ticket.cancel()
+        if not wait:
+            return
+        for ticket in tickets:
+            with suppress(CancelledError):
+                ticket.result()
+
+    def _discard_primed_full_verification(
+        self,
+        wait: bool,
+        record_outcome: bool = True,
+    ) -> None:
+        primed = self._primed_full_verification
+        if primed is None:
+            return
+
+        self._primed_full_verification = None
+        self._cancel_full_verification_prefetches(primed.prefetched, wait)
+        if record_outcome:
+            self._record_full_verification_prime_outcome(adopted=False)
+
+    def _discard_primed_full_verification_for_requests(
+        self,
+        request_ids: Sequence[str],
+        wait: bool,
+    ) -> None:
+        primed = self._primed_full_verification
+        if primed is None or set(request_ids).isdisjoint(primed.request_ids):
+            return
+        self._discard_primed_full_verification(wait=wait)
+
+    def _submit_full_verification_layer(
+        self,
+        request_ids: Sequence[str],
+        layer: tuple[str, int],
+        primed: bool,
+    ) -> _PrefetchedFullVerificationLayer:
+        layer_name, num_kv_heads = layer
         descriptors = self._get_full_verification_descriptors(
             layer_name,
             request_ids,
@@ -3759,7 +3948,123 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         return _PrefetchedFullVerificationLayer(
             layer_name=layer_name,
             ticket=ticket,
+            primed=primed,
         )
+
+    def _prefetch_full_verification_layer(
+        self,
+        layer_index: int,
+    ) -> _PrefetchedFullVerificationLayer:
+        if self._full_verification_device is None:
+            raise RuntimeError("Full-verification pipeline has no CUDA device")
+        return self._submit_full_verification_layer(
+            request_ids=self._full_verification_request_ids,
+            layer=self._full_verification_layers[layer_index],
+            primed=False,
+        )
+
+    def prime_full_verification_pipeline(
+        self,
+        request_ids: Sequence[str],
+        layer_num_kv_heads: Mapping[str, int],
+        device: torch.device,
+    ) -> bool:
+        if not self._proposal_active:
+            raise RuntimeError(
+                "Full-verification priming must run inside an active proposal"
+            )
+        if self._full_verification_pipeline_active:
+            raise RuntimeError(
+                "Cannot prime while a full-verification pipeline is active"
+            )
+
+        request_ids = tuple(request_ids)
+        if request_ids != self._proposal_request_ids:
+            raise ValueError(
+                "Full-verification prime requests do not match the proposal batch"
+            )
+
+        layers = self._normalize_full_verification_layers(layer_num_kv_heads)
+        device = self._canonical_full_verification_device(device)
+        revisions = self._get_full_verification_revisions(request_ids, layers)
+        current = self._primed_full_verification
+        if (
+            current is not None
+            and current.request_ids == request_ids
+            and current.layers == layers
+            and current.revisions == revisions
+            and current.device == device
+        ):
+            if self.performance_stats is not None:
+                self.performance_stats.add_counter("full_verify_prime_coalesced")
+            return True
+
+        if current is not None:
+            self._discard_primed_full_verification(wait=False)
+        if not self._should_submit_full_verification_prime():
+            return False
+
+        prime_depth = min(self._FULL_VERIFY_PRIME_DEPTH, len(layers))
+        prefetched: list[_PrefetchedFullVerificationLayer] = []
+        try:
+            for layer in layers[:prime_depth]:
+                prefetched.append(
+                    self._submit_full_verification_layer(
+                        request_ids=request_ids,
+                        layer=layer,
+                        primed=True,
+                    )
+                )
+        except BaseException:
+            self._cancel_full_verification_prefetches(prefetched, wait=False)
+            raise
+
+        if not any(layer.ticket is not None for layer in prefetched):
+            if self.performance_stats is not None:
+                self.performance_stats.add_counter("full_verify_prime_empty")
+            return False
+
+        self._primed_full_verification = _PrimedFullVerificationPipeline(
+            request_ids=request_ids,
+            layers=layers,
+            revisions=revisions,
+            device=device,
+            prefetched=tuple(prefetched),
+        )
+        if self.performance_stats is not None:
+            self.performance_stats.add_counter("full_verify_prime_submitted")
+            self.performance_stats.add_counter(
+                "full_verify_prime_layers",
+                sum(layer.ticket is not None for layer in prefetched),
+            )
+        return True
+
+    def _adopt_primed_full_verification(
+        self,
+        request_ids: tuple[str, ...],
+        layers: tuple[tuple[str, int], ...],
+        device: torch.device,
+    ) -> bool:
+        primed = self._primed_full_verification
+        if primed is None:
+            return False
+
+        revisions = self._get_full_verification_revisions(request_ids, layers)
+        matches = (
+            primed.request_ids == request_ids
+            and primed.layers == layers
+            and primed.revisions == revisions
+            and primed.device == device
+        )
+        if not matches:
+            self._discard_primed_full_verification(wait=False)
+            return False
+
+        self._primed_full_verification = None
+        self._full_verification_prefetched.extend(primed.prefetched)
+        self._full_verification_next_layer_index = len(primed.prefetched)
+        self._record_full_verification_prime_outcome(adopted=True)
+        return True
 
     def begin_full_verification_pipeline(
         self,
@@ -3769,27 +4074,29 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     ) -> None:
         if self._full_verification_pipeline_active:
             raise RuntimeError("Full-verification pipeline is already active")
-        if not layer_num_kv_heads:
-            raise ValueError("Full-verification pipeline requires model layers")
-        if device.type != "cuda":
-            raise ValueError("Full-verification pipeline requires a CUDA device")
 
-        layers = tuple(
-            (layer_name, int(num_kv_heads))
-            for layer_name, num_kv_heads in layer_num_kv_heads.items()
-        )
-        if any(num_kv_heads <= 0 for _, num_kv_heads in layers):
-            raise ValueError("Full-verification KV-head counts must be positive")
+        request_ids = tuple(request_ids)
+        layers = self._normalize_full_verification_layers(layer_num_kv_heads)
+        device = self._canonical_full_verification_device(device)
 
         self._full_verification_pipeline_active = True
-        self._full_verification_request_ids = tuple(request_ids)
+        self._full_verification_request_ids = request_ids
         self._full_verification_layers = layers
         self._full_verification_layer_cursor = 0
+        self._full_verification_next_layer_index = 0
         self._full_verification_device = device
+        self._full_verification_prefetched.clear()
         try:
-            self._full_verification_prefetched = self._prefetch_full_verification_layer(
-                0
+            adopted = self._adopt_primed_full_verification(
+                request_ids,
+                layers,
+                device,
             )
+            if not adopted:
+                self._full_verification_prefetched.append(
+                    self._prefetch_full_verification_layer(0)
+                )
+                self._full_verification_next_layer_index = 1
         except BaseException:
             self.end_full_verification_pipeline()
             raise
@@ -3800,35 +4107,56 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     ) -> RetroSpecFullVerificationStaging | None:
         if not self._full_verification_pipeline_active:
             raise RuntimeError("Full-verification pipeline is not active")
-        prefetched = self._full_verification_prefetched
-        if prefetched is None:
+        if not self._full_verification_prefetched:
             raise RuntimeError("Full-verification pipeline has no remaining layer")
-        if prefetched.layer_name != layer_name:
+
+        expected_layer_name = self._full_verification_layers[
+            self._full_verification_layer_cursor
+        ][0]
+        if expected_layer_name != layer_name:
             raise RuntimeError(
                 "Full-verification layer order differs from the installed model"
             )
 
-        clustered_kv = None if prefetched.ticket is None else prefetched.ticket.result()
-        next_cursor = self._full_verification_layer_cursor + 1
-        next_prefetched = None
-        if next_cursor < len(self._full_verification_layers):
-            next_prefetched = self._prefetch_full_verification_layer(next_cursor)
+        prefetched = self._full_verification_prefetched.popleft()
+        if prefetched.layer_name != layer_name:
+            raise RuntimeError(
+                "Prefetched full-verification layer does not match the model layer"
+            )
+        if prefetched.primed and prefetched.ticket is not None:
+            counter = (
+                "full_verify_prime_ready"
+                if prefetched.ticket.ready()
+                else "full_verify_prime_late"
+            )
+            if self.performance_stats is not None:
+                self.performance_stats.add_counter(counter)
 
-        self._full_verification_layer_cursor = next_cursor
-        self._full_verification_prefetched = next_prefetched
+        clustered_kv = None if prefetched.ticket is None else prefetched.ticket.result()
+        self._full_verification_layer_cursor += 1
+        if (
+            not self._full_verification_prefetched
+            and self._full_verification_next_layer_index
+            < len(self._full_verification_layers)
+        ):
+            next_layer = self._prefetch_full_verification_layer(
+                self._full_verification_next_layer_index
+            )
+            self._full_verification_prefetched.append(next_layer)
+            self._full_verification_next_layer_index += 1
         return clustered_kv
 
     def end_full_verification_pipeline(self) -> None:
-        prefetched = self._full_verification_prefetched
-        if prefetched is not None and prefetched.ticket is not None:
-            prefetched.ticket.cancel()
+        prefetched = tuple(self._full_verification_prefetched)
+        self._full_verification_prefetched.clear()
+        self._cancel_full_verification_prefetches(prefetched, wait=False)
 
         self._full_verification_pipeline_active = False
         self._full_verification_request_ids = ()
         self._full_verification_layers = ()
         self._full_verification_layer_cursor = 0
+        self._full_verification_next_layer_index = 0
         self._full_verification_device = None
-        self._full_verification_prefetched = None
 
     def build_full_verification_plan(
         self,

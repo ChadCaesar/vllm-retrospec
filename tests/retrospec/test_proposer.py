@@ -165,7 +165,7 @@ def mock_proposal_execution(
     monkeypatch.setattr(
         proposer.sparse_attention,
         "proposal_context",
-        lambda _request_ids: nullcontext(),
+        lambda _request_ids, _context_lens=None: nullcontext(),
     )
     monkeypatch.setattr(
         proposer,
@@ -1008,6 +1008,7 @@ def initialize_verification(
     pending_counts: torch.Tensor | None = None,
 ) -> None:
     batch_size = draft_token_ids.shape[0]
+    proposer.sparse_attention.maybe_prime_full_verification = Mock(return_value=False)
     proposer.state.begin_batch(batch_size)
     proposer.index_update_state.begin_batch(
         [f"request-{index}" for index in range(batch_size)],
@@ -1419,10 +1420,16 @@ def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch)
         fake_run_parallel_verification,
     )
     flush_prefetch = Mock()
+    prime_full_verification = Mock(return_value=False)
     monkeypatch.setattr(
         proposer.sparse_attention,
         "flush_sparse_verification_prefetch",
         flush_prefetch,
+    )
+    monkeypatch.setattr(
+        proposer.sparse_attention,
+        "maybe_prime_full_verification",
+        prime_full_verification,
     )
 
     verification = proposer._verify_draft_tokens(
@@ -1434,6 +1441,7 @@ def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch)
 
     assert observed_rows == [([0, 0, 0, 0], [0, 1, 2, 3])]
     flush_prefetch.assert_called_once_with()
+    prime_full_verification.assert_called_once_with(4)
     assert verification.verified_counts.tolist() == [4]
     assert verification.require_full.tolist() == [True]
 
@@ -1842,7 +1850,7 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
     monkeypatch.setattr(
         proposer.sparse_attention,
         "proposal_context",
-        lambda _request_ids: nullcontext(),
+        lambda _request_ids, _context_lens=None: nullcontext(),
     )
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)
@@ -1936,7 +1944,7 @@ def test_propose_handles_different_round_offsets_in_one_buffer(monkeypatch):
     monkeypatch.setattr(
         proposer.sparse_attention,
         "proposal_context",
-        lambda _request_ids: nullcontext(),
+        lambda _request_ids, _context_lens=None: nullcontext(),
     )
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)

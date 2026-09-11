@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -19,6 +20,7 @@ from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecClusterPageStore,
     RetroSpecCompactTokenRange,
     RetroSpecFullVerificationDescriptor,
+    RetroSpecFullVerificationTicket,
     RetroSpecResidentPrefetchInput,
 )
 from vllm.v1.spec_decode.retrospec.index_residency import RetroSpecResidentLayerArena
@@ -74,6 +76,24 @@ def make_token_offsets(
             next_offsets[cluster_idx] += 1
 
     return offsets
+
+
+def test_full_verification_ticket_reports_ready_and_signals_cancellation():
+    future = Future()
+    cancel_event = threading.Event()
+    ticket = RetroSpecFullVerificationTicket(future, cancel_event)
+
+    assert not ticket.ready()
+    assert ticket.cancel()
+    assert cancel_event.is_set()
+    assert not ticket.ready()
+
+    completed_future = Future()
+    completed_future.set_result(SimpleNamespace(ready_event=None))
+    completed_ticket = RetroSpecFullVerificationTicket(
+        completed_future, threading.Event()
+    )
+    assert completed_ticket.ready()
 
 
 def test_full_verification_descriptor_compacts_partial_pages():
@@ -2115,6 +2135,58 @@ def test_full_verification_submission_gathers_on_background_worker(monkeypatch):
         expected_values = torch.cat((values[0], values[1, [1, 3, 0, 2, 4]]))
         torch.testing.assert_close(staging.key_tokens.cpu(), expected_keys)
         torch.testing.assert_close(staging.value_tokens.cpu(), expected_values)
+    finally:
+        allow_gather.set()
+        store.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for cancellable full-verification staging",
+)
+def test_full_verification_submission_cancels_during_cpu_gather(monkeypatch):
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(page_size=2, cache_ratio=0.5)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    metadata = store.get_cluster_block_metadata(
+        "layer", table.cluster_ids, device=torch.device("cpu")
+    )
+    descriptor = store.build_full_verification_descriptor(
+        "layer", metadata.page_ids, metadata.page_token_counts
+    )
+
+    gather_started = threading.Event()
+    allow_gather = threading.Event()
+    original_gather = cluster_store_module.ops.retrospec_gather_compact_kv
+
+    def delayed_gather(*args):
+        gather_started.set()
+        if not allow_gather.wait(timeout=5):
+            raise TimeoutError("Timed out waiting to release native gather")
+        original_gather(*args)
+
+    monkeypatch.setattr(
+        cluster_store_module.ops,
+        "retrospec_gather_compact_kv",
+        delayed_gather,
+    )
+
+    try:
+        ticket = store.submit_full_verification_tokens("layer", (descriptor,))
+        assert gather_started.wait(timeout=5)
+        assert not ticket.cancel()
+        assert ticket.cancel_event.is_set()
+        allow_gather.set()
+        with pytest.raises(CancelledError):
+            ticket.result()
     finally:
         allow_gather.set()
         store.close()
