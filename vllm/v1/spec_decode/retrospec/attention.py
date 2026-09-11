@@ -172,6 +172,7 @@ class RetroSpecSparseAttention:
             num_kmeans_iterations=config.retrospec_kmeans_iterations,
             max_model_len=vllm_config.model_config.max_model_len,
             max_pending_cluster_builds=config.retrospec_max_pending_cluster_builds,
+            cpu_page_build_workers=config.retrospec_cpu_page_build_workers,
             cache_ratio=config.retrospec_cache_ratio,
             pin_memory=device.type == "cuda" and is_pin_memory_available(),
             max_resident_requests=vllm_config.scheduler_config.max_num_seqs,

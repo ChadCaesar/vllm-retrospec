@@ -19,6 +19,32 @@ logger = init_logger(__name__)
 current_platform.import_kernels()
 
 
+def retrospec_build_cluster_pages(
+    key_slabs: tuple[torch.Tensor, ...],
+    value_slabs: tuple[torch.Tensor, ...],
+    allocated_page_ids: torch.Tensor,
+    token_keys: torch.Tensor,
+    token_values: torch.Tensor,
+    assignments: torch.Tensor,
+    cluster_token_counts: torch.Tensor,
+    token_offsets_in_cluster: torch.Tensor,
+    page_size: int,
+    num_workers: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.ops._C.retrospec_build_cluster_pages(
+        key_slabs,
+        value_slabs,
+        allocated_page_ids,
+        token_keys,
+        token_values,
+        assignments,
+        cluster_token_counts,
+        token_offsets_in_cluster,
+        page_size,
+        num_workers,
+    )
+
+
 def retrospec_gather_compact_kv(
     key_slabs: tuple[torch.Tensor, ...],
     value_slabs: tuple[torch.Tensor, ...],

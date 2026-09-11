@@ -89,6 +89,14 @@ def test_full_verification_descriptor_compacts_partial_pages():
         "layer", metadata.page_ids, metadata.page_token_counts
     )
 
+    torch.testing.assert_close(
+        table.full_verification_descriptor.range_table,
+        descriptor.range_table,
+    )
+    torch.testing.assert_close(
+        table.full_verification_descriptor.head_token_counts_tensor,
+        descriptor.head_token_counts_tensor,
+    )
     assert descriptor.head_token_counts == (5, 5)
     assert descriptor.num_tokens == 10
     assert (
@@ -409,7 +417,7 @@ def test_cluster_store_uses_gpu_generated_offsets_without_sorting_tokens():
         ),
     ],
 )
-def test_cluster_store_vectorized_packing_matches_cluster_membership(
+def test_cluster_store_native_packing_matches_cluster_membership(
     page_size,
     num_kv_heads,
     num_tokens,
@@ -495,13 +503,19 @@ def test_cluster_store_vectorized_packing_matches_cluster_membership(
             assert not cluster_value_pages[~token_mask].any()
 
 
-def test_cluster_store_vectorized_packing_writes_pages_once():
-    store = RetroSpecClusterPageStore(page_size=2)
+def test_cluster_store_native_builder_writes_final_slabs_once(monkeypatch):
+    store = RetroSpecClusterPageStore(page_size=2, cpu_page_build_workers=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
     pool = store._get_or_create_pool("layer", keys)
-    pool.write = Mock(wraps=pool.write)
+    native_builder = Mock(wraps=ops.retrospec_build_cluster_pages)
+    monkeypatch.setattr(
+        cluster_store_module.ops,
+        "retrospec_build_cluster_pages",
+        native_builder,
+    )
+    pool.write = Mock(side_effect=AssertionError("legacy page copy was used"))
 
-    store_cluster_data(
+    table = store_cluster_data(
         store,
         "layer",
         keys,
@@ -510,11 +524,14 @@ def test_cluster_store_vectorized_packing_writes_pages_once():
         cluster_token_counts,
     )
 
-    pool.write.assert_called_once()
-    written_page_ids, written_keys, written_values = pool.write.call_args.args
-    assert written_page_ids.numel() == 6
-    assert written_keys.shape == (6, 2, 1)
-    assert written_values.shape == written_keys.shape
+    native_builder.assert_called_once()
+    assert native_builder.call_args.args[-1] == 2
+    pool.write.assert_not_called()
+    assert table.full_verification_descriptor.head_token_counts == (5, 5)
+    torch.testing.assert_close(
+        table.full_verification_descriptor.head_token_counts_tensor,
+        torch.tensor([5, 5], dtype=torch.int32),
+    )
 
 
 @pytest.mark.parametrize("invalid_assignment", [-1, 2])
@@ -2820,3 +2837,8 @@ def test_cluster_store_materializes_selected_cpu_block_metadata():
 def test_cluster_store_rejects_non_positive_page_size(page_size):
     with pytest.raises(ValueError, match="positive"):
         RetroSpecClusterPageStore(page_size)
+
+
+def test_cluster_store_rejects_non_positive_page_build_workers():
+    with pytest.raises(ValueError, match="cpu_page_build_workers"):
+        RetroSpecClusterPageStore(page_size=2, cpu_page_build_workers=0)

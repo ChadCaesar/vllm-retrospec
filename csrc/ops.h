@@ -186,6 +186,17 @@ void cutlass_mla_decode(torch::Tensor const& out, torch::Tensor const& q_nope,
 
 torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+retrospec_build_cluster_pages(const std::vector<torch::Tensor>& key_slabs,
+                              const std::vector<torch::Tensor>& value_slabs,
+                              const torch::Tensor& allocated_page_ids,
+                              const torch::Tensor& token_keys,
+                              const torch::Tensor& token_values,
+                              const torch::Tensor& assignments,
+                              const torch::Tensor& cluster_token_counts,
+                              const torch::Tensor& token_offsets_in_cluster,
+                              int64_t page_size, int64_t num_workers);
+
 void retrospec_gather_compact_kv(const std::vector<torch::Tensor>& key_slabs,
                                  const std::vector<torch::Tensor>& value_slabs,
                                  const std::vector<torch::Tensor>& range_tables,

@@ -189,6 +189,10 @@ class SpeculativeConfig:
     retrospec_max_pending_cluster_builds: int = Field(default=2, gt=0)
     """Maximum number of in-flight CPU cluster-page builds, including the active
     build. Prefill waits before staging more token KV when this limit is reached."""
+    retrospec_cpu_page_build_workers: int = Field(default=4, gt=0)
+    """Maximum number of native CPU workers used by one cluster-page build.
+    Builds remain serialized by the Python background executor, while independent
+    KV heads within one build may be processed in parallel."""
     retrospec_cpu_page_initial_slab_size_mib: int = Field(default=8, gt=0)
     """Initial pageable CPU cluster-page slab size in MiB for each layer.
     Later slabs grow geometrically up to retrospec_cpu_page_slab_size_mib."""

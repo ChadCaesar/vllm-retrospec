@@ -493,6 +493,7 @@ class RetroSpecClusterBlockTable:
     """
 
     cluster_ids: torch.Tensor
+    full_verification_descriptor: "RetroSpecFullVerificationDescriptor"
 
 
 @dataclass(frozen=True)
@@ -580,21 +581,20 @@ class RetroSpecCompactTokenRange:
     token_count: int
 
 
-@dataclass(frozen=True)
 class RetroSpecFullVerificationDescriptor:
     """Persistent compact full-prefix layout for every KV head of a request."""
 
-    head_ranges: tuple[tuple[RetroSpecCompactTokenRange, ...], ...]
-    head_token_counts: tuple[int, ...]
-    range_table: torch.Tensor = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if len(self.head_ranges) != len(self.head_token_counts):
+    def __init__(
+        self,
+        head_ranges: tuple[tuple[RetroSpecCompactTokenRange, ...], ...],
+        head_token_counts: tuple[int, ...],
+    ) -> None:
+        if len(head_ranges) != len(head_token_counts):
             raise ValueError("Full-verification descriptor head counts differ")
 
         rows: list[tuple[int, int, int, int, int]] = []
         for head_index, (ranges, expected_count) in enumerate(
-            zip(self.head_ranges, self.head_token_counts)
+            zip(head_ranges, head_token_counts)
         ):
             head_token_offset = 0
             for token_range in ranges:
@@ -626,24 +626,118 @@ class RetroSpecFullVerificationDescriptor:
             if rows
             else torch.empty((0, 5), dtype=torch.int64, device="cpu")
         )
-        object.__setattr__(self, "range_table", range_table.contiguous())
+        counts = torch.tensor(head_token_counts, dtype=torch.int32, device="cpu")
+        self._set_tensor_representation(range_table, counts)
+        self._head_ranges_cache = head_ranges
+        self._head_token_counts_cache = head_token_counts
+
+    def _set_tensor_representation(
+        self,
+        range_table: torch.Tensor,
+        head_token_counts: torch.Tensor,
+    ) -> None:
+        if range_table.device.type != "cpu" or range_table.dtype != torch.int64:
+            raise ValueError("Full-verification range table must be CPU int64")
+        if range_table.ndim != 2 or range_table.shape[1] != 5:
+            raise ValueError(
+                "Full-verification range table must have shape [ranges, 5]"
+            )
+        if (
+            head_token_counts.device.type != "cpu"
+            or head_token_counts.dtype != torch.int32
+        ):
+            raise ValueError("Full-verification head counts must be CPU int32")
+        if head_token_counts.ndim != 1:
+            raise ValueError("Full-verification head counts must be one-dimensional")
+
+        range_table = range_table.contiguous()
+        head_token_counts = head_token_counts.contiguous()
+        num_heads = head_token_counts.shape[0]
+
+        if range_table.numel():
+            head_ids = range_table[:, 0]
+            if torch.any((head_ids < 0) | (head_ids >= num_heads)).item():
+                raise ValueError("Full-verification range contains an invalid head")
+            if torch.any(range_table[:, 1:4] < 0).item():
+                raise ValueError("Full-verification range contains negative fields")
+            if torch.any(range_table[:, 3] == 0).item():
+                raise ValueError("Full-verification range must contain tokens")
+            if torch.any(range_table[:, 4] < 0).item():
+                raise ValueError("Full-verification output offset is negative")
+
+            actual_counts = torch.zeros(num_heads, dtype=torch.int64, device="cpu")
+            actual_counts.scatter_add_(0, head_ids, range_table[:, 3])
+            if not torch.equal(actual_counts, head_token_counts.to(dtype=torch.int64)):
+                raise ValueError(
+                    "Full-verification range counts do not match head counts"
+                )
+        elif torch.any(head_token_counts != 0).item():
+            raise ValueError("Empty range table has non-zero head counts")
+
+        self.range_table = range_table
+        self.head_token_counts_tensor = head_token_counts
+
+    @classmethod
+    def from_tensors(
+        cls,
+        range_table: torch.Tensor,
+        head_token_counts: torch.Tensor,
+    ) -> "RetroSpecFullVerificationDescriptor":
+        descriptor = cls.__new__(cls)
+        descriptor._set_tensor_representation(range_table, head_token_counts)
+        descriptor._head_ranges_cache = None
+        descriptor._head_token_counts_cache = None
+        return descriptor
 
     @classmethod
     def empty(cls, num_kv_heads: int) -> "RetroSpecFullVerificationDescriptor":
         if num_kv_heads <= 0:
             raise ValueError("num_kv_heads must be positive")
-        return cls(
-            head_ranges=tuple(() for _ in range(num_kv_heads)),
-            head_token_counts=(0,) * num_kv_heads,
+        return cls.from_tensors(
+            torch.empty((0, 5), dtype=torch.int64, device="cpu"),
+            torch.zeros(num_kv_heads, dtype=torch.int32, device="cpu"),
         )
 
     @property
     def num_kv_heads(self) -> int:
-        return len(self.head_ranges)
+        return self.head_token_counts_tensor.shape[0]
 
     @property
     def num_tokens(self) -> int:
-        return sum(self.head_token_counts)
+        return int(self.head_token_counts_tensor.sum().item())
+
+    @property
+    def head_token_counts(self) -> tuple[int, ...]:
+        if self._head_token_counts_cache is None:
+            self._head_token_counts_cache = tuple(
+                self.head_token_counts_tensor.tolist()
+            )
+        return self._head_token_counts_cache
+
+    @property
+    def head_ranges(
+        self,
+    ) -> tuple[tuple[RetroSpecCompactTokenRange, ...], ...]:
+        if self._head_ranges_cache is None:
+            ranges: list[list[RetroSpecCompactTokenRange]] = [
+                [] for _ in range(self.num_kv_heads)
+            ]
+            for (
+                head_index,
+                slab_id,
+                token_offset,
+                token_count,
+                _,
+            ) in self.range_table.tolist():
+                ranges[head_index].append(
+                    RetroSpecCompactTokenRange(
+                        slab_id=slab_id,
+                        token_offset=token_offset,
+                        token_count=token_count,
+                    )
+                )
+            self._head_ranges_cache = tuple(tuple(row) for row in ranges)
+        return self._head_ranges_cache
 
     def append(
         self, other: "RetroSpecFullVerificationDescriptor"
@@ -651,34 +745,18 @@ class RetroSpecFullVerificationDescriptor:
         if self.num_kv_heads != other.num_kv_heads:
             raise ValueError("Full-verification descriptors changed KV-head count")
 
-        merged_heads: list[tuple[RetroSpecCompactTokenRange, ...]] = []
-        for current, appended in zip(self.head_ranges, other.head_ranges):
-            ranges = list(current)
-            for token_range in appended:
-                if ranges:
-                    previous = ranges[-1]
-                    previous_end = previous.token_offset + previous.token_count
-                    if (
-                        previous.slab_id == token_range.slab_id
-                        and previous_end == token_range.token_offset
-                    ):
-                        ranges[-1] = RetroSpecCompactTokenRange(
-                            slab_id=previous.slab_id,
-                            token_offset=previous.token_offset,
-                            token_count=previous.token_count + token_range.token_count,
-                        )
-                        continue
-                ranges.append(token_range)
-            merged_heads.append(tuple(ranges))
-
-        return RetroSpecFullVerificationDescriptor(
-            head_ranges=tuple(merged_heads),
-            head_token_counts=tuple(
-                current + appended
-                for current, appended in zip(
-                    self.head_token_counts, other.head_token_counts
+        appended_ranges = other.range_table.clone()
+        if appended_ranges.numel():
+            appended_heads = appended_ranges[:, 0]
+            appended_ranges[:, 4].add_(
+                self.head_token_counts_tensor.index_select(0, appended_heads).to(
+                    dtype=torch.int64
                 )
-            ),
+            )
+
+        return RetroSpecFullVerificationDescriptor.from_tensors(
+            torch.cat((self.range_table, appended_ranges), dim=0),
+            self.head_token_counts_tensor + other.head_token_counts_tensor,
         )
 
 
@@ -937,6 +1015,39 @@ class _LayerClusterPagePool:
             key_slabs=tuple(slab.key_pages for slab in self._slabs),
             value_slabs=tuple(slab.value_pages for slab in self._slabs),
         )
+
+    def build_cluster_pages(
+        self,
+        allocated_page_ids: torch.Tensor,
+        token_keys: torch.Tensor,
+        token_values: torch.Tensor,
+        assignments: torch.Tensor,
+        cluster_token_counts: torch.Tensor,
+        token_offsets_in_cluster: torch.Tensor,
+        num_workers: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        RetroSpecFullVerificationDescriptor,
+    ]:
+        page_ids, page_token_counts, range_table, head_token_counts = (
+            ops.retrospec_build_cluster_pages(
+                tuple(slab.key_pages for slab in self._slabs),
+                tuple(slab.value_pages for slab in self._slabs),
+                allocated_page_ids.contiguous(),
+                token_keys.contiguous(),
+                token_values.contiguous(),
+                assignments.contiguous(),
+                cluster_token_counts.contiguous(),
+                token_offsets_in_cluster.contiguous(),
+                self.page_size,
+                num_workers,
+            )
+        )
+        descriptor = RetroSpecFullVerificationDescriptor.from_tensors(
+            range_table, head_token_counts
+        )
+        return page_ids, page_token_counts, descriptor
 
     def allocate(self, num_pages: int) -> torch.Tensor:
         if num_pages < 0:
@@ -1499,11 +1610,10 @@ class _FullVerificationTransferBuffer:
         if any(descriptor.num_kv_heads != num_kv_heads for descriptor in descriptors):
             raise ValueError("Full-verification descriptors changed KV-head count")
 
-        token_counts_cpu = torch.tensor(
-            [descriptor.head_token_counts for descriptor in descriptors],
-            dtype=torch.int32,
-            device="cpu",
-        )
+        token_counts_cpu = torch.stack(
+            tuple(descriptor.head_token_counts_tensor for descriptor in descriptors),
+            dim=0,
+        ).contiguous()
         flat_counts = token_counts_cpu.reshape(-1).to(dtype=torch.int64)
         flat_offsets = torch.zeros_like(flat_counts)
         if flat_offsets.numel() > 1:
@@ -1636,6 +1746,7 @@ class RetroSpecClusterPageStore:
         cpu_page_slab_bytes: int = 1 << 20,
         max_pinned_memory_bytes: int = 64 << 20,
         max_pending_cluster_builds: int = 2,
+        cpu_page_build_workers: int = 4,
         performance_stats: RetroSpecPerformanceStats | None = None,
         pinned_memory: RetroSpecPinnedMemoryManager | None = None,
     ) -> None:
@@ -1657,6 +1768,8 @@ class RetroSpecClusterPageStore:
             raise ValueError("max_pinned_memory_bytes must be positive")
         if max_pending_cluster_builds <= 0:
             raise ValueError("max_pending_cluster_builds must be positive")
+        if cpu_page_build_workers <= 0:
+            raise ValueError("cpu_page_build_workers must be positive")
 
         if pinned_memory is None:
             pinned_memory = RetroSpecPinnedMemoryManager(
@@ -1674,6 +1787,7 @@ class RetroSpecClusterPageStore:
         self.cpu_page_slab_bytes = cpu_page_slab_bytes
         self.max_pinned_memory_bytes = pinned_memory.max_bytes
         self.max_pending_cluster_builds = max_pending_cluster_builds
+        self.cpu_page_build_workers = cpu_page_build_workers
         self.performance_stats = performance_stats
 
         self._layer_pools: dict[str, _LayerClusterPagePool] = {}
@@ -2796,226 +2910,6 @@ class RetroSpecClusterPageStore:
             non_blocking=False,
         )
 
-    @staticmethod
-    def _allocate_packed_pages(
-        pool: _LayerClusterPagePool,
-        num_pages: int,
-    ) -> torch.Tensor:
-        shape = (
-            num_pages,
-            pool.page_size,
-            pool.head_size,
-        )
-
-        if pool.storage_device.type == "cpu":
-            return torch.zeros(
-                shape,
-                dtype=pool.dtype,
-                device=pool.storage_device,
-                pin_memory=pool.pin_memory,
-            )
-
-        return torch.zeros(
-            shape,
-            dtype=pool.dtype,
-            device=pool.storage_device,
-        )
-
-    @staticmethod
-    def _validate_cluster_assignment_counts(
-        assignments: torch.Tensor,
-        cluster_token_counts: torch.Tensor,
-        token_offsets_in_cluster: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        assignments_int64 = assignments.to(torch.int64)
-        cluster_token_counts_int64 = cluster_token_counts.to(torch.int64)
-        token_offsets_int64 = token_offsets_in_cluster.to(torch.int64)
-        num_clusters = cluster_token_counts.shape[1]
-
-        if assignments_int64.numel():
-            invalid_assignments = (assignments_int64 < 0) | (
-                assignments_int64 >= num_clusters
-            )
-            if torch.any(invalid_assignments).item():
-                raise RuntimeError(
-                    "Cluster assignment count does not match cluster_token_counts"
-                )
-
-        actual_cluster_counts = torch.zeros_like(cluster_token_counts_int64)
-        actual_cluster_counts.scatter_add_(
-            dim=1,
-            index=assignments_int64,
-            src=torch.ones_like(assignments_int64),
-        )
-
-        if not torch.equal(actual_cluster_counts, cluster_token_counts_int64):
-            raise RuntimeError(
-                "Cluster assignment count does not match cluster_token_counts"
-            )
-
-        assigned_cluster_counts = torch.gather(
-            cluster_token_counts_int64,
-            dim=1,
-            index=assignments_int64,
-        )
-        invalid_offsets = (token_offsets_int64 < 0) | (
-            token_offsets_int64 >= assigned_cluster_counts
-        )
-        if torch.any(invalid_offsets).item():
-            raise RuntimeError("Cluster token offsets exceed cluster boundaries")
-
-        cluster_starts = (
-            torch.cumsum(cluster_token_counts_int64, dim=1) - cluster_token_counts_int64
-        )
-        compact_positions = (
-            torch.gather(cluster_starts, dim=1, index=assignments_int64)
-            + token_offsets_int64
-        )
-        occupied_positions = torch.zeros_like(assignments_int64)
-        occupied_positions.scatter_add_(
-            dim=1,
-            index=compact_positions,
-            src=torch.ones_like(compact_positions),
-        )
-        if not torch.all(occupied_positions == 1).item():
-            raise RuntimeError("Cluster token offsets must be unique within clusters")
-
-        return assignments_int64, cluster_token_counts_int64, token_offsets_int64
-
-    def _pack_cluster_pages(
-        self,
-        pool: _LayerClusterPagePool,
-        storage_keys: torch.Tensor,
-        storage_values: torch.Tensor,
-        storage_assignments: torch.Tensor,
-        storage_token_offsets: torch.Tensor,
-        cluster_page_counts: torch.Tensor,
-        total_pages: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_kv_heads, num_tokens, head_size = storage_keys.shape
-
-        packed_keys = self._allocate_packed_pages(pool, total_pages)
-        packed_values = self._allocate_packed_pages(pool, total_pages)
-
-        if num_tokens == 0:
-            return packed_keys, packed_values
-
-        flat_cluster_page_counts = cluster_page_counts.reshape(-1)
-        flat_cluster_page_offsets = (
-            torch.cumsum(
-                flat_cluster_page_counts,
-                dim=0,
-            )
-            - flat_cluster_page_counts
-        )
-        cluster_page_offsets = flat_cluster_page_offsets.view_as(cluster_page_counts)
-
-        token_page_offsets = torch.gather(
-            cluster_page_offsets,
-            dim=1,
-            index=storage_assignments,
-        )
-        packed_token_positions = (
-            token_page_offsets * self.page_size + storage_token_offsets
-        ).reshape(-1)
-
-        packed_keys.view(-1, head_size).index_copy_(
-            0,
-            packed_token_positions,
-            storage_keys.reshape(num_kv_heads * num_tokens, head_size),
-        )
-        packed_values.view(-1, head_size).index_copy_(
-            0,
-            packed_token_positions,
-            storage_values.reshape(num_kv_heads * num_tokens, head_size),
-        )
-
-        return packed_keys, packed_values
-
-    def _build_cluster_page_metadata(
-        self,
-        cluster_token_counts: torch.Tensor,
-        cluster_page_counts: torch.Tensor,
-        allocated_metadata_page_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        cluster_token_counts_cpu = cluster_token_counts.detach().to(
-            device="cpu",
-            dtype=torch.int64,
-        )
-        cluster_page_counts_cpu = cluster_page_counts.detach().to(
-            device="cpu",
-            dtype=torch.int64,
-        )
-
-        num_kv_heads, num_clusters = cluster_token_counts_cpu.shape
-        max_pages_per_cluster = (
-            int(cluster_page_counts_cpu.max().item())
-            if cluster_page_counts_cpu.numel()
-            else 0
-        )
-
-        metadata_shape = (
-            num_kv_heads,
-            num_clusters,
-            max_pages_per_cluster,
-        )
-        page_ids = torch.full(
-            metadata_shape,
-            -1,
-            dtype=torch.int64,
-            device="cpu",
-        )
-        page_token_counts = torch.zeros(
-            metadata_shape,
-            dtype=torch.int32,
-            device="cpu",
-        )
-
-        if max_pages_per_cluster == 0:
-            return page_ids, page_token_counts
-
-        page_offsets = torch.arange(
-            max_pages_per_cluster,
-            dtype=torch.int64,
-            device="cpu",
-        ).view(1, 1, max_pages_per_cluster)
-        valid_page_mask = page_offsets < cluster_page_counts_cpu.unsqueeze(-1)
-        expected_page_count = int(valid_page_mask.sum().item())
-
-        if expected_page_count != allocated_metadata_page_ids.numel():
-            raise RuntimeError(
-                "Cluster page metadata does not cover all allocated pages"
-            )
-
-        # Row-major (head, cluster, page) order matches the flattened page
-        # offsets used for packing and the order returned by pool.allocate().
-        page_ids.masked_scatter_(
-            valid_page_mask,
-            allocated_metadata_page_ids,
-        )
-        page_token_counts.masked_fill_(
-            valid_page_mask,
-            self.page_size,
-        )
-
-        valid_cluster_mask = cluster_token_counts_cpu > 0
-        last_page_mask = valid_page_mask & (
-            page_offsets == cluster_page_counts_cpu.unsqueeze(-1) - 1
-        )
-        last_page_token_counts = (
-            torch.remainder(
-                cluster_token_counts_cpu[valid_cluster_mask] - 1,
-                self.page_size,
-            )
-            + 1
-        ).to(torch.int32)
-        page_token_counts.masked_scatter_(
-            last_page_mask,
-            last_page_token_counts,
-        )
-
-        return page_ids, page_token_counts
-
     def store_clusters(
         self,
         layer_name: str,
@@ -3040,9 +2934,6 @@ class RetroSpecClusterPageStore:
             token_offsets_in_cluster,
         )
 
-        if torch.any(cluster_token_counts < 0).item():
-            raise ValueError("cluster_token_counts must be non-negative")
-
         pool = self._get_or_create_pool(
             layer_name,
             token_keys,
@@ -3062,18 +2953,11 @@ class RetroSpecClusterPageStore:
             pool.storage_device,
         )
 
-        (
-            storage_assignments,
-            storage_cluster_counts,
-            storage_token_offsets,
-        ) = self._validate_cluster_assignment_counts(
-            storage_assignments,
-            storage_cluster_counts,
-            storage_token_offsets,
-        )
+        if torch.any(storage_cluster_counts < 0).item():
+            raise ValueError("cluster_token_counts must be non-negative")
 
         cluster_page_counts = torch.div(
-            storage_cluster_counts + self.page_size - 1,
+            storage_cluster_counts.to(dtype=torch.int64) + self.page_size - 1,
             self.page_size,
             rounding_mode="floor",
         )
@@ -3084,33 +2968,20 @@ class RetroSpecClusterPageStore:
                 total_pages,
             )
 
-        allocated_storage_page_ids = pool.allocate(total_pages)
-        allocated_metadata_page_ids = allocated_storage_page_ids.detach().to(
-            device="cpu", dtype=torch.int64
-        )
+        allocated_page_ids = pool.allocate(total_pages)
 
         try:
-            packed_keys, packed_values = self._pack_cluster_pages(
-                pool=pool,
-                storage_keys=storage_keys,
-                storage_values=storage_values,
-                storage_assignments=storage_assignments,
-                storage_token_offsets=storage_token_offsets,
-                cluster_page_counts=cluster_page_counts,
-                total_pages=total_pages,
-            )
-            page_ids, page_token_counts = self._build_cluster_page_metadata(
+            page_ids, page_token_counts, full_descriptor = pool.build_cluster_pages(
+                allocated_page_ids=allocated_page_ids,
+                token_keys=storage_keys,
+                token_values=storage_values,
+                assignments=storage_assignments,
                 cluster_token_counts=storage_cluster_counts,
-                cluster_page_counts=cluster_page_counts,
-                allocated_metadata_page_ids=allocated_metadata_page_ids,
-            )
-            pool.write(
-                allocated_storage_page_ids,
-                packed_keys,
-                packed_values,
+                token_offsets_in_cluster=storage_token_offsets,
+                num_workers=self.cpu_page_build_workers,
             )
         except Exception:
-            pool.free(allocated_storage_page_ids)
+            pool.free(allocated_page_ids)
             raise
 
         cluster_ids: torch.Tensor | None = None
@@ -3120,7 +2991,7 @@ class RetroSpecClusterPageStore:
                     layer_name=layer_name,
                     request_id=request_id,
                     cluster_start=cluster_start,
-                    cluster_token_counts=cluster_token_counts,
+                    cluster_token_counts=storage_cluster_counts,
                     page_ids=page_ids,
                     page_token_counts=page_token_counts,
                 )
@@ -3128,11 +2999,14 @@ class RetroSpecClusterPageStore:
             except Exception:
                 if cluster_ids is not None:
                     self._free_cluster_ids(layer_name, cluster_ids)
-                pool.free(allocated_storage_page_ids)
+                pool.free(allocated_page_ids)
                 raise
 
         assert cluster_ids is not None
-        return RetroSpecClusterBlockTable(cluster_ids=cluster_ids)
+        return RetroSpecClusterBlockTable(
+            cluster_ids=cluster_ids,
+            full_verification_descriptor=full_descriptor,
+        )
 
     def free(
         self,

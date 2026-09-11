@@ -35,6 +35,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &get_cuda_view_from_cpu_tensor);
 
   ops.def(
+      "retrospec_build_cluster_pages("
+      "Tensor[](a!) key_slabs, Tensor[](b!) value_slabs, "
+      "Tensor allocated_page_ids, Tensor token_keys, Tensor token_values, "
+      "Tensor assignments, Tensor cluster_token_counts, "
+      "Tensor token_offsets_in_cluster, int page_size, int num_workers) "
+      "-> (Tensor, Tensor, Tensor, Tensor)");
+  ops.impl("retrospec_build_cluster_pages", torch::kCPU,
+           &retrospec_build_cluster_pages);
+
+  ops.def(
       "retrospec_gather_compact_kv("
       "Tensor[] key_slabs, Tensor[] value_slabs, Tensor[] range_tables, "
       "Tensor token_offsets, int destination_token_start, "

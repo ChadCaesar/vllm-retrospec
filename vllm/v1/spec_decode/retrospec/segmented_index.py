@@ -633,6 +633,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         num_kmeans_iterations: int,
         max_model_len: int,
         max_pending_cluster_builds: int = 2,
+        cpu_page_build_workers: int = 4,
         cache_ratio: float = 0.0,
         pin_memory: bool = False,
         max_resident_requests: int = 1,
@@ -664,6 +665,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             raise ValueError("num_kmeans_iterations must be positive")
         if max_pending_cluster_builds <= 0:
             raise ValueError("max_pending_cluster_builds must be positive")
+        if cpu_page_build_workers <= 0:
+            raise ValueError("cpu_page_build_workers must be positive")
         if first_draft_warmup_multiplier <= 0:
             raise ValueError("first_draft_warmup_multiplier must be positive")
         if cpu_page_slab_bytes <= 0:
@@ -723,6 +726,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             cpu_page_initial_slab_bytes=cpu_page_initial_slab_bytes,
             cpu_page_slab_bytes=cpu_page_slab_bytes,
             max_pending_cluster_builds=max_pending_cluster_builds,
+            cpu_page_build_workers=cpu_page_build_workers,
             performance_stats=performance_stats,
             pinned_memory=self._pinned_memory,
         )
@@ -1329,19 +1333,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         for staged_segment, _, cluster_blocks in built_segments:
             self.cluster_store.free(staged_segment.layer_name, cluster_blocks)
 
+    @staticmethod
     def _append_full_verification_page_descriptor(
-        self,
-        layer_name: str,
         record: _RequestLayerIndex,
-        page_ids: torch.Tensor,
-        page_token_counts: torch.Tensor,
+        descriptor: RetroSpecFullVerificationDescriptor,
     ) -> None:
         """Append immutable valid-token ranges for one completed segment."""
-        descriptor = self.cluster_store.build_full_verification_descriptor(
-            layer_name,
-            page_ids,
-            page_token_counts,
-        )
         previous = record.full_verification_descriptor
         record.full_verification_descriptor = (
             descriptor if previous is None else previous.append(descriptor)
@@ -1414,10 +1411,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 )
             )
             self._append_full_verification_page_descriptor(
-                staged_segment.layer_name,
                 record,
-                block_metadata.page_ids,
-                block_metadata.page_token_counts,
+                cluster_blocks.full_verification_descriptor,
             )
 
             record.segments.append(
@@ -3957,10 +3952,18 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 )
         else:
             clustered_kv = None
-        clustered_exact_token_counts = torch.tensor(
-            [descriptor.head_token_counts for descriptor in descriptors],
-            dtype=torch.int32,
-            device=primary_exact_token_counts.device,
+        clustered_exact_token_counts = (
+            torch.stack(
+                tuple(
+                    descriptor.head_token_counts_tensor for descriptor in descriptors
+                ),
+                dim=0,
+            )
+            .to(
+                device=primary_exact_token_counts.device,
+                dtype=torch.int32,
+            )
+            .contiguous()
         )
         if clustered_exact_token_counts.shape != primary_exact_token_counts.shape:
             raise RuntimeError(
