@@ -249,20 +249,50 @@ class CudaCommunicator(DeviceCommunicatorBase):
         else:
             torch.distributed.send(tensor, self.ranks[dst], self.device_group)
 
-    def recv(
-        self, size: torch.Size, dtype: torch.dtype, src: int | None = None
-    ) -> torch.Tensor:
-        """Receives a tensor from the source rank."""
-        """NOTE: `src` is the local rank of the source rank."""
+    def all_gather_into_tensor(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+    ) -> None:
+        """All-gather into caller-owned CUDA storage."""
+        if not output_tensor.is_contiguous() or not input_tensor.is_contiguous():
+            raise ValueError("all-gather input and output tensors must be contiguous")
+        if output_tensor.dtype != input_tensor.dtype:
+            raise ValueError("all-gather input and output dtypes must match")
+        if output_tensor.device != input_tensor.device:
+            raise ValueError("all-gather input and output devices must match")
+        if output_tensor.numel() != input_tensor.numel() * self.world_size:
+            raise ValueError("all-gather output has an invalid capacity")
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_gather(output_tensor, input_tensor)
+        else:
+            torch.distributed.all_gather_into_tensor(
+                output_tensor,
+                input_tensor,
+                group=self.device_group,
+            )
+
+    def recv_into(self, tensor: torch.Tensor, src: int | None = None) -> None:
+        """Receive directly into caller-owned CUDA storage."""
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
+        if not tensor.is_contiguous():
+            raise ValueError("receive tensor must be contiguous")
 
-        tensor = torch.empty(size, dtype=dtype, device=self.device)
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.recv(tensor, src)
         else:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+
+    def recv(
+        self, size: torch.Size, dtype: torch.dtype, src: int | None = None
+    ) -> torch.Tensor:
+        """Receives a tensor from the source rank."""
+        tensor = torch.empty(size, dtype=dtype, device=self.device)
+        self.recv_into(tensor, src)
         return tensor
 
     def destroy(self):

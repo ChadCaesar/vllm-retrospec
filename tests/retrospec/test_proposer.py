@@ -72,8 +72,13 @@ def make_vllm_config(
             model_config=SimpleNamespace(
                 dtype=torch.float32,
                 max_model_len=max_model_len,
+                get_hidden_size=Mock(return_value=4),
             ),
             cache_config=SimpleNamespace(block_size=4),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                data_parallel_size=1,
+            ),
         ),
     )
 
@@ -257,7 +262,10 @@ def test_initialize_cudagraph_keys_records_piecewise_disabled():
 def test_initialize_cudagraph_keys_skips_unsupported_data_parallelism():
     dispatcher = Mock()
     config = make_vllm_config(enforce_eager=False)
-    config.parallel_config = SimpleNamespace(data_parallel_size=2)
+    config.parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        data_parallel_size=2,
+    )
     proposer = RetroSpecProposer(
         config,
         torch.device("cpu"),

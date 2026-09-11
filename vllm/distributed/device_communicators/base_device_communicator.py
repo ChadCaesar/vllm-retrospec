@@ -179,6 +179,27 @@ class DeviceCommunicatorBase:
         )
         return output_tensor
 
+    def all_gather_into_tensor(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+    ) -> None:
+        """All-gather into caller-owned storage without allocating output."""
+        if not output_tensor.is_contiguous() or not input_tensor.is_contiguous():
+            raise ValueError("all-gather input and output tensors must be contiguous")
+        if output_tensor.dtype != input_tensor.dtype:
+            raise ValueError("all-gather input and output dtypes must match")
+        if output_tensor.device != input_tensor.device:
+            raise ValueError("all-gather input and output devices must match")
+        if output_tensor.numel() != input_tensor.numel() * self.world_size:
+            raise ValueError("all-gather output has an invalid capacity")
+
+        dist.all_gather_into_tensor(
+            output_tensor,
+            input_tensor,
+            group=self.device_group,
+        )
+
     def all_gatherv(
         self,
         input_: torch.Tensor | list[torch.Tensor],
@@ -263,16 +284,21 @@ class DeviceCommunicatorBase:
             dst = (self.rank_in_group + 1) % self.world_size
         torch.distributed.send(tensor, self.ranks[dst], self.device_group)
 
+    def recv_into(self, tensor: torch.Tensor, src: int | None = None) -> None:
+        """Receive directly into caller-owned contiguous storage."""
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        if not tensor.is_contiguous():
+            raise ValueError("receive tensor must be contiguous")
+
+        torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: int | None = None
     ) -> torch.Tensor:
         """Receives a tensor from the source rank."""
-        """NOTE: `src` is the local rank of the source rank."""
-        if src is None:
-            src = (self.rank_in_group - 1) % self.world_size
-
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+        self.recv_into(tensor, src)
         return tensor
 
     def destroy(self):

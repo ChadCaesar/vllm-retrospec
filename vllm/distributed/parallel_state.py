@@ -525,6 +525,28 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gather(input_, dim)
 
+    def all_gather_into_tensor(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """All-gather into a caller-owned fixed-capacity tensor."""
+        expected_numel = input_tensor.numel() * self.world_size
+        if output_tensor.numel() != expected_numel:
+            raise ValueError(
+                "all-gather output capacity mismatch: "
+                f"expected={expected_numel}, got={output_tensor.numel()}"
+            )
+
+        if self.world_size == 1:
+            output_tensor.copy_(input_tensor)
+            return output_tensor
+
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        self.device_communicator.all_gather_into_tensor(output_tensor, input_tensor)
+        return output_tensor
+
     def all_gatherv(
         self,
         input_: torch.Tensor | list[torch.Tensor],
@@ -974,6 +996,12 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         self.device_communicator.send(tensor, dst)
+
+    def recv_into(self, tensor: torch.Tensor, src: int | None = None) -> None:
+        """Receive directly into caller-owned storage."""
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        self.device_communicator.recv_into(tensor, src)
 
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: int | None = None

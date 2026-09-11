@@ -43,6 +43,8 @@ def make_pp_group(
         last_rank=world_size - 1,
         device_group=object(),
         all_reduce=Mock(side_effect=lambda tensor: tensor),
+        recv_into=Mock(),
+        send=Mock(),
     )
 
 
@@ -51,12 +53,21 @@ def make_protocol(
     max_batch_size: int = 4,
     max_parallel_tokens: int = 16,
     max_sampled_tokens: int = 5,
+    tensor_parallel_size: int = 1,
+    enable_sp: bool = False,
 ) -> RetroSpecPipelineProtocol:
     vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(
-            pass_config=SimpleNamespace(enable_sp=False)
+            pass_config=SimpleNamespace(enable_sp=enable_sp),
+            splitting_ops=[],
+            use_inductor_graph_partition=False,
+            compile_sizes=None,
         ),
-        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            get_hidden_size=Mock(return_value=4),
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tensor_parallel_size),
     )
     return RetroSpecPipelineProtocol(
         vllm_config=vllm_config,
@@ -332,40 +343,35 @@ def test_final_pipeline_stage_broadcasts_model_output(compute_margin: bool):
 def test_nonfinal_pipeline_stage_receives_model_input():
     protocol = make_protocol()
     pp_group = make_pp_group(rank=1, world_size=3, is_last_rank=False)
-    pp_group.recv_tensor_dict = Mock(
-        return_value={
-            "hidden_states": torch.ones(3, 4),
-            "residual": torch.full((3, 4), 2.0),
-        }
-    )
-    tp_group = SimpleNamespace()
+
+    def receive_tensor(tensor: torch.Tensor) -> None:
+        value = (pp_group.recv_into.call_count - 1) % 2 + 1
+        tensor.fill_(float(value))
+
+    pp_group.recv_into.side_effect = receive_tensor
     stage = RetroSpecPipelineStage(1, 3, 2, 4)
 
-    with (
-        patch(
-            "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
-            return_value=pp_group,
-        ),
-        patch(
-            "vllm.v1.spec_decode.retrospec.pipeline.get_tp_group",
-            return_value=tp_group,
-        ),
+    with patch(
+        "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+        return_value=pp_group,
     ):
         output = protocol.receive_model_input(stage, num_tokens=3)
+        hidden_ptr = output["hidden_states"].data_ptr()
+        residual_ptr = output["residual"].data_ptr()
+        reused = protocol.receive_model_input(stage, num_tokens=3)
 
     assert isinstance(output, IntermediateTensors)
     torch.testing.assert_close(output["hidden_states"], torch.ones(3, 4))
-    pp_group.recv_tensor_dict.assert_called_once_with(
-        all_gather_group=tp_group,
-        all_gather_tensors={"residual": True},
-    )
+    torch.testing.assert_close(output["residual"], torch.full((3, 4), 2.0))
+    assert reused is output
+    assert reused["hidden_states"].data_ptr() == hidden_ptr
+    assert reused["residual"].data_ptr() == residual_ptr
+    assert pp_group.recv_into.call_count == 4
 
 
 def test_nonfinal_pipeline_stage_sends_model_output():
     protocol = make_protocol()
     pp_group = make_pp_group(rank=0, world_size=2, is_last_rank=False)
-    pp_group.send_tensor_dict = Mock()
-    tp_group = SimpleNamespace()
     stage = RetroSpecPipelineStage(0, 2, 0, 2)
     output = IntermediateTensors(
         {
@@ -373,6 +379,34 @@ def test_nonfinal_pipeline_stage_sends_model_output():
             "residual": torch.full((3, 4), 2.0),
         }
     )
+
+    with patch(
+        "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+        return_value=pp_group,
+    ):
+        protocol.send_model_output(stage, output, num_tokens=3)
+
+    assert pp_group.send.call_count == 2
+    torch.testing.assert_close(
+        pp_group.send.call_args_list[0].args[0], output["hidden_states"]
+    )
+    torch.testing.assert_close(
+        pp_group.send.call_args_list[1].args[0], output["residual"]
+    )
+
+
+def test_pipeline_proposal_tp_transport_sends_shards_and_gathers_into_workspace():
+    protocol = make_protocol(tensor_parallel_size=2)
+    pp_group = make_pp_group(rank=1, world_size=2, is_last_rank=True)
+    tp_group = SimpleNamespace(
+        rank_in_group=1,
+        world_size=2,
+        all_gather_into_tensor=Mock(),
+    )
+    stage = RetroSpecPipelineStage(0, 2, 0, 2)
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+    residual = hidden_states + 20
+    output = IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
 
     with (
         patch(
@@ -386,8 +420,93 @@ def test_nonfinal_pipeline_stage_sends_model_output():
     ):
         protocol.send_model_output(stage, output, num_tokens=3)
 
-    pp_group.send_tensor_dict.assert_called_once_with(
-        output.tensors,
-        all_gather_group=tp_group,
-        all_gather_tensors={"residual": True},
+    assert pp_group.send.call_count == 2
+    torch.testing.assert_close(
+        pp_group.send.call_args_list[0].args[0], hidden_states.reshape(2, -1)[1]
     )
+    torch.testing.assert_close(
+        pp_group.send.call_args_list[1].args[0], residual.reshape(2, -1)[1]
+    )
+
+    def receive_shard(tensor: torch.Tensor) -> None:
+        tensor.fill_(float(pp_group.recv_into.call_count))
+
+    def gather_tensor(output_tensor: torch.Tensor, input_tensor: torch.Tensor) -> None:
+        output_tensor.copy_(torch.cat((input_tensor, input_tensor + 10)))
+
+    pp_group.recv_into.reset_mock()
+    pp_group.recv_into.side_effect = receive_shard
+    tp_group.all_gather_into_tensor.side_effect = gather_tensor
+    stage = RetroSpecPipelineStage(1, 2, 2, 4)
+
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+            return_value=pp_group,
+        ),
+        patch(
+            "vllm.v1.spec_decode.retrospec.pipeline.get_tp_group",
+            return_value=tp_group,
+        ),
+    ):
+        received = protocol.receive_model_input(stage, num_tokens=3)
+
+    assert pp_group.recv_into.call_count == 2
+    assert tp_group.all_gather_into_tensor.call_count == 2
+    torch.testing.assert_close(
+        received["hidden_states"].view(-1),
+        torch.tensor([1.0] * 6 + [11.0] * 6),
+    )
+    torch.testing.assert_close(
+        received["residual"].view(-1),
+        torch.tensor([2.0] * 6 + [12.0] * 6),
+    )
+
+
+def test_pipeline_sequence_parallel_residual_is_not_gathered():
+    protocol = make_protocol(tensor_parallel_size=2, enable_sp=True)
+    pp_group = make_pp_group(rank=0, world_size=2, is_last_rank=False)
+    tp_group = SimpleNamespace(rank_in_group=0, world_size=2)
+    stage = RetroSpecPipelineStage(0, 2, 0, 2)
+    hidden_states = torch.arange(16, dtype=torch.float32).view(4, 4)
+    residual = torch.arange(8, dtype=torch.float32).view(2, 4)
+    output = IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
+
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+            return_value=pp_group,
+        ),
+        patch(
+            "vllm.v1.spec_decode.retrospec.pipeline.get_tp_group",
+            return_value=tp_group,
+        ),
+    ):
+        protocol.send_model_output(stage, output, num_tokens=4)
+
+    torch.testing.assert_close(
+        pp_group.send.call_args_list[0].args[0], hidden_states.reshape(2, -1)[0]
+    )
+    torch.testing.assert_close(pp_group.send.call_args_list[1].args[0], residual)
+
+
+def test_pipeline_proposal_transport_rejects_dynamic_schema():
+    protocol = make_protocol()
+    pp_group = make_pp_group(rank=0, world_size=2, is_last_rank=False)
+    stage = RetroSpecPipelineStage(0, 2, 0, 2)
+    output = IntermediateTensors(
+        {
+            "hidden_states": torch.ones(3, 4),
+            "residual": torch.ones(3, 4),
+            "extra": torch.ones(3, 4),
+        }
+    )
+
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+            return_value=pp_group,
+        ),
+        pytest.raises(RuntimeError, match="must contain exactly"),
+    ):
+        protocol.send_model_output(stage, output, num_tokens=3)

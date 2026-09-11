@@ -104,6 +104,9 @@ class RetroSpecPipelineProtocol:
     """Fixed-capacity GPU communication protocol for RetroSpec PP."""
 
     _HIDDEN_STATES_KEY = "retrospec_hidden_states"
+    _MODEL_HIDDEN_STATES_KEY = "hidden_states"
+    _MODEL_RESIDUAL_KEY = "residual"
+    _MODEL_TENSOR_KEYS = frozenset({_MODEL_HIDDEN_STATES_KEY, _MODEL_RESIDUAL_KEY})
 
     _TOKEN_IDS_COLUMN = 0
     _STAGES_COLUMN = 1
@@ -155,6 +158,38 @@ class RetroSpecPipelineProtocol:
         self._attention_reduce = torch.empty(
             max_parallel_tokens + 1, dtype=torch.float32, device=device
         )
+
+        model_config = vllm_config.model_config
+        self._proposal_hidden_size = int(model_config.get_hidden_size())
+        self._proposal_dtype = model_config.dtype
+        self._proposal_tp_size = int(vllm_config.parallel_config.tensor_parallel_size)
+
+        activation_shape = (max_parallel_tokens, self._proposal_hidden_size)
+        self._proposal_hidden_states = torch.empty(
+            activation_shape, dtype=self._proposal_dtype, device=device
+        )
+        self._proposal_residual = torch.empty(
+            activation_shape, dtype=self._proposal_dtype, device=device
+        )
+
+        if self._proposal_tp_size > 1:
+            max_activation_elements = max_parallel_tokens * self._proposal_hidden_size
+            shard_capacity = (
+                max_activation_elements + self._proposal_tp_size - 1
+            ) // self._proposal_tp_size
+            self._proposal_hidden_shard = torch.empty(
+                shard_capacity, dtype=self._proposal_dtype, device=device
+            )
+            self._proposal_residual_shard = torch.empty(
+                shard_capacity, dtype=self._proposal_dtype, device=device
+            )
+        else:
+            self._proposal_hidden_shard = None
+            self._proposal_residual_shard = None
+
+        self._proposal_input_descriptors: dict[
+            tuple[int, int], IntermediateTensors
+        ] = {}
 
     @property
     def pp_group(self) -> GroupCoordinator:
@@ -239,10 +274,124 @@ class RetroSpecPipelineProtocol:
             {self._HIDDEN_STATES_KEY: hidden_states.contiguous()}
         )
 
-    def _proposal_all_gather_tensors(self, num_tokens: int) -> dict[str, bool]:
-        return {
-            "residual": not is_residual_scattered_for_sp(self.vllm_config, num_tokens)
-        }
+    def _proposal_activation_shapes(
+        self,
+        num_tokens: int,
+    ) -> tuple[torch.Size, torch.Size, bool]:
+        if not 0 < num_tokens <= self.max_parallel_tokens:
+            raise ValueError(f"num_tokens must be in [1, {self.max_parallel_tokens}]")
+
+        residual_scattered = is_residual_scattered_for_sp(self.vllm_config, num_tokens)
+        residual_rows = num_tokens
+        if residual_scattered:
+            if num_tokens % self._proposal_tp_size != 0:
+                raise ValueError(
+                    "Sequence-parallel proposal tokens must be TP-divisible"
+                )
+            residual_rows //= self._proposal_tp_size
+
+        hidden_shape = torch.Size((num_tokens, self._proposal_hidden_size))
+        residual_shape = torch.Size((residual_rows, self._proposal_hidden_size))
+        return hidden_shape, residual_shape, residual_scattered
+
+    def _proposal_input_descriptor(
+        self,
+        num_tokens: int,
+    ) -> tuple[IntermediateTensors, bool]:
+        hidden_shape, residual_shape, residual_scattered = (
+            self._proposal_activation_shapes(num_tokens)
+        )
+        descriptor_key = (num_tokens, residual_shape[0])
+        descriptor = self._proposal_input_descriptors.get(descriptor_key)
+        if descriptor is None:
+            descriptor = IntermediateTensors(
+                {
+                    self._MODEL_HIDDEN_STATES_KEY: self._proposal_hidden_states[
+                        : hidden_shape[0]
+                    ],
+                    self._MODEL_RESIDUAL_KEY: self._proposal_residual[
+                        : residual_shape[0]
+                    ],
+                }
+            )
+            self._proposal_input_descriptors[descriptor_key] = descriptor
+        return descriptor, residual_scattered
+
+    def _use_proposal_send_all_gather(
+        self,
+        name: str,
+        num_elements: int,
+        residual_scattered: bool,
+    ) -> bool:
+        if self._proposal_tp_size == 1:
+            return False
+        if num_elements % self._proposal_tp_size != 0:
+            return False
+        return name != self._MODEL_RESIDUAL_KEY or not residual_scattered
+
+    def _validate_proposal_tensor(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        expected_shape: torch.Size,
+    ) -> None:
+        if tensor.shape != expected_shape:
+            raise ValueError(
+                f"RetroSpec PP tensor {name!r} has shape {tuple(tensor.shape)}, "
+                f"expected {tuple(expected_shape)}"
+            )
+        if tensor.dtype != self._proposal_dtype:
+            raise ValueError(
+                f"RetroSpec PP tensor {name!r} has dtype {tensor.dtype}, "
+                f"expected {self._proposal_dtype}"
+            )
+        if tensor.device != self.device:
+            raise ValueError(f"RetroSpec PP tensor {name!r} is on the wrong device")
+        if not tensor.is_contiguous():
+            raise ValueError(f"RetroSpec PP tensor {name!r} must be contiguous")
+
+    def _send_proposal_tensor(
+        self,
+        tensor: torch.Tensor,
+        use_all_gather: bool,
+    ) -> None:
+        payload = tensor
+        if use_all_gather:
+            tp_group = get_tp_group()
+            if tp_group.world_size != self._proposal_tp_size:
+                raise RuntimeError(
+                    "RetroSpec proposal TP group size changed after initialization"
+                )
+            payload = tensor.reshape(self._proposal_tp_size, -1)[tp_group.rank_in_group]
+
+        self.pp_group.send(payload)
+
+    def _receive_proposal_tensor(
+        self,
+        target: torch.Tensor,
+        shard_workspace: torch.Tensor | None,
+        use_all_gather: bool,
+    ) -> None:
+        if not use_all_gather:
+            self.pp_group.recv_into(target)
+            return
+
+        tp_group = get_tp_group()
+        if tp_group.world_size != self._proposal_tp_size:
+            raise RuntimeError(
+                "RetroSpec proposal TP group size changed after initialization"
+            )
+
+        target_flat = target.view(-1)
+        if target_flat.numel() % self._proposal_tp_size != 0:
+            raise RuntimeError("RetroSpec proposal activation is not TP-divisible")
+        shard_numel = target_flat.numel() // self._proposal_tp_size
+        if shard_workspace is None or shard_workspace.numel() < shard_numel:
+            raise RuntimeError("RetroSpec proposal TP shard workspace is too small")
+
+        shard = shard_workspace[:shard_numel]
+        self.pp_group.recv_into(shard)
+        tp_group.all_gather_into_tensor(target_flat, shard)
 
     def receive_model_input(
         self,
@@ -252,21 +401,28 @@ class RetroSpecPipelineProtocol:
         if stage.is_first:
             return None
 
-        tensor_dict = self.pp_group.recv_tensor_dict(
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=self._proposal_all_gather_tensors(num_tokens),
-        )
-        if tensor_dict is None:
-            raise RuntimeError(
-                "RetroSpec PP stage did not receive intermediate tensors"
-            )
+        descriptor, residual_scattered = self._proposal_input_descriptor(num_tokens)
+        hidden_states = descriptor[self._MODEL_HIDDEN_STATES_KEY]
+        residual = descriptor[self._MODEL_RESIDUAL_KEY]
 
-        for name, tensor in tensor_dict.items():
-            if isinstance(tensor, torch.Tensor) and tensor.device != self.device:
-                raise RuntimeError(
-                    f"RetroSpec PP tensor {name!r} is on the wrong device"
-                )
-        return IntermediateTensors(tensor_dict)
+        hidden_all_gather = self._use_proposal_send_all_gather(
+            self._MODEL_HIDDEN_STATES_KEY,
+            hidden_states.numel(),
+            residual_scattered,
+        )
+        residual_all_gather = self._use_proposal_send_all_gather(
+            self._MODEL_RESIDUAL_KEY,
+            residual.numel(),
+            residual_scattered,
+        )
+
+        self._receive_proposal_tensor(
+            hidden_states, self._proposal_hidden_shard, hidden_all_gather
+        )
+        self._receive_proposal_tensor(
+            residual, self._proposal_residual_shard, residual_all_gather
+        )
+        return descriptor
 
     def send_model_output(
         self,
@@ -278,12 +434,38 @@ class RetroSpecPipelineProtocol:
             raise RuntimeError(
                 "The final RetroSpec PP stage must not send intermediate output"
             )
+        if frozenset(output.tensors) != self._MODEL_TENSOR_KEYS:
+            raise RuntimeError(
+                "RetroSpec PP model output must contain exactly "
+                "'hidden_states' and 'residual'"
+            )
 
-        self.pp_group.send_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=self._proposal_all_gather_tensors(num_tokens),
+        hidden_shape, residual_shape, residual_scattered = (
+            self._proposal_activation_shapes(num_tokens)
         )
+        hidden_states = output[self._MODEL_HIDDEN_STATES_KEY]
+        residual = output[self._MODEL_RESIDUAL_KEY]
+
+        self._validate_proposal_tensor(
+            self._MODEL_HIDDEN_STATES_KEY, hidden_states, hidden_shape
+        )
+        self._validate_proposal_tensor(
+            self._MODEL_RESIDUAL_KEY, residual, residual_shape
+        )
+
+        hidden_all_gather = self._use_proposal_send_all_gather(
+            self._MODEL_HIDDEN_STATES_KEY,
+            hidden_states.numel(),
+            residual_scattered,
+        )
+        residual_all_gather = self._use_proposal_send_all_gather(
+            self._MODEL_RESIDUAL_KEY,
+            residual.numel(),
+            residual_scattered,
+        )
+
+        self._send_proposal_tensor(hidden_states, hidden_all_gather)
+        self._send_proposal_tensor(residual, residual_all_gather)
 
     def broadcast_target_sampled_token_ids(
         self,

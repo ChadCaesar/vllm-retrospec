@@ -15,6 +15,7 @@ import torch
 from vllm.distributed import (
     broadcast_tensor_dict,
     get_pp_group,
+    get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
@@ -117,6 +118,35 @@ def all_gather_test_worker(
         t = all_tensors[rank % tp_size]
         t = tensor_model_parallel_all_gather(t, all_gather_dimension)
         torch.testing.assert_close(t, expected)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def all_gather_into_test_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    input_tensor = torch.arange(8, dtype=torch.float32, device=device) + rank * 10
+    output_tensor = torch.empty(tp_size * 8, dtype=torch.float32, device=device)
+    output_ptr = output_tensor.data_ptr()
+
+    result = get_tp_group().all_gather_into_tensor(output_tensor, input_tensor)
+    expected = torch.cat(
+        [
+            torch.arange(8, dtype=torch.float32, device=device) + peer * 10
+            for peer in range(tp_size)
+        ]
+    )
+
+    assert result.data_ptr() == output_ptr
+    torch.testing.assert_close(result, expected)
 
 
 @ray.remote(num_gpus=1, max_calls=1)
@@ -226,11 +256,43 @@ def send_recv_test_worker(
         torch.testing.assert_close(test_tensor, recv_tensor)
 
 
+@ray.remote(num_gpus=1, max_calls=1)
+def send_recv_into_test_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    expected = torch.arange(64, dtype=torch.float32, device=device)
+    if not get_pp_group().is_first_rank:
+        recv_tensor = torch.empty_like(expected)
+        recv_ptr = recv_tensor.data_ptr()
+        get_pp_group().recv_into(recv_tensor)
+
+    if not get_pp_group().is_last_rank:
+        get_pp_group().send(expected)
+
+    if not get_pp_group().is_first_rank:
+        assert recv_tensor.data_ptr() == recv_ptr
+        torch.testing.assert_close(recv_tensor, expected)
+
+
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize("tp_size", [2])
 @pytest.mark.parametrize(
     "test_target",
-    [all_reduce_test_worker, all_gather_test_worker, broadcast_tensor_dict_test_worker],
+    [
+        all_reduce_test_worker,
+        all_gather_test_worker,
+        all_gather_into_test_worker,
+        broadcast_tensor_dict_test_worker,
+    ],
 )
 def test_multi_process_tensor_parallel(
     monkeypatch: pytest.MonkeyPatch,
@@ -243,7 +305,12 @@ def test_multi_process_tensor_parallel(
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize("pp_size", [2])
 @pytest.mark.parametrize(
-    "test_target", [send_recv_test_worker, send_recv_tensor_dict_test_worker]
+    "test_target",
+    [
+        send_recv_test_worker,
+        send_recv_into_test_worker,
+        send_recv_tensor_dict_test_worker,
+    ],
 )
 def test_multi_process_pipeline_parallel(
     monkeypatch: pytest.MonkeyPatch,
@@ -260,9 +327,11 @@ def test_multi_process_pipeline_parallel(
     "test_target",
     [
         send_recv_test_worker,
+        send_recv_into_test_worker,
         send_recv_tensor_dict_test_worker,
         all_reduce_test_worker,
         all_gather_test_worker,
+        all_gather_into_test_worker,
         broadcast_tensor_dict_test_worker,
     ],
 )
