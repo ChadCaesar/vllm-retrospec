@@ -162,6 +162,8 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.retrospec import RetroSpecProposer
 from vllm.v1.spec_decode.retrospec.prefill import (
     RetroSpecLayerMajorPrefillProtocol,
+    RetroSpecLayerPrefillTile,
+    RetroSpecLayerPrefillTilePlanner,
     RetroSpecLayerPrefillWorkspace,
     resolve_retrospec_layer_model,
 )
@@ -724,6 +726,9 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.retrospec_layer_prefill_workspace: (
             RetroSpecLayerPrefillWorkspace | None
+        ) = None
+        self.retrospec_layer_prefill_tile_planner: (
+            RetroSpecLayerPrefillTilePlanner | None
         ) = None
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
@@ -3175,6 +3180,58 @@ class GPUModelRunner(
             causal=True,
         )
 
+    def _estimate_retrospec_prefill_activation_bytes_per_token(self) -> int:
+        hidden_size = self.model_config.get_hidden_size()
+        head_size = self.model_config.get_head_size()
+        num_query_heads = self.model_config.get_num_attention_heads(
+            self.parallel_config
+        )
+        num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
+        intermediate_size = int(
+            getattr(
+                self.model_config.hf_text_config,
+                "intermediate_size",
+                4 * hidden_size,
+            )
+        )
+        local_intermediate_size = cdiv(
+            intermediate_size,
+            self.parallel_config.tensor_parallel_size,
+        )
+
+        activation_elements = (
+            4 * hidden_size
+            + 2 * local_intermediate_size
+            + (num_query_heads + 2 * num_kv_heads) * head_size
+        )
+        return 2 * get_dtype_size(self.model_config.dtype) * activation_elements
+
+    def _build_retrospec_prefill_tile_plan(
+        self,
+        workspace: RetroSpecLayerPrefillWorkspace,
+        prompt_num_tokens: int,
+        tile_size: int,
+        builder: AttentionMetadataBuilder,
+    ) -> tuple[
+        tuple[tuple[RetroSpecLayerPrefillTile, AttentionMetadata], ...],
+        RetroSpecLayerPrefillTile,
+    ]:
+        tiles = tuple(
+            workspace.tile(
+                tile_start,
+                min(tile_start + tile_size, prompt_num_tokens),
+            )
+            for tile_start in range(0, prompt_num_tokens, tile_size)
+        )
+        tile_plan = tuple(
+            (
+                tile,
+                self._build_retrospec_prefill_tile_metadata(tile, builder),
+            )
+            for tile in tiles
+        )
+        return tile_plan, workspace.tile(0, prompt_num_tokens)
+
     def _execute_retrospec_layer_major_prefill(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3239,7 +3296,44 @@ class GPUModelRunner(
         )
         hidden_states = layer_model.embed_input_ids(prompt_token_ids)
         builder = drafter.get_attention_metadata_builder()
-        tile_size = self.scheduler_config.max_num_batched_tokens
+        tile_planner = self.retrospec_layer_prefill_tile_planner
+        if tile_planner is None:
+            raise RuntimeError("Layer-major prefill tile planner is unavailable")
+
+        tile_selection = tile_planner.select(prompt_num_tokens)
+        tile_size_tensor = torch.tensor(
+            tile_selection.tile_size,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        if get_tp_group().world_size > 1:
+            torch.distributed.all_reduce(
+                tile_size_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_tp_group().device_group,
+            )
+        tile_size = int(tile_size_tensor.item())
+
+        stats = drafter.performance_stats
+        stats.observe_peak("layer_prefill_tile_tokens", tile_size)
+        stats.observe_peak(
+            "layer_prefill_activation_estimate_bytes",
+            tile_size * tile_planner.activation_bytes_per_token,
+        )
+        logger.debug(
+            "RetroSpec layer-prefill selected %d-token tiles for %d tokens "
+            "(available=%d, reserve=%d, activation_estimate=%d)",
+            tile_size,
+            prompt_num_tokens,
+            tile_selection.available_memory_bytes,
+            tile_selection.reserve_memory_bytes,
+            tile_size * tile_planner.activation_bytes_per_token,
+        )
+
+        tile_plan: (
+            tuple[tuple[RetroSpecLayerPrefillTile, AttentionMetadata], ...] | None
+        ) = None
+        full_prompt_tile: RetroSpecLayerPrefillTile | None = None
 
         try:
             for layer_index, layer_name in zip(layer_indices, layer_names, strict=True):
@@ -3253,12 +3347,26 @@ class GPUModelRunner(
 
                 workspace.begin_layer(layer_name)
                 try:
-                    for tile_start in range(0, prompt_num_tokens, tile_size):
-                        tile_end = min(tile_start + tile_size, prompt_num_tokens)
-                        tile = workspace.tile(tile_start, tile_end)
-                        attn_metadata = self._build_retrospec_prefill_tile_metadata(
-                            tile, builder
+                    if tile_plan is None:
+                        tile_plan, full_prompt_tile = (
+                            self._build_retrospec_prefill_tile_plan(
+                                workspace,
+                                prompt_num_tokens,
+                                tile_size,
+                                builder,
+                            )
                         )
+                        stats.add_counter(
+                            "layer_prefill_metadata_builds", len(tile_plan)
+                        )
+                        stats.add_counter(
+                            "layer_prefill_tile_executions",
+                            len(tile_plan) * len(layer_names),
+                        )
+
+                    for tile, attn_metadata in tile_plan:
+                        tile_start = tile.scheduled_start
+                        tile_end = tile.scheduled_end
                         per_layer_metadata = {layer_name: attn_metadata}
                         per_layer_slot_mapping = {layer_name: tile.slot_mapping}
 
@@ -3283,8 +3391,8 @@ class GPUModelRunner(
                             tile_hidden = tile_hidden + tile_residual
                         hidden_states[tile_start:tile_end].copy_(tile_hidden)
 
+                    assert full_prompt_tile is not None
                     key_cache, value_cache = workspace.kv_cache.unbind(0)
-                    full_prompt_tile = workspace.tile(0, prompt_num_tokens)
                     reuse_ready_event = drafter.stage_layer_major_prefill_layer(
                         layer_name=layer_name,
                         request_id=descriptor.request_id,
@@ -6622,6 +6730,20 @@ class GPUModelRunner(
                 backend=attn_group.backend,
                 kv_cache_spec=kv_cache_spec,
                 cache_dtype=self.cache_config.cache_dtype,
+            )
+            assert self.speculative_config is not None
+            self.retrospec_layer_prefill_tile_planner = (
+                RetroSpecLayerPrefillTilePlanner(
+                    device=self.device,
+                    block_size=kv_cache_spec.block_size,
+                    target_tile_tokens=(
+                        self.speculative_config.retrospec_prefill_tile_size
+                    ),
+                    minimum_tile_tokens=self.scheduler_config.max_num_batched_tokens,
+                    activation_bytes_per_token=(
+                        self._estimate_retrospec_prefill_activation_bytes_per_token()
+                    ),
+                )
             )
 
         if has_kv_transfer_group():

@@ -261,3 +261,54 @@ def test_layer_major_prefill_copies_only_resident_workspace_blocks():
     torch.testing.assert_close(native_cache[:, 5], workspace_cache[:, 3])
     torch.testing.assert_close(native_cache[:, 7], workspace_cache[:, 4])
     assert torch.all(native_cache[:, [0, 1, 3, 4, 6]] == -1)
+
+
+def test_estimate_layer_prefill_activation_bytes_uses_tp_local_widths():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(
+        dtype=torch.float16,
+        hf_text_config=SimpleNamespace(intermediate_size=14336),
+        get_hidden_size=lambda: 4096,
+        get_head_size=lambda: 128,
+        get_num_attention_heads=lambda parallel_config: 16,
+        get_num_kv_heads=lambda parallel_config: 4,
+    )
+    runner.parallel_config = SimpleNamespace(tensor_parallel_size=2)
+
+    estimated_bytes = runner._estimate_retrospec_prefill_activation_bytes_per_token()
+
+    activation_elements = 4 * 4096 + 2 * 7168 + (16 + 2 * 4) * 128
+    assert estimated_bytes == 2 * 2 * activation_elements
+
+
+def test_build_layer_prefill_tile_plan_builds_metadata_once_per_tile():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._build_retrospec_prefill_tile_metadata = Mock(
+        side_effect=lambda tile, builder: f"metadata-{tile.scheduled_start}"
+    )
+    tiles = {
+        (0, 4): SimpleNamespace(scheduled_start=0),
+        (4, 8): SimpleNamespace(scheduled_start=4),
+        (8, 10): SimpleNamespace(scheduled_start=8),
+        (0, 10): SimpleNamespace(scheduled_start=0),
+    }
+    workspace = SimpleNamespace(
+        tile=Mock(side_effect=lambda start, end: tiles[start, end])
+    )
+    builder = Mock()
+
+    tile_plan, full_prompt_tile = runner._build_retrospec_prefill_tile_plan(
+        workspace,
+        prompt_num_tokens=10,
+        tile_size=4,
+        builder=builder,
+    )
+
+    assert [tile.scheduled_start for tile, _ in tile_plan] == [0, 4, 8]
+    assert [metadata for _, metadata in tile_plan] == [
+        "metadata-0",
+        "metadata-4",
+        "metadata-8",
+    ]
+    assert full_prompt_tile is tiles[0, 10]
+    assert runner._build_retrospec_prefill_tile_metadata.call_count == 3

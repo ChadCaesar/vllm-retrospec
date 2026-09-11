@@ -8,7 +8,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import torch
 
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.core.sched.output import (
     RetroSpecLayerMajorPrefillDescriptor,
@@ -72,6 +72,94 @@ class RetroSpecLayerPrefillTile:
     @property
     def num_scheduled_tokens(self) -> int:
         return self.scheduled_end - self.scheduled_start
+
+
+@dataclass(frozen=True)
+class RetroSpecLayerPrefillTileSelection:
+    tile_size: int
+    available_memory_bytes: int
+    reserve_memory_bytes: int
+    estimated_activation_bytes: int
+
+
+class RetroSpecLayerPrefillTilePlanner:
+    """Choose a stable layer-prefill tile without OOM probing."""
+
+    _MIN_MEMORY_RESERVE_BYTES = 1 << 30
+    _MEMORY_RESERVE_FRACTION = 0.10
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        block_size: int,
+        target_tile_tokens: int,
+        minimum_tile_tokens: int,
+        activation_bytes_per_token: int,
+    ) -> None:
+        if device.type != "cuda":
+            raise ValueError("Layer-prefill tile planning requires CUDA")
+        if block_size <= 0:
+            raise ValueError("Layer-prefill tile block size must be positive")
+        if target_tile_tokens <= 0 or minimum_tile_tokens <= 0:
+            raise ValueError("Layer-prefill tile sizes must be positive")
+        if activation_bytes_per_token <= 0:
+            raise ValueError("Activation bytes per token must be positive")
+
+        self.device = device
+        self.block_size = block_size
+        self.target_tile_tokens = max(
+            block_size, target_tile_tokens // block_size * block_size
+        )
+        self.minimum_tile_tokens = min(
+            self.target_tile_tokens,
+            round_up(minimum_tile_tokens, block_size),
+        )
+        self.activation_bytes_per_token = activation_bytes_per_token
+
+    def _candidate_sizes(self, prompt_num_tokens: int) -> tuple[int, ...]:
+        prompt_limit = min(prompt_num_tokens, self.target_tile_tokens)
+        minimum = min(prompt_limit, self.minimum_tile_tokens)
+        candidates = [minimum]
+        while candidates[-1] < prompt_limit:
+            next_size = min(candidates[-1] * 2, prompt_limit)
+            if next_size < prompt_limit:
+                next_size = round_up(next_size, self.block_size)
+            if next_size == candidates[-1]:
+                break
+            candidates.append(next_size)
+        return tuple(candidates)
+
+    def select(self, prompt_num_tokens: int) -> RetroSpecLayerPrefillTileSelection:
+        if prompt_num_tokens <= 0:
+            raise ValueError("Layer-prefill prompt length must be positive")
+
+        free_memory, total_memory = torch.cuda.mem_get_info(self.device)
+        allocator_slack = max(
+            torch.cuda.memory_reserved(self.device)
+            - torch.cuda.memory_allocated(self.device),
+            0,
+        )
+        available_memory = free_memory + allocator_slack
+        reserve_memory = max(
+            self._MIN_MEMORY_RESERVE_BYTES,
+            int(total_memory * self._MEMORY_RESERVE_FRACTION),
+        )
+        usable_memory = max(available_memory - reserve_memory, 0)
+
+        candidates = self._candidate_sizes(prompt_num_tokens)
+        tile_size = candidates[0]
+        for candidate in reversed(candidates):
+            if candidate * self.activation_bytes_per_token <= usable_memory:
+                tile_size = candidate
+                break
+
+        return RetroSpecLayerPrefillTileSelection(
+            tile_size=tile_size,
+            available_memory_bytes=available_memory,
+            reserve_memory_bytes=reserve_memory,
+            estimated_activation_bytes=(tile_size * self.activation_bytes_per_token),
+        )
 
 
 class RetroSpecLayerPrefillWorkspace:

@@ -28,6 +28,7 @@ def test_retrospec_defaults():
     assert config.retrospec_estimation_ratio == pytest.approx(0.232)
     assert config.retrospec_cache_ratio == pytest.approx(0.0)
     assert config.retrospec_index_segment_size == 8192
+    assert config.retrospec_prefill_tile_size == 8192
     assert config.retrospec_blocks_per_cluster == 1
     assert config.retrospec_kmeans_iterations == 10
     assert config.retrospec_max_pending_cluster_builds == 2
@@ -124,6 +125,7 @@ def test_retrospec_inherits_target_enforce_eager(target_enforce_eager: bool):
         ("retrospec_cache_ratio", -0.01),
         ("retrospec_cache_ratio", 1.01),
         ("retrospec_index_segment_size", 0),
+        ("retrospec_prefill_tile_size", 0),
         ("retrospec_blocks_per_cluster", 0),
         ("retrospec_kmeans_iterations", 0),
         ("retrospec_max_pending_cluster_builds", 0),
@@ -210,6 +212,7 @@ def test_retrospec_clears_prompt_lookup_fields():
         ("retrospec_estimation_ratio", 0.25),
         ("retrospec_cache_ratio", 0.1),
         ("retrospec_index_segment_size", 2048),
+        ("retrospec_prefill_tile_size", 4096),
         ("retrospec_blocks_per_cluster", 8),
         ("retrospec_kmeans_iterations", 5),
         ("retrospec_index_update_interval", 2048),
