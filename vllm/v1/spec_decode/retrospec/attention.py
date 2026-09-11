@@ -1353,16 +1353,11 @@ class RetroSpecSparseAttention:
         estimation_keys, estimation_values, estimation_token_counts = (
             self._get_grouped_estimation(selection)
         )
-        plan_row_indices = (
-            selection.plan_row_indices
-            if isinstance(selection, RetroSpecIndexedTokenAttentionSelection)
-            else None
-        )
         estimation = RetroSpecEstimationKVSource(
             keys=estimation_keys,
             values=estimation_values,
             token_counts=estimation_token_counts,
-            plan_row_indices=plan_row_indices,
+            plan_row_indices=None,
         )
 
         try:

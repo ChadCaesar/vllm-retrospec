@@ -233,14 +233,24 @@ def test_draft_materialization_skips_resident_lookup_without_arena():
         sparse_exact_cluster_indices=torch.full(
             (1, 1, 1), -1, dtype=torch.int32, device=device
         ),
-        sparse_estimation_keys=torch.empty(1, 1, 0, 1, device=device),
-        sparse_estimation_values=torch.empty(1, 1, 0, 1, device=device),
-        sparse_estimation_token_counts=torch.empty(
+        sparse_estimation_cluster_indices=torch.empty(
+            1, 1, 0, dtype=torch.int32, device=device
+        ),
+        expanded_exact_cluster_indices=torch.full(
+            (1, 1, 1), -1, dtype=torch.int32, device=device
+        ),
+        expanded_estimation_cluster_indices=torch.empty(
             1, 1, 0, dtype=torch.int32, device=device
         ),
         sparse_attn=torch.ones(1, device=device),
+        expanded_attn=torch.ones(1, device=device),
     )
     index.cluster_store.resolve_draft_cluster_blocks = Mock()
+    index._selection_plan_tables["layer"] = SimpleNamespace(
+        head_size=1,
+        dtype=torch.float32,
+        valid_rows=torch.zeros(1, 1, dtype=torch.bool, device=device),
+    )
 
     index.begin_proposal(["request"])
     try:
@@ -427,6 +437,9 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
             active_mask=torch.tensor([True]),
             scale=1.0,
         )
+        sparse_estimation_counts = sparse.estimation_token_counts.clone()
+        sparse_estimation_keys = sparse.estimation_keys.clone()
+        sparse_estimation_values = sparse.estimation_values.clone()
         expanded = index.materialize(
             sparse.plan,
             RetroSpecAttentionLevel.EXPANDED,
@@ -455,9 +468,9 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     assert sparse_values.tolist() == pytest.approx(
         [0.0, 0.0, 30.0, 30.0, 40.0, 40.0, 20.0, 20.0]
     )
-    assert sparse.estimation_token_counts[0, 0, 0].item() == 2
-    assert sparse.estimation_keys[0, 0, 0, 0].item() == pytest.approx(1.0)
-    assert sparse.estimation_values[0, 0, 0, 0].item() == pytest.approx(10.0)
+    assert sparse_estimation_counts[0, 0, 0].item() == 2
+    assert sparse_estimation_keys[0, 0, 0, 0].item() == pytest.approx(1.0)
+    assert sparse_estimation_values[0, 0, 0, 0].item() == pytest.approx(10.0)
 
     assert expanded.exact_token_counts.tolist() == [[10]]
     assert expanded_keys.tolist() == pytest.approx(
@@ -2197,13 +2210,14 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     assert cold.hit_attn.item() == pytest.approx(1.0)
     assert not cold.resolved_pages.hit_gate_ready.any()
     assert not cold.exact_page_token_counts.any()
-    table = index._selection_plan_tables["layer"]
-    assert table.draft_exact_page_token_counts.sum().item() == 2
+    scratch = index._draft_selection_scratch
+    assert scratch is not None
+    assert scratch.draft_exact_page_token_counts.sum().item() == 2
 
     index.cluster_store.admit_resident_clusters(
         "layer",
-        table.draft_exact_cluster_ids,
-        table.draft_exact_page_ids,
+        scratch.draft_exact_cluster_ids,
+        scratch.draft_exact_page_ids,
     )
     index.cluster_store.get_resident_page_storage("layer")
     torch.cuda.current_stream().synchronize()

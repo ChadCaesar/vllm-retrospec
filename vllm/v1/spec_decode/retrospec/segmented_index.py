@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, prod
 
 import torch
 
@@ -60,14 +60,10 @@ class RetroSpecTokenSelectionPlan:
     primary_exact_token_mask: torch.Tensor
 
     sparse_exact_cluster_indices: torch.Tensor
-    sparse_estimation_keys: torch.Tensor
-    sparse_estimation_values: torch.Tensor
-    sparse_estimation_token_counts: torch.Tensor
+    sparse_estimation_cluster_indices: torch.Tensor
 
     expanded_exact_cluster_indices: torch.Tensor
-    expanded_estimation_keys: torch.Tensor
-    expanded_estimation_values: torch.Tensor
-    expanded_estimation_token_counts: torch.Tensor
+    expanded_estimation_cluster_indices: torch.Tensor
 
     sparse_attn: torch.Tensor
     expanded_attn: torch.Tensor
@@ -113,6 +109,7 @@ class RetroSpecIndexedTokenAttentionSelection:
 
     exact_cluster_indices: torch.Tensor
 
+    estimation_cluster_indices: torch.Tensor
     estimation_keys: torch.Tensor
     estimation_values: torch.Tensor
     estimation_token_counts: torch.Tensor
@@ -262,19 +259,7 @@ class _SelectionStepWorkspace:
 
 
 @dataclass(frozen=True)
-class _SelectionPlanTable:
-    layer_name: str
-    valid_rows: torch.Tensor
-
-    request_slot_ids: torch.Tensor
-    request_slot_generations: torch.Tensor
-
-    primary_exact_token_indices: torch.Tensor
-    primary_exact_token_mask: torch.Tensor
-
-    sparse_exact_cluster_indices: torch.Tensor
-    expanded_exact_cluster_indices: torch.Tensor
-
+class _DraftSelectionScratch:
     draft_exact_cluster_ids: torch.Tensor
     draft_exact_page_ids: torch.Tensor
     draft_exact_page_token_counts: torch.Tensor
@@ -289,24 +274,147 @@ class _SelectionPlanTable:
     draft_hit_cluster_counts: torch.Tensor
     draft_miss_cluster_counts: torch.Tensor
     draft_hit_gate_ready: torch.Tensor
-    draft_prefetch_miss_cluster_ids: torch.Tensor
-    draft_prefetch_miss_positions: torch.Tensor
-    draft_prefetch_miss_counts: torch.Tensor
 
     draft_estimation_keys: torch.Tensor
     draft_estimation_values: torch.Tensor
     draft_estimation_token_counts: torch.Tensor
-    expanded_estimation_keys: torch.Tensor
-    expanded_estimation_values: torch.Tensor
-    expanded_estimation_token_counts: torch.Tensor
+    primary_topk_order: torch.Tensor
+
+    @classmethod
+    def allocate(
+        cls,
+        batch_capacity: int,
+        num_kv_heads: int,
+        primary_exact_width: int,
+        sparse_retrieval_width: int,
+        sparse_estimation_width: int,
+        max_pages_per_cluster: int,
+        head_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> "_DraftSelectionScratch":
+        group_shape = (batch_capacity, num_kv_heads)
+        cluster_shape = (*group_shape, sparse_retrieval_width)
+        page_shape = (*cluster_shape, max_pages_per_cluster)
+        compact_page_shape = (
+            *group_shape,
+            sparse_retrieval_width * max_pages_per_cluster,
+        )
+        estimation_width = sparse_estimation_width + sparse_retrieval_width
+        estimation_shape = (*group_shape, estimation_width, head_size)
+
+        return cls(
+            draft_exact_cluster_ids=torch.empty(
+                cluster_shape, dtype=torch.int64, device=device
+            ),
+            draft_exact_page_ids=torch.empty(
+                page_shape, dtype=torch.int64, device=device
+            ),
+            draft_exact_page_token_counts=torch.empty(
+                page_shape, dtype=torch.int32, device=device
+            ),
+            draft_compact_page_ids=torch.empty(
+                compact_page_shape, dtype=torch.int64, device=device
+            ),
+            draft_compact_page_token_counts=torch.empty(
+                compact_page_shape, dtype=torch.int32, device=device
+            ),
+            draft_compact_page_counts=torch.empty(
+                group_shape, dtype=torch.int32, device=device
+            ),
+            draft_clustered_token_counts=torch.empty(
+                group_shape, dtype=torch.int32, device=device
+            ),
+            draft_attention_mass=torch.empty(
+                batch_capacity, dtype=torch.float32, device=device
+            ),
+            draft_hit_attention_by_head=torch.empty(
+                group_shape, dtype=torch.float32, device=device
+            ),
+            draft_selected_cluster_counts=torch.empty(
+                group_shape, dtype=torch.int32, device=device
+            ),
+            draft_hit_cluster_counts=torch.empty(
+                group_shape, dtype=torch.int32, device=device
+            ),
+            draft_miss_cluster_counts=torch.empty(
+                group_shape, dtype=torch.int32, device=device
+            ),
+            draft_hit_gate_ready=torch.empty(
+                group_shape, dtype=torch.bool, device=device
+            ),
+            draft_estimation_keys=torch.empty(
+                estimation_shape, dtype=dtype, device=device
+            ),
+            draft_estimation_values=torch.empty(
+                estimation_shape, dtype=dtype, device=device
+            ),
+            draft_estimation_token_counts=torch.empty(
+                estimation_shape[:-1], dtype=torch.int32, device=device
+            ),
+            primary_topk_order=torch.empty(
+                (batch_capacity, num_kv_heads, primary_exact_width),
+                dtype=torch.int64,
+                device=device,
+            ),
+        )
+
+    def matches(
+        self,
+        batch_size: int,
+        num_kv_heads: int,
+        primary_exact_width: int,
+        sparse_retrieval_width: int,
+        sparse_estimation_width: int,
+        max_pages_per_cluster: int,
+        head_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> bool:
+        estimation_width = sparse_estimation_width + sparse_retrieval_width
+        return (
+            self.draft_exact_cluster_ids.shape[0] >= batch_size
+            and self.draft_exact_cluster_ids.shape[1] == num_kv_heads
+            and self.draft_exact_cluster_ids.shape[2] >= sparse_retrieval_width
+            and self.draft_exact_page_ids.shape[3] >= max_pages_per_cluster
+            and self.draft_estimation_keys.shape[2] >= estimation_width
+            and self.draft_estimation_keys.shape[3] == head_size
+            and self.primary_topk_order.shape[2] >= primary_exact_width
+            and self.draft_estimation_keys.dtype == dtype
+            and self.draft_estimation_keys.device == device
+        )
+
+
+@dataclass(frozen=True)
+class _SelectionPlanTable:
+    layer_name: str
+    valid_rows: torch.Tensor
+
+    request_slot_ids: torch.Tensor
+    request_slot_generations: torch.Tensor
+
+    primary_exact_token_indices: torch.Tensor
+    primary_exact_token_mask: torch.Tensor
+
+    sparse_exact_cluster_indices: torch.Tensor
+    sparse_estimation_cluster_indices: torch.Tensor
+    expanded_exact_cluster_indices: torch.Tensor
+    expanded_estimation_cluster_indices: torch.Tensor
+
+    draft_prefetch_miss_cluster_ids: torch.Tensor
+    draft_prefetch_miss_positions: torch.Tensor
+    draft_prefetch_miss_counts: torch.Tensor
 
     sparse_attn: torch.Tensor
     expanded_attn: torch.Tensor
-    primary_topk_order: torch.Tensor
 
     sparse_estimation_width: int
     sparse_retrieval_width: int
+    expanded_retrieval_width: int
     prefetch_width: int
+    max_pages_per_cluster: int
+    head_size: int
+    dtype: torch.dtype
 
     @classmethod
     def allocate(
@@ -334,29 +442,9 @@ class _SelectionPlanTable:
             *prefix,
             expanded_retrieval_width,
         )
-        draft_cluster_shape = (
-            batch_capacity,
-            num_kv_heads,
-            sparse_retrieval_width,
-        )
-        draft_page_shape = (*draft_cluster_shape, max_pages_per_cluster)
-        draft_estimation_width = sparse_estimation_width + sparse_retrieval_width
-        draft_estimation_shape = (
-            *prefix,
-            draft_estimation_width,
-            head_size,
-        )
-        expanded_estimation_shape = (
-            *prefix,
-            sparse_estimation_width,
-            head_size,
-        )
+        estimation_cluster_shape = (*prefix, sparse_estimation_width)
         primary_shape = (*prefix, primary_exact_width)
         prefetch_capacity = batch_capacity * num_kv_heads * prefetch_width
-        compact_page_shape = (
-            *prefix,
-            sparse_retrieval_width * max_pages_per_cluster,
-        )
 
         return cls(
             layer_name=layer_name,
@@ -378,46 +466,15 @@ class _SelectionPlanTable:
             sparse_exact_cluster_indices=torch.empty(
                 sparse_cluster_shape, dtype=torch.int32, device=device
             ),
+            sparse_estimation_cluster_indices=torch.empty(
+                estimation_cluster_shape, dtype=torch.int32, device=device
+            ),
             expanded_exact_cluster_indices=torch.empty(
                 expanded_cluster_shape, dtype=torch.int32, device=device
             ),
-            draft_exact_cluster_ids=torch.empty(
-                draft_cluster_shape, dtype=torch.int64, device=device
+            expanded_estimation_cluster_indices=torch.empty(
+                estimation_cluster_shape, dtype=torch.int32, device=device
             ),
-            draft_exact_page_ids=torch.empty(
-                draft_page_shape, dtype=torch.int64, device=device
-            ),
-            draft_exact_page_token_counts=torch.empty(
-                draft_page_shape, dtype=torch.int32, device=device
-            ),
-            draft_compact_page_ids=torch.empty(
-                compact_page_shape, dtype=torch.int64, device=device
-            ),
-            draft_compact_page_token_counts=torch.empty(
-                compact_page_shape, dtype=torch.int32, device=device
-            ),
-            draft_compact_page_counts=torch.empty(
-                prefix, dtype=torch.int32, device=device
-            ),
-            draft_clustered_token_counts=torch.empty(
-                prefix, dtype=torch.int32, device=device
-            ),
-            draft_attention_mass=torch.empty(
-                (num_steps, batch_capacity), dtype=torch.float32, device=device
-            ),
-            draft_hit_attention_by_head=torch.empty(
-                prefix, dtype=torch.float32, device=device
-            ),
-            draft_selected_cluster_counts=torch.empty(
-                prefix, dtype=torch.int32, device=device
-            ),
-            draft_hit_cluster_counts=torch.empty(
-                prefix, dtype=torch.int32, device=device
-            ),
-            draft_miss_cluster_counts=torch.empty(
-                prefix, dtype=torch.int32, device=device
-            ),
-            draft_hit_gate_ready=torch.empty(prefix, dtype=torch.bool, device=device),
             draft_prefetch_miss_cluster_ids=torch.empty(
                 (num_steps, prefetch_capacity), dtype=torch.int64, device=device
             ),
@@ -427,40 +484,19 @@ class _SelectionPlanTable:
             draft_prefetch_miss_counts=torch.zeros(
                 (num_steps, 1), dtype=torch.int32, device=device
             ),
-            draft_estimation_keys=torch.empty(
-                draft_estimation_shape, dtype=dtype, device=device
-            ),
-            draft_estimation_values=torch.empty(
-                draft_estimation_shape, dtype=dtype, device=device
-            ),
-            draft_estimation_token_counts=torch.empty(
-                draft_estimation_shape[:-1], dtype=torch.int32, device=device
-            ),
-            expanded_estimation_keys=torch.empty(
-                expanded_estimation_shape, dtype=dtype, device=device
-            ),
-            expanded_estimation_values=torch.empty(
-                expanded_estimation_shape, dtype=dtype, device=device
-            ),
-            expanded_estimation_token_counts=torch.empty(
-                expanded_estimation_shape[:-1],
-                dtype=torch.int32,
-                device=device,
-            ),
             sparse_attn=torch.empty(
                 (num_steps, batch_capacity), dtype=torch.float32, device=device
             ),
             expanded_attn=torch.empty(
                 (num_steps, batch_capacity), dtype=torch.float32, device=device
             ),
-            primary_topk_order=torch.empty(
-                (batch_capacity, num_kv_heads, primary_exact_width),
-                dtype=torch.int64,
-                device=device,
-            ),
             sparse_estimation_width=sparse_estimation_width,
             sparse_retrieval_width=sparse_retrieval_width,
+            expanded_retrieval_width=expanded_retrieval_width,
             prefetch_width=prefetch_width,
+            max_pages_per_cluster=max_pages_per_cluster,
+            head_size=head_size,
+            dtype=dtype,
         )
 
     @property
@@ -489,45 +525,26 @@ class _SelectionPlanTable:
             == (num_kv_heads, primary_exact_width)
             and self.sparse_exact_cluster_indices.shape[2:]
             == (num_kv_heads, sparse_retrieval_width)
+            and self.sparse_estimation_cluster_indices.shape[2:]
+            == (num_kv_heads, sparse_estimation_width)
             and self.prefetch_width == prefetch_width
             and self.expanded_exact_cluster_indices.shape[2:]
             == (num_kv_heads, expanded_retrieval_width)
-            and self.draft_exact_page_ids.shape
-            == (
-                self.batch_capacity,
-                num_kv_heads,
-                sparse_retrieval_width,
-                max_pages_per_cluster,
-            )
-            and self.draft_estimation_keys.shape[2:]
-            == (
-                num_kv_heads,
-                sparse_estimation_width + sparse_retrieval_width,
-                head_size,
-            )
-            and self.expanded_estimation_keys.shape[2:]
-            == (
-                num_kv_heads,
-                sparse_estimation_width,
-                head_size,
-            )
-            and self.draft_estimation_keys.dtype == dtype
-            and self.draft_estimation_keys.device == device
+            and self.expanded_estimation_cluster_indices.shape[2:]
+            == (num_kv_heads, sparse_estimation_width)
+            and self.max_pages_per_cluster == max_pages_per_cluster
+            and self.head_size == head_size
+            and self.dtype == dtype
+            and self.valid_rows.device == device
         )
 
-    def step(
-        self, step_index: int, batch_size: int
-    ) -> tuple[RetroSpecTokenSelectionPlan, _SelectionStepWorkspace]:
+    def plan(self, step_index: int, batch_size: int) -> RetroSpecTokenSelectionPlan:
         if not 0 <= step_index < self.valid_rows.shape[0]:
             raise IndexError("Selection-plan step is out of range")
         if not 0 < batch_size <= self.batch_capacity:
             raise ValueError("Selection-plan batch exceeds table capacity")
 
-        draft_keys = self.draft_estimation_keys[step_index, :batch_size]
-        draft_values = self.draft_estimation_values[step_index, :batch_size]
-        draft_counts = self.draft_estimation_token_counts[step_index, :batch_size]
-        sparse_width = self.sparse_estimation_width
-        plan = RetroSpecTokenSelectionPlan(
+        return RetroSpecTokenSelectionPlan(
             layer_name=self.layer_name,
             request_slot_ids=self.request_slot_ids[:batch_size],
             request_slot_generations=self.request_slot_generations[:batch_size],
@@ -540,56 +557,83 @@ class _SelectionPlanTable:
             sparse_exact_cluster_indices=(
                 self.sparse_exact_cluster_indices[step_index, :batch_size]
             ),
-            sparse_estimation_keys=draft_keys[:, :, :sparse_width],
-            sparse_estimation_values=draft_values[:, :, :sparse_width],
-            sparse_estimation_token_counts=draft_counts[:, :, :sparse_width],
+            sparse_estimation_cluster_indices=(
+                self.sparse_estimation_cluster_indices[step_index, :batch_size]
+            ),
             expanded_exact_cluster_indices=(
                 self.expanded_exact_cluster_indices[step_index, :batch_size]
             ),
-            expanded_estimation_keys=(
-                self.expanded_estimation_keys[step_index, :batch_size]
-            ),
-            expanded_estimation_values=(
-                self.expanded_estimation_values[step_index, :batch_size]
-            ),
-            expanded_estimation_token_counts=(
-                self.expanded_estimation_token_counts[step_index, :batch_size]
+            expanded_estimation_cluster_indices=(
+                self.expanded_estimation_cluster_indices[step_index, :batch_size]
             ),
             sparse_attn=self.sparse_attn[step_index, :batch_size],
             expanded_attn=self.expanded_attn[step_index, :batch_size],
         )
-        workspace = _SelectionStepWorkspace(
-            draft_exact_cluster_ids=self.draft_exact_cluster_ids[:batch_size],
-            draft_exact_page_ids=self.draft_exact_page_ids[:batch_size],
-            draft_exact_page_token_counts=(
-                self.draft_exact_page_token_counts[:batch_size]
+
+    def step_workspace(
+        self,
+        step_index: int,
+        batch_size: int,
+        scratch: _DraftSelectionScratch,
+    ) -> _SelectionStepWorkspace:
+        if not 0 <= step_index < self.valid_rows.shape[0]:
+            raise IndexError("Selection-plan step is out of range")
+        if not 0 < batch_size <= self.batch_capacity:
+            raise ValueError("Selection-plan batch exceeds table capacity")
+
+        draft_width = self.sparse_estimation_width + self.sparse_retrieval_width
+        num_kv_heads = self.sparse_exact_cluster_indices.shape[2]
+        retrieval_width = self.sparse_retrieval_width
+        max_pages = self.max_pages_per_cluster
+        compact_width = retrieval_width * max_pages
+        group_shape = (batch_size, num_kv_heads)
+        cluster_shape = (*group_shape, retrieval_width)
+        page_shape = (*cluster_shape, max_pages)
+        compact_shape = (*group_shape, compact_width)
+        estimation_shape = (*group_shape, draft_width)
+
+        def prefix_view(tensor: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+            num_items = prod(shape)
+            return tensor.view(-1)[:num_items].view(shape)
+
+        return _SelectionStepWorkspace(
+            draft_exact_cluster_ids=prefix_view(
+                scratch.draft_exact_cluster_ids, cluster_shape
             ),
-            draft_compact_page_ids=(
-                self.draft_compact_page_ids[step_index, :batch_size]
+            draft_exact_page_ids=prefix_view(scratch.draft_exact_page_ids, page_shape),
+            draft_exact_page_token_counts=(
+                prefix_view(scratch.draft_exact_page_token_counts, page_shape)
+            ),
+            draft_compact_page_ids=prefix_view(
+                scratch.draft_compact_page_ids, compact_shape
             ),
             draft_compact_page_token_counts=(
-                self.draft_compact_page_token_counts[step_index, :batch_size]
+                prefix_view(scratch.draft_compact_page_token_counts, compact_shape)
             ),
             draft_compact_page_counts=(
-                self.draft_compact_page_counts[step_index, :batch_size]
+                prefix_view(scratch.draft_compact_page_counts, group_shape)
             ),
             draft_clustered_token_counts=(
-                self.draft_clustered_token_counts[step_index, :batch_size]
+                prefix_view(scratch.draft_clustered_token_counts, group_shape)
             ),
-            draft_attention_mass=self.draft_attention_mass[step_index, :batch_size],
+            draft_attention_mass=prefix_view(
+                scratch.draft_attention_mass, (batch_size,)
+            ),
             draft_hit_attention_by_head=(
-                self.draft_hit_attention_by_head[step_index, :batch_size]
+                prefix_view(scratch.draft_hit_attention_by_head, group_shape)
             ),
             draft_selected_cluster_counts=(
-                self.draft_selected_cluster_counts[step_index, :batch_size]
+                prefix_view(scratch.draft_selected_cluster_counts, group_shape)
             ),
             draft_hit_cluster_counts=(
-                self.draft_hit_cluster_counts[step_index, :batch_size]
+                prefix_view(scratch.draft_hit_cluster_counts, group_shape)
             ),
             draft_miss_cluster_counts=(
-                self.draft_miss_cluster_counts[step_index, :batch_size]
+                prefix_view(scratch.draft_miss_cluster_counts, group_shape)
             ),
-            draft_hit_gate_ready=(self.draft_hit_gate_ready[step_index, :batch_size]),
+            draft_hit_gate_ready=(
+                prefix_view(scratch.draft_hit_gate_ready, group_shape)
+            ),
             draft_prefetch_miss_cluster_ids=(
                 self.draft_prefetch_miss_cluster_ids[step_index]
             ),
@@ -597,13 +641,77 @@ class _SelectionPlanTable:
                 self.draft_prefetch_miss_positions[step_index]
             ),
             draft_prefetch_miss_count=self.draft_prefetch_miss_counts[step_index],
-            draft_estimation_keys=draft_keys,
-            draft_estimation_values=draft_values,
-            draft_estimation_token_counts=draft_counts,
-            sparse_estimation_width=sparse_width,
+            draft_estimation_keys=prefix_view(
+                scratch.draft_estimation_keys, (*estimation_shape, self.head_size)
+            ),
+            draft_estimation_values=prefix_view(
+                scratch.draft_estimation_values, (*estimation_shape, self.head_size)
+            ),
+            draft_estimation_token_counts=(
+                prefix_view(scratch.draft_estimation_token_counts, estimation_shape)
+            ),
+            sparse_estimation_width=self.sparse_estimation_width,
             sparse_retrieval_width=self.sparse_retrieval_width,
         )
-        return plan, workspace
+
+
+@dataclass(frozen=True)
+class _VerificationEstimationWorkspace:
+    selected_cluster_indices: torch.Tensor
+    selected_cluster_mask: torch.Tensor
+    request_slot_ids: torch.Tensor
+    request_slot_generations: torch.Tensor
+    keys: torch.Tensor
+    values: torch.Tensor
+    token_counts: torch.Tensor
+
+    @classmethod
+    def allocate(
+        cls,
+        pair_capacity: int,
+        num_kv_heads: int,
+        estimation_width: int,
+        head_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> "_VerificationEstimationWorkspace":
+        cluster_shape = (pair_capacity, num_kv_heads, estimation_width)
+        summary_shape = (*cluster_shape, head_size)
+        return cls(
+            selected_cluster_indices=torch.empty(
+                cluster_shape, dtype=torch.int32, device=device
+            ),
+            selected_cluster_mask=torch.empty(
+                cluster_shape, dtype=torch.bool, device=device
+            ),
+            request_slot_ids=torch.empty(
+                pair_capacity, dtype=torch.int64, device=device
+            ),
+            request_slot_generations=torch.empty(
+                pair_capacity, dtype=torch.int64, device=device
+            ),
+            keys=torch.empty(summary_shape, dtype=dtype, device=device),
+            values=torch.empty(summary_shape, dtype=dtype, device=device),
+            token_counts=torch.empty(cluster_shape, dtype=torch.int32, device=device),
+        )
+
+    def matches(
+        self,
+        pair_capacity: int,
+        num_kv_heads: int,
+        estimation_width: int,
+        head_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> bool:
+        return (
+            self.keys.shape[0] >= pair_capacity
+            and self.keys.shape[1] == num_kv_heads
+            and self.keys.shape[2] >= estimation_width
+            and self.keys.shape[3] == head_size
+            and self.keys.dtype == dtype
+            and self.keys.device == device
+        )
 
 
 @dataclass(frozen=True)
@@ -779,6 +887,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self._selection_plan_tables: dict[str, _SelectionPlanTable] = {}
         self._selection_plan_written_layers: set[str] = set()
         self._indexed_plan_workspace: _IndexedPlanWorkspace | None = None
+        self._draft_selection_scratch: _DraftSelectionScratch | None = None
+        self._verification_estimation_workspace: (
+            _VerificationEstimationWorkspace | None
+        ) = None
 
         # CPU-offload construction is staged during layer execution and
         # committed after the complete prefill attention context.
@@ -2713,6 +2825,108 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         return selected_scores.masked_fill(~selected_mask, 0.0).sum(dim=2)
 
+    def _get_draft_selection_scratch(
+        self,
+        batch_size: int,
+        num_kv_heads: int,
+        primary_exact_width: int,
+        sparse_retrieval_width: int,
+        sparse_estimation_width: int,
+        max_pages_per_cluster: int,
+        head_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> _DraftSelectionScratch:
+        scratch = self._draft_selection_scratch
+        matches = scratch is not None and scratch.matches(
+            batch_size=batch_size,
+            num_kv_heads=num_kv_heads,
+            primary_exact_width=primary_exact_width,
+            sparse_retrieval_width=sparse_retrieval_width,
+            sparse_estimation_width=sparse_estimation_width,
+            max_pages_per_cluster=max_pages_per_cluster,
+            head_size=head_size,
+            dtype=dtype,
+            device=device,
+        )
+        if matches:
+            return scratch
+
+        batch_capacity = batch_size
+        compatible_scratch = (
+            scratch is not None
+            and scratch.draft_exact_cluster_ids.shape[1] == num_kv_heads
+            and scratch.draft_estimation_keys.shape[3] == head_size
+            and scratch.draft_estimation_keys.dtype == dtype
+            and scratch.draft_estimation_keys.device == device
+        )
+        if compatible_scratch:
+            assert scratch is not None
+            batch_capacity = max(
+                batch_capacity,
+                scratch.draft_exact_cluster_ids.shape[0],
+            )
+            primary_exact_width = max(
+                primary_exact_width, scratch.primary_topk_order.shape[2]
+            )
+            old_retrieval_width = scratch.draft_exact_cluster_ids.shape[2]
+            old_estimation_width = (
+                scratch.draft_estimation_keys.shape[2] - old_retrieval_width
+            )
+            sparse_retrieval_width = max(sparse_retrieval_width, old_retrieval_width)
+            sparse_estimation_width = max(sparse_estimation_width, old_estimation_width)
+            max_pages_per_cluster = max(
+                max_pages_per_cluster, scratch.draft_exact_page_ids.shape[3]
+            )
+        scratch = _DraftSelectionScratch.allocate(
+            batch_capacity=batch_capacity,
+            num_kv_heads=num_kv_heads,
+            primary_exact_width=primary_exact_width,
+            sparse_retrieval_width=sparse_retrieval_width,
+            sparse_estimation_width=sparse_estimation_width,
+            max_pages_per_cluster=max_pages_per_cluster,
+            head_size=head_size,
+            dtype=dtype,
+            device=device,
+        )
+        self._draft_selection_scratch = scratch
+        return scratch
+
+    def _get_verification_estimation_workspace(
+        self,
+        pair_capacity: int,
+        num_kv_heads: int,
+        estimation_width: int,
+        head_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> _VerificationEstimationWorkspace:
+        workspace = self._verification_estimation_workspace
+        matches = workspace is not None and workspace.matches(
+            pair_capacity=pair_capacity,
+            num_kv_heads=num_kv_heads,
+            estimation_width=estimation_width,
+            head_size=head_size,
+            dtype=dtype,
+            device=device,
+        )
+        if matches:
+            return workspace
+
+        if workspace is not None:
+            pair_capacity = max(pair_capacity, workspace.keys.shape[0])
+            estimation_width = max(estimation_width, workspace.keys.shape[2])
+        workspace = _VerificationEstimationWorkspace.allocate(
+            pair_capacity=pair_capacity,
+            num_kv_heads=num_kv_heads,
+            estimation_width=estimation_width,
+            head_size=head_size,
+            dtype=dtype,
+            device=device,
+        )
+        self._verification_estimation_workspace = workspace
+        return workspace
+
     def _get_selection_plan_step(
         self,
         layer_name: str,
@@ -2806,7 +3020,19 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             self._selection_plan_tables[layer_name] = table
 
         assert table is not None
-        plan, workspace = table.step(plan_slot, batch_size)
+        scratch = self._get_draft_selection_scratch(
+            batch_size=batch_size,
+            num_kv_heads=num_kv_heads,
+            primary_exact_width=primary_exact_width,
+            sparse_retrieval_width=sparse_retrieval_width,
+            sparse_estimation_width=sparse_estimation_width,
+            max_pages_per_cluster=view.max_pages_per_cluster,
+            head_size=head_size,
+            dtype=dtype,
+            device=device,
+        )
+        plan = table.plan(plan_slot, batch_size)
+        workspace = table.step_workspace(plan_slot, batch_size, scratch)
         return plan, workspace, table
 
     @staticmethod
@@ -3010,12 +3236,17 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         per_head_forced_exact = forced_exact_mask.unsqueeze(1).expand(
             -1, num_kv_heads, -1
         )
+        scratch = self._draft_selection_scratch
+        if scratch is None:
+            raise RuntimeError("Draft selection scratch was not prepared")
         self._pack_bounded_mask_indices(
             per_head_forced_exact,
             plan.primary_exact_token_indices.shape[-1],
             plan.primary_exact_token_indices,
             plan.primary_exact_token_mask,
-            table.primary_topk_order[: forced_exact_mask.shape[0]],
+            scratch.primary_topk_order.view(-1)[
+                : plan.primary_exact_token_indices.numel()
+            ].view_as(plan.primary_exact_token_indices),
         )
         return plan, output_workspace, table
 
@@ -3069,11 +3300,23 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         plan.sparse_exact_cluster_indices.masked_fill_(
             ~cluster_zones.sparse_retrieval_mask, -1
         )
+        plan.sparse_estimation_cluster_indices.copy_(
+            cluster_zones.sparse_estimation_indices
+        )
+        plan.sparse_estimation_cluster_indices.masked_fill_(
+            ~cluster_zones.sparse_estimation_mask, -1
+        )
         plan.expanded_exact_cluster_indices.copy_(
             cluster_zones.expanded_retrieval_indices
         )
         plan.expanded_exact_cluster_indices.masked_fill_(
             ~cluster_zones.expanded_retrieval_mask, -1
+        )
+        plan.expanded_estimation_cluster_indices.copy_(
+            cluster_zones.expanded_estimation_indices
+        )
+        plan.expanded_estimation_cluster_indices.masked_fill_(
+            ~cluster_zones.expanded_estimation_mask, -1
         )
 
         self._build_resident_exact_cluster_selection(
@@ -3085,25 +3328,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             output_workspace.draft_exact_page_token_counts,
         )
 
+        sparse_width = output_workspace.sparse_estimation_width
         self._build_resident_estimation_selection(
             view,
             cluster_zones.sparse_estimation_indices,
             cluster_zones.sparse_estimation_mask,
             head_size,
             dtype,
-            plan.sparse_estimation_keys,
-            plan.sparse_estimation_values,
-            plan.sparse_estimation_token_counts,
-        )
-        self._build_resident_estimation_selection(
-            view,
-            cluster_zones.expanded_estimation_indices,
-            cluster_zones.expanded_estimation_mask,
-            head_size,
-            dtype,
-            plan.expanded_estimation_keys,
-            plan.expanded_estimation_values,
-            plan.expanded_estimation_token_counts,
+            output_workspace.draft_estimation_keys[:, :, :sparse_width],
+            output_workspace.draft_estimation_values[:, :, :sparse_width],
+            output_workspace.draft_estimation_token_counts[:, :, :sparse_width],
         )
 
         plan.sparse_attn.copy_(sparse_attn)
@@ -3158,7 +3392,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             retrieval_ratio=self.retrieval_ratio,
             estimation_ratio=self.estimation_ratio,
             sparse_exact_cluster_indices=plan.sparse_exact_cluster_indices,
+            sparse_estimation_cluster_indices=(plan.sparse_estimation_cluster_indices),
             expanded_exact_cluster_indices=plan.expanded_exact_cluster_indices,
+            expanded_estimation_cluster_indices=(
+                plan.expanded_estimation_cluster_indices
+            ),
             draft_exact_cluster_ids=output_workspace.draft_exact_cluster_ids,
             draft_exact_page_ids=output_workspace.draft_exact_page_ids,
             draft_exact_page_token_counts=(
@@ -3169,9 +3407,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             draft_estimation_token_counts=(
                 output_workspace.draft_estimation_token_counts
             ),
-            expanded_estimation_keys=plan.expanded_estimation_keys,
-            expanded_estimation_values=plan.expanded_estimation_values,
-            expanded_estimation_token_counts=(plan.expanded_estimation_token_counts),
             sparse_attn=plan.sparse_attn,
             expanded_attn=plan.expanded_attn,
         )
@@ -3188,8 +3423,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         table = self._selection_plan_tables.get(layer_name)
         if table is None:
             raise RuntimeError(f"No draft selection plan for layer {layer_name!r}")
-        plan, _ = table.step(step_index, len(self._proposal_request_ids))
-        return plan
+        return table.plan(step_index, len(self._proposal_request_ids))
 
     def prepare_indexed_plan_workspace(self, pair_capacity: int) -> None:
         if pair_capacity <= 0:
@@ -3208,6 +3442,111 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     @staticmethod
     def _flatten_plan_rows(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.flatten(0, 1)
+
+    def _materialize_estimation_selection(
+        self,
+        layer_name: str,
+        cluster_indices: torch.Tensor,
+        request_slot_ids: torch.Tensor,
+        request_slot_generations: torch.Tensor,
+        head_size: int,
+        dtype: torch.dtype,
+        plan_row_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_rows = (
+            cluster_indices.shape[0]
+            if plan_row_indices is None
+            else plan_row_indices.shape[0]
+        )
+        num_kv_heads = cluster_indices.shape[1]
+        estimation_width = cluster_indices.shape[2]
+        workspace = self._get_verification_estimation_workspace(
+            pair_capacity=num_rows,
+            num_kv_heads=num_kv_heads,
+            estimation_width=estimation_width,
+            head_size=head_size,
+            dtype=dtype,
+            device=cluster_indices.device,
+        )
+
+        cluster_shape = (num_rows, num_kv_heads, estimation_width)
+        summary_shape = (*cluster_shape, head_size)
+        num_clusters = prod(cluster_shape)
+        num_summary_items = prod(summary_shape)
+        selected_indices = workspace.selected_cluster_indices.view(-1)[
+            :num_clusters
+        ].view(cluster_shape)
+        selected_mask = workspace.selected_cluster_mask.view(-1)[:num_clusters].view(
+            cluster_shape
+        )
+        packed_slots = workspace.request_slot_ids[:num_rows]
+        packed_generations = workspace.request_slot_generations[:num_rows]
+
+        if plan_row_indices is None:
+            selected_indices.copy_(cluster_indices)
+            packed_slots.copy_(request_slot_ids)
+            packed_generations.copy_(request_slot_generations)
+        else:
+            torch.index_select(
+                cluster_indices,
+                0,
+                plan_row_indices,
+                out=selected_indices,
+            )
+            request_rows = plan_row_indices.remainder(request_slot_ids.shape[0])
+            torch.index_select(
+                request_slot_ids,
+                0,
+                request_rows,
+                out=packed_slots,
+            )
+            torch.index_select(
+                request_slot_generations,
+                0,
+                request_rows,
+                out=packed_generations,
+            )
+
+        torch.ge(selected_indices, 0, out=selected_mask)
+        view = self._gpu_index_residency.get_active_view(
+            layer_name,
+            self._proposal_request_ids,
+            cluster_indices.device,
+        )
+        arena = view.arena
+        if arena is not None:
+            valid_slots = packed_slots >= 0
+            safe_slots = packed_slots.clamp_min(0)
+            current_generations = arena.generations.index_select(0, safe_slots)
+            descriptors_valid = ~valid_slots | (
+                current_generations == packed_generations
+            )
+            torch._assert_async(
+                descriptors_valid.all(),
+                f"Stale RetroSpec request descriptor for layer {layer_name!r}",
+            )
+
+        row_view = RetroSpecResidentBatchView(
+            arena=arena,
+            request_slot_ids=packed_slots,
+            max_num_clusters=view.max_num_clusters,
+            max_pages_per_cluster=view.max_pages_per_cluster,
+            max_num_pages=view.max_num_pages,
+        )
+        keys = workspace.keys.view(-1)[:num_summary_items].view(summary_shape)
+        values = workspace.values.view(-1)[:num_summary_items].view(summary_shape)
+        counts = workspace.token_counts.view(-1)[:num_clusters].view(cluster_shape)
+        self._build_resident_estimation_selection(
+            row_view,
+            selected_indices,
+            selected_mask,
+            head_size,
+            dtype,
+            keys,
+            values,
+            counts,
+        )
+        return selected_indices, keys, values, counts
 
     def get_indexed_selection(
         self,
@@ -3249,23 +3588,25 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         if level == RetroSpecAttentionLevel.SPARSE:
             exact_cluster_indices = table.sparse_exact_cluster_indices
-            width = table.sparse_estimation_width
-            estimation_keys = table.draft_estimation_keys[:, :, :, :width]
-            estimation_values = table.draft_estimation_values[:, :, :, :width]
-            estimation_token_counts = table.draft_estimation_token_counts[
-                :, :, :, :width
-            ]
+            estimation_cluster_indices = table.sparse_estimation_cluster_indices
             attention_mass = table.sparse_attn
         elif level == RetroSpecAttentionLevel.EXPANDED:
             exact_cluster_indices = table.expanded_exact_cluster_indices
-            estimation_keys = table.expanded_estimation_keys
-            estimation_values = table.expanded_estimation_values
-            estimation_token_counts = table.expanded_estimation_token_counts
+            estimation_cluster_indices = table.expanded_estimation_cluster_indices
             attention_mass = table.expanded_attn
         else:
             raise ValueError(f"Unsupported RetroSpec attention level: {level}")
 
         flatten = self._flatten_plan_rows
+        packed_indices, keys, values, counts = self._materialize_estimation_selection(
+            layer_name=layer_name,
+            cluster_indices=flatten(estimation_cluster_indices),
+            request_slot_ids=table.request_slot_ids,
+            request_slot_generations=table.request_slot_generations,
+            head_size=table.head_size,
+            dtype=table.dtype,
+            plan_row_indices=plan_rows,
+        )
         return RetroSpecIndexedTokenAttentionSelection(
             layer_name=layer_name,
             plan_row_indices=plan_rows,
@@ -3274,9 +3615,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             primary_exact_token_indices=flatten(table.primary_exact_token_indices),
             primary_exact_token_mask=flatten(table.primary_exact_token_mask),
             exact_cluster_indices=flatten(exact_cluster_indices),
-            estimation_keys=flatten(estimation_keys),
-            estimation_values=flatten(estimation_values),
-            estimation_token_counts=flatten(estimation_token_counts),
+            estimation_cluster_indices=packed_indices,
+            estimation_keys=keys,
+            estimation_values=values,
+            estimation_token_counts=counts,
             attention_mass=attention_mass.view(-1),
         )
 
@@ -3291,9 +3633,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         primary_indices = gather(selection.primary_exact_token_indices)
         primary_mask = gather(selection.primary_exact_token_mask)
         cluster_indices = gather(selection.exact_cluster_indices)
-        estimation_keys = gather(selection.estimation_keys)
-        estimation_values = gather(selection.estimation_values)
-        estimation_counts = gather(selection.estimation_token_counts)
+        estimation_indices = selection.estimation_cluster_indices
+        estimation_keys = selection.estimation_keys
+        estimation_values = selection.estimation_values
+        estimation_counts = selection.estimation_token_counts
         attention_mass = gather(selection.attention_mass)
         batch_capacity = selection.request_slot_ids.shape[0]
         request_rows = rows.remainder(batch_capacity)
@@ -3314,13 +3657,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             primary_exact_token_indices=primary_indices,
             primary_exact_token_mask=primary_mask,
             sparse_exact_cluster_indices=cluster_indices,
-            sparse_estimation_keys=estimation_keys,
-            sparse_estimation_values=estimation_values,
-            sparse_estimation_token_counts=estimation_counts,
+            sparse_estimation_cluster_indices=estimation_indices,
             expanded_exact_cluster_indices=cluster_indices,
-            expanded_estimation_keys=estimation_keys,
-            expanded_estimation_values=estimation_values,
-            expanded_estimation_token_counts=estimation_counts,
+            expanded_estimation_cluster_indices=estimation_indices,
             sparse_attn=attention_mass,
             expanded_attn=attention_mass,
         )
@@ -3642,19 +3981,26 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     ) -> RetroSpecTokenAttentionSelection:
         if level == RetroSpecAttentionLevel.SPARSE:
             cluster_indices = plan.sparse_exact_cluster_indices
-            estimation_keys = plan.sparse_estimation_keys
-            estimation_values = plan.sparse_estimation_values
-            estimation_token_counts = plan.sparse_estimation_token_counts
+            estimation_cluster_indices = plan.sparse_estimation_cluster_indices
             attention_mass = plan.sparse_attn
         elif level == RetroSpecAttentionLevel.EXPANDED:
             cluster_indices = plan.expanded_exact_cluster_indices
-            estimation_keys = plan.expanded_estimation_keys
-            estimation_values = plan.expanded_estimation_values
-            estimation_token_counts = plan.expanded_estimation_token_counts
+            estimation_cluster_indices = plan.expanded_estimation_cluster_indices
             attention_mass = plan.expanded_attn
         else:
             raise ValueError(f"Unsupported RetroSpec attention level: {level}")
 
+        table = self._selection_plan_tables[plan.layer_name]
+        _, estimation_keys, estimation_values, estimation_token_counts = (
+            self._materialize_estimation_selection(
+                layer_name=plan.layer_name,
+                cluster_indices=estimation_cluster_indices,
+                request_slot_ids=plan.request_slot_ids,
+                request_slot_generations=plan.request_slot_generations,
+                head_size=table.head_size,
+                dtype=table.dtype,
+            )
+        )
         cluster_ids, page_ids, page_token_counts = self._materialize_logical_selection(
             layer_name=plan.layer_name,
             cluster_indices=cluster_indices,

@@ -203,20 +203,13 @@ def make_token_plan(
         dtype=torch.int64,
     )
     exact_mask = torch.zeros_like(exact_indices, dtype=torch.bool)
-    estimation_keys = torch.zeros(
-        batch_size,
-        num_kv_heads,
-        estimation_width,
-        1,
-    )
-    estimation_counts = torch.zeros(
-        batch_size,
-        num_kv_heads,
-        estimation_width,
-        dtype=torch.int32,
-    )
     cluster_indices = torch.full(
         (batch_size, num_kv_heads, exact_width), -1, dtype=torch.int32
+    )
+    estimation_cluster_indices = torch.full(
+        (batch_size, num_kv_heads, estimation_width),
+        -1,
+        dtype=torch.int32,
     )
 
     return RetroSpecTokenSelectionPlan(
@@ -226,13 +219,9 @@ def make_token_plan(
         primary_exact_token_indices=exact_indices,
         primary_exact_token_mask=exact_mask,
         sparse_exact_cluster_indices=cluster_indices,
-        sparse_estimation_keys=estimation_keys,
-        sparse_estimation_values=estimation_keys.clone(),
-        sparse_estimation_token_counts=estimation_counts,
+        sparse_estimation_cluster_indices=estimation_cluster_indices,
         expanded_exact_cluster_indices=cluster_indices,
-        expanded_estimation_keys=estimation_keys,
-        expanded_estimation_values=estimation_keys.clone(),
-        expanded_estimation_token_counts=estimation_counts,
+        expanded_estimation_cluster_indices=estimation_cluster_indices.clone(),
         sparse_attn=torch.ones(batch_size),
         expanded_attn=torch.ones(batch_size),
     )
@@ -261,6 +250,24 @@ def make_empty_logical_selection(
     return cluster_ids, page_ids, torch.empty_like(page_ids, dtype=torch.int32)
 
 
+def make_empty_estimation(
+    plan: RetroSpecTokenSelectionPlan,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> dict[str, torch.Tensor]:
+    shape = (*plan.sparse_estimation_cluster_indices.shape, 1)
+    if device is None:
+        device = plan.sparse_estimation_cluster_indices.device
+    keys = torch.empty(shape, dtype=dtype, device=device)
+    return {
+        "estimation_keys": keys,
+        "estimation_values": torch.empty_like(keys),
+        "estimation_token_counts": torch.empty(
+            shape[:-1], dtype=torch.int32, device=device
+        ),
+    }
+
+
 def make_selection(batch_size: int = 2) -> RetroSpecTokenAttentionSelection:
     plan = make_plan(batch_size)
     cluster_ids, page_ids, page_token_counts = make_empty_logical_selection(plan)
@@ -269,9 +276,7 @@ def make_selection(batch_size: int = 2) -> RetroSpecTokenAttentionSelection:
         exact_page_ids=page_ids,
         exact_page_token_counts=page_token_counts,
         exact_token_counts=torch.zeros(batch_size, 1, dtype=torch.int32),
-        estimation_keys=plan.sparse_estimation_keys,
-        estimation_values=plan.sparse_estimation_values,
-        estimation_token_counts=plan.sparse_estimation_token_counts,
+        **make_empty_estimation(plan),
         attention_mass=torch.ones(batch_size),
         plan=plan,
         resolved_pages=None,
@@ -284,13 +289,9 @@ _TOKEN_PLAN_TENSOR_FIELDS = (
     "primary_exact_token_indices",
     "primary_exact_token_mask",
     "sparse_exact_cluster_indices",
-    "sparse_estimation_keys",
-    "sparse_estimation_values",
-    "sparse_estimation_token_counts",
+    "sparse_estimation_cluster_indices",
     "expanded_exact_cluster_indices",
-    "expanded_estimation_keys",
-    "expanded_estimation_values",
-    "expanded_estimation_token_counts",
+    "expanded_estimation_cluster_indices",
     "sparse_attn",
     "expanded_attn",
 )
@@ -305,9 +306,9 @@ def store_token_plan(
     batch_size, num_kv_heads, primary_width = plan.primary_exact_token_indices.shape
     sparse_width = plan.sparse_exact_cluster_indices.shape[-1]
     expanded_width = plan.expanded_exact_cluster_indices.shape[-1]
-    estimation_width = plan.sparse_estimation_keys.shape[-2]
+    estimation_width = plan.sparse_estimation_cluster_indices.shape[-1]
     max_pages_per_cluster = 1
-    head_size = plan.sparse_estimation_keys.shape[-1]
+    head_size = 1
     table = index._selection_plan_tables.get(plan.layer_name)
     if table is None:
         table = _SelectionPlanTable.allocate(
@@ -322,12 +323,12 @@ def store_token_plan(
             sparse_estimation_width=estimation_width,
             max_pages_per_cluster=max_pages_per_cluster,
             head_size=head_size,
-            dtype=plan.sparse_estimation_keys.dtype,
-            device=plan.sparse_estimation_keys.device,
+            dtype=torch.float32,
+            device=plan.sparse_estimation_cluster_indices.device,
         )
         index._selection_plan_tables[plan.layer_name] = table
 
-    stored, _ = table.step(step_index, batch_size)
+    stored = table.plan(step_index, batch_size)
     for field_name in _TOKEN_PLAN_TENSOR_FIELDS:
         getattr(stored, field_name).copy_(getattr(plan, field_name))
     if active_mask is None:
@@ -1041,9 +1042,7 @@ def test_cuda_reference_fallback_updates_resident_cache_after_materialization():
         exact_page_ids=page_ids,
         exact_page_token_counts=page_counts,
         exact_token_counts=torch.ones(1, 1, dtype=torch.int32, device=device),
-        estimation_keys=plan.sparse_estimation_keys,
-        estimation_values=plan.sparse_estimation_values,
-        estimation_token_counts=plan.sparse_estimation_token_counts,
+        **make_empty_estimation(plan, device=device),
         attention_mass=torch.ones(1, device=device),
         plan=plan,
         resolved_pages=None,
@@ -1289,17 +1288,13 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         sparse_exact_cluster_indices=torch.tensor(
             [[[0, 1]]], dtype=torch.int32, device=device
         ),
-        sparse_estimation_keys=torch.empty(1, 1, 0, 1, device=device),
-        sparse_estimation_values=torch.empty(1, 1, 0, 1, device=device),
-        sparse_estimation_token_counts=torch.empty(
+        sparse_estimation_cluster_indices=torch.empty(
             1, 1, 0, dtype=torch.int32, device=device
         ),
         expanded_exact_cluster_indices=torch.tensor(
             [[[0, 1]]], dtype=torch.int32, device=device
         ),
-        expanded_estimation_keys=torch.empty(1, 1, 0, 1, device=device),
-        expanded_estimation_values=torch.empty(1, 1, 0, 1, device=device),
-        expanded_estimation_token_counts=torch.empty(
+        expanded_estimation_cluster_indices=torch.empty(
             1, 1, 0, dtype=torch.int32, device=device
         ),
         sparse_attn=torch.ones(1, device=device),
@@ -1310,9 +1305,7 @@ def test_exact_attention_resolves_resident_and_staging_pages(
         exact_page_ids=page_ids,
         exact_page_token_counts=page_counts,
         exact_token_counts=torch.tensor([[3]], dtype=torch.int32, device=device),
-        estimation_keys=plan.sparse_estimation_keys,
-        estimation_values=plan.sparse_estimation_values,
-        estimation_token_counts=plan.sparse_estimation_token_counts,
+        **make_empty_estimation(plan, device=device),
         attention_mass=torch.ones(1, device=device),
         plan=plan,
         resolved_pages=None,
@@ -1443,9 +1436,12 @@ def test_indexed_verification_source_uses_compact_query_row_pages():
         ),
         primary_exact_token_mask=torch.ones(2, 1, 1, dtype=torch.bool, device=device),
         exact_cluster_indices=torch.zeros(2, 1, 1, dtype=torch.int32, device=device),
-        estimation_keys=torch.empty(2, 1, 0, 1, device=device),
-        estimation_values=torch.empty(2, 1, 0, 1, device=device),
-        estimation_token_counts=torch.empty(2, 1, 0, dtype=torch.int32, device=device),
+        estimation_cluster_indices=torch.empty(
+            1, 1, 0, dtype=torch.int32, device=device
+        ),
+        estimation_keys=torch.empty(1, 1, 0, 1, device=device),
+        estimation_values=torch.empty(1, 1, 0, 1, device=device),
+        estimation_token_counts=torch.empty(1, 1, 0, dtype=torch.int32, device=device),
         attention_mass=torch.ones(2, device=device),
     )
     resident_page_ids = torch.tensor([[[2, -1]]], dtype=torch.int64, device=device)
@@ -1519,9 +1515,7 @@ def test_draft_exact_source_preserves_compact_page_descriptor():
         exact_page_ids=page_ids,
         exact_page_token_counts=page_token_counts,
         exact_token_counts=torch.tensor([[3]], dtype=torch.int32, device=device),
-        estimation_keys=plan.sparse_estimation_keys.to(device),
-        estimation_values=plan.sparse_estimation_values.to(device),
-        estimation_token_counts=plan.sparse_estimation_token_counts.to(device),
+        **make_empty_estimation(plan, device=device),
         attention_mass=torch.ones(1, device=device),
         plan=plan,
         resolved_pages=resolved,
@@ -1557,9 +1551,7 @@ def test_fused_proposal_attention_releases_pages_before_miss_admission():
         exact_page_ids=page_ids.to(device),
         exact_page_token_counts=page_token_counts.to(device),
         exact_token_counts=torch.zeros(1, 1, dtype=torch.int32, device=device),
-        estimation_keys=plan.sparse_estimation_keys.to(device),
-        estimation_values=plan.sparse_estimation_values.to(device),
-        estimation_token_counts=plan.sparse_estimation_token_counts.to(device),
+        **make_empty_estimation(plan, device=device, dtype=torch.float16),
         attention_mass=plan.sparse_attn.to(device),
         plan=plan,
         resolved_pages=None,
@@ -1789,9 +1781,7 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
         exact_page_ids=page_ids,
         exact_page_token_counts=page_token_counts,
         exact_token_counts=torch.zeros(2, 1, dtype=torch.int32),
-        estimation_keys=plan.sparse_estimation_keys,
-        estimation_values=plan.sparse_estimation_values,
-        estimation_token_counts=plan.sparse_estimation_token_counts,
+        **make_empty_estimation(plan),
         attention_mass=torch.ones(2),
         plan=plan,
         resolved_pages=None,
@@ -1913,18 +1903,14 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         sparse_exact_cluster_indices=torch.tensor(
             [[[10, 11]], [[12, 13]]], dtype=torch.int32
         ),
-        sparse_estimation_keys=torch.tensor([[[[20.0]]], [[[21.0]]]]),
-        sparse_estimation_values=torch.tensor([[[[22.0]]], [[[23.0]]]]),
-        sparse_estimation_token_counts=torch.tensor(
-            [[[24]], [[25]]], dtype=torch.int32
+        sparse_estimation_cluster_indices=torch.tensor(
+            [[[20]], [[21]]], dtype=torch.int32
         ),
         expanded_exact_cluster_indices=torch.tensor(
             [[[30, 31, 32]], [[33, 34, 35]]], dtype=torch.int32
         ),
-        expanded_estimation_keys=torch.tensor([[[[50.0]]], [[[51.0]]]]),
-        expanded_estimation_values=torch.tensor([[[[52.0]]], [[[53.0]]]]),
-        expanded_estimation_token_counts=torch.tensor(
-            [[[54]], [[55]]], dtype=torch.int32
+        expanded_estimation_cluster_indices=torch.tensor(
+            [[[50]], [[51]]], dtype=torch.int32
         ),
         sparse_attn=torch.tensor([0.1, 0.2]),
         expanded_attn=torch.tensor([0.5, 0.6]),
@@ -1936,24 +1922,20 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         sparse_exact_cluster_indices=torch.tensor(
             [[[60, 61]], [[62, 63]]], dtype=torch.int32
         ),
-        sparse_estimation_keys=torch.tensor([[[[90.0]]], [[[91.0]]]]),
-        sparse_estimation_values=torch.tensor([[[[92.0]]], [[[93.0]]]]),
-        sparse_estimation_token_counts=torch.tensor(
-            [[[94]], [[95]]], dtype=torch.int32
+        sparse_estimation_cluster_indices=torch.tensor(
+            [[[90]], [[91]]], dtype=torch.int32
         ),
         expanded_exact_cluster_indices=torch.tensor(
             [[[100, 101, 102]], [[103, 104, 105]]], dtype=torch.int32
         ),
-        expanded_estimation_keys=torch.tensor([[[[130.0]]], [[[131.0]]]]),
-        expanded_estimation_values=torch.tensor([[[[132.0]]], [[[133.0]]]]),
-        expanded_estimation_token_counts=torch.tensor(
-            [[[134]], [[135]]], dtype=torch.int32
+        expanded_estimation_cluster_indices=torch.tensor(
+            [[[130]], [[131]]], dtype=torch.int32
         ),
         sparse_attn=torch.tensor([0.3, 0.4]),
         expanded_attn=torch.tensor([0.7, 0.8]),
     )
     other_layer = replace(
-        make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),
+        make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=2),
         layer_name="other",
         sparse_exact_cluster_indices=torch.tensor(
             [[[140]], [[141]]], dtype=torch.int32
@@ -1985,9 +1967,6 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
             "primary_exact_token_indices": table.primary_exact_token_indices,
             "primary_exact_token_mask": table.primary_exact_token_mask,
             "exact_cluster_indices": table.expanded_exact_cluster_indices,
-            "estimation_keys": table.expanded_estimation_keys,
-            "estimation_values": table.expanded_estimation_values,
-            "estimation_token_counts": table.expanded_estimation_token_counts,
             "attention_mass": table.expanded_attn,
         }
         for field_name, source in indexed_fields.items():
@@ -2000,6 +1979,20 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
             torch.testing.assert_close(
                 actual.index_select(0, selection.plan_row_indices), expected
             )
+        expected_estimation_indices = table.expanded_estimation_cluster_indices.flatten(
+            0, 1
+        ).index_select(0, selection.plan_row_indices)
+        torch.testing.assert_close(
+            selection.estimation_cluster_indices,
+            expected_estimation_indices,
+        )
+        assert selection.estimation_keys.shape == (3, 1, 1, 1)
+        assert selection.estimation_values.shape == (3, 1, 1, 1)
+        assert selection.estimation_token_counts.shape == (3, 1, 1)
+        assert selection.estimation_keys.count_nonzero().item() == 0
+        assert selection.estimation_values.count_nonzero().item() == 0
+        assert selection.estimation_token_counts.count_nonzero().item() == 0
+        first_estimation_pointer = selection.estimation_keys.data_ptr()
 
         other_selection = controller._get_indexed_selection(
             "other", RetroSpecAttentionLevel.EXPANDED
@@ -2012,6 +2005,9 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
             [[160, 161]],
             [[162, 163]],
         ]
+        assert other_selection.estimation_keys.shape == (3, 1, 2, 1)
+        grown_estimation_pointer = other_selection.estimation_keys.data_ptr()
+        assert grown_estimation_pointer != first_estimation_pointer
         first_row_pointer = selection.plan_row_indices.data_ptr()
 
         controller.attention_mass_layer_count = 1
@@ -2033,6 +2029,13 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
             [[4, 5]],
             [[2, 3]],
         ]
+        assert reused.estimation_cluster_indices.tolist() == [
+            [[90]],
+            [[21]],
+        ]
+        assert reused.estimation_keys.data_ptr() == grown_estimation_pointer
+        assert reused.estimation_keys.is_contiguous()
+        assert reused.estimation_cluster_indices.is_contiguous()
         controller.attention_mass_layer_count = 1
         controller.end_step()
 

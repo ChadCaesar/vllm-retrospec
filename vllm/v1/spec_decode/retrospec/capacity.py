@@ -374,6 +374,95 @@ def build_retrospec_long_context_capacity(
         max_retrieval_clusters * 2,
         max_total_compute_clusters,
     )
+
+    # Selection history retains only compact token/cluster descriptors. Summary
+    # K/V is gathered from the resident arena into one reusable layer workspace.
+    num_plan_rows = planning_requests * config.num_speculative_tokens
+    primary_exact_width = exact_attention_primary_token_capacity(
+        max_model_len=vllm_config.model_config.max_model_len,
+        prefill_segment_size=prefill_segment_size,
+        generation_update_interval=generation_update_interval,
+        num_speculative_tokens=config.num_speculative_tokens,
+        block_size=block_size,
+    )
+    max_prefetch_clusters = max(max_retrieval_clusters, max_warmup_clusters)
+
+    selection_journal_bytes = 0
+    for spec in attention_specs:
+        row_cluster_index_bytes = (
+            max_retrieval_clusters
+            + max_estimation_clusters
+            + max_expanded_clusters
+            + max_estimation_clusters
+        ) * 4
+        per_head_row_bytes = primary_exact_width * (8 + 1) + row_cluster_index_bytes
+        miss_command_bytes = (
+            config.num_speculative_tokens
+            * planning_requests
+            * spec.num_kv_heads
+            * max_prefetch_clusters
+            * (8 + 8)
+        )
+        selection_journal_bytes += (
+            num_plan_rows
+            + planning_requests * (8 + 8)
+            + num_plan_rows * spec.num_kv_heads * per_head_row_bytes
+            + num_plan_rows * (4 + 4)
+            + miss_command_bytes
+            + config.num_speculative_tokens * 4
+        )
+
+    max_pages_per_cluster = cdiv(cluster_build_tokens, block_size)
+    draft_selection_scratch_bytes = 0
+    verification_estimation_workspace_bytes = 0
+    for spec in attention_specs:
+        dtype_bytes = get_dtype_size(spec.dtype)
+        draft_estimation_width = max_estimation_clusters + max_retrieval_clusters
+        summary_bytes = (
+            planning_requests
+            * spec.num_kv_heads
+            * draft_estimation_width
+            * (2 * spec.head_size * dtype_bytes + 4)
+        )
+        primary_order_bytes = (
+            planning_requests * spec.num_kv_heads * primary_exact_width * 8
+        )
+        exact_descriptor_bytes = (
+            planning_requests
+            * spec.num_kv_heads
+            * max_retrieval_clusters
+            * (8 + max_pages_per_cluster * (8 + 4))
+        )
+        compact_descriptor_bytes = (
+            planning_requests
+            * spec.num_kv_heads
+            * max_retrieval_clusters
+            * max_pages_per_cluster
+            * (8 + 4)
+        )
+        group_stat_bytes = planning_requests * spec.num_kv_heads * 32
+        draft_selection_scratch_bytes = max(
+            draft_selection_scratch_bytes,
+            summary_bytes
+            + primary_order_bytes
+            + exact_descriptor_bytes
+            + compact_descriptor_bytes
+            + group_stat_bytes,
+        )
+
+        per_estimation_entry_bytes = 4 + 1 + 2 * spec.head_size * dtype_bytes + 4
+        workspace_bytes = (
+            num_plan_rows
+            * spec.num_kv_heads
+            * max_estimation_clusters
+            * per_estimation_entry_bytes
+            + num_plan_rows * (8 + 8)
+        )
+        verification_estimation_workspace_bytes = max(
+            verification_estimation_workspace_bytes,
+            workspace_bytes,
+        )
+
     verification_record_capacity = (
         planning_requests
         * config.num_speculative_tokens
@@ -393,7 +482,12 @@ def build_retrospec_long_context_capacity(
     )
 
     auxiliary_memory_bytes = (
-        persistent_index_bytes + resident_cache_bytes + phase_workspace_bytes
+        persistent_index_bytes
+        + resident_cache_bytes
+        + selection_journal_bytes
+        + draft_selection_scratch_bytes
+        + verification_estimation_workspace_bytes
+        + phase_workspace_bytes
     )
 
     # Cover allocator rounding, CUDA events and small metadata tensors.

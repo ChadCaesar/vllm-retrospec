@@ -185,12 +185,11 @@ def _emit_ranked_estimation_plan_kernel(
     active_mask,
     ranked_indices,
     candidate_counts,
+    sparse_estimation_cluster_indices,
+    expanded_estimation_cluster_indices,
     draft_estimation_keys,
     draft_estimation_values,
     draft_estimation_token_counts,
-    expanded_estimation_keys,
-    expanded_estimation_values,
-    expanded_estimation_token_counts,
     CLUSTER_CAPACITY: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     RANKING_WIDTH: tl.constexpr,
@@ -307,6 +306,12 @@ def _emit_ranked_estimation_plan_kernel(
             other=0,
         ).to(tl.int32)
         sparse_valid &= sparse_token_count > 0
+        sparse_plan_offset = group_offset * ESTIMATION_WIDTH + output_idx
+        tl.store(
+            sparse_estimation_cluster_indices + sparse_plan_offset,
+            tl.where(sparse_valid, sparse_local_idx, -1),
+            mask=output_idx < ESTIMATION_WIDTH,
+        )
         sparse_source_offsets = sparse_count_offset * HEAD_SIZE + head_offsets
         sparse_output_offsets = (
             group_offset * draft_width + output_idx
@@ -359,36 +364,10 @@ def _emit_ranked_estimation_plan_kernel(
             other=0,
         ).to(tl.int32)
         expanded_valid &= expanded_token_count > 0
-        expanded_source_offsets = expanded_count_offset * HEAD_SIZE + head_offsets
-        expanded_output_offsets = (
-            group_offset * ESTIMATION_WIDTH + output_idx
-        ) * HEAD_SIZE + head_offsets
-        expanded_copy_mask = expanded_valid & head_mask
-        expanded_keys = tl.load(
-            cluster_keys + expanded_source_offsets,
-            mask=expanded_copy_mask,
-            other=0.0,
-        )
-        expanded_values = tl.load(
-            cluster_values + expanded_source_offsets,
-            mask=expanded_copy_mask,
-            other=0.0,
-        )
+        expanded_plan_offset = group_offset * ESTIMATION_WIDTH + output_idx
         tl.store(
-            expanded_estimation_keys + expanded_output_offsets,
-            expanded_keys,
-            mask=(output_idx < ESTIMATION_WIDTH) & head_mask,
-        )
-        tl.store(
-            expanded_estimation_values + expanded_output_offsets,
-            expanded_values,
-            mask=(output_idx < ESTIMATION_WIDTH) & head_mask,
-        )
-        tl.store(
-            expanded_estimation_token_counts
-            + group_offset * ESTIMATION_WIDTH
-            + output_idx,
-            tl.where(expanded_valid, expanded_token_count, 0),
+            expanded_estimation_cluster_indices + expanded_plan_offset,
+            tl.where(expanded_valid, expanded_local_idx, -1),
             mask=output_idx < ESTIMATION_WIDTH,
         )
 
@@ -520,16 +499,15 @@ def emit_ranked_selection_plan(
     retrieval_ratio: float,
     estimation_ratio: float,
     sparse_exact_cluster_indices: torch.Tensor,
+    sparse_estimation_cluster_indices: torch.Tensor,
     expanded_exact_cluster_indices: torch.Tensor,
+    expanded_estimation_cluster_indices: torch.Tensor,
     draft_exact_cluster_ids: torch.Tensor,
     draft_exact_page_ids: torch.Tensor,
     draft_exact_page_token_counts: torch.Tensor,
     draft_estimation_keys: torch.Tensor,
     draft_estimation_values: torch.Tensor,
     draft_estimation_token_counts: torch.Tensor,
-    expanded_estimation_keys: torch.Tensor,
-    expanded_estimation_values: torch.Tensor,
-    expanded_estimation_token_counts: torch.Tensor,
     sparse_attn: torch.Tensor,
     expanded_attn: torch.Tensor,
 ) -> None:
@@ -553,11 +531,16 @@ def emit_ranked_selection_plan(
 
     sparse_width = sparse_exact_cluster_indices.shape[2]
     expanded_width = expanded_exact_cluster_indices.shape[2]
-    estimation_width = expanded_estimation_token_counts.shape[2]
+    estimation_width = sparse_estimation_cluster_indices.shape[2]
     draft_width = draft_estimation_token_counts.shape[2]
     max_pages = draft_exact_page_ids.shape[3]
     if draft_width != estimation_width + sparse_width:
         raise ValueError("Draft estimation workspace has an invalid width")
+    expected_estimation_shape = (batch_size, num_kv_heads, estimation_width)
+    if sparse_estimation_cluster_indices.shape != expected_estimation_shape:
+        raise ValueError("Sparse estimation journal has the wrong shape")
+    if expanded_estimation_cluster_indices.shape != expected_estimation_shape:
+        raise ValueError("Expanded estimation journal has the wrong shape")
     if draft_exact_cluster_ids.shape != sparse_exact_cluster_indices.shape:
         raise ValueError("DRAFT cluster workspace has the wrong shape")
     if draft_exact_page_token_counts.shape != draft_exact_page_ids.shape:
@@ -584,16 +567,15 @@ def emit_ranked_selection_plan(
         request_slot_ids,
         active_mask,
         sparse_exact_cluster_indices,
+        sparse_estimation_cluster_indices,
         expanded_exact_cluster_indices,
+        expanded_estimation_cluster_indices,
         draft_exact_cluster_ids,
         draft_exact_page_ids,
         draft_exact_page_token_counts,
         draft_estimation_keys,
         draft_estimation_values,
         draft_estimation_token_counts,
-        expanded_estimation_keys,
-        expanded_estimation_values,
-        expanded_estimation_token_counts,
         sparse_attn,
         expanded_attn,
     )
@@ -646,12 +628,11 @@ def emit_ranked_selection_plan(
             active_mask,
             ranked_indices,
             candidate_counts,
+            sparse_estimation_cluster_indices,
+            expanded_estimation_cluster_indices,
             draft_estimation_keys,
             draft_estimation_values,
             draft_estimation_token_counts,
-            expanded_estimation_keys,
-            expanded_estimation_values,
-            expanded_estimation_token_counts,
             CLUSTER_CAPACITY=cluster_keys.shape[1],
             NUM_KV_HEADS=num_kv_heads,
             RANKING_WIDTH=ranking_width,

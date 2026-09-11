@@ -430,6 +430,13 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
         dtype=torch.int32,
         device=device,
     )
+    sparse_estimation_indices = torch.full(
+        (batch_size, num_kv_heads, estimation_width),
+        777,
+        dtype=torch.int32,
+        device=device,
+    )
+    expanded_estimation_indices = torch.full_like(sparse_estimation_indices, 777)
     draft_width = estimation_width + sparse_width
     draft_keys = torch.full(
         (batch_size, num_kv_heads, draft_width, head_size),
@@ -440,19 +447,6 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
     draft_values = torch.full_like(draft_keys, 777)
     draft_counts = torch.full(
         (batch_size, num_kv_heads, draft_width),
-        777,
-        dtype=torch.int32,
-        device=device,
-    )
-    expanded_keys = torch.full(
-        (batch_size, num_kv_heads, estimation_width, head_size),
-        777,
-        dtype=torch.float32,
-        device=device,
-    )
-    expanded_values = torch.full_like(expanded_keys, 777)
-    expanded_counts = torch.full(
-        (batch_size, num_kv_heads, estimation_width),
         777,
         dtype=torch.int32,
         device=device,
@@ -479,16 +473,15 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
         retrieval_ratio=retrieval_ratio,
         estimation_ratio=estimation_ratio,
         sparse_exact_cluster_indices=sparse_cluster_indices,
+        sparse_estimation_cluster_indices=sparse_estimation_indices,
         expanded_exact_cluster_indices=expanded_cluster_indices,
+        expanded_estimation_cluster_indices=expanded_estimation_indices,
         draft_exact_cluster_ids=draft_cluster_ids,
         draft_exact_page_ids=draft_page_ids,
         draft_exact_page_token_counts=draft_page_counts,
         draft_estimation_keys=draft_keys,
         draft_estimation_values=draft_values,
         draft_estimation_token_counts=draft_counts,
-        expanded_estimation_keys=expanded_keys,
-        expanded_estimation_values=expanded_values,
-        expanded_estimation_token_counts=expanded_counts,
         sparse_attn=sparse_attn,
         expanded_attn=expanded_attn,
     )
@@ -498,12 +491,13 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
     expected_draft_page_ids = torch.full_like(draft_page_ids, -1)
     expected_draft_page_counts = torch.zeros_like(draft_page_counts)
     expected_expanded_indices = torch.full_like(expanded_cluster_indices, -1)
+    expected_sparse_estimation_indices = torch.full_like(sparse_estimation_indices, -1)
+    expected_expanded_estimation_indices = torch.full_like(
+        expanded_estimation_indices, -1
+    )
     expected_draft_keys = torch.zeros_like(draft_keys)
     expected_draft_values = torch.zeros_like(draft_values)
     expected_draft_counts = torch.zeros_like(draft_counts)
-    expected_expanded_keys = torch.zeros_like(expanded_keys)
-    expected_expanded_values = torch.zeros_like(expanded_values)
-    expected_expanded_counts = torch.zeros_like(expanded_counts)
     expected_sparse_attn = torch.ones_like(sparse_attn)
     expected_expanded_attn = torch.ones_like(expanded_attn)
 
@@ -567,6 +561,7 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
                 rank = retrieval_count + output_idx
                 cluster = int(ranked_indices[batch, head, rank])
                 absolute_cluster = int(cluster_offsets[slot]) + cluster
+                expected_sparse_estimation_indices[batch, head, output_idx] = cluster
                 expected_draft_keys[batch, head, output_idx] = cluster_keys[
                     head, absolute_cluster
                 ]
@@ -584,16 +579,7 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
             for output_idx in range(total_count - expanded_count):
                 rank = expanded_count + output_idx
                 cluster = int(ranked_indices[batch, head, rank])
-                absolute_cluster = int(cluster_offsets[slot]) + cluster
-                expected_expanded_keys[batch, head, output_idx] = cluster_keys[
-                    head, absolute_cluster
-                ]
-                expected_expanded_values[batch, head, output_idx] = cluster_values[
-                    head, absolute_cluster
-                ]
-                expected_expanded_counts[batch, head, output_idx] = (
-                    cluster_token_counts[head, absolute_cluster]
-                )
+                expected_expanded_estimation_indices[batch, head, output_idx] = cluster
 
         expected_sparse_attn[batch] = sparse_mass / num_kv_heads
         expected_expanded_attn[batch] = expanded_mass / num_kv_heads
@@ -604,18 +590,21 @@ def test_emit_ranked_selection_plan_matches_request_head_reference():
     torch.testing.assert_close(draft_page_ids, expected_draft_page_ids)
     torch.testing.assert_close(draft_page_counts, expected_draft_page_counts)
     torch.testing.assert_close(expanded_cluster_indices, expected_expanded_indices)
+    torch.testing.assert_close(
+        sparse_estimation_indices, expected_sparse_estimation_indices
+    )
+    torch.testing.assert_close(
+        expanded_estimation_indices, expected_expanded_estimation_indices
+    )
     torch.testing.assert_close(draft_keys, expected_draft_keys)
     torch.testing.assert_close(draft_values, expected_draft_values)
     torch.testing.assert_close(draft_counts, expected_draft_counts)
-    torch.testing.assert_close(expanded_keys, expected_expanded_keys)
-    torch.testing.assert_close(expanded_values, expected_expanded_values)
-    torch.testing.assert_close(expanded_counts, expected_expanded_counts)
     torch.testing.assert_close(sparse_attn, expected_sparse_attn)
     torch.testing.assert_close(expanded_attn, expected_expanded_attn)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_selection_plan_table_reuses_fixed_step_slots_across_proposals():
+def test_selection_plan_table_uses_one_shared_draft_scratch():
     device = torch.device("cuda", torch.cuda.current_device())
     index = RetroSpecSegmentedTokenIndex(
         block_size=2,
@@ -652,7 +641,11 @@ def test_selection_plan_table_reuses_fixed_step_slots_across_proposals():
 
     assert second_table is table
     assert same_table is table
-    assert first.draft_estimation_keys.data_ptr() != (
+    assert not hasattr(table, "draft_estimation_keys")
+    assert not hasattr(table, "expanded_estimation_keys")
+    assert table.sparse_estimation_cluster_indices.shape == (2, 1, 1, 1)
+    assert table.expanded_estimation_cluster_indices.shape == (2, 1, 1, 1)
+    assert first.draft_estimation_keys.data_ptr() == (
         second.draft_estimation_keys.data_ptr()
     )
     assert same_first.draft_estimation_keys.data_ptr() == (
@@ -670,4 +663,56 @@ def test_selection_plan_table_reuses_fixed_step_slots_across_proposals():
     assert reused_table is table
     assert reused.draft_estimation_keys.data_ptr() == (
         first.draft_estimation_keys.data_ptr()
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_shared_draft_scratch_grows_and_returns_layer_sized_views():
+    device = torch.device("cuda", torch.cuda.current_device())
+    index = RetroSpecSegmentedTokenIndex(
+        block_size=2,
+        num_speculative_tokens=2,
+        retrieval_ratio=0.5,
+        estimation_ratio=0.25,
+        prefill_segment_size_tokens=4,
+        generation_update_interval=2,
+        blocks_per_cluster=1,
+        num_kmeans_iterations=2,
+        max_model_len=64,
+    )
+    small_view = RetroSpecResidentBatchView(
+        arena=None,
+        request_slot_ids=torch.tensor([-1], dtype=torch.int64, device=device),
+        max_num_clusters=4,
+        max_pages_per_cluster=1,
+        max_num_pages=0,
+    )
+    large_view = RetroSpecResidentBatchView(
+        arena=None,
+        request_slot_ids=torch.tensor([-1], dtype=torch.int64, device=device),
+        max_num_clusters=8,
+        max_pages_per_cluster=3,
+        max_num_pages=0,
+    )
+
+    index.begin_proposal(["request"])
+    try:
+        _, small_before_growth, _ = index._get_selection_plan_step(
+            "small", 0, small_view, 1, 1, 8, torch.float16, device
+        )
+        _, large, _ = index._get_selection_plan_step(
+            "large", 0, large_view, 1, 1, 8, torch.float16, device
+        )
+        _, small_after_growth, _ = index._get_selection_plan_step(
+            "small", 0, small_view, 1, 1, 8, torch.float16, device
+        )
+    finally:
+        index.end_proposal()
+
+    assert small_before_growth.draft_exact_page_ids.shape == (1, 1, 2, 1)
+    assert large.draft_exact_page_ids.shape == (1, 1, 4, 3)
+    assert small_after_growth.draft_exact_page_ids.shape == (1, 1, 2, 1)
+    assert small_after_growth.draft_estimation_keys.shape == (1, 1, 3, 8)
+    assert large.draft_exact_page_ids.data_ptr() == (
+        small_after_growth.draft_exact_page_ids.data_ptr()
     )
