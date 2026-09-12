@@ -610,6 +610,7 @@ def test_emit_ranked_estimation_plan_omits_exact_page_intermediates():
     cluster_keys = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]], device=device)
     cluster_values = cluster_keys * 10
     cluster_counts = torch.tensor([[4, 5, 6]], dtype=torch.int32, device=device)
+    expanded_exact = torch.empty((1, 1, 3), dtype=torch.int32, device=device)
     sparse_estimation = torch.empty((1, 1, 1), dtype=torch.int32, device=device)
     expanded_estimation = torch.empty_like(sparse_estimation)
     draft_keys = torch.empty((1, 1, 3, 2), device=device)
@@ -628,6 +629,7 @@ def test_emit_ranked_estimation_plan_omits_exact_page_intermediates():
         retrieval_ratio=0.34,
         estimation_ratio=0.34,
         sparse_exact_width=2,
+        expanded_exact_cluster_indices=expanded_exact,
         sparse_estimation_cluster_indices=sparse_estimation,
         expanded_estimation_cluster_indices=expanded_estimation,
         draft_estimation_keys=draft_keys,
@@ -635,6 +637,7 @@ def test_emit_ranked_estimation_plan_omits_exact_page_intermediates():
         draft_estimation_token_counts=draft_counts,
     )
 
+    assert expanded_exact.cpu().tolist() == [[[2, 0, 1]]]
     assert sparse_estimation.item() == 1
     assert expanded_estimation.item() == -1
     torch.testing.assert_close(

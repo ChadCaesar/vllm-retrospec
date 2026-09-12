@@ -176,6 +176,87 @@ def _capture_request_descriptors_kernel(
 
 
 @triton.jit
+def _emit_expanded_exact_cluster_indices_kernel(
+    ranked_indices,
+    candidate_counts,
+    cluster_token_counts,
+    cluster_offsets,
+    request_slot_ids,
+    active_mask,
+    expanded_exact_cluster_indices,
+    num_outputs,
+    CLUSTER_CAPACITY: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    EXPANDED_WIDTH: tl.constexpr,
+    RANKED_STRIDE_0: tl.constexpr,
+    RANKED_STRIDE_1: tl.constexpr,
+    RANKED_STRIDE_2: tl.constexpr,
+    RETRIEVAL_RATIO: tl.constexpr,
+    ESTIMATION_RATIO: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    output_offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    output_valid = output_offsets < num_outputs
+
+    rank = output_offsets % EXPANDED_WIDTH
+    row = output_offsets // EXPANDED_WIDTH
+    batch_idx = row // NUM_KV_HEADS
+    kv_head_idx = row % NUM_KV_HEADS
+
+    candidate_count = tl.load(candidate_counts + row, mask=output_valid, other=0).to(
+        tl.int32
+    )
+    retrieval_count = tl.ceil(candidate_count.to(tl.float32) * RETRIEVAL_RATIO).to(
+        tl.int32
+    )
+    retrieval_count = tl.minimum(retrieval_count, candidate_count)
+    estimation_count = tl.ceil(candidate_count.to(tl.float32) * ESTIMATION_RATIO).to(
+        tl.int32
+    )
+    estimation_count = tl.minimum(estimation_count, candidate_count - retrieval_count)
+    expanded_count = tl.minimum(retrieval_count * 2, retrieval_count + estimation_count)
+
+    request_slot = tl.load(request_slot_ids + batch_idx, mask=output_valid, other=-1)
+    request_active = tl.load(active_mask + batch_idx, mask=output_valid, other=0).to(
+        tl.int1
+    )
+    request_valid = output_valid & request_active & (request_slot >= 0)
+    safe_slot = tl.maximum(request_slot, 0).to(tl.int64)
+    request_cluster_offset = tl.load(
+        cluster_offsets + safe_slot, mask=request_valid, other=0
+    ).to(tl.int64)
+
+    ranked_offset = (
+        batch_idx * RANKED_STRIDE_0
+        + kv_head_idx * RANKED_STRIDE_1
+        + rank * RANKED_STRIDE_2
+    )
+    cluster_valid = request_valid & (rank < expanded_count)
+    local_cluster_idx = tl.load(
+        ranked_indices + ranked_offset, mask=cluster_valid, other=-1
+    ).to(tl.int64)
+    cluster_valid &= local_cluster_idx >= 0
+
+    absolute_cluster_idx = (
+        kv_head_idx * CLUSTER_CAPACITY
+        + request_cluster_offset
+        + tl.maximum(local_cluster_idx, 0)
+    )
+    token_count = tl.load(
+        cluster_token_counts + absolute_cluster_idx,
+        mask=cluster_valid,
+        other=0,
+    ).to(tl.int32)
+    cluster_valid &= token_count > 0
+
+    tl.store(
+        expanded_exact_cluster_indices + output_offsets,
+        tl.where(cluster_valid, local_cluster_idx, -1),
+        mask=output_valid,
+    )
+
+
+@triton.jit
 def _emit_ranked_estimation_plan_kernel(
     cluster_keys,
     cluster_values,
@@ -492,6 +573,7 @@ def emit_ranked_estimation_plan(
     retrieval_ratio: float,
     estimation_ratio: float,
     sparse_exact_width: int,
+    expanded_exact_cluster_indices: torch.Tensor,
     sparse_estimation_cluster_indices: torch.Tensor,
     expanded_estimation_cluster_indices: torch.Tensor,
     draft_estimation_keys: torch.Tensor,
@@ -507,6 +589,7 @@ def emit_ranked_estimation_plan(
         raise ValueError("Ranked indices must use int64")
 
     batch_size, num_kv_heads, ranking_width = ranked_indices.shape
+    expanded_exact_width = expanded_exact_cluster_indices.shape[2]
     estimation_width = sparse_estimation_cluster_indices.shape[2]
     draft_width = draft_estimation_token_counts.shape[2]
     head_size = cluster_keys.shape[2]
@@ -521,6 +604,11 @@ def emit_ranked_estimation_plan(
         raise ValueError("Active mask does not match ranked indices")
     if draft_width != estimation_width + sparse_exact_width:
         raise ValueError("Draft estimation workspace has an invalid width")
+    if expanded_exact_cluster_indices.shape[:2] != (
+        batch_size,
+        num_kv_heads,
+    ):
+        raise ValueError("Expanded exact journal has the wrong row shape")
     if expanded_estimation_cluster_indices.shape != (
         batch_size,
         num_kv_heads,
@@ -542,7 +630,7 @@ def emit_ranked_estimation_plan(
         draft_width,
     ):
         raise ValueError("Draft estimation counts have the wrong shape")
-    if ranking_width < sparse_exact_width + estimation_width:
+    if ranking_width < max(expanded_exact_width, sparse_exact_width + estimation_width):
         raise ValueError("Ranked workspace is too narrow")
 
     tensors = (
@@ -554,6 +642,7 @@ def emit_ranked_estimation_plan(
         cluster_offsets,
         request_slot_ids,
         active_mask,
+        expanded_exact_cluster_indices,
         sparse_estimation_cluster_indices,
         expanded_estimation_cluster_indices,
         draft_estimation_keys,
@@ -562,6 +651,31 @@ def emit_ranked_estimation_plan(
     )
     if any(tensor.device != ranked_indices.device for tensor in tensors):
         raise ValueError("Ranked estimation tensors must use one device")
+
+    if expanded_exact_width > 0:
+        num_outputs = batch_size * num_kv_heads * expanded_exact_width
+        block_size = 256
+        _emit_expanded_exact_cluster_indices_kernel[
+            (triton.cdiv(num_outputs, block_size),)
+        ](
+            ranked_indices,
+            candidate_counts,
+            cluster_token_counts,
+            cluster_offsets,
+            request_slot_ids,
+            active_mask,
+            expanded_exact_cluster_indices,
+            num_outputs,
+            CLUSTER_CAPACITY=cluster_token_counts.shape[1],
+            NUM_KV_HEADS=num_kv_heads,
+            EXPANDED_WIDTH=expanded_exact_width,
+            RANKED_STRIDE_0=ranked_indices.stride(0),
+            RANKED_STRIDE_1=ranked_indices.stride(1),
+            RANKED_STRIDE_2=ranked_indices.stride(2),
+            RETRIEVAL_RATIO=retrieval_ratio,
+            ESTIMATION_RATIO=estimation_ratio,
+            BLOCK_SIZE=block_size,
+        )
 
     summary_width = max(sparse_exact_width, estimation_width)
     if summary_width == 0:

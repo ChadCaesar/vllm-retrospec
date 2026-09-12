@@ -241,6 +241,7 @@ def _resolve_ranked_compact_draft_pages_kernel(
     ranked_indices,
     candidate_counts,
     arena_cluster_ids,
+    arena_resident_table_buckets,
     arena_cluster_page_starts,
     arena_cluster_page_counts,
     arena_page_ids,
@@ -258,7 +259,6 @@ def _resolve_ranked_compact_draft_pages_kernel(
     access_epoch,
     fallback_token_counts,
     sparse_cluster_indices,
-    expanded_cluster_indices,
     output_cluster_handles,
     output_page_slots,
     output_page_token_counts,
@@ -282,16 +282,13 @@ def _resolve_ranked_compact_draft_pages_kernel(
     NUM_KV_HEADS: tl.constexpr,
     RANKING_WIDTH: tl.constexpr,
     SPARSE_WIDTH: tl.constexpr,
-    EXPANDED_WIDTH: tl.constexpr,
     MAX_PAGES: tl.constexpr,
     PAGE_CAPACITY: tl.constexpr,
     TABLE_CAPACITY: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
     BLOCK_OUTPUT_PAGES: tl.constexpr,
     BLOCK_SPARSE: tl.constexpr,
-    BLOCK_EXPANDED: tl.constexpr,
     RETRIEVAL_RATIO: tl.constexpr,
-    ESTIMATION_RATIO: tl.constexpr,
     EMIT_MISSES: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -303,12 +300,6 @@ def _resolve_ranked_compact_draft_pages_kernel(
         tl.int32
     )
     retrieval_count = tl.minimum(retrieval_count, candidate_count)
-    estimation_count = tl.ceil(candidate_count.to(tl.float32) * ESTIMATION_RATIO).to(
-        tl.int32
-    )
-    estimation_count = tl.minimum(estimation_count, candidate_count - retrieval_count)
-    total_compute_count = retrieval_count + estimation_count
-    expanded_count = tl.minimum(retrieval_count * 2, total_compute_count)
 
     request_slot = tl.load(request_slot_ids + batch_idx)
     request_active = tl.load(active_mask + batch_idx).to(tl.int1)
@@ -333,36 +324,6 @@ def _resolve_ranked_compact_draft_pages_kernel(
         mask=output_page_offsets < PAGE_CAPACITY,
     )
 
-    expanded_ranks = tl.arange(0, BLOCK_EXPANDED)
-    expanded_output_valid = expanded_ranks < EXPANDED_WIDTH
-    expanded_valid = request_valid & (expanded_ranks < expanded_count)
-    expanded_ranked_offsets = (
-        batch_idx * ranked_stride_0
-        + kv_head_idx * ranked_stride_1
-        + expanded_ranks * ranked_stride_2
-    )
-    expanded_local_indices = tl.load(
-        ranked_indices + expanded_ranked_offsets,
-        mask=expanded_valid,
-        other=0,
-    ).to(tl.int64)
-    expanded_arena_offsets = (
-        kv_head_idx * ARENA_CLUSTER_CAPACITY
-        + request_cluster_offset
-        + tl.maximum(expanded_local_indices, 0)
-    )
-    expanded_handles = tl.load(
-        arena_cluster_ids + expanded_arena_offsets,
-        mask=expanded_valid,
-        other=-1,
-    ).to(tl.int64)
-    expanded_valid &= expanded_handles >= 0
-    tl.store(
-        expanded_cluster_indices + row * EXPANDED_WIDTH + expanded_ranks,
-        tl.where(expanded_valid, expanded_local_indices, -1),
-        mask=expanded_output_valid,
-    )
-
     ranks = tl.arange(0, BLOCK_SPARSE)
     valid_ranks = ranks < SPARSE_WIDTH
     sparse_valid = request_valid & valid_ranks & (ranks < retrieval_count)
@@ -376,13 +337,13 @@ def _resolve_ranked_compact_draft_pages_kernel(
         mask=sparse_valid,
         other=0,
     ).to(tl.int64)
-    arena_cluster_offsets = (
+    arena_cluster_storage_offsets = (
         kv_head_idx * ARENA_CLUSTER_CAPACITY
         + request_cluster_offset
         + tl.maximum(local_cluster_indices, 0)
     )
     cluster_handles = tl.load(
-        arena_cluster_ids + arena_cluster_offsets,
+        arena_cluster_ids + arena_cluster_storage_offsets,
         mask=sparse_valid,
         other=-1,
     ).to(tl.int64)
@@ -400,19 +361,44 @@ def _resolve_ranked_compact_draft_pages_kernel(
     )
 
     logical_page_starts = tl.load(
-        arena_cluster_page_starts + arena_cluster_offsets,
+        arena_cluster_page_starts + arena_cluster_storage_offsets,
         mask=selected,
         other=0,
     ).to(tl.int64)
     logical_page_counts = tl.load(
-        arena_cluster_page_counts + arena_cluster_offsets,
+        arena_cluster_page_counts + arena_cluster_storage_offsets,
         mask=selected,
         other=0,
     ).to(tl.int32)
 
+    bound_buckets = tl.load(
+        arena_resident_table_buckets + arena_cluster_storage_offsets,
+        mask=selected,
+        other=-1,
+    ).to(tl.int64)
+    bound_valid = selected & (bound_buckets >= 0) & (bound_buckets < TABLE_CAPACITY)
+    safe_bound_buckets = tl.maximum(bound_buckets, 0)
+    bound_versions_before = tl.atomic_add(
+        table_versions + safe_bound_buckets, 0, mask=bound_valid, sem="acquire"
+    )
+    bound_handles = tl.load(
+        table_handles + safe_bound_buckets, mask=bound_valid, other=-1
+    )
+    bound_versions_after = tl.atomic_add(
+        table_versions + safe_bound_buckets, 0, mask=bound_valid, sem="acquire"
+    )
+    bound_stable = (bound_versions_before == bound_versions_after) & (
+        (bound_versions_before & 1) == 0
+    )
+    direct_hits = bound_valid & bound_stable & (bound_handles == cluster_handles)
+
     first_buckets = cluster_handles & (TABLE_CAPACITY - 1)
-    matched_buckets = tl.full((BLOCK_SPARSE,), -1, tl.int64)
-    searching = selected
+    matched_buckets = tl.where(
+        direct_hits,
+        bound_buckets,
+        tl.full((BLOCK_SPARSE,), -1, tl.int64),
+    )
+    searching = selected & ~direct_hits
     for probe in tl.range(0, 64, num_stages=1, loop_unroll_factor=1):
         buckets = (first_buckets + probe) & (TABLE_CAPACITY - 1)
         versions_before = tl.atomic_add(
@@ -493,6 +479,12 @@ def _resolve_ranked_compact_draft_pages_kernel(
         & (resolved_page_counts == actual_page_counts)
     )
     misses = selected & ~stable_hits
+
+    tl.store(
+        arena_resident_table_buckets + arena_cluster_storage_offsets,
+        tl.where(stable_hits, safe_buckets, -1),
+        mask=selected,
+    )
 
     tl.atomic_max(
         table_last_access_epochs + safe_buckets,
@@ -1540,6 +1532,7 @@ def resolve_ranked_compact_draft_pages(
     ranked_indices: torch.Tensor,
     candidate_counts: torch.Tensor,
     arena_cluster_ids: torch.Tensor,
+    arena_resident_table_buckets: torch.Tensor,
     arena_cluster_page_starts: torch.Tensor,
     arena_cluster_page_counts: torch.Tensor,
     arena_page_ids: torch.Tensor,
@@ -1557,10 +1550,10 @@ def resolve_ranked_compact_draft_pages(
     access_epoch: int,
     retrieval_ratio: float,
     estimation_ratio: float,
+    expanded_retrieval_width: int,
     max_pages_per_cluster: int,
     fallback_token_counts: torch.Tensor,
     sparse_cluster_indices: torch.Tensor,
-    expanded_cluster_indices: torch.Tensor,
     output_cluster_handles: torch.Tensor,
     output_page_slots: torch.Tensor,
     output_page_token_counts: torch.Tensor,
@@ -1595,7 +1588,6 @@ def resolve_ranked_compact_draft_pages(
 
     batch_size, num_kv_heads, ranking_width = ranked_indices.shape
     sparse_width = sparse_cluster_indices.shape[2]
-    expanded_width = expanded_cluster_indices.shape[2]
     row_shape = (batch_size, num_kv_heads)
     page_capacity = sparse_width * max_pages_per_cluster
 
@@ -1605,10 +1597,12 @@ def resolve_ranked_compact_draft_pages(
         raise ValueError("Request slots do not match ranked rows")
     if active_mask.shape != (batch_size,):
         raise ValueError("Active mask does not match ranked rows")
+    if arena_resident_table_buckets.shape != arena_cluster_ids.shape:
+        raise ValueError("Resident bucket bindings do not match cluster IDs")
+    if arena_resident_table_buckets.dtype != torch.int32:
+        raise ValueError("Resident bucket bindings must use int32")
     if sparse_cluster_indices.shape[:2] != row_shape:
         raise ValueError("Sparse journal has the wrong row shape")
-    if expanded_cluster_indices.shape[:2] != row_shape:
-        raise ValueError("Expanded journal has the wrong row shape")
     if output_cluster_handles.shape != sparse_cluster_indices.shape:
         raise ValueError("Draft cluster-handle output has the wrong shape")
     if fallback_token_counts.shape != sparse_cluster_indices.shape:
@@ -1617,7 +1611,9 @@ def resolve_ranked_compact_draft_pages(
         raise ValueError("Compact page output has the wrong shape")
     if output_page_token_counts.shape != output_page_slots.shape:
         raise ValueError("Compact page token counts have the wrong shape")
-    if ranking_width < max(sparse_width, expanded_width):
+    if expanded_retrieval_width < 0:
+        raise ValueError("Expanded retrieval width must be non-negative")
+    if ranking_width < max(sparse_width, expanded_retrieval_width):
         raise ValueError("Ranked workspace is too narrow")
     if table_page_slots.shape[1] < max_pages_per_cluster:
         raise ValueError("Resident table has too few page slots")
@@ -1654,6 +1650,7 @@ def resolve_ranked_compact_draft_pages(
         ranked_indices,
         candidate_counts,
         arena_cluster_ids,
+        arena_resident_table_buckets,
         arena_cluster_page_starts,
         arena_cluster_page_counts,
         arena_page_ids,
@@ -1670,7 +1667,6 @@ def resolve_ranked_compact_draft_pages(
         table_last_access_epochs,
         fallback_token_counts,
         sparse_cluster_indices,
-        expanded_cluster_indices,
         output_cluster_handles,
         output_page_slots,
         output_page_token_counts,
@@ -1712,6 +1708,7 @@ def resolve_ranked_compact_draft_pages(
         ranked_indices,
         candidate_counts,
         arena_cluster_ids,
+        arena_resident_table_buckets,
         arena_cluster_page_starts,
         arena_cluster_page_counts,
         arena_page_ids,
@@ -1729,7 +1726,6 @@ def resolve_ranked_compact_draft_pages(
         access_epoch,
         fallback_token_counts,
         sparse_cluster_indices,
-        expanded_cluster_indices,
         output_cluster_handles,
         output_page_slots,
         output_page_token_counts,
@@ -1753,16 +1749,13 @@ def resolve_ranked_compact_draft_pages(
         NUM_KV_HEADS=num_kv_heads,
         RANKING_WIDTH=ranking_width,
         SPARSE_WIDTH=sparse_width,
-        EXPANDED_WIDTH=expanded_width,
         MAX_PAGES=max_pages_per_cluster,
         PAGE_CAPACITY=page_capacity,
         TABLE_CAPACITY=table_handles.numel(),
         BLOCK_PAGES=triton.next_power_of_2(max_pages_per_cluster),
         BLOCK_OUTPUT_PAGES=triton.next_power_of_2(page_capacity),
         BLOCK_SPARSE=triton.next_power_of_2(sparse_width),
-        BLOCK_EXPANDED=triton.next_power_of_2(max(expanded_width, 1)),
         RETRIEVAL_RATIO=retrieval_ratio,
-        ESTIMATION_RATIO=estimation_ratio,
         EMIT_MISSES=emit_misses,
     )
     _finalize_ranked_compact_draft_attention_kernel[(batch_size,)](
@@ -1778,7 +1771,7 @@ def resolve_ranked_compact_draft_pages(
         NUM_KV_HEADS=num_kv_heads,
         RANKING_WIDTH=ranking_width,
         BLOCK_HEADS=triton.next_power_of_2(num_kv_heads),
-        BLOCK_RANK=triton.next_power_of_2(max(expanded_width, 1)),
+        BLOCK_RANK=triton.next_power_of_2(max(expanded_retrieval_width, 1)),
         RANKED_STRIDE_0=ranked_values.stride(0),
         RANKED_STRIDE_1=ranked_values.stride(1),
         RANKED_STRIDE_2=ranked_values.stride(2),

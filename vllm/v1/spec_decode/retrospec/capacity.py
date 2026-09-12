@@ -249,11 +249,12 @@ def build_retrospec_long_context_capacity(
     )
 
     # Packed cluster descriptors use an int64 ID, an int32 token count, an
-    # int64 relative page start and an int32 page count. Page descriptors use
-    # 12 bytes per page. Request descriptors add cluster/page offsets, counts,
-    # a generation and the indexed token range.
+    # int64 relative page start, an int32 page count and an int32 resident
+    # table-bucket binding. Page descriptors use 12 bytes per page. Request
+    # descriptors add cluster/page offsets, counts, a generation and the
+    # indexed token range.
     persistent_cluster_metadata_bytes = sum(
-        total_resident_clusters * spec.num_kv_heads * 24
+        total_resident_clusters * spec.num_kv_heads * 28
         + cluster_pages_per_head * spec.num_kv_heads * 12
         + planning_requests * (40 + 4 * spec.num_kv_heads)
         for spec in attention_specs

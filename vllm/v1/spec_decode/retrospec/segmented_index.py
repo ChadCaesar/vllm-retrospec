@@ -3363,6 +3363,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             retrieval_ratio=self.retrieval_ratio,
             estimation_ratio=self.estimation_ratio,
             sparse_exact_width=output_workspace.sparse_retrieval_width,
+            expanded_exact_cluster_indices=plan.expanded_exact_cluster_indices,
             sparse_estimation_cluster_indices=(plan.sparse_estimation_cluster_indices),
             expanded_estimation_cluster_indices=(
                 plan.expanded_estimation_cluster_indices
@@ -3741,10 +3742,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             active_mask=active_mask,
             retrieval_ratio=self.retrieval_ratio,
             estimation_ratio=self.estimation_ratio,
+            expanded_retrieval_width=plan.expanded_exact_cluster_indices.shape[2],
             max_pages_per_cluster=view.max_pages_per_cluster,
             fallback_token_counts=retrieval_fallback_counts,
             sparse_cluster_indices=plan.sparse_exact_cluster_indices,
-            expanded_cluster_indices=plan.expanded_exact_cluster_indices,
             cluster_handles=output_workspace.draft_exact_cluster_ids,
             cache_page_ids=output_workspace.draft_compact_page_ids,
             page_token_counts=output_workspace.draft_compact_page_token_counts,

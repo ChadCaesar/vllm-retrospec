@@ -121,6 +121,7 @@ class RetroSpecResidentLayerArena:
     cluster_token_counts: torch.Tensor
     cluster_page_starts: torch.Tensor
     cluster_page_counts: torch.Tensor
+    resident_table_buckets: torch.Tensor
 
     # Page storage is [num_kv_heads, page_capacity].
     page_ids: torch.Tensor
@@ -407,6 +408,9 @@ class RetroSpecGPUIndexResidencyManager:
             cluster_page_counts=torch.empty(
                 cluster_shape, dtype=torch.int32, device=device
             ),
+            resident_table_buckets=torch.empty(
+                cluster_shape, dtype=torch.int32, device=device
+            ),
             page_ids=torch.empty(page_shape, dtype=torch.int64, device=device),
             page_token_counts=torch.empty(page_shape, dtype=torch.int32, device=device),
             cluster_offsets=torch.zeros(
@@ -460,7 +464,7 @@ class RetroSpecGPUIndexResidencyManager:
         added_bytes = (
             num_kv_heads
             * added_capacity
-            * (24 + 2 * head_size * arena.cluster_keys.element_size())
+            * (28 + 2 * head_size * arena.cluster_keys.element_size())
         )
         self._reserve_gpu_index_bytes(added_bytes)
 
@@ -491,6 +495,12 @@ class RetroSpecGPUIndexResidencyManager:
                 dtype=arena.cluster_page_counts.dtype,
                 device=arena.cluster_page_counts.device,
             )
+            resident_table_buckets = torch.full(
+                (num_kv_heads, new_capacity),
+                -1,
+                dtype=torch.int32,
+                device=arena.cluster_ids.device,
+            )
             if old_capacity:
                 cluster_ids[:, :old_capacity].copy_(arena.cluster_ids)
                 cluster_keys[:, :old_capacity].copy_(arena.cluster_keys)
@@ -498,6 +508,9 @@ class RetroSpecGPUIndexResidencyManager:
                 cluster_token_counts[:, :old_capacity].copy_(arena.cluster_token_counts)
                 cluster_page_starts[:, :old_capacity].copy_(arena.cluster_page_starts)
                 cluster_page_counts[:, :old_capacity].copy_(arena.cluster_page_counts)
+                resident_table_buckets[:, :old_capacity].copy_(
+                    arena.resident_table_buckets
+                )
         except BaseException:
             self._allocated_gpu_index_bytes -= added_bytes
             raise
@@ -508,6 +521,7 @@ class RetroSpecGPUIndexResidencyManager:
         arena.cluster_token_counts = cluster_token_counts
         arena.cluster_page_starts = cluster_page_starts
         arena.cluster_page_counts = cluster_page_counts
+        arena.resident_table_buckets = resident_table_buckets
         allocator.extend(new_capacity)
 
     def _grow_page_storage(
@@ -882,6 +896,9 @@ class RetroSpecGPUIndexResidencyManager:
                     arena.cluster_page_counts[:, destination].copy_(
                         arena.cluster_page_counts[:, source]
                     )
+                    arena.resident_table_buckets[:, destination].copy_(
+                        arena.resident_table_buckets[:, source]
+                    )
                 except BaseException:
                     layer_state.cluster_allocator.release(*new_cluster_span)
                     raise
@@ -921,6 +938,7 @@ class RetroSpecGPUIndexResidencyManager:
             absolute_cluster_start = cluster_offset + cluster_start
             absolute_cluster_end = cluster_offset + cluster_end
             cluster_slice = slice(absolute_cluster_start, absolute_cluster_end)
+            arena.resident_table_buckets[:, cluster_slice].fill_(-1)
             arena.cluster_ids[:, cluster_slice].copy_(segment.cluster_ids_cpu)
             arena.cluster_keys[:, cluster_slice].copy_(segment.cluster_keys)
             arena.cluster_values[:, cluster_slice].copy_(segment.cluster_values)

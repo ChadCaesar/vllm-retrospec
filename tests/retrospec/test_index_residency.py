@@ -296,6 +296,10 @@ def test_resident_arena_uses_request_slots_and_ragged_page_offsets():
             [10, 11, -1],
             [12, 13, 14],
         ]
+        assert arena.resident_table_buckets[:, :3].tolist() == [
+            [-1, -1, -1],
+            [-1, -1, -1],
+        ]
     finally:
         manager.deactivate()
 
@@ -346,6 +350,12 @@ def test_resident_arena_grows_from_published_cluster_count():
     layer_state = manager._layer_arenas["layer"]
     assert layer_state.arena.cluster_keys.shape == (1, 64, 1)
     assert layer_state.arena.page_ids.shape == (1, 64)
+    first_state = manager._resident_states["layer"]["request"]
+    first_slice = slice(
+        first_state.cluster_offset,
+        first_state.cluster_offset + first_state.num_clusters,
+    )
+    layer_state.arena.resident_table_buckets[0, first_slice].fill_(17)
 
     second = make_resident_segment(
         manager,
@@ -361,6 +371,12 @@ def test_resident_arena_grows_from_published_cluster_count():
     assert state.page_capacity == 128
     cluster_slice = slice(state.cluster_offset, state.cluster_offset + 65)
     assert layer_state.arena.cluster_ids[0, cluster_slice].tolist() == list(range(65))
+    assert layer_state.arena.resident_table_buckets[0, cluster_slice].tolist() == [
+        17,
+        17,
+        17,
+        *([-1] * 62),
+    ]
 
 
 def test_resident_arena_reuses_released_cluster_and_page_spans():
@@ -369,6 +385,13 @@ def test_resident_arena_reuses_released_cluster_and_page_spans():
         [make_resident_segment(manager, request_id="first", num_clusters=3)]
     )
     first_state = manager._resident_states["layer"]["first"]
+    first_slice = slice(
+        first_state.cluster_offset,
+        first_state.cluster_offset + first_state.num_clusters,
+    )
+    manager._layer_arenas["layer"].arena.resident_table_buckets[0, first_slice].fill_(
+        11
+    )
 
     manager.invalidate_requests(["first"])
     manager.publish_resident_segments(
@@ -378,6 +401,13 @@ def test_resident_arena_reuses_released_cluster_and_page_spans():
 
     assert replacement_state.cluster_offset == first_state.cluster_offset
     assert replacement_state.page_offset == first_state.page_offset
+    replacement_slice = slice(
+        replacement_state.cluster_offset,
+        replacement_state.cluster_offset + replacement_state.num_clusters,
+    )
+    assert manager._layer_arenas["layer"].arena.resident_table_buckets[
+        0, replacement_slice
+    ].tolist() == [-1, -1, -1]
 
 
 def test_gpu_index_budget_failure_preserves_previous_resident_span():

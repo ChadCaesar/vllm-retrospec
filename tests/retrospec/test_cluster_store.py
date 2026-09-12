@@ -260,6 +260,12 @@ def make_resident_arena(
         )[None, :].expand(num_kv_heads, -1)
         * max_pages,
         cluster_page_counts=(metadata.page_ids >= 0).sum(dim=-1, dtype=torch.int32),
+        resident_table_buckets=torch.full(
+            (num_kv_heads, num_clusters),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        ),
         page_ids=metadata.page_ids.flatten(1),
         page_token_counts=metadata.page_token_counts.flatten(1),
         cluster_offsets=torch.zeros(1, dtype=torch.int64, device=device),
