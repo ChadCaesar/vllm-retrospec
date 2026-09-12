@@ -79,6 +79,7 @@ def make_controller(
                 retrospec_max_pinned_memory=max_pinned_memory,
                 retrospec_max_gpu_index_memory=max_gpu_index_memory,
                 retrospec_cache_ratio=cache_ratio,
+                retrospec_prefill_warmup_multiplier=4,
                 retrospec_stats_interval_seconds=stats_interval_seconds,
                 retrospec_hit_attn_threshold=hit_attn_threshold,
                 retrospec_retrieval_attn_threshold=retrieval_attn_threshold,
@@ -589,12 +590,12 @@ def test_passthrough_forward_builds_segmented_index_after_target_attention():
     assert controller.index_update_build_rows == ()
 
 
-def test_prefill_completion_marks_each_request_for_first_draft_warmup():
+def test_standard_index_update_does_not_submit_prefill_hint():
     controller = make_controller()
     mark_installed(controller)
     controller.index.build_or_update = Mock()
     controller.index.flush_staged_updates = Mock()
-    controller.index.mark_first_draft_warmup = Mock()
+    controller.index.prefetch_final_prefill_queries = Mock()
 
     layer = SimpleNamespace()
     query = torch.arange(5, dtype=torch.float32).view(5, 1, 1)
@@ -622,11 +623,70 @@ def test_prefill_completion_marks_each_request_for_first_draft_warmup():
             metadata,
         )
 
-    controller.index.mark_first_draft_warmup.assert_called_once_with(
-        ("first", "second"), ("layer",)
-    )
+    controller.index.prefetch_final_prefill_queries.assert_not_called()
     assert controller.index_update_request_ids == ()
     assert controller.index_update_build_rows == ()
+
+
+def test_layer_major_prefill_commit_submits_last_query_hint():
+    class FakeFlashAttentionImpl:
+        scale = 0.25
+
+    controller = make_controller()
+    controller.index.cluster_store.pin_memory = True
+    controller.index.flush_staged_updates = Mock()
+    controller.index.has_cluster_pages = Mock(return_value=True)
+    controller.index.prefetch_final_prefill_queries = Mock(return_value=1)
+    query = torch.arange(6, dtype=torch.float32).view(3, 2, 1)
+    layer = SimpleNamespace(impl=FakeFlashAttentionImpl())
+
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.attention.FlashAttentionImpl",
+            FakeFlashAttentionImpl,
+        ),
+        controller.capture_layer_major_prefill_query("layer"),
+    ):
+        controller._maybe_capture_layer_major_prefill_query("layer", layer, query)
+
+    query[-1].fill_(-1)
+    controller.commit_layer_major_prefill("request", ["layer"])
+
+    controller.index.flush_staged_updates.assert_called_once_with()
+    call = controller.index.prefetch_final_prefill_queries.call_args
+    assert call.kwargs["request_ids"] == ("request",)
+    captured_query, scale = call.kwargs["query_hints"]["layer"]
+    assert captured_query.tolist() == [[[4.0], [5.0]]]
+    assert scale == pytest.approx(0.25)
+    assert controller._layer_major_prefill_query_hints == {}
+
+
+def test_layer_major_prefill_skips_hint_without_cluster_pages():
+    class FakeFlashAttentionImpl:
+        scale = 0.25
+
+    controller = make_controller()
+    controller.index.cluster_store.pin_memory = True
+    controller.index.flush_staged_updates = Mock()
+    controller.index.has_cluster_pages = Mock(return_value=False)
+    controller.index.prefetch_final_prefill_queries = Mock()
+    layer = SimpleNamespace(impl=FakeFlashAttentionImpl())
+
+    with (
+        patch(
+            "vllm.v1.spec_decode.retrospec.attention.FlashAttentionImpl",
+            FakeFlashAttentionImpl,
+        ),
+        controller.capture_layer_major_prefill_query("layer"),
+    ):
+        controller._maybe_capture_layer_major_prefill_query(
+            "layer", layer, torch.ones(1, 2, 1)
+        )
+
+    controller.commit_layer_major_prefill("request", ["layer"])
+
+    controller.index.prefetch_final_prefill_queries.assert_not_called()
+    assert controller._layer_major_prefill_query_hints == {}
 
 
 def test_index_update_context_restores_state_after_exception():
@@ -1869,8 +1929,6 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
     controller.index.submit_sparse_verification_prefetch_wave = Mock(
         side_effect=lambda records: call_order.append("submit") or True
     )
-    controller.index.complete_first_draft_warmup = Mock()
-
     impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
     layer = cast(torch.nn.Module, SimpleNamespace())
     query = torch.zeros(2, 1, 1)
@@ -1912,10 +1970,7 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
     controller.index.submit_sparse_verification_prefetch_wave.assert_called_once_with(
         (prefetch_record,)
     )
-    assert controller.index.select_segmented.call_args.kwargs["warm_first_draft"]
-    controller.index.complete_first_draft_warmup.assert_called_once_with(
-        ("request-0", "request-1"), ("layer",), active_mask
-    )
+    assert "warm_first_draft" not in controller.index.select_segmented.call_args.kwargs
 
 
 def test_draft_end_step_submits_one_cross_layer_prefetch_wave():
@@ -1932,7 +1987,6 @@ def test_draft_end_step_submits_one_cross_layer_prefetch_wave():
         )
         for index, layer_name in enumerate(("first", "second"))
     )
-    controller.index.complete_first_draft_warmup = Mock()
     controller.index.submit_sparse_verification_prefetch_wave = Mock(return_value=True)
     controller.index.flush_sparse_verification_prefetch = Mock()
 

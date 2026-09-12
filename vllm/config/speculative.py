@@ -210,8 +210,8 @@ class SpeculativeConfig:
     """Maximum GPU-memory budget in GiB for persistent RetroSpec cluster
     summaries and page descriptors. The budget is shared by all attention
     layers in one worker."""
-    retrospec_first_draft_warmup_multiplier: int = Field(default=4, ge=1)
-    """Maximum number of clusters admitted after the first real draft ranking,
+    retrospec_prefill_warmup_multiplier: int = Field(default=4, ge=1)
+    """Maximum number of clusters admitted from the final prefill query,
     relative to the normal sparse retrieval-cluster count. Admission is also
     capped to half of each request/head resident-cache page target."""
 

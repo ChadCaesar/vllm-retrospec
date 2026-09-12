@@ -38,7 +38,7 @@ def test_retrospec_defaults():
     assert config.retrospec_cpu_page_slab_size_mib == 256
     assert config.retrospec_max_pinned_memory == pytest.approx(1.0)
     assert config.retrospec_max_gpu_index_memory == pytest.approx(4.0)
-    assert config.retrospec_first_draft_warmup_multiplier == 4
+    assert config.retrospec_prefill_warmup_multiplier == 4
     assert config.retrospec_index_update_interval == 1024
     assert config.retrospec_min_draft_tokens == 1
     assert config.retrospec_max_draft_tokens == 16
@@ -139,7 +139,7 @@ def test_retrospec_inherits_target_enforce_eager(target_enforce_eager: bool):
         ("retrospec_cpu_page_slab_size_mib", 0),
         ("retrospec_max_pinned_memory", 0.0),
         ("retrospec_max_gpu_index_memory", 0.0),
-        ("retrospec_first_draft_warmup_multiplier", 0),
+        ("retrospec_prefill_warmup_multiplier", 0),
         ("retrospec_index_update_interval", 0),
         ("num_speculative_tokens", 0),
         ("retrospec_min_draft_tokens", 0),
@@ -253,7 +253,7 @@ def test_retrospec_hash_tracks_execution_structure(field: str, value: Any):
         ("retrospec_cpu_page_slab_size_mib", 512),
         ("retrospec_max_pinned_memory", 2.0),
         ("retrospec_max_gpu_index_memory", 8.0),
-        ("retrospec_first_draft_warmup_multiplier", 8),
+        ("retrospec_prefill_warmup_multiplier", 8),
         ("retrospec_stats_interval_seconds", 5.0),
         ("retrospec_stats_cuda_timing_level", "detailed"),
         ("retrospec_stats_cuda_sample_interval", 1),

@@ -3435,9 +3435,15 @@ class GPUModelRunner(
                         tile_end = tile.scheduled_end
                         per_layer_metadata = {layer_name: attn_metadata}
                         per_layer_slot_mapping = {layer_name: tile.slot_mapping}
+                        capture_context = (
+                            drafter.capture_layer_major_prefill_query(layer_name)
+                            if tile.scheduled_end == prompt_num_tokens
+                            else nullcontext()
+                        )
 
                         with (
                             workspace.bind_layer(layer_name, attention_layer),
+                            capture_context,
                             set_forward_context(
                                 per_layer_metadata,
                                 self.vllm_config,

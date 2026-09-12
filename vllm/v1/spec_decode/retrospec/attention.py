@@ -59,6 +59,12 @@ class _RetroSpecFullVerificationBatch:
     query_lens: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class _RetroSpecPrefillQueryHint:
+    query: torch.Tensor
+    scale: float
+
+
 LayerForward = Callable[..., torch.Tensor]
 
 
@@ -188,9 +194,9 @@ class RetroSpecSparseAttention:
             cache_ratio=config.retrospec_cache_ratio,
             pin_memory=device.type == "cuda" and is_pin_memory_available(),
             max_resident_requests=vllm_config.scheduler_config.max_num_seqs,
-            first_draft_warmup_multiplier=getattr(
+            prefill_warmup_multiplier=getattr(
                 config,
-                "retrospec_first_draft_warmup_multiplier",
+                "retrospec_prefill_warmup_multiplier",
                 4,
             ),
             cpu_page_initial_slab_bytes=(cpu_page_initial_slab_size_mib * MiB_bytes),
@@ -238,6 +244,11 @@ class RetroSpecSparseAttention:
         self.batch_size = 0
         self.parallel_request_indices: torch.Tensor | None = None
         self.parallel_token_indices: torch.Tensor | None = None
+
+        self._layer_major_prefill_capture_layer: str | None = None
+        self._layer_major_prefill_query_hints: dict[
+            str, _RetroSpecPrefillQueryHint
+        ] = {}
 
         self.attention_mass_layer_count = 0
         self.attention_mass_sum = torch.zeros(
@@ -291,10 +302,6 @@ class RetroSpecSparseAttention:
 
         if self.index.has_staged_updates:
             raise RuntimeError("A previous RetroSpec update left staged index changes")
-        first_draft_warmup_request_ids = tuple(
-            request_ids[row] for row in build_rows if prefill_complete[row]
-        )
-
         self.index_update_active = True
         self.index_update_request_ids = request_ids
         self.index_update_seq_lens = seq_lens
@@ -309,10 +316,6 @@ class RetroSpecSparseAttention:
             raise
         else:
             self.index.flush_staged_updates()
-            self.index.mark_first_draft_warmup(
-                first_draft_warmup_request_ids,
-                tuple(self.original_forwards),
-            )
         finally:
             self.index_update_active = False
             self.index_update_request_ids = ()
@@ -370,16 +373,88 @@ class RetroSpecSparseAttention:
             prefill_complete=(True,),
         )
 
+    @contextmanager
+    def capture_layer_major_prefill_query(
+        self,
+        layer_name: str,
+    ) -> Iterator[None]:
+        if not self.index.cluster_store.pin_memory:
+            yield
+            return
+        if self.in_proposal:
+            raise RuntimeError("Cannot capture a prefill query during proposal")
+        if self._layer_major_prefill_capture_layer is not None:
+            raise RuntimeError("Layer-major prefill query capture cannot be nested")
+        if layer_name in self._layer_major_prefill_query_hints:
+            raise RuntimeError(
+                f"Layer-major prefill query for {layer_name!r} was captured twice"
+            )
+
+        self._layer_major_prefill_capture_layer = layer_name
+        try:
+            yield
+        except BaseException:
+            self._layer_major_prefill_query_hints.pop(layer_name, None)
+            raise
+        finally:
+            self._layer_major_prefill_capture_layer = None
+
+        if layer_name not in self._layer_major_prefill_query_hints:
+            raise RuntimeError(
+                f"Layer-major prefill did not capture a query for {layer_name!r}"
+            )
+
+    def _maybe_capture_layer_major_prefill_query(
+        self,
+        layer_name: str,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+    ) -> None:
+        if self._layer_major_prefill_capture_layer != layer_name:
+            return
+
+        impl = getattr(layer, "impl", None)
+        if not isinstance(impl, FlashAttentionImpl):
+            raise RuntimeError(
+                "Layer-major prefill query capture requires FlashAttention"
+            )
+        if query.ndim != 3 or query.shape[0] == 0:
+            raise ValueError(
+                "Layer-major prefill query must have shape "
+                "[num_tokens, num_query_heads, head_size]"
+            )
+
+        self._layer_major_prefill_query_hints[layer_name] = _RetroSpecPrefillQueryHint(
+            query=query[-1:].detach().clone(),
+            scale=impl.scale,
+        )
+
     def commit_layer_major_prefill(
         self,
         request_id: str,
         layer_names: Sequence[str],
     ) -> None:
-        """Publish every layer after the complete request succeeds."""
+        """Publish every layer and enqueue final-prefill cache hints."""
+        layer_names = tuple(layer_names)
         self.index.flush_staged_updates()
-        self.index.mark_first_draft_warmup((request_id,), tuple(layer_names))
+        query_hints = {
+            layer_name: (hint.query, hint.scale)
+            for layer_name in layer_names
+            if (hint := self._layer_major_prefill_query_hints.get(layer_name))
+            is not None
+            and self.index.has_cluster_pages(layer_name, (request_id,))
+        }
+        self._layer_major_prefill_query_hints.clear()
+        if query_hints:
+            with self.performance_stats.cpu_timer("prefill_hint_submit_wall"):
+                self.index.prefetch_final_prefill_queries(
+                    request_ids=(request_id,),
+                    query_hints=query_hints,
+                )
 
     def abort_layer_major_prefill(self) -> None:
+        self._layer_major_prefill_capture_layer = None
+        self._layer_major_prefill_query_hints.clear()
         self.index.discard_staged_updates()
 
     def has_retired_kv_blocks(self, request_ids: Sequence[str]) -> bool:
@@ -787,11 +862,6 @@ class RetroSpecSparseAttention:
 
         if self.mode == RetroSpecAttentionMode.DRAFT:
             assert self.active_mask is not None
-            self.index.complete_first_draft_warmup(
-                self.proposal_request_ids,
-                tuple(self.original_forwards),
-                self.active_mask,
-            )
             prefetch_wave = tuple(self._resident_prefetch_wave)
             self._resident_prefetch_wave.clear()
             if prefetch_wave:
@@ -891,6 +961,11 @@ class RetroSpecSparseAttention:
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.mode == RetroSpecAttentionMode.PASSTHROUGH:
+            self._maybe_capture_layer_major_prefill_query(
+                layer_name,
+                layer,
+                query,
+            )
             result = original_forward(
                 layer,
                 query,
@@ -1492,7 +1567,6 @@ class RetroSpecSparseAttention:
                     seq_lens=attn_metadata.seq_lens,
                     active_mask=self.active_mask,
                     scale=impl.scale,
-                    warm_first_draft=True,
                     plan_slot=self.step_index,
                 )
         else:

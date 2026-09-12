@@ -687,7 +687,7 @@ def test_tensor_core_cluster_logits_reuse_output():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_cluster_selection_workspace_is_reused_and_resized():
+def test_cluster_selection_workspace_separates_prefill_hint_storage():
     index = RetroSpecSegmentedTokenIndex(
         block_size=16,
         num_speculative_tokens=4,
@@ -710,14 +710,26 @@ def test_cluster_selection_workspace_is_reused_and_resized():
     assert first.tile_max.shape == (2, 2, 4, 1)
     assert first.tile_sum.shape == (2, 2, 4, 1)
     assert first.tile_candidate_counts.shape == (2, 2, 1)
-    assert first.topk_indices.shape == (2, 2, 23)
+    assert first.topk_indices.shape == (2, 2, 12)
+
+    prefill_hint = index._get_cluster_selection_workspace(
+        query, 2, 23, prefill_hint=True
+    )
+    reused_prefill_hint = index._get_cluster_selection_workspace(
+        query, 2, 23, prefill_hint=True
+    )
+
+    assert prefill_hint is reused_prefill_hint
+    assert prefill_hint is not first
+    assert prefill_hint.topk_indices.shape == (2, 2, 23)
 
     resized = index._get_cluster_selection_workspace(query, 2, 29)
 
     assert resized is not first
     assert resized.scores.shape == (2, 2, 29)
     assert resized.tile_max.shape == (2, 2, 4, 1)
-    assert resized.topk_indices.shape == (2, 2, 29)
+    assert resized.topk_indices.shape == (2, 2, 16)
+    assert index._prefill_hint_selection_workspace is prefill_hint
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

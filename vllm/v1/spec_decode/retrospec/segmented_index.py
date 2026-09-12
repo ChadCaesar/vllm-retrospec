@@ -210,9 +210,6 @@ class _PackedClusterZones:
     expanded_estimation_indices: torch.Tensor
     expanded_estimation_mask: torch.Tensor
 
-    first_draft_warmup_indices: torch.Tensor
-    first_draft_warmup_mask: torch.Tensor
-
 
 @dataclass(frozen=True)
 class _ClusterSelectionWorkspace:
@@ -731,7 +728,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         cache_ratio: float = 0.0,
         pin_memory: bool = False,
         max_resident_requests: int = 1,
-        first_draft_warmup_multiplier: int = 4,
+        prefill_warmup_multiplier: int = 4,
         cpu_page_initial_slab_bytes: int | None = None,
         cpu_page_slab_bytes: int = 1 << 20,
         max_pinned_memory_bytes: int = 64 << 20,
@@ -763,8 +760,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             raise ValueError("cpu_page_build_workers must be positive")
         if full_verify_gather_workers <= 0:
             raise ValueError("full_verify_gather_workers must be positive")
-        if first_draft_warmup_multiplier <= 0:
-            raise ValueError("first_draft_warmup_multiplier must be positive")
+        if prefill_warmup_multiplier <= 0:
+            raise ValueError("prefill_warmup_multiplier must be positive")
         if cpu_page_slab_bytes <= 0:
             raise ValueError("cpu_page_slab_bytes must be positive")
         if cpu_page_initial_slab_bytes is None:
@@ -800,7 +797,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self.tokens_per_cluster = tokens_per_cluster
         self.num_kmeans_iterations = num_kmeans_iterations
         self.max_pending_cluster_builds = max_pending_cluster_builds
-        self.first_draft_warmup_multiplier = first_draft_warmup_multiplier
+        self.prefill_warmup_multiplier = prefill_warmup_multiplier
         self.max_model_len = max_model_len
         self.performance_stats = performance_stats
         effective_cache_ratio = cache_ratio
@@ -844,13 +841,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self._proposal_request_ids: tuple[str, ...] = ()
         self._proposal_read_leases: list[RetroSpecResidentReadLease] = []
 
-        # request_id -> layers that still need one query-guided resident
-        # admission after the first real draft ranking.
-        self._first_draft_warm_layers_by_request: dict[str, set[str]] = {}
-
         # Shared across model layers. Selection results are copied into each
         # plan before the workspace is reused.
         self._cluster_selection_workspace: _ClusterSelectionWorkspace | None = None
+        self._prefill_hint_selection_workspace: _ClusterSelectionWorkspace | None = None
+        self._prefill_hint_streams: dict[torch.device, torch.cuda.Stream] = {}
 
         # One contiguous table is retained per layer. Its first dimensions are
         # [draft_step, request], so verification can gather packed pair rows
@@ -1028,9 +1023,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self.cluster_store.wait_for_resident_prefetches()
         self._gpu_index_residency.invalidate_requests(request_ids)
 
-        for request_id in request_ids:
-            self._first_draft_warm_layers_by_request.pop(request_id, None)
-
         for layer_name, layer_indices in self._indices.items():
             for request_id in request_ids:
                 record = layer_indices.pop(request_id, None)
@@ -1112,86 +1104,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             and record.num_clusters > 0
             for request_id in request_ids
         )
-
-    def mark_first_draft_warmup(
-        self,
-        request_ids: Sequence[str],
-        layer_names: Sequence[str],
-    ) -> None:
-        if not self.cluster_store.pin_memory:
-            return
-
-        layer_names = tuple(layer_names)
-        if not layer_names:
-            return
-
-        for request_id in request_ids:
-            indexed_layers = {
-                layer_name
-                for layer_name in layer_names
-                if self.has_cluster_pages(layer_name, (request_id,))
-            }
-            if not indexed_layers:
-                continue
-
-            self._first_draft_warm_layers_by_request.setdefault(
-                request_id,
-                set(),
-            ).update(indexed_layers)
-
-    def _get_first_draft_warmup_mask(
-        self,
-        request_ids: Sequence[str],
-        layer_name: str,
-        active_mask: torch.Tensor,
-        warm_first_draft: bool,
-    ) -> torch.Tensor | None:
-        if not warm_first_draft or not self.cluster_store.pin_memory:
-            return None
-
-        pending_rows = [
-            layer_name in self._first_draft_warm_layers_by_request.get(request_id, ())
-            for request_id in request_ids
-        ]
-        if not any(pending_rows):
-            return None
-
-        pending_mask = torch.tensor(
-            pending_rows,
-            dtype=torch.bool,
-            device=active_mask.device,
-        )
-        return pending_mask & active_mask
-
-    def complete_first_draft_warmup(
-        self,
-        request_ids: Sequence[str],
-        layer_names: Sequence[str],
-        active_mask: torch.Tensor,
-    ) -> None:
-        """Consume warmup state after every active request finishes its draft."""
-        completed_layers = set(layer_names)
-        has_pending = any(
-            completed_layers
-            & self._first_draft_warm_layers_by_request.get(request_id, set())
-            for request_id in request_ids
-        )
-        if not has_pending:
-            return
-
-        active_rows = active_mask.detach().to(device="cpu").tolist()
-
-        for request_id, active in zip(request_ids, active_rows):
-            if not active:
-                continue
-
-            pending_layers = self._first_draft_warm_layers_by_request.get(request_id)
-            if pending_layers is None:
-                continue
-
-            pending_layers.difference_update(completed_layers)
-            if not pending_layers:
-                self._first_draft_warm_layers_by_request.pop(request_id, None)
 
     def begin_proposal(self, request_ids: Sequence[str]) -> None:
         if self._proposal_active:
@@ -1282,6 +1194,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 self._discard_primed_full_verification(wait=True, record_outcome=False)
             finally:
                 try:
+                    for stream in self._prefill_hint_streams.values():
+                        stream.synchronize()
+                    self._prefill_hint_streams.clear()
+                    self._prefill_hint_selection_workspace = None
                     self.cluster_store.close()
                 finally:
                     self._gpu_index_residency.close()
@@ -2147,10 +2063,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             max_expanded_retrieval,
         )
 
-    def _maximum_first_draft_warmup_width(self, num_clusters: int) -> int:
+    def _maximum_prefill_warmup_width(self, num_clusters: int) -> int:
         max_retrieval, _, _ = self._maximum_zone_widths(num_clusters)
         return min(
-            max_retrieval * self.first_draft_warmup_multiplier,
+            max_retrieval * self.prefill_warmup_multiplier,
             num_clusters,
         )
 
@@ -2159,6 +2075,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         query: torch.Tensor,
         num_kv_heads: int,
         num_clusters: int,
+        prefill_hint: bool = False,
     ) -> _ClusterSelectionWorkspace:
         """Return a reusable CUDA workspace for cluster selection."""
         if query.device.type != "cuda":
@@ -2179,8 +2096,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             _,
         ) = self._maximum_zone_widths(num_clusters)
         max_total_compute = max_retrieval + max_estimation
-        max_first_draft_warmup = self._maximum_first_draft_warmup_width(num_clusters)
-        max_ranked_clusters = max(max_total_compute, max_first_draft_warmup)
+        max_ranked_clusters = (
+            self._maximum_prefill_warmup_width(num_clusters)
+            if prefill_hint
+            else max_total_compute
+        )
 
         num_tiles = (
             num_clusters + RESIDENT_CLUSTER_SCORE_TILE_SIZE - 1
@@ -2203,7 +2123,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             max_ranked_clusters,
         )
 
-        workspace = self._cluster_selection_workspace
+        workspace = (
+            self._prefill_hint_selection_workspace
+            if prefill_hint
+            else self._cluster_selection_workspace
+        )
         if (
             workspace is not None
             and workspace.scores.device == query.device
@@ -2254,7 +2178,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 device=query.device,
             ),
         )
-        self._cluster_selection_workspace = workspace
+        if prefill_hint:
+            self._prefill_hint_selection_workspace = workspace
+        else:
+            self._cluster_selection_workspace = workspace
         return workspace
 
     def _score_resident_view(
@@ -2263,6 +2190,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         view: RetroSpecResidentBatchView,
         scale: float,
         num_kv_heads: int,
+        prefill_hint: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2271,7 +2199,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         workspace = None
         if query.device.type == "cuda":
             workspace = self._get_cluster_selection_workspace(
-                query, num_kv_heads, view.max_num_clusters
+                query,
+                num_kv_heads,
+                view.max_num_clusters,
+                prefill_hint=prefill_hint,
             )
 
         arena = view.arena
@@ -2347,20 +2278,18 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self,
         cluster_scores: torch.Tensor,
         workspace: _ClusterSelectionWorkspace,
-        warmup_enabled: bool,
+        ranking_width: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Rank into the fixed CUDA workspace without allocating zone tensors."""
         if cluster_scores is not workspace.scores:
             raise ValueError("Workspace scores do not match cluster scores")
 
         num_clusters = cluster_scores.shape[2]
-        max_retrieval, max_estimation, _ = self._maximum_zone_widths(num_clusters)
-        ranking_width = max_retrieval + max_estimation
-        if warmup_enabled:
-            ranking_width = max(
-                ranking_width,
-                self._maximum_first_draft_warmup_width(num_clusters),
-            )
+        if ranking_width is None:
+            max_retrieval, max_estimation, _ = self._maximum_zone_widths(num_clusters)
+            ranking_width = max_retrieval + max_estimation
+        if ranking_width <= 0 or ranking_width > num_clusters:
+            raise ValueError("Cluster ranking width is outside the valid range")
         if workspace.topk_indices.shape[2] < ranking_width:
             raise ValueError("Workspace top-k capacity is too small")
 
@@ -2418,35 +2347,35 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             selected_mask.contiguous(),
         )
 
-    def _select_first_draft_warmup(
+    def _select_prefill_warmup(
         self,
         ranked_indices: torch.Tensor,
         candidate_counts: torch.Tensor,
         view: RetroSpecResidentBatchView,
-        first_draft_warmup_mask: torch.Tensor,
+        active_mask: torch.Tensor,
         warmup_page_budgets: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build the exceptional one-shot first-draft warmup rank prefix."""
+        """Select a bounded final-prefill resident-cache seed."""
         batch_size, num_kv_heads = candidate_counts.shape
-        if first_draft_warmup_mask.shape != (batch_size,):
-            raise ValueError("First-draft warmup mask has an unexpected shape")
+        if active_mask.shape != (batch_size,):
+            raise ValueError("Prefill warmup mask has an unexpected shape")
         if warmup_page_budgets.shape != (batch_size, num_kv_heads):
-            raise ValueError("First-draft page budgets have an unexpected shape")
-        if first_draft_warmup_mask.device != ranked_indices.device:
-            raise ValueError("First-draft warmup mask must use the rank device")
+            raise ValueError("Prefill warmup page budgets have an unexpected shape")
+        if active_mask.device != ranked_indices.device:
+            raise ValueError("Prefill warmup mask must use the rank device")
         if warmup_page_budgets.device != ranked_indices.device:
-            raise ValueError("First-draft page budgets must use the rank device")
+            raise ValueError("Prefill warmup page budgets must use the rank device")
 
         num_clusters = view.max_num_clusters
         max_retrieval, _, _ = self._maximum_zone_widths(num_clusters)
-        max_warmup = self._maximum_first_draft_warmup_width(num_clusters)
+        max_warmup = self._maximum_prefill_warmup_width(num_clusters)
         counts = candidate_counts.to(torch.int64)
         retrieval_counts = torch.ceil(counts.float() * self.retrieval_ratio).to(
             torch.int64
         )
         retrieval_counts = torch.minimum(retrieval_counts, counts)
         warmup_counts = torch.minimum(
-            retrieval_counts * self.first_draft_warmup_multiplier,
+            retrieval_counts * self.prefill_warmup_multiplier,
             counts,
         )
         zero_counts = torch.zeros_like(retrieval_counts)
@@ -2487,17 +2416,210 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         ranked_page_counts = cluster_page_counts.gather(2, warmup_indices)
         cumulative_pages = ranked_page_counts.cumsum(dim=2)
         warmup_mask &= cumulative_pages <= warmup_page_budgets.unsqueeze(-1)
-        warmup_mask &= first_draft_warmup_mask[:, None, None]
+        warmup_mask &= active_mask[:, None, None]
         warmup_mask &= view.request_slot_ids[:, None, None] >= 0
         return warmup_indices, warmup_mask
+
+    def _get_prefill_hint_stream(self, device: torch.device) -> torch.cuda.Stream:
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        stream = self._prefill_hint_streams.get(device)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._prefill_hint_streams[device] = stream
+        return stream
+
+    def _get_prefill_hint_view(
+        self,
+        layer_name: str,
+        request_ids: tuple[str, ...],
+        query: torch.Tensor,
+    ) -> RetroSpecResidentBatchView:
+        self._validate_resident_index(layer_name, request_ids)
+        view = self._gpu_index_residency.get_active_view(
+            layer_name,
+            request_ids,
+            query.device,
+        )
+        arena = view.arena
+        if arena is None:
+            return view
+        if arena.cluster_keys.device != query.device:
+            raise RuntimeError("Prefill hint and cluster index use different devices")
+        if arena.cluster_keys.dtype != query.dtype:
+            raise RuntimeError("Prefill hint and cluster index use different dtypes")
+        if arena.cluster_keys.shape[2] != query.shape[2]:
+            raise RuntimeError("Prefill hint and cluster index head sizes differ")
+        return view
+
+    @staticmethod
+    def _gather_ranked_cluster_handles(
+        view: RetroSpecResidentBatchView,
+        ranked_indices: torch.Tensor,
+        ranked_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if ranked_indices.shape != ranked_mask.shape:
+            raise ValueError("Ranked cluster indices and mask must match")
+
+        output = torch.full(
+            ranked_indices.shape,
+            -1,
+            dtype=torch.int64,
+            device=ranked_indices.device,
+        )
+        if view.arena is None or ranked_indices.shape[2] == 0:
+            return output
+
+        arena = view.arena
+        safe_slots = view.request_slot_ids.clamp_min(0)
+        request_offsets = arena.cluster_offsets.index_select(0, safe_slots)
+        absolute_indices = request_offsets[:, None, None] + ranked_indices
+        absolute_indices.clamp_(min=0, max=arena.cluster_ids.shape[1] - 1)
+        head_indices = torch.arange(
+            ranked_indices.shape[1],
+            dtype=torch.int64,
+            device=ranked_indices.device,
+        )[None, :, None].expand_as(ranked_indices)
+
+        handles = arena.cluster_ids[head_indices, absolute_indices]
+        valid = (
+            ranked_mask & (view.request_slot_ids[:, None, None] >= 0) & (handles >= 0)
+        )
+        output.copy_(handles)
+        output.masked_fill_(~valid, -1)
+        return output
+
+    def _prefetch_final_prefill_query(
+        self,
+        request_ids: tuple[str, ...],
+        layer_name: str,
+        query: torch.Tensor,
+        scale: float,
+    ) -> bool:
+        if query.ndim != 3 or query.shape[0] != len(request_ids):
+            raise ValueError("Prefill hint query batch does not match request IDs")
+
+        view = self._get_prefill_hint_view(layer_name, request_ids, query)
+        arena = view.arena
+        if arena is None:
+            return False
+
+        num_kv_heads = arena.cluster_keys.shape[0]
+        if query.shape[1] % num_kv_heads != 0:
+            raise ValueError("Query heads must be divisible by KV heads")
+
+        cluster_scores, candidate_counts, workspace = self._score_resident_view(
+            query=query,
+            view=view,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            prefill_hint=True,
+        )
+        if workspace is None:
+            return False
+
+        warmup_width = self._maximum_prefill_warmup_width(view.max_num_clusters)
+        _, ranked_indices = self._rank_cluster_scores(
+            cluster_scores,
+            workspace,
+            ranking_width=warmup_width,
+        )
+        group_targets = self.cluster_store.resident_group_target_pages(
+            layer_name,
+            request_ids,
+            num_kv_heads,
+        )
+        page_budgets = torch.tensor(
+            group_targets,
+            dtype=torch.int64,
+            device=query.device,
+        )
+        page_budgets = torch.div(
+            page_budgets + 1,
+            2,
+            rounding_mode="floor",
+        )
+        active_mask = torch.ones(
+            len(request_ids),
+            dtype=torch.bool,
+            device=query.device,
+        )
+        warmup_indices, warmup_mask = self._select_prefill_warmup(
+            ranked_indices=ranked_indices,
+            candidate_counts=candidate_counts,
+            view=view,
+            active_mask=active_mask,
+            warmup_page_budgets=page_budgets,
+        )
+        cluster_handles = self._gather_ranked_cluster_handles(
+            view,
+            warmup_indices,
+            warmup_mask,
+        )
+        access_kinds = warmup_mask.to(torch.int8)
+        access_kinds.mul_(2)
+
+        self.cluster_store.reserve_resident_access_ring(
+            query.device,
+            cluster_handles.numel(),
+        )
+        return self.cluster_store.prefetch_resident_clusters(
+            layer_name=layer_name,
+            cluster_ids=cluster_handles,
+            access_kinds=access_kinds,
+        )
+
+    def prefetch_final_prefill_queries(
+        self,
+        request_ids: Sequence[str],
+        query_hints: Mapping[str, tuple[torch.Tensor, float]],
+    ) -> int:
+        """Seed resident pages without delaying the first draft step."""
+        if not self.cluster_store.pin_memory or not query_hints:
+            return 0
+        if self._proposal_active:
+            raise RuntimeError("Prefill hints cannot start during a proposal")
+
+        request_ids = tuple(request_ids)
+        devices = {query.device for query, _ in query_hints.values()}
+        if len(devices) != 1:
+            raise ValueError("All prefill hints must use one CUDA device")
+        device = next(iter(devices))
+        if device.type != "cuda":
+            return 0
+
+        producer_event = torch.cuda.Event()
+        producer_event.record(torch.cuda.current_stream(device))
+        hint_stream = self._get_prefill_hint_stream(device)
+        submitted = 0
+
+        self._gpu_index_residency.activate(request_ids)
+        try:
+            with torch.cuda.stream(hint_stream):
+                hint_stream.wait_event(producer_event)
+                for layer_name, (query, scale) in query_hints.items():
+                    query.record_stream(hint_stream)
+                    with self._cuda_timer("prefill_hint_selection"):
+                        queued = self._prefetch_final_prefill_query(
+                            request_ids=request_ids,
+                            layer_name=layer_name,
+                            query=query,
+                            scale=scale,
+                        )
+                    submitted += int(queued)
+        finally:
+            self._gpu_index_residency.deactivate()
+
+        if self.performance_stats is not None:
+            self.performance_stats.add_counter("prefill_hint_layers", len(query_hints))
+            self.performance_stats.add_counter("prefill_hint_records", submitted)
+        return submitted
 
     def _select_cluster_zones(
         self,
         cluster_scores: torch.Tensor,
         candidate_counts: torch.Tensor,
         view: RetroSpecResidentBatchView,
-        first_draft_warmup_mask: torch.Tensor | None = None,
-        warmup_page_budgets: torch.Tensor | None = None,
         workspace: _ClusterSelectionWorkspace | None = None,
     ) -> _PackedClusterZones:
         """Rank relevant clusters once and return compact zone indices."""
@@ -2508,31 +2630,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         if candidate_counts.shape != cluster_scores.shape[:2]:
             raise ValueError("Candidate counts do not match cluster scores")
 
-        batch_size, num_kv_heads, num_clusters = cluster_scores.shape
+        _, _, num_clusters = cluster_scores.shape
         (
             max_retrieval,
             max_estimation,
             max_expanded_retrieval,
         ) = self._maximum_zone_widths(num_clusters)
         max_total_compute = max_retrieval + max_estimation
-        max_warmup = self._maximum_first_draft_warmup_width(num_clusters)
-
-        warmup_enabled = first_draft_warmup_mask is not None
-        if warmup_enabled:
-            if first_draft_warmup_mask.shape != (batch_size,):
-                raise ValueError("First-draft warmup mask has an unexpected shape")
-            if first_draft_warmup_mask.device != cluster_scores.device:
-                raise ValueError("First-draft warmup mask must use the score device")
-            if warmup_page_budgets is None:
-                raise ValueError("First-draft warmup requires page budgets")
-            if warmup_page_budgets.shape != (batch_size, num_kv_heads):
-                raise ValueError("First-draft page budgets have an unexpected shape")
-            if warmup_page_budgets.device != cluster_scores.device:
-                raise ValueError("First-draft page budgets must use the score device")
-
-        ranking_width = (
-            max(max_total_compute, max_warmup) if warmup_enabled else max_total_compute
-        )
+        ranking_width = max_total_compute
 
         candidate_counts = candidate_counts.to(torch.int64)
 
@@ -2630,26 +2735,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             max_estimation,
         )
 
-        if not warmup_enabled:
-            first_draft_warmup_indices = ranked_indices[:, :, :0].contiguous()
-            first_draft_warmup_cluster_mask = torch.empty_like(
-                first_draft_warmup_indices,
-                dtype=torch.bool,
-            )
-        else:
-            assert first_draft_warmup_mask is not None
-            assert warmup_page_budgets is not None
-            (
-                first_draft_warmup_indices,
-                first_draft_warmup_cluster_mask,
-            ) = self._select_first_draft_warmup(
-                ranked_indices,
-                candidate_counts,
-                view,
-                first_draft_warmup_mask,
-                warmup_page_budgets,
-            )
-
         return _PackedClusterZones(
             sparse_retrieval_indices=sparse_retrieval_indices,
             sparse_retrieval_mask=sparse_retrieval_mask,
@@ -2661,8 +2746,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             expanded_retrieval_scores=expanded_retrieval_scores,
             expanded_estimation_indices=expanded_estimation_indices,
             expanded_estimation_mask=expanded_estimation_mask,
-            first_draft_warmup_indices=first_draft_warmup_indices,
-            first_draft_warmup_mask=first_draft_warmup_cluster_mask,
         )
 
     @staticmethod
@@ -2898,10 +2981,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             num_speculative_tokens=self.num_speculative_tokens,
             block_size=self.block_size,
         )
-        max_access_width = max(
-            sparse_retrieval_width,
-            self._maximum_first_draft_warmup_width(view.max_num_clusters),
-        )
+        max_access_width = sparse_retrieval_width
         if device.type == "cuda":
             self.cluster_store.reserve_resident_access_ring(
                 device,
@@ -3712,9 +3792,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         ranked_values: torch.Tensor | None = None,
         ranked_indices: torch.Tensor | None = None,
         candidate_counts: torch.Tensor | None = None,
-        warmup_active_mask: torch.Tensor | None = None,
-        warmup_page_budgets: torch.Tensor | None = None,
-        prefetch_num_ranks: int | None = None,
     ) -> RetroSpecTokenAttentionSelection:
         """Use resident retrieval clusters and estimate selected cache misses."""
         if (
@@ -3739,7 +3816,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         retrieval_fallback_counts = estimation_token_counts[
             :, :, sparse_width : sparse_width + retrieval_width
         ]
-        normal_prefetch = prefetch_num_ranks is None
         resolved_pages = self.cluster_store.resolve_ranked_compact_draft_cluster_blocks(
             layer_name=plan.layer_name,
             ranked_values=ranked_values,
@@ -3770,11 +3846,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             miss_count=output_workspace.draft_prefetch_miss_count,
             sparse_attention=plan.sparse_attn,
             expanded_attention=plan.expanded_attn,
-            warmup_active_mask=warmup_active_mask,
-            warmup_page_budgets=warmup_page_budgets,
-            warmup_multiplier=self.first_draft_warmup_multiplier,
-            warmup_width=prefetch_num_ranks or 0,
-            emit_misses=normal_prefetch,
         )
         self._proposal_read_leases.append(resolved_pages.read_lease)
 
@@ -3790,8 +3861,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             output_workspace.draft_exact_cluster_ids.shape[0]
             * output_workspace.draft_exact_cluster_ids.shape[1]
         )
-        if prefetch_num_ranks is None:
-            prefetch_num_ranks = output_workspace.draft_exact_cluster_ids.shape[2]
+        prefetch_num_ranks = output_workspace.draft_exact_cluster_ids.shape[2]
         if prefetch_num_ranks < 0:
             raise ValueError("Prefetch rank width must be non-negative")
         if (
@@ -4645,7 +4715,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         seq_lens: torch.Tensor,
         active_mask: torch.Tensor,
         scale: float,
-        warm_first_draft: bool = False,
         plan_slot: int = 0,
     ) -> RetroSpecTokenAttentionSelection:
         self._validate_inputs(
@@ -4670,40 +4739,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             max_num_tokens = block_table.shape[1] * self.block_size
 
         num_kv_heads = key_cache.shape[2]
-        first_draft_warmup_mask = self._get_first_draft_warmup_mask(
-            request_ids,
-            layer_name,
-            active_mask,
-            warm_first_draft,
-        )
-        warmup_page_budgets = None
-        if first_draft_warmup_mask is not None:
-            group_targets = self.cluster_store.resident_group_target_pages(
-                layer_name,
-                request_ids,
-                num_kv_heads,
-            )
-            warmup_page_budgets = torch.tensor(
-                group_targets,
-                dtype=torch.int64,
-                device=query.device,
-            )
-            warmup_page_budgets = torch.div(
-                warmup_page_budgets + 1,
-                2,
-                rounding_mode="floor",
-            )
-
         with self._cuda_timer("draft_cluster_score"):
             cluster_scores, candidate_counts, workspace = self._score_resident_view(
                 query, view, scale, num_kv_heads
             )
 
         direct_cuda_plan = workspace is not None and view.arena is not None
-        if first_draft_warmup_mask is not None and not direct_cuda_plan:
-            raise RuntimeError(
-                "First-draft warmup requires the resident CUDA ranked path"
-            )
         ranked_values = None
         ranked_indices = None
         cluster_zones = None
@@ -4727,7 +4768,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 ranked_values, ranked_indices = self._rank_cluster_scores(
                     cluster_scores,
                     workspace,
-                    warmup_enabled=first_draft_warmup_mask is not None,
                 )
             with self._cuda_timer("draft_plan_build"):
                 self._emit_cuda_draft_plan(
@@ -4805,12 +4845,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     dtype=key_cache.dtype,
                 )
 
-        warmup_num_ranks = None
-        if first_draft_warmup_mask is not None:
-            warmup_num_ranks = self._maximum_first_draft_warmup_width(
-                view.max_num_clusters
-            )
-
         with self._cuda_timer("draft_plan_materialize"):
             selection = self._materialize_draft_selection(
                 plan=plan,
@@ -4820,9 +4854,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 ranked_values=ranked_values,
                 ranked_indices=ranked_indices,
                 candidate_counts=candidate_counts,
-                warmup_active_mask=first_draft_warmup_mask,
-                warmup_page_budgets=warmup_page_budgets,
-                prefetch_num_ranks=warmup_num_ranks,
             )
         if plan_table is not None:
             self._publish_plan_step(

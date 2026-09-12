@@ -1781,6 +1781,46 @@ def test_resident_prefetch_coalesces_latest_wave_and_applies_bounded_backpressur
     store.close()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_deferred_prefetch_keeps_per_layer_producer_events():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(page_size=2)
+    store.configure_resident_prefetch_wave(2)
+
+    def make_record(layer_name: str, handle: int) -> RetroSpecResidentPrefetchInput:
+        return RetroSpecResidentPrefetchInput(
+            layer_name=layer_name,
+            miss_cluster_ids=torch.tensor([handle], dtype=torch.int64, device=device),
+            miss_positions=torch.zeros(1, dtype=torch.int64, device=device),
+            miss_count=torch.ones(1, dtype=torch.int32, device=device),
+            num_groups=1,
+            num_ranks=1,
+        )
+
+    first = make_record("first", 1)
+    second = make_record("second", 2)
+    replacement = make_record("first", 3)
+    store._defer_resident_prefetch_wave(device, (first,))
+    first_event = store._resident_prefetch_deferred[device].source_ready_events[0]
+    store._defer_resident_prefetch_wave(device, (second,))
+    second_event = store._resident_prefetch_deferred[device].source_ready_events[1]
+
+    deferred = store._resident_prefetch_deferred[device]
+    assert deferred.records[0] is first
+    assert deferred.records[1] is second
+    assert deferred.source_ready_events == (first_event, second_event)
+
+    store._defer_resident_prefetch_wave(device, (replacement,))
+    deferred = store._resident_prefetch_deferred[device]
+    assert deferred.records[0] is replacement
+    assert deferred.records[1] is second
+    assert deferred.source_ready_events[1] is second_event
+    assert deferred.source_ready_events[0] is not first_event
+
+    store._resident_prefetch_deferred.clear()
+    store.close()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA is required to resolve cluster pages",

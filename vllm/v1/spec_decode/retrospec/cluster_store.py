@@ -513,10 +513,10 @@ class _StagedResidentPrefetchWave:
 
 @dataclass(frozen=True)
 class _DeferredResidentPrefetchWave:
-    """Latest GPU command wave retained while the pinned ring is full."""
+    """Latest per-layer commands retained while the pinned ring is full."""
 
     records: tuple[RetroSpecResidentPrefetchInput, ...]
-    source_ready_event: torch.cuda.Event
+    source_ready_events: tuple[torch.cuda.Event, ...]
 
 
 @dataclass(frozen=True)
@@ -3699,7 +3699,7 @@ class RetroSpecClusterPageStore:
         self,
         records: tuple[RetroSpecResidentPrefetchInput, ...],
         slot: _PinnedSelectionSlot,
-        source_ready_event: torch.cuda.Event | None,
+        source_ready_events: Sequence[torch.cuda.Event] | None,
     ) -> None:
         device = self._canonical_cuda_device(records[0].miss_cluster_ids.device)
         stream = self._get_resident_prefetch_stream(device)
@@ -3709,15 +3709,22 @@ class RetroSpecClusterPageStore:
         ownership_transferred = False
         try:
             cpu_views = slot.reserve_wave(records)
-            if source_ready_event is None:
+            if source_ready_events is not None and len(source_ready_events) != len(
+                records
+            ):
+                raise ValueError(
+                    "Resident prefetch producer events must match layer records"
+                )
+            if source_ready_events is None:
                 stream.wait_stream(torch.cuda.current_stream(device))
-            else:
-                stream.wait_event(source_ready_event)
 
             with torch.cuda.stream(stream):
-                for record, (cluster_ids_cpu, positions_cpu, count_cpu) in zip(
-                    records, cpu_views
-                ):
+                for record_index, (
+                    record,
+                    (cluster_ids_cpu, positions_cpu, count_cpu),
+                ) in enumerate(zip(records, cpu_views)):
+                    if source_ready_events is not None:
+                        stream.wait_event(source_ready_events[record_index])
                     cluster_ids_cpu.copy_(record.miss_cluster_ids, non_blocking=True)
                     positions_cpu.copy_(record.miss_positions, non_blocking=True)
                     count_cpu.copy_(record.miss_count, non_blocking=True)
@@ -3791,19 +3798,41 @@ class RetroSpecClusterPageStore:
     ) -> None:
         source_ready_event = torch.cuda.Event()
         source_ready_event.record(torch.cuda.current_stream(device))
-        deferred = _DeferredResidentPrefetchWave(
-            records=records, source_ready_event=source_ready_event
-        )
+        superseded = 0
         with self._resident_prefetch_lock:
             previous = self._resident_prefetch_deferred.get(device)
+            merged: dict[
+                str, tuple[RetroSpecResidentPrefetchInput, torch.cuda.Event]
+            ] = {}
+            if previous is not None:
+                merged.update(
+                    (record.layer_name, (record, ready_event))
+                    for record, ready_event in zip(
+                        previous.records, previous.source_ready_events
+                    )
+                )
+            for record in records:
+                if record.layer_name in merged:
+                    superseded += 1
+                merged[record.layer_name] = (record, source_ready_event)
+            if len(merged) > self._resident_prefetch_wave_max_records:
+                raise RuntimeError("Deferred resident prefetch exceeds layer capacity")
+            deferred = _DeferredResidentPrefetchWave(
+                records=tuple(record for record, _ in merged.values()),
+                source_ready_events=tuple(event for _, event in merged.values()),
+            )
             self._resident_prefetch_deferred[device] = deferred
 
         if self.performance_stats is not None:
             self.performance_stats.add_counter("prefetch_waves_deferred")
+            self.performance_stats.observe_peak(
+                "prefetch_deferred_layer_records", len(deferred.records)
+            )
             if previous is not None:
                 self.performance_stats.add_counter("prefetch_waves_coalesced")
+            if superseded:
                 self.performance_stats.add_counter(
-                    "prefetch_records_superseded", len(previous.records)
+                    "prefetch_records_superseded", superseded
                 )
 
     def _wait_for_one_resident_prefetch(self, device: torch.device) -> bool:
@@ -3873,7 +3902,7 @@ class RetroSpecClusterPageStore:
                 continue
 
             self._submit_resident_prefetch_wave(
-                current.records, slot, current.source_ready_event
+                current.records, slot, current.source_ready_events
             )
             return True
 
@@ -4255,7 +4284,7 @@ class RetroSpecClusterPageStore:
             self._defer_resident_prefetch_wave(device, records)
             return True
 
-        self._submit_resident_prefetch_wave(records, slot, source_ready_event=None)
+        self._submit_resident_prefetch_wave(records, slot, source_ready_events=None)
         return True
 
     def wait_for_resident_prefetches(
@@ -4623,10 +4652,6 @@ class RetroSpecClusterPageStore:
         miss_count: torch.Tensor,
         sparse_attention: torch.Tensor,
         expanded_attention: torch.Tensor,
-        warmup_active_mask: torch.Tensor | None = None,
-        warmup_page_budgets: torch.Tensor | None = None,
-        warmup_multiplier: int = 1,
-        warmup_width: int = 0,
         emit_misses: bool = True,
     ) -> RetroSpecCompactResolvedClusterPages:
         """Resolve ranked DRAFT rows directly into compact resident pages."""
@@ -4672,10 +4697,6 @@ class RetroSpecClusterPageStore:
             miss_count=miss_count,
             sparse_attention=sparse_attention,
             expanded_attention=expanded_attention,
-            warmup_active_mask=warmup_active_mask,
-            warmup_page_budgets=warmup_page_budgets,
-            warmup_multiplier=warmup_multiplier,
-            warmup_width=warmup_width,
             emit_misses=emit_misses,
         )
         if self.performance_stats is not None:

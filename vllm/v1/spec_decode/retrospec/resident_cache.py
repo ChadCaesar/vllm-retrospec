@@ -14,7 +14,6 @@ from .resident_kernels import (
     lookup_resident_handles,
     resolve_compact_draft_pages,
     resolve_compact_verification_pages,
-    resolve_ranked_warmup_misses,
     update_resident_handles,
 )
 
@@ -1286,10 +1285,6 @@ class RetroSpecResidentClusterCache:
         miss_count: torch.Tensor,
         sparse_attention: torch.Tensor,
         expanded_attention: torch.Tensor,
-        warmup_active_mask: torch.Tensor | None = None,
-        warmup_page_budgets: torch.Tensor | None = None,
-        warmup_multiplier: int = 1,
-        warmup_width: int = 0,
         emit_misses: bool = True,
     ) -> RetroSpecCompactResidentPageAccess:
         """Resolve ranked DRAFT rows without logical-page intermediates."""
@@ -1301,36 +1296,6 @@ class RetroSpecResidentClusterCache:
             self._ensure_handle_table(max_pages_per_cluster)
             access_epoch = self._next_access_epoch
             self._next_access_epoch += 1
-            if warmup_active_mask is not None:
-                if warmup_page_budgets is None:
-                    raise ValueError("Warmup page budgets are required")
-                resolve_ranked_warmup_misses(
-                    ranked_indices=ranked_indices,
-                    candidate_counts=candidate_counts,
-                    arena_cluster_ids=arena_cluster_ids,
-                    arena_resident_table_buckets=arena_resident_table_buckets,
-                    arena_cluster_page_counts=arena_cluster_page_counts,
-                    arena_cluster_offsets=arena_cluster_offsets,
-                    request_slot_ids=request_slot_ids,
-                    active_mask=warmup_active_mask,
-                    warmup_page_budgets=warmup_page_budgets,
-                    table_handles=self._handle_table_handles,
-                    table_versions=self._handle_table_versions,
-                    table_page_counts=self._handle_table_page_counts,
-                    table_page_slots=self._handle_table_page_slots,
-                    table_last_access_epochs=self._handle_table_last_access_epochs,
-                    access_epoch=access_epoch,
-                    retrieval_ratio=retrieval_ratio,
-                    warmup_multiplier=warmup_multiplier,
-                    warmup_width=warmup_width,
-                    max_pages_per_cluster=max_pages_per_cluster,
-                    output_miss_handles=miss_cluster_ids,
-                    output_miss_positions=miss_positions,
-                    output_miss_count=miss_count,
-                )
-                emit_misses = False
-            elif warmup_page_budgets is not None:
-                raise ValueError("Warmup page budgets require an active mask")
             resolve_compact_draft_pages(
                 ranked_values=ranked_values,
                 candidate_counts=candidate_counts,

@@ -344,32 +344,43 @@ def build_retrospec_long_context_capacity(
     max_total_compute_clusters = max_retrieval_clusters + max_estimation_clusters
     max_warmup_clusters = min(
         max_retrieval_clusters
-        * getattr(config, "retrospec_first_draft_warmup_multiplier", 4),
+        * getattr(config, "retrospec_prefill_warmup_multiplier", 4),
         num_clusters_per_request,
     )
-    max_ranked_clusters = max(max_total_compute_clusters, max_warmup_clusters)
-
     # Resident scoring retains one probability score per cluster, bounded
-    # top-k outputs and small per-query-group tile statistics. It does not
-    # materialize grouped logits or a duplicate ranking tensor.
+    # top-k outputs and small per-query-group tile statistics. Final-prefill
+    # hints use a second one-request workspace because their CUDA stream may
+    # overlap the ordinary draft selection workspace.
     selection_num_tiles = cdiv(
         num_clusters_per_request, RESIDENT_CLUSTER_SCORE_TILE_SIZE
     )
-    selection_score_bytes = total_resident_clusters * max_kv_heads * 4
-    selection_topk_bytes = (
-        planning_requests * max_kv_heads * max_ranked_clusters * (4 + 8)
+    normal_selection_score_bytes = total_resident_clusters * max_kv_heads * 4
+    normal_selection_topk_bytes = (
+        planning_requests * max_kv_heads * max_total_compute_clusters * (4 + 8)
     )
-    selection_tile_bytes = (
+    normal_selection_tile_bytes = (
         planning_requests
         * selection_num_tiles
         * (num_query_heads * (4 + 4) + max_kv_heads * 4)
     )
-    selection_row_bytes = planning_requests * (num_query_heads * 4 + max_kv_heads * 4)
+    normal_selection_row_bytes = planning_requests * (
+        num_query_heads * 4 + max_kv_heads * 4
+    )
+    prefill_hint_score_bytes = num_clusters_per_request * max_kv_heads * 4
+    prefill_hint_topk_bytes = max_kv_heads * max_warmup_clusters * (4 + 8)
+    prefill_hint_tile_bytes = selection_num_tiles * (
+        num_query_heads * (4 + 4) + max_kv_heads * 4
+    )
+    prefill_hint_row_bytes = num_query_heads * 4 + max_kv_heads * 4
     selection_workspace_bytes = (
-        selection_score_bytes
-        + selection_topk_bytes
-        + selection_tile_bytes
-        + selection_row_bytes
+        normal_selection_score_bytes
+        + normal_selection_topk_bytes
+        + normal_selection_tile_bytes
+        + normal_selection_row_bytes
+        + prefill_hint_score_bytes
+        + prefill_hint_topk_bytes
+        + prefill_hint_tile_bytes
+        + prefill_hint_row_bytes
     )
     max_expanded_clusters = min(
         max_retrieval_clusters * 2,
