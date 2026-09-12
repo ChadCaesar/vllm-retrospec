@@ -4445,146 +4445,6 @@ class RetroSpecClusterPageStore:
         self._verification_resolve_cursors.clear()
         self._verification_metadata_streams.clear()
 
-    def resolve_draft_cluster_blocks(
-        self,
-        layer_name: str,
-        cluster_ids: torch.Tensor,
-        logical_page_ids: torch.Tensor,
-        active_mask: torch.Tensor,
-        cache_page_ids: torch.Tensor,
-        hit_cluster_mask: torch.Tensor,
-        miss_cluster_mask: torch.Tensor,
-        hit_gate_ready_mask: torch.Tensor,
-        access_kinds: torch.Tensor,
-    ) -> RetroSpecResolvedClusterPages:
-        """Resolve draft cluster handles entirely on the model device."""
-        if cluster_ids.device.type != "cuda":
-            raise ValueError("Draft resident lookup requires CUDA")
-        if logical_page_ids.shape[:-1] != cluster_ids.shape:
-            raise ValueError("Logical pages do not match cluster IDs")
-        if active_mask.shape != (cluster_ids.shape[0],):
-            raise ValueError("active_mask does not match the draft batch")
-
-        with self._resident_state_lock:
-            _, resident_cache = self._get_or_create_resident_cache(layer_name)
-
-        access = resident_cache.lookup_gpu(
-            cluster_ids=cluster_ids,
-            page_ids=logical_page_ids,
-            active_mask=active_mask,
-            cache_page_ids=cache_page_ids,
-            hit_cluster_mask=hit_cluster_mask,
-            miss_cluster_mask=miss_cluster_mask,
-            hit_gate_ready_mask=hit_gate_ready_mask,
-            access_kinds=access_kinds,
-        )
-        if self.performance_stats is not None:
-            self.performance_stats.add_gpu_counter(
-                "resident_cluster_hits", access.hit_cluster_mask
-            )
-            self.performance_stats.add_gpu_counter(
-                "resident_cluster_misses", access.miss_cluster_mask
-            )
-        return RetroSpecResolvedClusterPages(
-            resident_page_ids=access.cache_page_ids,
-            staging_page_ids=torch.full_like(logical_page_ids, -1),
-            resident_key_pages=resident_cache.key_pages,
-            resident_value_pages=resident_cache.value_pages,
-            staging_key_pages=resident_cache.key_pages[:0],
-            staging_value_pages=resident_cache.value_pages[:0],
-            hit_cluster_mask=access.hit_cluster_mask,
-            miss_cluster_mask=access.miss_cluster_mask,
-            hit_gate_ready_mask=access.hit_gate_ready_mask,
-            resident_ready_event=None,
-            staging_ready_event=None,
-            access_kinds=access.access_kinds,
-            read_lease=access.read_lease,
-        )
-
-    def resolve_compact_draft_cluster_blocks(
-        self,
-        layer_name: str,
-        cluster_ids: torch.Tensor,
-        logical_page_ids: torch.Tensor,
-        logical_page_token_counts: torch.Tensor,
-        retrieval_scores: torch.Tensor,
-        active_mask: torch.Tensor,
-        has_clusters: torch.Tensor,
-        fallback_token_counts: torch.Tensor,
-        cache_page_ids: torch.Tensor,
-        page_token_counts: torch.Tensor,
-        page_counts: torch.Tensor,
-        clustered_token_counts: torch.Tensor,
-        attention_mass: torch.Tensor,
-        hit_attention_by_head: torch.Tensor,
-        selected_cluster_counts: torch.Tensor,
-        hit_cluster_counts: torch.Tensor,
-        miss_cluster_counts: torch.Tensor,
-        hit_gate_ready: torch.Tensor,
-        miss_cluster_ids: torch.Tensor,
-        miss_positions: torch.Tensor,
-        miss_count: torch.Tensor,
-        emit_misses: bool = True,
-    ) -> RetroSpecCompactResolvedClusterPages:
-        """Resolve DRAFT pages into a compact GPU-only descriptor."""
-        if cluster_ids.device.type != "cuda":
-            raise ValueError("Compact draft resident lookup requires CUDA")
-
-        with self._resident_state_lock:
-            _, resident_cache = self._get_or_create_resident_cache(layer_name)
-
-        access = resident_cache.lookup_compact_draft_gpu(
-            cluster_ids=cluster_ids,
-            logical_page_ids=logical_page_ids,
-            logical_page_token_counts=logical_page_token_counts,
-            retrieval_scores=retrieval_scores,
-            active_mask=active_mask,
-            has_clusters=has_clusters,
-            fallback_token_counts=fallback_token_counts,
-            cache_page_ids=cache_page_ids,
-            page_token_counts=page_token_counts,
-            page_counts=page_counts,
-            clustered_token_counts=clustered_token_counts,
-            attention_mass=attention_mass,
-            hit_attention_by_head=hit_attention_by_head,
-            selected_cluster_counts=selected_cluster_counts,
-            hit_cluster_counts=hit_cluster_counts,
-            miss_cluster_counts=miss_cluster_counts,
-            hit_gate_ready=hit_gate_ready,
-            miss_cluster_ids=miss_cluster_ids,
-            miss_positions=miss_positions,
-            miss_count=miss_count,
-            emit_misses=emit_misses,
-        )
-        if self.performance_stats is not None:
-            self.performance_stats.add_gpu_counter(
-                "resident_cluster_hits", access.hit_cluster_counts
-            )
-            self.performance_stats.add_gpu_counter(
-                "resident_cluster_misses", access.miss_cluster_counts
-            )
-            self.performance_stats.add_gpu_counter(
-                "draft_compact_resident_pages", access.page_counts
-            )
-            self.performance_stats.add_gpu_counter(
-                "draft_compact_selected_clusters", access.selected_cluster_counts
-            )
-
-        return RetroSpecCompactResolvedClusterPages(
-            resident_page_ids=access.cache_page_ids,
-            page_token_counts=access.page_token_counts,
-            page_counts=access.page_counts,
-            clustered_token_counts=access.clustered_token_counts,
-            attention_mass=access.attention_mass,
-            selected_cluster_counts=access.selected_cluster_counts,
-            hit_cluster_counts=access.hit_cluster_counts,
-            miss_cluster_counts=access.miss_cluster_counts,
-            hit_gate_ready=access.hit_gate_ready,
-            resident_key_pages=resident_cache.key_pages,
-            resident_value_pages=resident_cache.value_pages,
-            read_lease=access.read_lease,
-        )
-
     def resolve_ranked_compact_draft_cluster_blocks(
         self,
         *,
@@ -4617,6 +4477,10 @@ class RetroSpecClusterPageStore:
         miss_count: torch.Tensor,
         sparse_attention: torch.Tensor,
         expanded_attention: torch.Tensor,
+        warmup_active_mask: torch.Tensor | None = None,
+        warmup_page_budgets: torch.Tensor | None = None,
+        warmup_multiplier: int = 1,
+        warmup_width: int = 0,
         emit_misses: bool = True,
     ) -> RetroSpecCompactResolvedClusterPages:
         """Resolve ranked DRAFT rows directly into compact resident pages."""
@@ -4662,6 +4526,10 @@ class RetroSpecClusterPageStore:
             miss_count=miss_count,
             sparse_attention=sparse_attention,
             expanded_attention=expanded_attention,
+            warmup_active_mask=warmup_active_mask,
+            warmup_page_budgets=warmup_page_budgets,
+            warmup_multiplier=warmup_multiplier,
+            warmup_width=warmup_width,
             emit_misses=emit_misses,
         )
         if self.performance_stats is not None:

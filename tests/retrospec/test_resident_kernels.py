@@ -9,6 +9,7 @@ from vllm.v1.spec_decode.retrospec.resident_kernels import (
     lookup_resident_handles,
     resolve_compact_verification_pages,
     resolve_ranked_compact_draft_pages,
+    resolve_ranked_warmup_misses,
     scatter_compact_staging_page_ids,
     scatter_staging_page_ids,
     update_resident_handles,
@@ -390,7 +391,7 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
     sparse_attention = torch.empty(1, device=device)
     expanded_attention = torch.empty(1, device=device)
 
-    def resolve() -> None:
+    def resolve(emit_misses: bool = True) -> None:
         resolve_ranked_compact_draft_pages(
             ranked_values=torch.tensor([[[1.0]]], device=device),
             ranked_indices=torch.tensor([[[0]]], dtype=torch.int64, device=device),
@@ -440,6 +441,7 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
             output_miss_count=miss_count,
             sparse_attention=sparse_attention,
             expanded_attention=expanded_attention,
+            emit_misses=emit_misses,
         )
 
     resolve()
@@ -447,6 +449,14 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
     assert hit_counts.item() == 1
     assert miss_count.item() == 0
     assert binding.item() == 3
+
+    miss_handles.fill_(99)
+    miss_positions.fill_(7)
+    miss_count.fill_(1)
+    resolve(emit_misses=False)
+    assert miss_count.item() == 1
+    assert miss_handles.item() == 99
+    assert miss_positions.item() == 7
 
     # An invalid binding must not bypass normal hash-table semantics. Bucket 2
     # is empty, so probing stops and the stale binding is cleared.
@@ -501,6 +511,117 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
     assert hit_counts.item() == 1
     assert miss_count.item() == 0
     assert binding.item() == 3
+
+
+def test_ranked_warmup_resolution_emits_budgeted_misses_directly():
+    device = torch.device("cuda")
+    table = _make_table(capacity=8, max_pages=2)
+    update_resident_handles(
+        bucket_ids=torch.tensor([2], dtype=torch.int32, device=device),
+        cluster_handles=torch.tensor([10], dtype=torch.int64, device=device),
+        page_counts=torch.tensor([1], dtype=torch.int32, device=device),
+        page_slots=torch.tensor([[5, -1]], dtype=torch.int32, device=device),
+        hit_gate_ready=torch.tensor([True], device=device),
+        table_handles=table[0],
+        table_versions=table[1],
+        table_page_counts=table[2],
+        table_page_slots=table[3],
+        table_hit_gate_ready=table[4],
+    )
+
+    ranked_indices = torch.tensor(
+        [[[0, 1, 2, 3]], [[3, 2, 1, 0]]], dtype=torch.int64, device=device
+    )
+    candidate_counts = torch.tensor([[4], [4]], dtype=torch.int32, device=device)
+    cluster_ids = torch.tensor([[10, 11, 12, 13]], dtype=torch.int64, device=device)
+    bindings = torch.full_like(cluster_ids, -1, dtype=torch.int32)
+    cluster_page_counts = torch.tensor([[1, 2, 1, 1]], dtype=torch.int32, device=device)
+    miss_handles = torch.empty(8, dtype=torch.int64, device=device)
+    miss_positions = torch.empty_like(miss_handles)
+    miss_count = torch.empty(1, dtype=torch.int32, device=device)
+
+    resolve_ranked_warmup_misses(
+        ranked_indices=ranked_indices,
+        candidate_counts=candidate_counts,
+        arena_cluster_ids=cluster_ids,
+        arena_resident_table_buckets=bindings,
+        arena_cluster_page_counts=cluster_page_counts,
+        arena_cluster_offsets=torch.tensor([0], dtype=torch.int64, device=device),
+        request_slot_ids=torch.tensor([0, 0], dtype=torch.int64, device=device),
+        active_mask=torch.tensor([True, False], device=device),
+        warmup_page_budgets=torch.tensor([[3], [4]], device=device),
+        table_handles=table[0],
+        table_versions=table[1],
+        table_page_counts=table[2],
+        table_page_slots=table[3],
+        table_last_access_epochs=table[5],
+        access_epoch=13,
+        retrieval_ratio=0.5,
+        warmup_multiplier=2,
+        warmup_width=4,
+        max_pages_per_cluster=2,
+        output_miss_handles=miss_handles,
+        output_miss_positions=miss_positions,
+        output_miss_count=miss_count,
+    )
+
+    torch.cuda.synchronize()
+    assert miss_count.item() == 1
+    assert miss_handles[0].item() == 11
+    assert miss_positions[0].item() == 1
+    assert bindings.cpu().tolist() == [[2, -1, -1, -1]]
+    assert table[5][2].item() == 13
+
+
+def test_ranked_warmup_resolution_falls_back_from_stale_binding():
+    device = torch.device("cuda")
+    table = _make_table(capacity=8, max_pages=1)
+    update_resident_handles(
+        bucket_ids=torch.tensor([2, 3], dtype=torch.int32, device=device),
+        cluster_handles=torch.tensor([-2, 10], dtype=torch.int64, device=device),
+        page_counts=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        page_slots=torch.tensor([[-1], [6]], dtype=torch.int32, device=device),
+        hit_gate_ready=torch.tensor([False, True], device=device),
+        table_handles=table[0],
+        table_versions=table[1],
+        table_page_counts=table[2],
+        table_page_slots=table[3],
+        table_hit_gate_ready=table[4],
+    )
+
+    bindings = torch.tensor([[4]], dtype=torch.int32, device=device)
+    miss_handles = torch.empty(1, dtype=torch.int64, device=device)
+    miss_positions = torch.empty_like(miss_handles)
+    miss_count = torch.empty(1, dtype=torch.int32, device=device)
+    resolve_ranked_warmup_misses(
+        ranked_indices=torch.tensor([[[0]]], dtype=torch.int64, device=device),
+        candidate_counts=torch.tensor([[1]], dtype=torch.int32, device=device),
+        arena_cluster_ids=torch.tensor([[10]], dtype=torch.int64, device=device),
+        arena_resident_table_buckets=bindings,
+        arena_cluster_page_counts=torch.tensor([[1]], dtype=torch.int32, device=device),
+        arena_cluster_offsets=torch.tensor([0], dtype=torch.int64, device=device),
+        request_slot_ids=torch.tensor([0], dtype=torch.int64, device=device),
+        active_mask=torch.tensor([True], device=device),
+        warmup_page_budgets=torch.tensor([[1]], device=device),
+        table_handles=table[0],
+        table_versions=table[1],
+        table_page_counts=table[2],
+        table_page_slots=table[3],
+        table_last_access_epochs=table[5],
+        access_epoch=17,
+        retrieval_ratio=1.0,
+        warmup_multiplier=1,
+        warmup_width=1,
+        max_pages_per_cluster=1,
+        output_miss_handles=miss_handles,
+        output_miss_positions=miss_positions,
+        output_miss_count=miss_count,
+    )
+
+    torch.cuda.synchronize()
+    assert miss_count.item() == 0
+    assert bindings.item() == 3
+    assert table[5][3].item() == 17
 
 
 def test_compact_resident_misses_preserves_handles_and_flat_positions():

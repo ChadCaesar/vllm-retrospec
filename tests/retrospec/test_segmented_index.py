@@ -245,7 +245,7 @@ def test_draft_materialization_skips_resident_lookup_without_arena():
         sparse_attn=torch.ones(1, device=device),
         expanded_attn=torch.ones(1, device=device),
     )
-    index.cluster_store.resolve_draft_cluster_blocks = Mock()
+    index.cluster_store.resolve_ranked_compact_draft_cluster_blocks = Mock()
     index._selection_plan_tables["layer"] = SimpleNamespace(
         head_size=1,
         dtype=torch.float32,
@@ -265,7 +265,7 @@ def test_draft_materialization_skips_resident_lookup_without_arena():
 
     assert selection.resolved_pages is None
     assert selection.exact_token_counts.tolist() == [[2]]
-    index.cluster_store.resolve_draft_cluster_blocks.assert_not_called()
+    index.cluster_store.resolve_ranked_compact_draft_cluster_blocks.assert_not_called()
 
 
 def test_first_draft_warmup_waits_for_each_requests_first_active_draft():

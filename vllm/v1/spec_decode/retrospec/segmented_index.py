@@ -39,7 +39,6 @@ from .index_residency import (
 from .performance import RetroSpecPerformanceStats
 from .pinned_memory import RetroSpecPinnedMemoryManager
 from .resident_cache import RetroSpecResidentReadLease
-from .resident_kernels import compact_resident_misses
 from .selection_kernels import (
     capture_request_descriptors,
     emit_ranked_estimation_plan,
@@ -3705,8 +3704,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         ranked_values: torch.Tensor | None = None,
         ranked_indices: torch.Tensor | None = None,
         candidate_counts: torch.Tensor | None = None,
-        prefetch_cluster_ids: torch.Tensor | None = None,
-        prefetch_miss_mask: torch.Tensor | None = None,
+        warmup_active_mask: torch.Tensor | None = None,
+        warmup_page_budgets: torch.Tensor | None = None,
+        prefetch_num_ranks: int | None = None,
     ) -> RetroSpecTokenAttentionSelection:
         """Use resident retrieval clusters and estimate selected cache misses."""
         if (
@@ -3731,7 +3731,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         retrieval_fallback_counts = estimation_token_counts[
             :, :, sparse_width : sparse_width + retrieval_width
         ]
-        normal_prefetch = prefetch_cluster_ids is None
+        normal_prefetch = prefetch_num_ranks is None
         resolved_pages = self.cluster_store.resolve_ranked_compact_draft_cluster_blocks(
             layer_name=plan.layer_name,
             ranked_values=ranked_values,
@@ -3762,6 +3762,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             miss_count=output_workspace.draft_prefetch_miss_count,
             sparse_attention=plan.sparse_attn,
             expanded_attention=plan.expanded_attn,
+            warmup_active_mask=warmup_active_mask,
+            warmup_page_budgets=warmup_page_budgets,
+            warmup_multiplier=self.first_draft_warmup_multiplier,
+            warmup_width=prefetch_num_ranks or 0,
             emit_misses=normal_prefetch,
         )
         self._proposal_read_leases.append(resolved_pages.read_lease)
@@ -3774,18 +3778,19 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             primary_token_counts + resolved_pages.clustered_token_counts
         ).contiguous()
 
-        prefetch_source_ids = output_workspace.draft_exact_cluster_ids
-        if prefetch_cluster_ids is not None:
-            if prefetch_miss_mask is None:
-                raise RuntimeError("Warmup prefetch requires a miss mask")
-            prefetch_source_ids = prefetch_cluster_ids
-            compact_resident_misses(
-                cluster_handles=prefetch_cluster_ids,
-                miss_mask=prefetch_miss_mask,
-                output_handles=output_workspace.draft_prefetch_miss_cluster_ids,
-                output_positions=output_workspace.draft_prefetch_miss_positions,
-                output_count=output_workspace.draft_prefetch_miss_count,
-            )
+        num_prefetch_groups = (
+            output_workspace.draft_exact_cluster_ids.shape[0]
+            * output_workspace.draft_exact_cluster_ids.shape[1]
+        )
+        if prefetch_num_ranks is None:
+            prefetch_num_ranks = output_workspace.draft_exact_cluster_ids.shape[2]
+        if prefetch_num_ranks < 0:
+            raise ValueError("Prefetch rank width must be non-negative")
+        if (
+            num_prefetch_groups * prefetch_num_ranks
+            > output_workspace.draft_prefetch_miss_cluster_ids.numel()
+        ):
+            raise ValueError("Prefetch layout exceeds the fixed miss-ring capacity")
 
         return RetroSpecTokenAttentionSelection(
             exact_cluster_ids=output_workspace.draft_exact_cluster_ids,
@@ -3803,10 +3808,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             ),
             prefetch_miss_positions=output_workspace.draft_prefetch_miss_positions,
             prefetch_miss_count=output_workspace.draft_prefetch_miss_count,
-            prefetch_num_groups=(
-                prefetch_source_ids.shape[0] * prefetch_source_ids.shape[1]
-            ),
-            prefetch_num_ranks=prefetch_source_ids.shape[2],
+            prefetch_num_groups=num_prefetch_groups,
+            prefetch_num_ranks=prefetch_num_ranks,
         )
 
     def configure_sparse_prefetch_wave(self, max_layers: int) -> None:
@@ -4714,6 +4717,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             )
 
         direct_cuda_plan = workspace is not None and view.arena is not None
+        if first_draft_warmup_mask is not None and not direct_cuda_plan:
+            raise RuntimeError(
+                "First-draft warmup requires the resident CUDA ranked path"
+            )
         ranked_values = None
         ranked_indices = None
         cluster_zones = None
@@ -4752,8 +4759,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     cluster_scores,
                     candidate_counts,
                     view=view,
-                    first_draft_warmup_mask=first_draft_warmup_mask,
-                    warmup_page_budgets=warmup_page_budgets,
                     workspace=workspace,
                 )
 
@@ -4804,58 +4809,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     dtype=key_cache.dtype,
                 )
 
-        warmup_indices = None
-        warmup_mask = None
+        warmup_num_ranks = None
         if first_draft_warmup_mask is not None:
-            assert warmup_page_budgets is not None
-            if ranked_indices is not None:
-                warmup_indices, warmup_mask = self._select_first_draft_warmup(
-                    ranked_indices,
-                    candidate_counts,
-                    view,
-                    first_draft_warmup_mask,
-                    warmup_page_budgets,
-                )
-            else:
-                assert cluster_zones is not None
-                warmup_indices = cluster_zones.first_draft_warmup_indices
-                warmup_mask = cluster_zones.first_draft_warmup_mask
-
-        prefetch_cluster_ids = None
-        prefetch_miss_mask = None
-        if warmup_indices is not None:
-            assert warmup_mask is not None
-            with self._cuda_timer("draft_first_warmup_resolve"):
-                warmup_cluster_ids, warmup_page_ids, _ = (
-                    self._build_resident_exact_cluster_selection(
-                        view,
-                        warmup_indices,
-                        warmup_mask,
-                    )
-                )
-                warmup_access = self.cluster_store.resolve_draft_cluster_blocks(
-                    layer_name=layer_name,
-                    cluster_ids=warmup_cluster_ids,
-                    logical_page_ids=warmup_page_ids,
-                    active_mask=active_mask,
-                    cache_page_ids=torch.empty_like(warmup_page_ids),
-                    hit_cluster_mask=torch.empty_like(
-                        warmup_cluster_ids, dtype=torch.bool
-                    ),
-                    miss_cluster_mask=torch.empty_like(
-                        warmup_cluster_ids, dtype=torch.bool
-                    ),
-                    hit_gate_ready_mask=torch.empty_like(
-                        warmup_cluster_ids, dtype=torch.bool
-                    ),
-                    access_kinds=torch.empty_like(
-                        warmup_cluster_ids, dtype=torch.uint8
-                    ),
-                )
-                if warmup_access.read_lease is not None:
-                    warmup_access.read_lease.release()
-                prefetch_cluster_ids = warmup_cluster_ids
-                prefetch_miss_mask = warmup_access.miss_cluster_mask
+            warmup_num_ranks = self._maximum_first_draft_warmup_width(
+                view.max_num_clusters
+            )
 
         with self._cuda_timer("draft_plan_materialize"):
             selection = self._materialize_draft_selection(
@@ -4866,8 +4824,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 ranked_values=ranked_values,
                 ranked_indices=ranked_indices,
                 candidate_counts=candidate_counts,
-                prefetch_cluster_ids=prefetch_cluster_ids,
-                prefetch_miss_mask=prefetch_miss_mask,
+                warmup_active_mask=first_draft_warmup_mask,
+                warmup_page_budgets=warmup_page_budgets,
+                prefetch_num_ranks=warmup_num_ranks,
             )
         if plan_table is not None:
             self._publish_plan_step(

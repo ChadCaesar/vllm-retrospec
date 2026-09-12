@@ -12,9 +12,9 @@ import torch
 from .cluster_identity import RetroSpecClusterGroup
 from .resident_kernels import (
     lookup_resident_handles,
-    resolve_compact_draft_pages,
     resolve_compact_verification_pages,
     resolve_ranked_compact_draft_pages,
+    resolve_ranked_warmup_misses,
     update_resident_handles,
 )
 
@@ -1222,89 +1222,6 @@ class RetroSpecResidentClusterCache:
             read_lease=RetroSpecResidentReadLease(self._gpu_access_lock),
         )
 
-    def lookup_compact_draft_gpu(
-        self,
-        cluster_ids: torch.Tensor,
-        logical_page_ids: torch.Tensor,
-        logical_page_token_counts: torch.Tensor,
-        retrieval_scores: torch.Tensor,
-        active_mask: torch.Tensor,
-        has_clusters: torch.Tensor,
-        fallback_token_counts: torch.Tensor,
-        cache_page_ids: torch.Tensor,
-        page_token_counts: torch.Tensor,
-        page_counts: torch.Tensor,
-        clustered_token_counts: torch.Tensor,
-        attention_mass: torch.Tensor,
-        hit_attention_by_head: torch.Tensor,
-        selected_cluster_counts: torch.Tensor,
-        hit_cluster_counts: torch.Tensor,
-        miss_cluster_counts: torch.Tensor,
-        hit_gate_ready: torch.Tensor,
-        miss_cluster_ids: torch.Tensor,
-        miss_positions: torch.Tensor,
-        miss_count: torch.Tensor,
-        emit_misses: bool = True,
-    ) -> RetroSpecCompactResidentPageAccess:
-        """Fuse DRAFT handle lookup, page compaction and hit accounting."""
-        if cluster_ids.device != self.device:
-            raise ValueError("Compact draft lookup tensors must use the cache device")
-        if logical_page_ids.device != self.device:
-            raise ValueError("Compact draft pages must use the cache device")
-
-        self._gpu_access_lock.acquire()
-        try:
-            self._ensure_handle_table(logical_page_ids.shape[-1])
-            access_epoch = self._next_access_epoch
-            self._next_access_epoch += 1
-            resolve_compact_draft_pages(
-                cluster_handles=cluster_ids,
-                logical_page_ids=logical_page_ids,
-                logical_page_token_counts=logical_page_token_counts,
-                retrieval_scores=retrieval_scores,
-                active_mask=active_mask,
-                has_clusters=has_clusters,
-                table_handles=self._handle_table_handles,
-                table_versions=self._handle_table_versions,
-                table_page_counts=self._handle_table_page_counts,
-                table_page_slots=self._handle_table_page_slots,
-                table_hit_gate_ready=self._handle_table_hit_gate_ready,
-                table_last_access_epochs=self._handle_table_last_access_epochs,
-                access_epoch=access_epoch,
-                fallback_token_counts=fallback_token_counts,
-                output_page_slots=cache_page_ids,
-                output_page_token_counts=page_token_counts,
-                output_page_counts=page_counts,
-                output_clustered_token_counts=clustered_token_counts,
-                output_attention=attention_mass,
-                output_hit_attention_by_head=hit_attention_by_head,
-                output_selected_counts=selected_cluster_counts,
-                output_hit_counts=hit_cluster_counts,
-                output_miss_counts=miss_cluster_counts,
-                output_gate_ready=hit_gate_ready,
-                output_miss_handles=miss_cluster_ids,
-                output_miss_positions=miss_positions,
-                output_miss_count=miss_count,
-                emit_misses=emit_misses,
-            )
-        except BaseException:
-            self._gpu_access_lock.release()
-            raise
-
-        return RetroSpecCompactResidentPageAccess(
-            cache_page_ids=cache_page_ids,
-            page_token_counts=page_token_counts,
-            page_counts=page_counts,
-            clustered_token_counts=clustered_token_counts,
-            attention_mass=attention_mass,
-            selected_cluster_counts=selected_cluster_counts,
-            hit_cluster_counts=hit_cluster_counts,
-            miss_cluster_counts=miss_cluster_counts,
-            hit_gate_ready=hit_gate_ready,
-            access_kinds=None,
-            read_lease=RetroSpecResidentReadLease(self._gpu_access_lock),
-        )
-
     def lookup_ranked_compact_draft_gpu(
         self,
         *,
@@ -1343,6 +1260,10 @@ class RetroSpecResidentClusterCache:
         miss_count: torch.Tensor,
         sparse_attention: torch.Tensor,
         expanded_attention: torch.Tensor,
+        warmup_active_mask: torch.Tensor | None = None,
+        warmup_page_budgets: torch.Tensor | None = None,
+        warmup_multiplier: int = 1,
+        warmup_width: int = 0,
         emit_misses: bool = True,
     ) -> RetroSpecCompactResidentPageAccess:
         """Resolve ranked DRAFT rows without logical-page intermediates."""
@@ -1354,6 +1275,36 @@ class RetroSpecResidentClusterCache:
             self._ensure_handle_table(max_pages_per_cluster)
             access_epoch = self._next_access_epoch
             self._next_access_epoch += 1
+            if warmup_active_mask is not None:
+                if warmup_page_budgets is None:
+                    raise ValueError("Warmup page budgets are required")
+                resolve_ranked_warmup_misses(
+                    ranked_indices=ranked_indices,
+                    candidate_counts=candidate_counts,
+                    arena_cluster_ids=arena_cluster_ids,
+                    arena_resident_table_buckets=arena_resident_table_buckets,
+                    arena_cluster_page_counts=arena_cluster_page_counts,
+                    arena_cluster_offsets=arena_cluster_offsets,
+                    request_slot_ids=request_slot_ids,
+                    active_mask=warmup_active_mask,
+                    warmup_page_budgets=warmup_page_budgets,
+                    table_handles=self._handle_table_handles,
+                    table_versions=self._handle_table_versions,
+                    table_page_counts=self._handle_table_page_counts,
+                    table_page_slots=self._handle_table_page_slots,
+                    table_last_access_epochs=self._handle_table_last_access_epochs,
+                    access_epoch=access_epoch,
+                    retrieval_ratio=retrieval_ratio,
+                    warmup_multiplier=warmup_multiplier,
+                    warmup_width=warmup_width,
+                    max_pages_per_cluster=max_pages_per_cluster,
+                    output_miss_handles=miss_cluster_ids,
+                    output_miss_positions=miss_positions,
+                    output_miss_count=miss_count,
+                )
+                emit_misses = False
+            elif warmup_page_budgets is not None:
+                raise ValueError("Warmup page budgets require an active mask")
             resolve_ranked_compact_draft_pages(
                 ranked_values=ranked_values,
                 ranked_indices=ranked_indices,
