@@ -257,16 +257,15 @@ class _PinnedSelectionSlot:
 
 @dataclass
 class _PinnedVerificationMissSlot:
-    """Pinned metadata for one GPU-compacted verification miss batch."""
+    """Pinned metadata for one GPU-unique verification miss batch."""
 
     pinned_memory: RetroSpecPinnedMemoryManager
-    cluster_id_storage: torch.Tensor | None = None
-    logical_page_id_storage: torch.Tensor | None = None
-    output_page_offset_storage: torch.Tensor | None = None
-    source_page_count_storage: torch.Tensor | None = None
-    staging_start_storage: torch.Tensor | None = None
-    page_count_storage: torch.Tensor | None = None
+    unique_cluster_id_storage: torch.Tensor | None = None
+    unique_logical_page_id_storage: torch.Tensor | None = None
+    unique_page_count_storage: torch.Tensor | None = None
+    unique_staging_start_storage: torch.Tensor | None = None
     miss_count_storage: torch.Tensor | None = None
+    unique_miss_count_storage: torch.Tensor | None = None
     invalid_descriptor_count_storage: torch.Tensor | None = None
     capacity: int = 0
     max_pages: int = 0
@@ -278,45 +277,37 @@ class _PinnedVerificationMissSlot:
             return
         capacity = max(capacity, self.capacity)
         max_pages = max(max_pages, self.max_pages)
-        self.cluster_id_storage = self.pinned_memory.replace(
-            self.cluster_id_storage,
+        self.unique_cluster_id_storage = self.pinned_memory.replace(
+            self.unique_cluster_id_storage,
             (capacity,),
             torch.int64,
-            "verification-miss-cluster-ids",
+            "verification-unique-cluster-ids",
         )
-        self.logical_page_id_storage = self.pinned_memory.replace(
-            self.logical_page_id_storage,
+        self.unique_logical_page_id_storage = self.pinned_memory.replace(
+            self.unique_logical_page_id_storage,
             (capacity, max_pages),
             torch.int64,
-            "verification-miss-logical-page-ids",
+            "verification-unique-logical-page-ids",
         )
-        self.output_page_offset_storage = self.pinned_memory.replace(
-            self.output_page_offset_storage,
-            (capacity,),
-            torch.int64,
-            "verification-miss-output-page-offsets",
-        )
-        self.source_page_count_storage = self.pinned_memory.replace(
-            self.source_page_count_storage,
+        self.unique_page_count_storage = self.pinned_memory.replace(
+            self.unique_page_count_storage,
             (capacity,),
             torch.int32,
-            "verification-miss-source-page-counts",
+            "verification-unique-page-counts",
         )
-        self.staging_start_storage = self.pinned_memory.replace(
-            self.staging_start_storage,
+        self.unique_staging_start_storage = self.pinned_memory.replace(
+            self.unique_staging_start_storage,
             (capacity,),
             torch.int64,
-            "verification-miss-staging-starts",
-        )
-        self.page_count_storage = self.pinned_memory.replace(
-            self.page_count_storage,
-            (capacity,),
-            torch.int32,
-            "verification-miss-page-counts",
+            "verification-unique-staging-starts",
         )
         if self.miss_count_storage is None:
             self.miss_count_storage = self.pinned_memory.empty(
                 (1,), torch.int32, "verification-miss-count"
+            )
+        if self.unique_miss_count_storage is None:
+            self.unique_miss_count_storage = self.pinned_memory.empty(
+                (1,), torch.int32, "verification-unique-miss-count"
             )
         if self.invalid_descriptor_count_storage is None:
             self.invalid_descriptor_count_storage = self.pinned_memory.empty(
@@ -326,21 +317,19 @@ class _PinnedVerificationMissSlot:
         self.max_pages = max_pages
 
     def release_storage(self) -> None:
-        self.pinned_memory.release(self.cluster_id_storage)
-        self.pinned_memory.release(self.logical_page_id_storage)
-        self.pinned_memory.release(self.output_page_offset_storage)
-        self.pinned_memory.release(self.source_page_count_storage)
-        self.pinned_memory.release(self.staging_start_storage)
-        self.pinned_memory.release(self.page_count_storage)
+        self.pinned_memory.release(self.unique_cluster_id_storage)
+        self.pinned_memory.release(self.unique_logical_page_id_storage)
+        self.pinned_memory.release(self.unique_page_count_storage)
+        self.pinned_memory.release(self.unique_staging_start_storage)
         self.pinned_memory.release(self.miss_count_storage)
+        self.pinned_memory.release(self.unique_miss_count_storage)
         self.pinned_memory.release(self.invalid_descriptor_count_storage)
-        self.cluster_id_storage = None
-        self.logical_page_id_storage = None
-        self.output_page_offset_storage = None
-        self.source_page_count_storage = None
-        self.staging_start_storage = None
-        self.page_count_storage = None
+        self.unique_cluster_id_storage = None
+        self.unique_logical_page_id_storage = None
+        self.unique_page_count_storage = None
+        self.unique_staging_start_storage = None
         self.miss_count_storage = None
+        self.unique_miss_count_storage = None
         self.invalid_descriptor_count_storage = None
         self.capacity = 0
         self.max_pages = 0
@@ -350,14 +339,18 @@ class _PinnedVerificationMissSlot:
 class _VerificationResolveGPUArena:
     """Reusable device records for one verification resident lookup."""
 
-    cluster_ids: torch.Tensor | None = None
-    logical_page_ids: torch.Tensor | None = None
-    output_page_offsets: torch.Tensor | None = None
-    source_page_counts: torch.Tensor | None = None
-    staging_starts: torch.Tensor | None = None
-    page_counts: torch.Tensor | None = None
+    unique_cluster_ids: torch.Tensor | None = None
+    unique_logical_page_ids: torch.Tensor | None = None
+    unique_page_counts: torch.Tensor | None = None
+    unique_staging_starts: torch.Tensor | None = None
+    miss_hash_buckets: torch.Tensor | None = None
+    miss_unique_indices: torch.Tensor | None = None
+    miss_output_page_offsets: torch.Tensor | None = None
     miss_count: torch.Tensor | None = None
+    unique_miss_count: torch.Tensor | None = None
     invalid_descriptor_count: torch.Tensor | None = None
+    miss_table_handles: torch.Tensor | None = None
+    miss_table_unique_indices: torch.Tensor | None = None
     resident_page_ids: torch.Tensor | None = None
     staging_page_ids: torch.Tensor | None = None
     page_token_counts: torch.Tensor | None = None
@@ -367,6 +360,7 @@ class _VerificationResolveGPUArena:
     miss_cluster_counts: torch.Tensor | None = None
     capacity: int = 0
     max_pages: int = 0
+    hash_capacity: int = 0
     row_capacity: int = 0
     page_capacity: int = 0
 
@@ -378,31 +372,48 @@ class _VerificationResolveGPUArena:
         page_capacity: int,
         device: torch.device,
     ) -> None:
+        required_hash_capacity = 1 << (max(2, 2 * capacity) - 1).bit_length()
         if (
             capacity <= self.capacity
             and max_pages <= self.max_pages
+            and required_hash_capacity <= self.hash_capacity
             and row_capacity <= self.row_capacity
             and page_capacity <= self.page_capacity
         ):
             return
         capacity = max(capacity, self.capacity)
         max_pages = max(max_pages, self.max_pages)
+        hash_capacity = max(required_hash_capacity, self.hash_capacity)
         row_capacity = max(row_capacity, self.row_capacity)
         page_capacity = max(page_capacity, self.page_capacity)
-        self.cluster_ids = torch.empty(capacity, dtype=torch.int64, device=device)
-        self.logical_page_ids = torch.empty(
-            (capacity, max_pages), dtype=torch.int64, device=device
-        )
-        self.output_page_offsets = torch.empty(
+        self.unique_cluster_ids = torch.empty(
             capacity, dtype=torch.int64, device=device
         )
-        self.source_page_counts = torch.empty(
+        self.unique_logical_page_ids = torch.empty(
+            (capacity, max_pages), dtype=torch.int64, device=device
+        )
+        self.unique_page_counts = torch.empty(
             capacity, dtype=torch.int32, device=device
         )
-        self.staging_starts = torch.empty(capacity, dtype=torch.int64, device=device)
-        self.page_counts = torch.empty(capacity, dtype=torch.int32, device=device)
+        self.unique_staging_starts = torch.empty(
+            capacity, dtype=torch.int64, device=device
+        )
+        self.miss_hash_buckets = torch.empty(capacity, dtype=torch.int64, device=device)
+        self.miss_unique_indices = torch.empty(
+            capacity, dtype=torch.int32, device=device
+        )
+        self.miss_output_page_offsets = torch.empty(
+            capacity, dtype=torch.int64, device=device
+        )
         self.miss_count = torch.empty(1, dtype=torch.int32, device=device)
+        self.unique_miss_count = torch.empty(1, dtype=torch.int32, device=device)
         self.invalid_descriptor_count = torch.empty(1, dtype=torch.int32, device=device)
+        self.miss_table_handles = torch.empty(
+            hash_capacity, dtype=torch.int64, device=device
+        )
+        self.miss_table_unique_indices = torch.empty(
+            hash_capacity, dtype=torch.int32, device=device
+        )
         self.resident_page_ids = torch.empty(
             page_capacity, dtype=torch.int64, device=device
         )
@@ -426,6 +437,7 @@ class _VerificationResolveGPUArena:
         )
         self.capacity = capacity
         self.max_pages = max_pages
+        self.hash_capacity = hash_capacity
         self.row_capacity = row_capacity
         self.page_capacity = page_capacity
 
@@ -4457,12 +4469,12 @@ class RetroSpecClusterPageStore:
             )
         return staging_key_pages, staging_value_pages, staging_ready_event
 
-    def _build_verification_miss_metadata(
+    def _validate_unique_verification_miss_metadata(
         self,
         layer_name: str,
         max_pages: int,
         slot: _PinnedVerificationMissSlot,
-        num_misses: int,
+        num_unique_misses: int,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -4470,70 +4482,57 @@ class RetroSpecClusterPageStore:
         torch.Tensor,
     ]:
         if (
-            slot.cluster_id_storage is None
-            or slot.logical_page_id_storage is None
-            or slot.output_page_offset_storage is None
-            or slot.source_page_count_storage is None
+            slot.unique_cluster_id_storage is None
+            or slot.unique_logical_page_id_storage is None
+            or slot.unique_page_count_storage is None
+            or slot.unique_staging_start_storage is None
         ):
-            raise RuntimeError("Verification-miss CPU input storage is unavailable")
-        if slot.staging_start_storage is None or slot.page_count_storage is None:
-            raise RuntimeError("Verification-miss CPU output storage is unavailable")
+            raise RuntimeError("Unique verification-miss CPU storage is unavailable")
 
-        cluster_ids = slot.cluster_id_storage[:num_misses].tolist()
-        output_page_offsets = slot.output_page_offset_storage[:num_misses].tolist()
-        source_page_counts = slot.source_page_count_storage[:num_misses].tolist()
-        logical_page_ids = slot.logical_page_id_storage[:num_misses, :max_pages]
-        record_order = sorted(
-            range(num_misses), key=lambda index: output_page_offsets[index]
-        )
+        cluster_ids = slot.unique_cluster_id_storage[:num_unique_misses].tolist()
+        page_counts = slot.unique_page_count_storage[:num_unique_misses].tolist()
+        logical_page_ids = slot.unique_logical_page_id_storage[
+            :num_unique_misses, :max_pages
+        ]
 
         descriptors = self._cluster_block_descriptors.get(layer_name)
         if descriptors is None:
             raise RuntimeError(f"No cluster descriptors exist for {layer_name!r}")
         allocated_cluster_ids = self._get_allocated_cluster_ids(layer_name)
 
-        ordered_cluster_ids: list[int] = []
-        staging_start_by_cluster: dict[int, int] = {}
         unique_page_ids: list[int] = []
-        for record_index in record_order:
-            cluster_id = int(cluster_ids[record_index])
+        for unique_index, cluster_id_value in enumerate(cluster_ids):
+            cluster_id = int(cluster_id_value)
             if cluster_id not in allocated_cluster_ids:
                 raise RuntimeError(
                     f"Verification selected stale cluster handle {cluster_id}"
                 )
             descriptor = descriptors[cluster_id]
-            page_count = int(source_page_counts[record_index])
+            page_count = int(page_counts[unique_index])
+            if page_count < 0 or page_count > max_pages:
+                raise RuntimeError(
+                    "Verification descriptor exceeds the packed page-table width"
+                )
             emitted_pages = tuple(
                 int(page_id)
-                for page_id in logical_page_ids[record_index, :page_count].tolist()
+                for page_id in logical_page_ids[unique_index, :page_count].tolist()
             )
             if descriptor.page_ids != emitted_pages:
                 raise RuntimeError(
                     f"Verification selected stale pages for cluster {cluster_id}"
                 )
-            if page_count > max_pages:
-                raise RuntimeError(
-                    "Verification descriptor exceeds the packed page-table width"
-                )
-            staging_start = staging_start_by_cluster.get(cluster_id)
-            if staging_start is None:
-                staging_start = len(unique_page_ids)
-                staging_start_by_cluster[cluster_id] = staging_start
-                ordered_cluster_ids.append(cluster_id)
-                unique_page_ids.extend(emitted_pages)
-            slot.staging_start_storage[record_index] = staging_start
-            slot.page_count_storage[record_index] = page_count
+            slot.unique_staging_start_storage[unique_index] = len(unique_page_ids)
+            unique_page_ids.extend(emitted_pages)
 
-        cluster_ids_cpu = torch.tensor(ordered_cluster_ids, dtype=torch.int64)
+        cluster_ids_cpu = torch.tensor(cluster_ids, dtype=torch.int64)
         metadata = self._materialize_cluster_block_metadata_cpu(
             layer_name, cluster_ids_cpu, page_width=max_pages
         )
         staging_page_ids_cpu = torch.full_like(metadata.page_ids, -1)
-        for row_index, cluster_id in enumerate(ordered_cluster_ids):
-            descriptor = descriptors[cluster_id]
-            staging_start = staging_start_by_cluster[cluster_id]
-            page_count = len(descriptor.page_ids)
-            staging_page_ids_cpu[row_index, :page_count] = torch.arange(
+        for unique_index, page_count_value in enumerate(page_counts):
+            page_count = int(page_count_value)
+            staging_start = int(slot.unique_staging_start_storage[unique_index].item())
+            staging_page_ids_cpu[unique_index, :page_count] = torch.arange(
                 staging_start, staging_start + page_count, dtype=torch.int64
             )
 
@@ -4759,14 +4758,18 @@ class RetroSpecClusterPageStore:
                 page_capacity,
             )
             required = (
-                resolve_arena.cluster_ids,
-                resolve_arena.logical_page_ids,
-                resolve_arena.output_page_offsets,
-                resolve_arena.source_page_counts,
-                resolve_arena.staging_starts,
-                resolve_arena.page_counts,
+                resolve_arena.unique_cluster_ids,
+                resolve_arena.unique_logical_page_ids,
+                resolve_arena.unique_page_counts,
+                resolve_arena.unique_staging_starts,
+                resolve_arena.miss_hash_buckets,
+                resolve_arena.miss_unique_indices,
+                resolve_arena.miss_output_page_offsets,
                 resolve_arena.miss_count,
+                resolve_arena.unique_miss_count,
                 resolve_arena.invalid_descriptor_count,
+                resolve_arena.miss_table_handles,
+                resolve_arena.miss_table_unique_indices,
                 resolve_arena.resident_page_ids,
                 resolve_arena.staging_page_ids,
                 resolve_arena.page_token_counts,
@@ -4778,14 +4781,18 @@ class RetroSpecClusterPageStore:
             if any(tensor is None for tensor in required):
                 raise RuntimeError("Verification compact arena is unavailable")
 
-            assert resolve_arena.cluster_ids is not None
-            assert resolve_arena.logical_page_ids is not None
-            assert resolve_arena.output_page_offsets is not None
-            assert resolve_arena.source_page_counts is not None
-            assert resolve_arena.staging_starts is not None
-            assert resolve_arena.page_counts is not None
+            assert resolve_arena.unique_cluster_ids is not None
+            assert resolve_arena.unique_logical_page_ids is not None
+            assert resolve_arena.unique_page_counts is not None
+            assert resolve_arena.unique_staging_starts is not None
+            assert resolve_arena.miss_hash_buckets is not None
+            assert resolve_arena.miss_unique_indices is not None
+            assert resolve_arena.miss_output_page_offsets is not None
             assert resolve_arena.miss_count is not None
+            assert resolve_arena.unique_miss_count is not None
             assert resolve_arena.invalid_descriptor_count is not None
+            assert resolve_arena.miss_table_handles is not None
+            assert resolve_arena.miss_table_unique_indices is not None
             assert resolve_arena.resident_page_ids is not None
             assert resolve_arena.staging_page_ids is not None
             assert resolve_arena.page_token_counts is not None
@@ -4841,15 +4848,22 @@ class RetroSpecClusterPageStore:
                 selected_cluster_counts=selected_counts,
                 hit_cluster_counts=hit_counts,
                 miss_cluster_counts=miss_counts,
-                miss_cluster_ids=resolve_arena.cluster_ids[:cluster_capacity],
-                miss_logical_page_ids=resolve_arena.logical_page_ids[
+                unique_cluster_ids=resolve_arena.unique_cluster_ids[:cluster_capacity],
+                unique_logical_page_ids=resolve_arena.unique_logical_page_ids[
                     :cluster_capacity, :max_pages_per_cluster
                 ],
-                miss_page_counts=resolve_arena.source_page_counts[:cluster_capacity],
-                miss_output_page_offsets=resolve_arena.output_page_offsets[
+                unique_page_counts=resolve_arena.unique_page_counts[:cluster_capacity],
+                miss_hash_buckets=resolve_arena.miss_hash_buckets[:cluster_capacity],
+                miss_unique_indices=resolve_arena.miss_unique_indices[
+                    :cluster_capacity
+                ],
+                miss_output_page_offsets=resolve_arena.miss_output_page_offsets[
                     :cluster_capacity
                 ],
                 miss_count=resolve_arena.miss_count,
+                unique_miss_count=resolve_arena.unique_miss_count,
+                miss_table_handles=resolve_arena.miss_table_handles,
+                miss_table_unique_indices=resolve_arena.miss_table_unique_indices,
                 invalid_descriptor_count=resolve_arena.invalid_descriptor_count,
             )
             if self.performance_stats is not None:
@@ -4865,20 +4879,22 @@ class RetroSpecClusterPageStore:
                 )
 
             pinned_required = (
-                slot.cluster_id_storage,
-                slot.logical_page_id_storage,
-                slot.output_page_offset_storage,
-                slot.source_page_count_storage,
+                slot.unique_cluster_id_storage,
+                slot.unique_logical_page_id_storage,
+                slot.unique_page_count_storage,
+                slot.unique_staging_start_storage,
                 slot.miss_count_storage,
+                slot.unique_miss_count_storage,
                 slot.invalid_descriptor_count_storage,
             )
             if any(tensor is None for tensor in pinned_required):
                 raise RuntimeError("Verification pinned compact slot is unavailable")
-            assert slot.cluster_id_storage is not None
-            assert slot.logical_page_id_storage is not None
-            assert slot.output_page_offset_storage is not None
-            assert slot.source_page_count_storage is not None
+            assert slot.unique_cluster_id_storage is not None
+            assert slot.unique_logical_page_id_storage is not None
+            assert slot.unique_page_count_storage is not None
+            assert slot.unique_staging_start_storage is not None
             assert slot.miss_count_storage is not None
+            assert slot.unique_miss_count_storage is not None
             assert slot.invalid_descriptor_count_storage is not None
 
             lookup_ready_event = torch.cuda.Event()
@@ -4888,74 +4904,55 @@ class RetroSpecClusterPageStore:
             )
             with torch.cuda.stream(metadata_stream):
                 metadata_stream.wait_event(lookup_ready_event)
-                slot.cluster_id_storage[:cluster_capacity].copy_(
-                    access.miss_cluster_ids[:cluster_capacity],
-                    non_blocking=self.pin_memory,
-                )
-                slot.logical_page_id_storage[
-                    :cluster_capacity, :max_pages_per_cluster
-                ].copy_(
-                    access.miss_logical_page_ids[
-                        :cluster_capacity, :max_pages_per_cluster
-                    ],
-                    non_blocking=self.pin_memory,
-                )
-                slot.output_page_offset_storage[:cluster_capacity].copy_(
-                    access.miss_output_page_offsets[:cluster_capacity],
-                    non_blocking=self.pin_memory,
-                )
-                slot.source_page_count_storage[:cluster_capacity].copy_(
-                    access.miss_page_counts[:cluster_capacity],
-                    non_blocking=self.pin_memory,
-                )
                 slot.miss_count_storage.copy_(
                     access.miss_count, non_blocking=self.pin_memory
+                )
+                slot.unique_miss_count_storage.copy_(
+                    access.unique_miss_count, non_blocking=self.pin_memory
                 )
                 slot.invalid_descriptor_count_storage.copy_(
                     access.invalid_descriptor_count, non_blocking=self.pin_memory
                 )
-                metadata_ready_event = torch.cuda.Event()
-                metadata_ready_event.record(metadata_stream)
+                count_ready_event = torch.cuda.Event()
+                count_ready_event.record(metadata_stream)
 
             wait_started_at = (
                 perf_counter()
                 if self.performance_stats is not None and self.performance_stats.enabled
                 else None
             )
-            metadata_ready_event.synchronize()
-            if wait_started_at is not None:
-                self.performance_stats.record_cpu_time(
-                    "verification_miss_metadata_wait",
-                    perf_counter() - wait_started_at,
-                )
+            count_ready_event.synchronize()
 
             invalid_descriptors = int(slot.invalid_descriptor_count_storage.item())
             if invalid_descriptors:
                 raise RuntimeError(
-                    "Verification selected a missing or stale request descriptor"
+                    "Verification selected an invalid descriptor or miss mapping"
                 )
             num_misses = int(slot.miss_count_storage.item())
+            num_unique_misses = int(slot.unique_miss_count_storage.item())
             if num_misses < 0 or num_misses > cluster_capacity:
                 raise RuntimeError("GPU verification miss count is out of bounds")
-            if self.performance_stats is not None:
-                metadata_bytes = (
-                    cluster_capacity
-                    * (
-                        slot.cluster_id_storage.element_size()
-                        + slot.output_page_offset_storage.element_size()
-                        + slot.source_page_count_storage.element_size()
-                        + max_pages_per_cluster
-                        * slot.logical_page_id_storage.element_size()
-                    )
-                    + slot.miss_count_storage.element_size()
-                    + slot.invalid_descriptor_count_storage.element_size()
-                )
-                self.performance_stats.add_counter(
-                    "verification_miss_metadata_d2h_bytes", metadata_bytes
+            if num_unique_misses < 0 or num_unique_misses > num_misses:
+                raise RuntimeError(
+                    "GPU unique verification miss count is out of bounds"
                 )
 
             empty_pages = resident_cache.key_pages[:0]
             if num_misses == 0:
+                if num_unique_misses != 0:
+                    raise RuntimeError("Empty miss batch contains unique miss records")
+                if wait_started_at is not None:
+                    self.performance_stats.record_cpu_time(
+                        "verification_miss_metadata_wait",
+                        perf_counter() - wait_started_at,
+                    )
+                if self.performance_stats is not None:
+                    self.performance_stats.add_counter(
+                        "verification_miss_metadata_d2h_bytes",
+                        slot.miss_count_storage.element_size()
+                        + slot.unique_miss_count_storage.element_size()
+                        + slot.invalid_descriptor_count_storage.element_size(),
+                    )
                 self._release_verification_miss_slot(slot, None)
                 slot = None
                 return RetroSpecCompactVerificationResolvedPages(
@@ -4971,6 +4968,48 @@ class RetroSpecClusterPageStore:
                     read_lease=access.read_lease,
                 )
 
+            with torch.cuda.stream(metadata_stream):
+                slot.unique_cluster_id_storage[:num_unique_misses].copy_(
+                    access.unique_cluster_ids[:num_unique_misses],
+                    non_blocking=self.pin_memory,
+                )
+                slot.unique_logical_page_id_storage[
+                    :num_unique_misses, :max_pages_per_cluster
+                ].copy_(
+                    access.unique_logical_page_ids[
+                        :num_unique_misses, :max_pages_per_cluster
+                    ],
+                    non_blocking=self.pin_memory,
+                )
+                slot.unique_page_count_storage[:num_unique_misses].copy_(
+                    access.unique_page_counts[:num_unique_misses],
+                    non_blocking=self.pin_memory,
+                )
+                metadata_ready_event = torch.cuda.Event()
+                metadata_ready_event.record(metadata_stream)
+            metadata_ready_event.synchronize()
+            if wait_started_at is not None:
+                self.performance_stats.record_cpu_time(
+                    "verification_miss_metadata_wait",
+                    perf_counter() - wait_started_at,
+                )
+            if self.performance_stats is not None:
+                metadata_bytes = (
+                    slot.miss_count_storage.element_size()
+                    + slot.unique_miss_count_storage.element_size()
+                    + slot.invalid_descriptor_count_storage.element_size()
+                    + num_unique_misses
+                    * (
+                        slot.unique_cluster_id_storage.element_size()
+                        + slot.unique_page_count_storage.element_size()
+                        + max_pages_per_cluster
+                        * slot.unique_logical_page_id_storage.element_size()
+                    )
+                )
+                self.performance_stats.add_counter(
+                    "verification_miss_metadata_d2h_bytes", metadata_bytes
+                )
+
             descriptor_started_at = (
                 perf_counter()
                 if self.performance_stats is not None and self.performance_stats.enabled
@@ -4981,11 +5020,11 @@ class RetroSpecClusterPageStore:
                 miss_page_ids_cpu,
                 miss_staging_page_ids_cpu,
                 unique_page_ids_cpu,
-            ) = self._build_verification_miss_metadata(
+            ) = self._validate_unique_verification_miss_metadata(
                 layer_name=layer_name,
                 max_pages=max_pages_per_cluster,
                 slot=slot,
-                num_misses=num_misses,
+                num_unique_misses=num_unique_misses,
             )
             if descriptor_started_at is not None:
                 self.performance_stats.record_cpu_time(
@@ -4993,20 +5032,17 @@ class RetroSpecClusterPageStore:
                     perf_counter() - descriptor_started_at,
                 )
 
-            assert slot.staging_start_storage is not None
-            assert slot.page_count_storage is not None
-            resolve_arena.staging_starts[:num_misses].copy_(
-                slot.staging_start_storage[:num_misses],
+            resolve_arena.unique_staging_starts[:num_unique_misses].copy_(
+                slot.unique_staging_start_storage[:num_unique_misses],
                 non_blocking=self.pin_memory,
             )
-            resolve_arena.page_counts[:num_misses].copy_(
-                slot.page_count_storage[:num_misses], non_blocking=self.pin_memory
-            )
             scatter_compact_staging_page_ids(
+                miss_unique_indices=access.miss_unique_indices,
                 miss_output_page_offsets=access.miss_output_page_offsets,
-                staging_starts=resolve_arena.staging_starts,
-                page_counts=resolve_arena.page_counts,
+                unique_staging_starts=resolve_arena.unique_staging_starts,
+                unique_page_counts=access.unique_page_counts,
                 num_misses=num_misses,
+                num_unique_misses=num_unique_misses,
                 max_pages=max_pages_per_cluster,
                 output_page_ids=access.staging_page_ids,
             )
@@ -5019,7 +5055,6 @@ class RetroSpecClusterPageStore:
                 self._stage_verification_miss_pages(pool, unique_page_ids_cpu)
             )
             if self.performance_stats is not None:
-                num_unique_misses = miss_cluster_ids_cpu.numel()
                 self.performance_stats.add_counter(
                     "verification_unique_miss_clusters", num_unique_misses
                 )

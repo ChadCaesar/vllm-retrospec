@@ -583,6 +583,25 @@ def _finalize_ranked_compact_draft_attention_kernel(
 
 
 @triton.jit
+def _reset_verification_miss_hash_kernel(
+    miss_table_handles,
+    output_miss_count,
+    output_unique_miss_count,
+    output_invalid_descriptor_count,
+    TABLE_CAPACITY: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = offsets < TABLE_CAPACITY
+    tl.store(miss_table_handles + offsets, -1, mask=valid)
+
+    reset_counter = offsets == 0
+    tl.store(output_miss_count + offsets, 0, mask=reset_counter)
+    tl.store(output_unique_miss_count + offsets, 0, mask=reset_counter)
+    tl.store(output_invalid_descriptor_count + offsets, 0, mask=reset_counter)
+
+
+@triton.jit
 def _resolve_compact_verification_pages_vector_kernel(
     selected_cluster_indices,
     plan_valid_rows,
@@ -609,14 +628,18 @@ def _resolve_compact_verification_pages_vector_kernel(
     output_selected_counts,
     output_hit_counts,
     output_miss_counts,
-    output_miss_handles,
-    output_miss_logical_page_ids,
-    output_miss_page_counts,
+    miss_table_handles,
+    miss_table_unique_indices,
+    output_miss_hash_buckets,
     output_miss_page_offsets,
     output_miss_count,
+    output_unique_handles,
+    output_unique_logical_page_ids,
+    output_unique_page_counts,
+    output_unique_miss_count,
     output_invalid_descriptor_count,
     table_page_stride,
-    output_miss_logical_page_stride,
+    output_unique_logical_page_stride,
     selected_stride_0,
     selected_stride_1,
     selected_stride_2,
@@ -627,6 +650,7 @@ def _resolve_compact_verification_pages_vector_kernel(
     ARENA_CLUSTER_CAPACITY: tl.constexpr,
     ARENA_PAGE_CAPACITY: tl.constexpr,
     TABLE_CAPACITY: tl.constexpr,
+    MISS_TABLE_CAPACITY: tl.constexpr,
     BLOCK_CLUSTERS: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
     BLOCK_OUTPUT_PAGES: tl.constexpr,
@@ -807,29 +831,75 @@ def _resolve_compact_verification_pages_vector_kernel(
         mask=valid_compact_pages & stable_hits[:, None],
     )
 
+    miss_buckets = tl.full((BLOCK_CLUSTERS,), -1, tl.int64)
+    claimed_unique = tl.full((BLOCK_CLUSTERS,), False, tl.int1)
+    searching = misses
+    searching_count = tl.sum(searching.to(tl.int32), axis=0)
+    first_miss_buckets = handles & (MISS_TABLE_CAPACITY - 1)
+    empty_handles = tl.full((BLOCK_CLUSTERS,), -1, tl.int64)
+    inactive_handles = tl.full((BLOCK_CLUSTERS,), -2, tl.int64)
+    probe = 0
+    while tl.condition(
+        (probe < MISS_TABLE_CAPACITY) & (searching_count > 0), disable_licm=True
+    ):
+        buckets = (first_miss_buckets + probe) & (MISS_TABLE_CAPACITY - 1)
+        safe_buckets = tl.where(searching, buckets, 0)
+        previous_handles = tl.atomic_cas(
+            miss_table_handles + safe_buckets,
+            tl.where(searching, empty_handles, inactive_handles),
+            tl.where(searching, handles, inactive_handles),
+            sem="acq_rel",
+        )
+        inserted = searching & (previous_handles == -1)
+        matched = searching & (inserted | (previous_handles == handles))
+        miss_buckets = tl.where(matched, buckets, miss_buckets)
+        claimed_unique |= inserted
+        searching &= ~matched
+        searching_count = tl.sum(searching.to(tl.int32), axis=0)
+        probe += 1
+
+    unique_prefix = tl.cumsum(claimed_unique.to(tl.int32), axis=0)
+    num_unique = tl.sum(claimed_unique.to(tl.int32), axis=0)
+    unique_base = tl.atomic_add(output_unique_miss_count, num_unique)
+    unique_indices = unique_base + unique_prefix - 1
+    tl.store(
+        miss_table_unique_indices + miss_buckets,
+        unique_indices,
+        mask=claimed_unique,
+    )
+    tl.store(output_unique_handles + unique_indices, handles, mask=claimed_unique)
+    tl.store(
+        output_unique_page_counts + unique_indices,
+        logical_page_counts,
+        mask=claimed_unique,
+    )
+    tl.store(
+        output_unique_logical_page_ids
+        + unique_indices[:, None] * output_unique_logical_page_stride
+        + page_offsets[None, :],
+        tl.where(valid_logical_pages, logical_page_ids, -1),
+        mask=claimed_unique[:, None] & valid_page_offsets[None, :],
+    )
+
     miss_prefix = tl.cumsum(misses.to(tl.int32), axis=0)
     num_misses = tl.sum(misses.to(tl.int32), axis=0)
     miss_base = tl.atomic_add(output_miss_count, num_misses)
     miss_slots = miss_base + miss_prefix - 1
-    tl.store(output_miss_handles + miss_slots, handles, mask=misses)
-    tl.store(output_miss_page_counts + miss_slots, logical_page_counts, mask=misses)
+    tl.store(output_miss_hash_buckets + miss_slots, miss_buckets, mask=misses)
     tl.store(
         output_miss_page_offsets + miss_slots,
         output_base + compact_starts,
         mask=misses,
     )
-    tl.store(
-        output_miss_logical_page_ids
-        + miss_slots[:, None] * output_miss_logical_page_stride
-        + page_offsets[None, :],
-        logical_page_ids,
-        mask=misses[:, None] & valid_page_offsets[None, :],
-    )
 
     invalid_descriptor = ~plan_valid | (has_selected & ~descriptor_valid)
+    hash_failures = misses & (miss_buckets < 0)
+    invalid_count = invalid_descriptor.to(tl.int32) + tl.sum(
+        hash_failures.to(tl.int32), axis=0
+    )
     tl.atomic_add(
         output_invalid_descriptor_count,
-        invalid_descriptor.to(tl.int32),
+        invalid_count,
     )
     tl.store(output_page_counts + row, tl.sum(selected_page_counts, axis=0))
     tl.store(output_selected_counts + row, tl.sum(selected.to(tl.int32), axis=0))
@@ -838,24 +908,70 @@ def _resolve_compact_verification_pages_vector_kernel(
 
 
 @triton.jit
+def _map_compact_verification_miss_indices_kernel(
+    miss_hash_buckets,
+    miss_table_unique_indices,
+    miss_count,
+    unique_miss_count,
+    output_miss_unique_indices,
+    output_invalid_descriptor_count,
+    miss_capacity,
+    table_capacity,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    num_misses = tl.load(miss_count)
+    num_unique_misses = tl.load(unique_miss_count)
+    active = (offsets < miss_capacity) & (offsets < num_misses)
+
+    buckets = tl.load(miss_hash_buckets + offsets, mask=active, other=-1)
+    valid_bucket = active & (buckets >= 0) & (buckets < table_capacity)
+    safe_buckets = tl.maximum(buckets, 0)
+    unique_indices = tl.load(
+        miss_table_unique_indices + safe_buckets, mask=valid_bucket, other=-1
+    )
+    valid_mapping = (
+        valid_bucket & (unique_indices >= 0) & (unique_indices < num_unique_misses)
+    )
+    tl.store(
+        output_miss_unique_indices + offsets,
+        tl.where(valid_mapping, unique_indices, -1),
+        mask=offsets < miss_capacity,
+    )
+    tl.atomic_add(
+        output_invalid_descriptor_count,
+        tl.sum((active & ~valid_mapping).to(tl.int32), axis=0),
+    )
+
+
+@triton.jit
 def _scatter_compact_staging_page_ids_kernel(
+    miss_unique_indices,
     miss_output_page_offsets,
-    staging_starts,
-    page_counts,
+    unique_staging_starts,
+    unique_page_counts,
     output_page_ids,
     num_misses,
+    num_unique_misses,
     MAX_PAGES: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
 ):
     miss_index = tl.program_id(0)
     valid_miss = miss_index < num_misses
+    unique_index = tl.load(miss_unique_indices + miss_index, mask=valid_miss, other=-1)
+    valid_unique = valid_miss & (unique_index >= 0) & (unique_index < num_unique_misses)
+    safe_unique_index = tl.maximum(unique_index, 0)
     output_start = tl.load(
-        miss_output_page_offsets + miss_index, mask=valid_miss, other=0
+        miss_output_page_offsets + miss_index, mask=valid_unique, other=0
     )
-    staging_start = tl.load(staging_starts + miss_index, mask=valid_miss, other=0)
-    page_count = tl.load(page_counts + miss_index, mask=valid_miss, other=0)
+    staging_start = tl.load(
+        unique_staging_starts + safe_unique_index, mask=valid_unique, other=0
+    )
+    page_count = tl.load(
+        unique_page_counts + safe_unique_index, mask=valid_unique, other=0
+    )
     page_offsets = tl.arange(0, BLOCK_PAGES)
-    valid_page = valid_miss & (page_offsets < page_count) & (page_offsets < MAX_PAGES)
+    valid_page = valid_unique & (page_offsets < page_count) & (page_offsets < MAX_PAGES)
     tl.store(
         output_page_ids + output_start + page_offsets,
         staging_start + page_offsets,
@@ -1724,11 +1840,16 @@ def resolve_compact_verification_pages(
     output_selected_counts: torch.Tensor,
     output_hit_counts: torch.Tensor,
     output_miss_counts: torch.Tensor,
-    output_miss_handles: torch.Tensor,
-    output_miss_logical_page_ids: torch.Tensor,
-    output_miss_page_counts: torch.Tensor,
+    output_miss_hash_buckets: torch.Tensor,
+    output_miss_unique_indices: torch.Tensor,
     output_miss_page_offsets: torch.Tensor,
     output_miss_count: torch.Tensor,
+    output_unique_handles: torch.Tensor,
+    output_unique_logical_page_ids: torch.Tensor,
+    output_unique_page_counts: torch.Tensor,
+    output_unique_miss_count: torch.Tensor,
+    miss_table_handles: torch.Tensor,
+    miss_table_unique_indices: torch.Tensor,
     output_invalid_descriptor_count: torch.Tensor,
 ) -> None:
     if selected_cluster_indices.device.type != "cuda":
@@ -1748,7 +1869,7 @@ def resolve_compact_verification_pages(
     if request_slot_ids.shape != (num_queries,):
         raise ValueError("Request slot descriptors must contain one entry per query")
     _, num_kv_heads, num_clusters = selected_cluster_indices.shape
-    max_pages = output_miss_logical_page_ids.shape[1]
+    max_pages = output_unique_logical_page_ids.shape[1]
     page_capacity = num_clusters * max_pages
     expected_page_shape = (num_queries, num_kv_heads, page_capacity)
     if output_resident_page_ids.shape != expected_page_shape:
@@ -1767,19 +1888,32 @@ def resolve_compact_verification_pages(
         if output.shape != row_shape:
             raise ValueError("Compact verification row output has the wrong shape")
     miss_capacity = num_queries * num_kv_heads * num_clusters
-    if output_miss_handles.numel() < miss_capacity:
+    if output_miss_hash_buckets.numel() < miss_capacity:
         raise ValueError("Verification miss output is too small")
-    if output_miss_logical_page_ids.shape[0] < miss_capacity:
-        raise ValueError("Verification miss-page output is too small")
     if any(
         output.numel() < miss_capacity
-        for output in (output_miss_page_counts, output_miss_page_offsets)
+        for output in (output_miss_unique_indices, output_miss_page_offsets)
     ):
         raise ValueError("Verification miss metadata output is too small")
+    if output_unique_handles.numel() < miss_capacity:
+        raise ValueError("Unique verification output is too small")
+    if output_unique_logical_page_ids.shape[0] < miss_capacity:
+        raise ValueError("Unique verification page output is too small")
+    if output_unique_page_counts.numel() < miss_capacity:
+        raise ValueError("Unique verification page counts are too small")
     if output_miss_count.shape != (1,):
         raise ValueError("Verification miss count must contain one element")
+    if output_unique_miss_count.shape != (1,):
+        raise ValueError("Unique verification miss count must contain one element")
     if output_invalid_descriptor_count.shape != (1,):
         raise ValueError("Invalid descriptor count must contain one element")
+    miss_table_capacity = miss_table_handles.numel()
+    if miss_table_capacity < max(2, 2 * miss_capacity):
+        raise ValueError("Verification miss hash table is too small")
+    if miss_table_capacity & (miss_table_capacity - 1):
+        raise ValueError("Verification miss hash capacity must be a power of two")
+    if miss_table_unique_indices.shape != miss_table_handles.shape:
+        raise ValueError("Verification miss hash arrays must have equal shapes")
 
     tensors = (
         selected_cluster_indices,
@@ -1806,18 +1940,32 @@ def resolve_compact_verification_pages(
         output_selected_counts,
         output_hit_counts,
         output_miss_counts,
-        output_miss_handles,
-        output_miss_logical_page_ids,
-        output_miss_page_counts,
+        output_miss_hash_buckets,
+        output_miss_unique_indices,
         output_miss_page_offsets,
         output_miss_count,
+        output_unique_handles,
+        output_unique_logical_page_ids,
+        output_unique_page_counts,
+        output_unique_miss_count,
+        miss_table_handles,
+        miss_table_unique_indices,
         output_invalid_descriptor_count,
     )
     if any(tensor.device != selected_cluster_indices.device for tensor in tensors):
         raise ValueError("Compact verification tensors must use one CUDA device")
 
-    output_miss_count.zero_()
-    output_invalid_descriptor_count.zero_()
+    reset_block_size = 256
+    _reset_verification_miss_hash_kernel[
+        (triton.cdiv(miss_table_capacity, reset_block_size),)
+    ](
+        miss_table_handles,
+        output_miss_count,
+        output_unique_miss_count,
+        output_invalid_descriptor_count,
+        TABLE_CAPACITY=miss_table_capacity,
+        BLOCK_SIZE=reset_block_size,
+    )
     if num_queries == 0:
         return
     if num_clusters == 0 or max_pages == 0:
@@ -1856,14 +2004,18 @@ def resolve_compact_verification_pages(
         output_selected_counts,
         output_hit_counts,
         output_miss_counts,
-        output_miss_handles,
-        output_miss_logical_page_ids,
-        output_miss_page_counts,
+        miss_table_handles,
+        miss_table_unique_indices,
+        output_miss_hash_buckets,
         output_miss_page_offsets,
         output_miss_count,
+        output_unique_handles,
+        output_unique_logical_page_ids,
+        output_unique_page_counts,
+        output_unique_miss_count,
         output_invalid_descriptor_count,
         table_page_slots.stride(0),
-        output_miss_logical_page_ids.stride(0),
+        output_unique_logical_page_ids.stride(0),
         selected_cluster_indices.stride(0),
         selected_cluster_indices.stride(1),
         selected_cluster_indices.stride(2),
@@ -1874,45 +2026,77 @@ def resolve_compact_verification_pages(
         ARENA_CLUSTER_CAPACITY=arena_cluster_ids.shape[1],
         ARENA_PAGE_CAPACITY=arena_page_ids.shape[1],
         TABLE_CAPACITY=table_handles.numel(),
+        MISS_TABLE_CAPACITY=miss_table_capacity,
         BLOCK_CLUSTERS=triton.next_power_of_2(num_clusters),
         BLOCK_PAGES=triton.next_power_of_2(max_pages),
         BLOCK_OUTPUT_PAGES=triton.next_power_of_2(page_capacity),
     )
 
+    mapping_block_size = 256
+    _map_compact_verification_miss_indices_kernel[
+        (triton.cdiv(miss_capacity, mapping_block_size),)
+    ](
+        output_miss_hash_buckets,
+        miss_table_unique_indices,
+        output_miss_count,
+        output_unique_miss_count,
+        output_miss_unique_indices,
+        output_invalid_descriptor_count,
+        miss_capacity,
+        miss_table_capacity,
+        BLOCK_SIZE=mapping_block_size,
+    )
+
 
 def scatter_compact_staging_page_ids(
+    miss_unique_indices: torch.Tensor,
     miss_output_page_offsets: torch.Tensor,
-    staging_starts: torch.Tensor,
-    page_counts: torch.Tensor,
+    unique_staging_starts: torch.Tensor,
+    unique_page_counts: torch.Tensor,
     num_misses: int,
+    num_unique_misses: int,
     max_pages: int,
     output_page_ids: torch.Tensor,
 ) -> None:
     if output_page_ids.device.type != "cuda":
         raise ValueError("Compact staging-page scatter requires CUDA")
-    if num_misses < 0:
-        raise ValueError("num_misses must be non-negative")
+    if num_misses < 0 or num_unique_misses < 0:
+        raise ValueError("Verification miss counts must be non-negative")
+    if num_unique_misses > num_misses:
+        raise ValueError("Unique verification misses exceed total misses")
     if max_pages <= 0 and num_misses:
         raise ValueError("max_pages must be positive for non-empty misses")
     if any(
         tensor.device != output_page_ids.device
-        for tensor in (miss_output_page_offsets, staging_starts, page_counts)
+        for tensor in (
+            miss_unique_indices,
+            miss_output_page_offsets,
+            unique_staging_starts,
+            unique_page_counts,
+        )
     ):
         raise ValueError("Compact staging tensors must use one CUDA device")
     if any(
         tensor.numel() < num_misses
-        for tensor in (miss_output_page_offsets, staging_starts, page_counts)
+        for tensor in (miss_unique_indices, miss_output_page_offsets)
     ):
         raise ValueError("Compact staging input does not have enough capacity")
+    if any(
+        tensor.numel() < num_unique_misses
+        for tensor in (unique_staging_starts, unique_page_counts)
+    ):
+        raise ValueError("Unique staging input does not have enough capacity")
     if num_misses == 0:
         return
 
     _scatter_compact_staging_page_ids_kernel[(num_misses,)](
+        miss_unique_indices,
         miss_output_page_offsets,
-        staging_starts,
-        page_counts,
+        unique_staging_starts,
+        unique_page_counts,
         output_page_ids.reshape(-1),
         num_misses,
+        num_unique_misses,
         MAX_PAGES=max_pages,
         BLOCK_PAGES=triton.next_power_of_2(max_pages),
     )

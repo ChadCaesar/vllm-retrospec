@@ -1992,6 +1992,17 @@ def test_gpu_verification_resolution_deduplicates_miss_pages_before_h2d():
     assert stats._cpu_counters["verification_unique_miss_clusters"] == 4
     assert stats._cpu_counters["verification_duplicate_miss_clusters"] == 4
     assert stats._cpu_counters["verification_miss_pages"] == 6
+    expected_metadata_bytes = 3 * torch.tensor([], dtype=torch.int32).element_size()
+    expected_metadata_bytes += cluster_ids.numel() * (
+        torch.tensor([], dtype=torch.int64).element_size()
+        + torch.tensor([], dtype=torch.int32).element_size()
+        + metadata.page_ids.shape[-1]
+        * torch.tensor([], dtype=torch.int64).element_size()
+    )
+    assert (
+        stats._cpu_counters["verification_miss_metadata_d2h_bytes"]
+        == expected_metadata_bytes
+    )
     reference_store.close()
     store.close()
 

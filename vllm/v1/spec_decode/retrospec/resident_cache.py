@@ -74,7 +74,7 @@ class RetroSpecCompactResidentPageAccess:
 
 @dataclass(frozen=True)
 class RetroSpecCompactVerificationPageAccess:
-    """Query-row compact resident pages and miss commands for verification."""
+    """Query-row compact resident pages and GPU-unique verification misses."""
 
     resident_page_ids: torch.Tensor
     staging_page_ids: torch.Tensor
@@ -83,11 +83,13 @@ class RetroSpecCompactVerificationPageAccess:
     selected_cluster_counts: torch.Tensor
     hit_cluster_counts: torch.Tensor
     miss_cluster_counts: torch.Tensor
-    miss_cluster_ids: torch.Tensor
-    miss_logical_page_ids: torch.Tensor
-    miss_page_counts: torch.Tensor
+    unique_cluster_ids: torch.Tensor
+    unique_logical_page_ids: torch.Tensor
+    unique_page_counts: torch.Tensor
+    miss_unique_indices: torch.Tensor
     miss_output_page_offsets: torch.Tensor
     miss_count: torch.Tensor
+    unique_miss_count: torch.Tensor
     invalid_descriptor_count: torch.Tensor
     read_lease: "RetroSpecResidentReadLease"
 
@@ -1411,11 +1413,16 @@ class RetroSpecResidentClusterCache:
         selected_cluster_counts: torch.Tensor,
         hit_cluster_counts: torch.Tensor,
         miss_cluster_counts: torch.Tensor,
-        miss_cluster_ids: torch.Tensor,
-        miss_logical_page_ids: torch.Tensor,
-        miss_page_counts: torch.Tensor,
+        unique_cluster_ids: torch.Tensor,
+        unique_logical_page_ids: torch.Tensor,
+        unique_page_counts: torch.Tensor,
+        miss_hash_buckets: torch.Tensor,
+        miss_unique_indices: torch.Tensor,
         miss_output_page_offsets: torch.Tensor,
         miss_count: torch.Tensor,
+        unique_miss_count: torch.Tensor,
+        miss_table_handles: torch.Tensor,
+        miss_table_unique_indices: torch.Tensor,
         invalid_descriptor_count: torch.Tensor,
     ) -> RetroSpecCompactVerificationPageAccess:
         """Resolve verification selections directly from the resident arena."""
@@ -1424,7 +1431,7 @@ class RetroSpecResidentClusterCache:
 
         self._gpu_access_lock.acquire()
         try:
-            self._ensure_handle_table(miss_logical_page_ids.shape[1])
+            self._ensure_handle_table(unique_logical_page_ids.shape[1])
             access_epoch = self._next_access_epoch
             self._next_access_epoch += 1
             resolve_compact_verification_pages(
@@ -1453,11 +1460,16 @@ class RetroSpecResidentClusterCache:
                 output_selected_counts=selected_cluster_counts,
                 output_hit_counts=hit_cluster_counts,
                 output_miss_counts=miss_cluster_counts,
-                output_miss_handles=miss_cluster_ids,
-                output_miss_logical_page_ids=miss_logical_page_ids,
-                output_miss_page_counts=miss_page_counts,
+                output_miss_hash_buckets=miss_hash_buckets,
+                output_miss_unique_indices=miss_unique_indices,
                 output_miss_page_offsets=miss_output_page_offsets,
                 output_miss_count=miss_count,
+                output_unique_handles=unique_cluster_ids,
+                output_unique_logical_page_ids=unique_logical_page_ids,
+                output_unique_page_counts=unique_page_counts,
+                output_unique_miss_count=unique_miss_count,
+                miss_table_handles=miss_table_handles,
+                miss_table_unique_indices=miss_table_unique_indices,
                 output_invalid_descriptor_count=invalid_descriptor_count,
             )
         except BaseException:
@@ -1472,11 +1484,13 @@ class RetroSpecResidentClusterCache:
             selected_cluster_counts=selected_cluster_counts,
             hit_cluster_counts=hit_cluster_counts,
             miss_cluster_counts=miss_cluster_counts,
-            miss_cluster_ids=miss_cluster_ids,
-            miss_logical_page_ids=miss_logical_page_ids,
-            miss_page_counts=miss_page_counts,
+            unique_cluster_ids=unique_cluster_ids,
+            unique_logical_page_ids=unique_logical_page_ids,
+            unique_page_counts=unique_page_counts,
+            miss_unique_indices=miss_unique_indices,
             miss_output_page_offsets=miss_output_page_offsets,
             miss_count=miss_count,
+            unique_miss_count=unique_miss_count,
             invalid_descriptor_count=invalid_descriptor_count,
             read_lease=RetroSpecResidentReadLease(self._gpu_access_lock),
         )

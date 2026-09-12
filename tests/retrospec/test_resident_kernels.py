@@ -705,10 +705,11 @@ def _compact_verification_outputs(
     page_shape = (num_queries, num_kv_heads, num_clusters * max_pages)
     row_shape = (num_queries, num_kv_heads)
     miss_capacity = num_queries * num_kv_heads * num_clusters
-    miss_page_stride = miss_page_stride or max_pages
-    miss_page_storage = torch.empty(
-        (miss_capacity, miss_page_stride), dtype=torch.int64, device=device
+    unique_page_stride = miss_page_stride or max_pages
+    unique_page_storage = torch.empty(
+        (miss_capacity, unique_page_stride), dtype=torch.int64, device=device
     )
+    hash_capacity = 1 << (max(2, 2 * miss_capacity) - 1).bit_length()
     return (
         torch.empty(page_shape, dtype=torch.int64, device=device),
         torch.empty(page_shape, dtype=torch.int64, device=device),
@@ -718,10 +719,15 @@ def _compact_verification_outputs(
         torch.empty(row_shape, dtype=torch.int32, device=device),
         torch.empty(row_shape, dtype=torch.int32, device=device),
         torch.empty(miss_capacity, dtype=torch.int64, device=device),
-        miss_page_storage[:, :max_pages],
         torch.empty(miss_capacity, dtype=torch.int32, device=device),
         torch.empty(miss_capacity, dtype=torch.int64, device=device),
         torch.empty(1, dtype=torch.int32, device=device),
+        torch.empty(miss_capacity, dtype=torch.int64, device=device),
+        unique_page_storage[:, :max_pages],
+        torch.empty(miss_capacity, dtype=torch.int32, device=device),
+        torch.empty(1, dtype=torch.int32, device=device),
+        torch.empty(hash_capacity, dtype=torch.int64, device=device),
+        torch.empty(hash_capacity, dtype=torch.int32, device=device),
         torch.empty(1, dtype=torch.int32, device=device),
     )
 
@@ -733,11 +739,16 @@ def _resolve_compact_verification(
     table: tuple[torch.Tensor, ...],
     plan_valid_rows: torch.Tensor | None = None,
     miss_page_stride: int | None = None,
+    arena_cluster_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     device = selected_cluster_indices.device
     num_queries = selected_cluster_indices.shape[0]
     if plan_valid_rows is None:
         plan_valid_rows = torch.ones(num_queries, dtype=torch.bool, device=device)
+    if arena_cluster_ids is None:
+        arena_cluster_ids = torch.tensor(
+            [[10, 11, 20, 21]], dtype=torch.int64, device=device
+        )
     outputs = _compact_verification_outputs(
         num_queries,
         selected_cluster_indices.shape[1],
@@ -750,9 +761,7 @@ def _resolve_compact_verification(
         plan_valid_rows=plan_valid_rows,
         request_slot_ids=request_slot_ids,
         request_slot_generations=request_slot_generations,
-        arena_cluster_ids=torch.tensor(
-            [[10, 11, 20, 21]], dtype=torch.int64, device=device
-        ),
+        arena_cluster_ids=arena_cluster_ids,
         arena_cluster_page_starts=torch.tensor(
             [[0, 2, 0, 1]], dtype=torch.int64, device=device
         ),
@@ -781,12 +790,17 @@ def _resolve_compact_verification(
         output_selected_counts=outputs[4],
         output_hit_counts=outputs[5],
         output_miss_counts=outputs[6],
-        output_miss_handles=outputs[7],
-        output_miss_logical_page_ids=outputs[8],
-        output_miss_page_counts=outputs[9],
-        output_miss_page_offsets=outputs[10],
-        output_miss_count=outputs[11],
-        output_invalid_descriptor_count=outputs[12],
+        output_miss_hash_buckets=outputs[7],
+        output_miss_unique_indices=outputs[8],
+        output_miss_page_offsets=outputs[9],
+        output_miss_count=outputs[10],
+        output_unique_handles=outputs[11],
+        output_unique_logical_page_ids=outputs[12],
+        output_unique_page_counts=outputs[13],
+        output_unique_miss_count=outputs[14],
+        miss_table_handles=outputs[15],
+        miss_table_unique_indices=outputs[16],
+        output_invalid_descriptor_count=outputs[17],
     )
     torch.cuda.synchronize()
     return outputs
@@ -835,18 +849,29 @@ def test_compact_verification_resolver_preserves_ranked_pages_and_emits_misses()
     assert outputs[4].cpu().tolist() == [[2], [1], [2]]
     assert outputs[5].cpu().tolist() == [[1], [1], [1]]
     assert outputs[6].cpu().tolist() == [[1], [0], [1]]
-    assert outputs[12].item() == 0
+    assert outputs[17].item() == 0
 
-    miss_count = int(outputs[11].item())
-    records = sorted(
+    miss_count = int(outputs[10].item())
+    unique_count = int(outputs[14].item())
+    assert miss_count == 2
+    assert unique_count == 1
+    unique_records = sorted(
         zip(
-            outputs[10][:miss_count].cpu().tolist(),
-            outputs[7][:miss_count].cpu().tolist(),
+            outputs[11][:unique_count].cpu().tolist(),
+            outputs[13][:unique_count].cpu().tolist(),
+            outputs[12][:unique_count].cpu().tolist(),
+        )
+    )
+    assert unique_records == [(20, 1, [200, -1])]
+    miss_records = sorted(
+        zip(
             outputs[9][:miss_count].cpu().tolist(),
             outputs[8][:miss_count].cpu().tolist(),
         )
     )
-    assert records == [(2, 20, 1, [200, -1]), (8, 20, 1, [200, -1])]
+    assert miss_records[0][0] == 2
+    assert miss_records[1][0] == 8
+    assert miss_records[0][1] == miss_records[1][1] == 0
     assert table[5].cpu().tolist()[3:6] == [19, 0, 19]
 
 
@@ -861,12 +886,12 @@ def test_compact_verification_resolver_honors_miss_page_row_stride():
         miss_page_stride=4,
     )
 
-    miss_count = int(outputs[11].item())
+    unique_count = int(outputs[14].item())
     records = sorted(
         zip(
-            outputs[7][:miss_count].cpu().tolist(),
-            outputs[9][:miss_count].cpu().tolist(),
-            outputs[8][:miss_count].cpu().tolist(),
+            outputs[11][:unique_count].cpu().tolist(),
+            outputs[13][:unique_count].cpu().tolist(),
+            outputs[12][:unique_count].cpu().tolist(),
         )
     )
     assert records == [
@@ -875,6 +900,49 @@ def test_compact_verification_resolver_honors_miss_page_row_stride():
         (20, 1, [200, -1]),
         (21, 2, [201, 202]),
     ]
+
+
+def test_compact_verification_resolver_deduplicates_colliding_handles():
+    device = torch.device("cuda")
+    selected = torch.tensor([[[0, 1]], [[0, 1]]], dtype=torch.int32, device=device)
+    outputs = _resolve_compact_verification(
+        selected,
+        torch.tensor([0, 1], dtype=torch.int64, device=device),
+        torch.tensor([5, 7], dtype=torch.int64, device=device),
+        _make_table(max_pages=2),
+        arena_cluster_ids=torch.tensor(
+            [[10, 18, 26, 34]], dtype=torch.int64, device=device
+        ),
+    )
+
+    miss_count = int(outputs[10].item())
+    unique_count = int(outputs[14].item())
+    assert miss_count == unique_count == 4
+    assert outputs[17].item() == 0
+    assert sorted(outputs[11][:unique_count].cpu().tolist()) == [10, 18, 26, 34]
+    assert sorted(outputs[8][:miss_count].cpu().tolist()) == [0, 1, 2, 3]
+
+
+def test_compact_verification_resolver_deduplicates_across_programs():
+    device = torch.device("cuda")
+    num_queries = 128
+    selected = torch.tensor([0, 1], dtype=torch.int32, device=device).repeat(
+        num_queries, 1, 1
+    )
+    outputs = _resolve_compact_verification(
+        selected,
+        torch.zeros(num_queries, dtype=torch.int64, device=device),
+        torch.full((num_queries,), 5, dtype=torch.int64, device=device),
+        _make_table(max_pages=2),
+    )
+
+    miss_count = int(outputs[10].item())
+    unique_count = int(outputs[14].item())
+    assert miss_count == num_queries * 2
+    assert unique_count == 2
+    assert outputs[17].item() == 0
+    assert sorted(outputs[11][:unique_count].cpu().tolist()) == [10, 11]
+    assert set(outputs[8][:miss_count].cpu().tolist()) == {0, 1}
 
 
 def test_compact_verification_resolver_reports_stale_request_generation():
@@ -889,8 +957,9 @@ def test_compact_verification_resolver_reports_stale_request_generation():
     )
 
     assert outputs[3].cpu().tolist() == [[0], [0]]
-    assert outputs[11].item() == 0
-    assert outputs[12].item() == 1
+    assert outputs[10].item() == 0
+    assert outputs[14].item() == 0
+    assert outputs[17].item() == 1
 
 
 def test_compact_verification_resolver_reports_missing_plan_row():
@@ -903,17 +972,19 @@ def test_compact_verification_resolver_reports_missing_plan_row():
         plan_valid_rows=torch.tensor([True, False], device=device),
     )
 
-    assert outputs[12].item() == 1
+    assert outputs[17].item() == 1
 
 
 def test_compact_verification_staging_scatter_uses_reserved_page_offsets():
     device = torch.device("cuda")
     output = torch.full((2, 1, 4), -1, dtype=torch.int64, device=device)
     scatter_compact_staging_page_ids(
+        miss_unique_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
         miss_output_page_offsets=torch.tensor([2, 4], device=device),
-        staging_starts=torch.tensor([0, 3], device=device),
-        page_counts=torch.tensor([2, 1], dtype=torch.int32, device=device),
+        unique_staging_starts=torch.tensor([0, 3], device=device),
+        unique_page_counts=torch.tensor([2, 1], dtype=torch.int32, device=device),
         num_misses=2,
+        num_unique_misses=2,
         max_pages=2,
         output_page_ids=output,
     )
