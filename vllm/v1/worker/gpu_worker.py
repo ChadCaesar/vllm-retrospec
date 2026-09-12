@@ -1011,6 +1011,12 @@ class Worker(WorkerBase):
             )
 
     def shutdown(self) -> None:
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            shutdown_model_runner = getattr(model_runner, "shutdown", None)
+            if callable(shutdown_model_runner):
+                shutdown_model_runner()
+
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()

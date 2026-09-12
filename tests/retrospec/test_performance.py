@@ -32,8 +32,10 @@ def test_disabled_stats_allocate_no_device_workspace(monkeypatch: pytest.MonkeyP
     ):
         pass
     stats.maybe_log()
+    stats.flush("shutdown")
 
     assert not stats.enabled
+    assert stats._gpu_observations.numel() == 0
     assert stats._gpu_counters.numel() == 0
     assert not stats._cpu_times
     assert not stats._pending_cuda_samples
@@ -45,6 +47,62 @@ def test_negative_interval_is_rejected():
         RetroSpecPerformanceStats(
             device=torch.device("cpu"),
             log_interval_seconds=-1.0,
+        )
+
+
+def test_negative_histogram_maximum_is_rejected():
+    with pytest.raises(ValueError, match="histogram maximum"):
+        RetroSpecPerformanceStats(
+            device=torch.device("cpu"),
+            log_interval_seconds=1.0,
+            histogram_max_value=-1,
+        )
+
+
+def test_gpu_histograms_share_observation_workspace_and_clamp_values(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    clock = fake_clock([100.0, 102.0])
+    monkeypatch.setattr(performance, "monotonic", lambda: next(clock))
+    messages: list[tuple[object, ...]] = []
+    monkeypatch.setattr(performance.logger, "info", lambda *args: messages.append(args))
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cpu"),
+        log_interval_seconds=1.0,
+        histogram_max_value=4,
+    )
+
+    stats.add_gpu_histogram(
+        "draft_to_sparse_tokens",
+        torch.tensor([-1, 1, 4, 8]),
+        torch.tensor([True, False, True, True]),
+    )
+    stats.add_gpu_histogram("sparse_to_expanded_prefix", torch.tensor([2, 2, 3]))
+    stats.maybe_log()
+
+    assert stats._gpu_counters.untyped_storage().data_ptr() == (
+        stats._gpu_histograms["draft_to_sparse_tokens"].untyped_storage().data_ptr()
+    )
+    message = messages[0][0] % messages[0][1:]
+    assert "draft_to_sparse_tokens=[0:1,4:2]" in message
+    assert "sparse_to_expanded_prefix=[2:2,3:1]" in message
+    assert torch.count_nonzero(stats._gpu_observations).item() == 0
+
+
+def test_gpu_histogram_validates_name_device_and_mask_shape():
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cpu"),
+        log_interval_seconds=1.0,
+        histogram_max_value=4,
+    )
+
+    with pytest.raises(KeyError, match="unknown"):
+        stats.add_gpu_histogram("unknown", torch.tensor([1]))
+    with pytest.raises(ValueError, match="values and mask"):
+        stats.add_gpu_histogram(
+            "draft_to_sparse_tokens",
+            torch.tensor([1, 2]),
+            torch.tensor([True]),
         )
 
 
@@ -120,11 +178,60 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     assert "sparse_verify_graph_replay=1.000" in message
     assert "expanded_verify_graph_replay=0.000" in message
     assert "proposal_wall=12.000ms/1" in message
+    assert "reason=interval" in message
 
     assert not stats._cpu_counters
     assert not stats._peaks
     assert not stats._cpu_times
     assert torch.count_nonzero(stats._gpu_counters).item() == 0
+
+
+def test_force_flush_waits_for_cuda_samples_and_does_not_repeat_cpu_data(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeEndEvent:
+        def __init__(self) -> None:
+            self.synchronize_calls = 0
+
+        def query(self) -> bool:
+            return False
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+
+    class FakeStartEvent:
+        @staticmethod
+        def elapsed_time(end_event: object) -> float:
+            return 7.5
+
+    clock = fake_clock([100.0, 100.5, 101.0])
+    monkeypatch.setattr(performance, "monotonic", lambda: next(clock))
+    messages: list[tuple[object, ...]] = []
+    monkeypatch.setattr(performance.logger, "info", lambda *args: messages.append(args))
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cpu"), log_interval_seconds=10.0
+    )
+    end_event = FakeEndEvent()
+    stats._pending_cuda_samples.append(
+        performance._PendingCudaSample(
+            name="transfer",
+            start_event=FakeStartEvent(),
+            end_event=end_event,
+        )
+    )
+    stats.add_counter("proposal_calls")
+
+    stats.flush("request_finished")
+    stats.flush("shutdown")
+
+    assert end_event.synchronize_calls == 1
+    first = messages[0][0] % messages[0][1:]
+    second = messages[1][0] % messages[1][1:]
+    assert "reason=request_finished" in first
+    assert "proposal_calls=1" in first
+    assert "transfer=7.500ms/1" in first
+    assert "reason=shutdown" in second
+    assert "proposal_calls=1" not in second
 
 
 def test_enabled_stats_reject_unknown_gpu_counter():

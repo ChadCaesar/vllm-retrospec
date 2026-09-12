@@ -2839,8 +2839,19 @@ class RetroSpecClusterPageStore:
             ready_event = torch.cuda.Event()
 
             with torch.cuda.stream(offload_stream):
-                staged_token_keys.copy_(token_keys, non_blocking=True)
-                staged_token_values.copy_(token_values, non_blocking=True)
+                timer = (
+                    None
+                    if self.performance_stats is None
+                    else self.performance_stats.start_cuda_timer(
+                        "prefill_token_kv_d2h", offload_stream
+                    )
+                )
+                try:
+                    staged_token_keys.copy_(token_keys, non_blocking=True)
+                    staged_token_values.copy_(token_values, non_blocking=True)
+                finally:
+                    if self.performance_stats is not None:
+                        self.performance_stats.stop_cuda_timer(timer, offload_stream)
                 ready_event.record(offload_stream)
 
             token_keys.record_stream(offload_stream)
@@ -2937,15 +2948,24 @@ class RetroSpecClusterPageStore:
             ready_event = torch.cuda.Event()
 
             with torch.cuda.stream(offload_stream):
-                staged_assignments.copy_(assignments, non_blocking=True)
-                staged_cluster_token_counts.copy_(
-                    cluster_token_counts,
-                    non_blocking=True,
+                timer = (
+                    None
+                    if self.performance_stats is None
+                    else self.performance_stats.start_cuda_timer(
+                        "prefill_cluster_metadata_d2h", offload_stream
+                    )
                 )
-                staged_token_offsets.copy_(
-                    token_offsets_in_cluster,
-                    non_blocking=True,
-                )
+                try:
+                    staged_assignments.copy_(assignments, non_blocking=True)
+                    staged_cluster_token_counts.copy_(
+                        cluster_token_counts, non_blocking=True
+                    )
+                    staged_token_offsets.copy_(
+                        token_offsets_in_cluster, non_blocking=True
+                    )
+                finally:
+                    if self.performance_stats is not None:
+                        self.performance_stats.stop_cuda_timer(timer, offload_stream)
                 ready_event.record(offload_stream)
 
             assignments.record_stream(offload_stream)

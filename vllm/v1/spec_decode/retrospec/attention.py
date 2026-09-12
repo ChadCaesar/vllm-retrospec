@@ -152,6 +152,7 @@ class RetroSpecSparseAttention:
                 "retrospec_stats_interval_seconds",
                 0.0,
             ),
+            histogram_max_value=config.num_speculative_tokens,
         )
         cpu_page_slab_size_mib = getattr(
             config, "retrospec_cpu_page_slab_size_mib", 256
@@ -508,7 +509,10 @@ class RetroSpecSparseAttention:
 
         self.original_forwards.clear()
         self.forward_wrappers.clear()
-        self.index.close()
+        try:
+            self.index.close()
+        finally:
+            self.performance_stats.flush("shutdown")
 
     @contextmanager
     def full_verification_context(
@@ -559,42 +563,54 @@ class RetroSpecSparseAttention:
                     f"behind retired KV boundary {retired_end}"
                 )
 
-        self.index.prepare_full_verification(
-            request_ids,
-            context_lens,
-            tuple(self.original_forwards),
+        transaction_timer = self.performance_stats.start_cuda_timer(
+            "full_verify_transaction"
         )
-        self.index.begin_full_verification_residency(request_ids)
+        residency_started = False
         pipeline_started = False
         try:
-            if self.device.type == "cuda":
-                layer_num_kv_heads = {
-                    layer_name: impl.num_kv_heads
-                    for layer_name, (impl, _) in self.original_forwards.items()
-                }
-                self.index.begin_full_verification_pipeline(
-                    request_ids,
-                    layer_num_kv_heads,
-                    self.device,
-                )
-                pipeline_started = True
-            self.performance_stats.add_counter(
-                "full_verify_requests",
-                len(request_ids),
-            )
-            self.full_verification_batch = _RetroSpecFullVerificationBatch(
-                request_ids=request_ids,
-                context_lens=context_lens,
-                query_lens=query_lens,
-            )
-            self.mode = RetroSpecAttentionMode.FULL_VERIFY
-            yield
+            with self.performance_stats.cpu_timer("full_verify_transaction_wall"):
+                try:
+                    self.index.prepare_full_verification(
+                        request_ids,
+                        context_lens,
+                        tuple(self.original_forwards),
+                    )
+                    self.index.begin_full_verification_residency(request_ids)
+                    residency_started = True
+                    if self.device.type == "cuda":
+                        layer_num_kv_heads = {
+                            layer_name: impl.num_kv_heads
+                            for layer_name, (impl, _) in self.original_forwards.items()
+                        }
+                        self.index.begin_full_verification_pipeline(
+                            request_ids,
+                            layer_num_kv_heads,
+                            self.device,
+                        )
+                        pipeline_started = True
+                    self.performance_stats.add_counter(
+                        "full_verify_requests", len(request_ids)
+                    )
+                    self.performance_stats.add_counter(
+                        "full_verify_query_tokens", sum(query_lens)
+                    )
+                    self.full_verification_batch = _RetroSpecFullVerificationBatch(
+                        request_ids=request_ids,
+                        context_lens=context_lens,
+                        query_lens=query_lens,
+                    )
+                    self.mode = RetroSpecAttentionMode.FULL_VERIFY
+                    yield
+                finally:
+                    self.performance_stats.stop_cuda_timer(transaction_timer)
+                    self.mode = RetroSpecAttentionMode.PASSTHROUGH
+                    self.full_verification_batch = None
+                    if pipeline_started:
+                        self.index.end_full_verification_pipeline()
+                    if residency_started:
+                        self.index.end_full_verification_residency()
         finally:
-            self.mode = RetroSpecAttentionMode.PASSTHROUGH
-            self.full_verification_batch = None
-            if pipeline_started:
-                self.index.end_full_verification_pipeline()
-            self.index.end_full_verification_residency()
             self.performance_stats.maybe_log()
 
     @contextmanager

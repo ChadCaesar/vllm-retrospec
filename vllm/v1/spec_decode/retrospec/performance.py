@@ -50,29 +50,54 @@ class RetroSpecPerformanceStats:
         "verification_resident_hits",
         "verification_resident_misses",
     )
+    _GPU_HISTOGRAM_NAMES = (
+        "draft_to_sparse_tokens",
+        "sparse_to_expanded_prefix",
+        "expanded_to_full_prefix",
+    )
 
     def __init__(
         self,
         device: torch.device,
         log_interval_seconds: float,
+        histogram_max_value: int = 0,
     ) -> None:
         if log_interval_seconds < 0:
             raise ValueError("RetroSpec stats interval must be non-negative")
+        if histogram_max_value < 0:
+            raise ValueError("RetroSpec histogram maximum must be non-negative")
 
         if device.type == "cuda" and device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
         self.device = device
         self.log_interval_seconds = log_interval_seconds
         self.enabled = log_interval_seconds > 0
+        self.histogram_max_value = histogram_max_value
+        self._histogram_num_bins = histogram_max_value + 1
 
         self._gpu_counter_indices = {
             name: index for index, name in enumerate(self._GPU_COUNTER_NAMES)
         }
-        self._gpu_counters = (
-            torch.zeros(len(self._GPU_COUNTER_NAMES), dtype=torch.int64, device=device)
+        num_counters = len(self._GPU_COUNTER_NAMES)
+        num_histogram_values = len(self._GPU_HISTOGRAM_NAMES) * self._histogram_num_bins
+        self._gpu_observations = (
+            torch.zeros(
+                num_counters + num_histogram_values,
+                dtype=torch.int64,
+                device=device,
+            )
             if self.enabled
             else torch.empty(0, dtype=torch.int64)
         )
+        self._gpu_counters = self._gpu_observations[:num_counters]
+        histogram_values = self._gpu_observations[num_counters:]
+        self._gpu_histograms = {
+            name: histogram_values[
+                index * self._histogram_num_bins : (index + 1)
+                * self._histogram_num_bins
+            ]
+            for index, name in enumerate(self._GPU_HISTOGRAM_NAMES)
+        }
 
         self._lock = Lock()
         self._cpu_counters: Counter[str] = Counter()
@@ -105,6 +130,37 @@ class RetroSpecPerformanceStats:
             counter.add_(value.sum(dtype=torch.int64))
         else:
             counter.add_(int(value))
+
+    def add_gpu_histogram(
+        self,
+        name: str,
+        values: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        histogram = self._gpu_histograms.get(name)
+        if histogram is None:
+            raise KeyError(f"Unknown RetroSpec GPU histogram: {name}")
+        if values.device != self.device:
+            raise ValueError(
+                f"RetroSpec GPU histogram {name!r} must use device {self.device}"
+            )
+        values = values.reshape(-1)
+        if mask is None:
+            weights = torch.ones_like(values, dtype=torch.int64)
+        else:
+            if mask.device != self.device:
+                raise ValueError(
+                    f"RetroSpec GPU histogram mask {name!r} must use device "
+                    f"{self.device}"
+                )
+            if mask.numel() != values.numel():
+                raise ValueError("RetroSpec histogram values and mask must match")
+            weights = mask.reshape(-1).to(dtype=torch.int64)
+        bins = values.to(dtype=torch.int64).clamp_(0, self.histogram_max_value)
+        histogram.scatter_add_(0, bins, weights)
 
     def observe_peak(self, name: str, value: int) -> None:
         if not self.enabled:
@@ -186,7 +242,7 @@ class RetroSpecPerformanceStats:
             total_ms, count = target.get(name, (0.0, 0))
             target[name] = (total_ms + elapsed_ms, count + 1)
 
-    def _drain_cuda_samples(self) -> None:
+    def _drain_cuda_samples(self, wait_for_completion: bool = False) -> None:
         with self._lock:
             pending = tuple(self._pending_cuda_samples)
             self._pending_cuda_samples.clear()
@@ -194,7 +250,9 @@ class RetroSpecPerformanceStats:
         retained: list[_PendingCudaSample] = []
         completed: list[tuple[str, float]] = []
         for sample in pending:
-            if not sample.end_event.query():
+            if wait_for_completion:
+                sample.end_event.synchronize()
+            elif not sample.end_event.query():
                 retained.append(sample)
                 continue
             completed.append(
@@ -228,6 +286,19 @@ class RetroSpecPerformanceStats:
         return ", ".join(parts)
 
     @staticmethod
+    def _format_histograms(histograms: dict[str, list[int]]) -> str:
+        if not histograms:
+            return "none"
+
+        parts = []
+        for name, bins in sorted(histograms.items()):
+            populated = ",".join(
+                f"{value}:{count}" for value, count in enumerate(bins) if count
+            )
+            parts.append(f"{name}=[{populated}]")
+        return ", ".join(parts)
+
+    @staticmethod
     def _ratio(numerator: int, denominator: int) -> float:
         if denominator == 0:
             return 0.0
@@ -236,27 +307,47 @@ class RetroSpecPerformanceStats:
     def maybe_log(self) -> None:
         if not self.enabled:
             return
+        self._log(force=False, wait_for_cuda=False, reason="interval")
+
+    def flush(self, reason: str) -> None:
+        if not self.enabled:
+            return
+        self._log(force=True, wait_for_cuda=True, reason=reason)
+
+    def _log(self, force: bool, wait_for_cuda: bool, reason: str) -> None:
+        if not self.enabled:
+            return
 
         now = monotonic()
         elapsed_seconds = now - self._last_log_time
-        if elapsed_seconds < self.log_interval_seconds:
+        if not force and elapsed_seconds < self.log_interval_seconds:
             return
 
         # This is the only periodic device-to-host synchronization introduced
         # by RetroSpec performance observation.
-        gpu_values = self._gpu_counters.detach().cpu().tolist()
-        self._gpu_counters.zero_()
+        gpu_values = self._gpu_observations.detach().cpu().tolist()
+        self._gpu_observations.zero_()
+        num_counters = len(self._GPU_COUNTER_NAMES)
+        gpu_counter_values = gpu_values[:num_counters]
+        gpu_histogram_values = gpu_values[num_counters:]
+        histograms = {
+            name: gpu_histogram_values[
+                index * self._histogram_num_bins : (index + 1)
+                * self._histogram_num_bins
+            ]
+            for index, name in enumerate(self._GPU_HISTOGRAM_NAMES)
+        }
 
         # The counter synchronization completes main-stream CUDA timers. Timers
         # from transfer streams remain queued until their events finish.
-        self._drain_cuda_samples()
+        self._drain_cuda_samples(wait_for_completion=wait_for_cuda)
 
         with self._lock:
             counters = dict(self._cpu_counters)
             counters.update(
                 {
                     name: int(value)
-                    for name, value in zip(self._GPU_COUNTER_NAMES, gpu_values)
+                    for name, value in zip(self._GPU_COUNTER_NAMES, gpu_counter_values)
                 }
             )
             peaks = dict(self._peaks)
@@ -283,6 +374,8 @@ class RetroSpecPerformanceStats:
         prefetch_coalesced = counters.get("prefetch_waves_coalesced", 0)
         prefetch_backpressured = counters.get("prefetch_backpressure_waits", 0)
         prefetch_wave_opportunities = prefetch_waves + prefetch_coalesced
+        terminal_proposed = counters.get("terminal_proposal_tokens", 0)
+        terminal_wasted = counters.get("terminal_wasted_proposal_tokens", 0)
 
         def cudagraph_replay_rate(stage_name: str) -> float:
             replay = counters.get(f"{stage_name}_cudagraph_replay", 0)
@@ -291,20 +384,24 @@ class RetroSpecPerformanceStats:
             return self._ratio(replay, replay + fallback + eager)
 
         logger.info(
-            "RetroSpec performance over %.2fs: counters={%s}; peaks={%s}; "
+            "RetroSpec performance over %.2fs (reason=%s): counters={%s}; "
+            "peaks={%s}; histograms={%s}; "
             "derived={draft_tokens/request=%.2f, expanded/sparse=%.3f, "
             "full/request=%.3f, resident_hit_rate=%.3f, "
             "verification_hit_rate=%.3f, "
             "prefetch_coalesce_rate=%.3f, "
             "prefetch_backpressure_rate=%.3f, "
             "prefetch_records/wave=%.2f, "
+            "terminal_waste_rate=%.3f, "
             "draft_graph_replay=%.3f, "
             "sparse_verify_graph_replay=%.3f, "
             "expanded_verify_graph_replay=%.3f}; "
             "cpu_avg={%s}; cuda_avg={%s}",
             elapsed_seconds,
+            reason,
             self._format_counters(counters),
             self._format_counters(peaks),
+            self._format_histograms(histograms),
             self._ratio(draft_tokens, proposal_requests),
             self._ratio(expanded_tokens, sparse_tokens),
             self._ratio(full_requests, proposal_requests),
@@ -319,6 +416,7 @@ class RetroSpecPerformanceStats:
             ),
             self._ratio(prefetch_backpressured, prefetch_waves),
             self._ratio(counters.get("prefetch_wave_records", 0), prefetch_waves),
+            self._ratio(terminal_wasted, terminal_proposed),
             cudagraph_replay_rate("draft"),
             cudagraph_replay_rate("sparse_verify"),
             cudagraph_replay_rate("expanded_verify"),

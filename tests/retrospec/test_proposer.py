@@ -123,6 +123,17 @@ def make_sampling_metadata(*, all_greedy: bool) -> SamplingMetadata:
     )
 
 
+def test_close_uninstalls_sparse_attention_once():
+    proposer = RetroSpecProposer.__new__(RetroSpecProposer)
+    proposer.sparse_attention = Mock()
+    proposer._closed = False
+
+    proposer.close()
+    proposer.close()
+
+    proposer.sparse_attention.uninstall.assert_called_once_with()
+
+
 def run_proposal(
     proposer: RetroSpecProposer,
     next_token_ids: torch.Tensor,
@@ -615,6 +626,10 @@ def test_propose_keeps_partial_prefill_rows_idle(monkeypatch):
     stats = proposer.performance_stats
     proposal_requests_index = stats._gpu_counter_indices["proposal_requests"]
     assert stats._gpu_counters[proposal_requests_index].item() == 1
+    assert stats._gpu_histograms["draft_to_sparse_tokens"].tolist() == [0, 1, 0, 0, 0]
+    assert stats._cpu_counters["first_proposal_requests"] == 1
+    assert stats._cpu_times["first_proposal_batch_wall"][1] == 1
+    assert proposer._last_proposed_counts == {"request-1": 1}
 
 
 def test_propose_stops_requests_independently_on_draft_margin(monkeypatch):
@@ -1585,6 +1600,79 @@ def test_remove_requests_resets_proposer_index_update_boundary():
     proposer.index_update_state.begin_batch(["request"], [100])
 
     assert proposer.index_update_state.next_update_positions.tolist() == [104]
+
+
+def test_finished_request_records_terminal_proposal_outcome_and_flushes():
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_stats_interval_seconds=60.0),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer._seen_proposal_request_ids.update(("finished", "running"))
+    proposer._last_proposed_counts.update({"finished": 4, "running": 3})
+    proposer.performance_stats.flush = Mock()
+
+    proposer.record_previous_proposal_outcomes(
+        ("finished", "running"),
+        (3, 4),
+        {"finished"},
+    )
+
+    counters = proposer.performance_stats._cpu_counters
+    assert counters["terminal_proposal_tokens"] == 4
+    assert counters["terminal_committed_proposal_tokens"] == 2
+    assert counters["terminal_wasted_proposal_tokens"] == 2
+    assert proposer._last_proposed_counts == {"running": 3}
+    assert proposer._last_committed_proposal_counts == {"running": 3}
+    assert proposer._seen_proposal_request_ids == {"running"}
+    proposer.performance_stats.flush.assert_called_once_with("request_finished")
+
+
+def test_preempted_request_preserves_first_proposal_tracking():
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_stats_interval_seconds=60.0),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer._seen_proposal_request_ids.add("preempted")
+    proposer._last_proposed_counts["preempted"] = 4
+    proposer.performance_stats.flush = Mock()
+
+    proposer.record_previous_proposal_outcomes(("preempted",), (2,), set())
+
+    assert proposer._last_proposed_counts == {"preempted": 4}
+    assert proposer._seen_proposal_request_ids == {"preempted"}
+    proposer.performance_stats.flush.assert_not_called()
+
+
+def test_finished_request_without_sample_count_clears_request_id_lifecycle():
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_stats_interval_seconds=60.0),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer._seen_proposal_request_ids.add("reused")
+    proposer._last_proposed_counts["reused"] = 4
+    proposer.performance_stats.flush = Mock()
+
+    proposer.record_previous_proposal_outcomes((), (), {"reused"})
+
+    assert "reused" not in proposer._last_proposed_counts
+    assert "reused" not in proposer._seen_proposal_request_ids
+    proposer.performance_stats.flush.assert_called_once_with("request_finished")
+
+
+def test_sync_bookkeeping_records_committed_proposal_before_finish():
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_stats_interval_seconds=60.0),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer._last_proposed_counts.update({"first": 4, "second": 3})
+
+    proposer.record_sampled_proposal_outcomes(("first", "second"), (3, 1))
+
+    assert proposer._last_committed_proposal_counts == {"first": 2, "second": 0}
 
 
 def test_verify_unchanged_sparse_tokens_keeps_complete_prefix(monkeypatch):

@@ -8,6 +8,7 @@ from vllm.v1.spec_decode.retrospec.index_residency import (
     RetroSpecGPUIndexResidencyManager,
     RetroSpecResidentSegment,
 )
+from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
 
 pytestmark = pytest.mark.cpu_test
 
@@ -482,10 +483,14 @@ def test_cluster_summary_is_copied_to_cpu_authoritative_storage():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cluster_summary_offloads_asynchronously_to_pinned_cpu_storage():
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cuda"), log_interval_seconds=60.0
+    )
     manager = RetroSpecGPUIndexResidencyManager(
         pin_memory=True,
         max_resident_requests=2,
         max_gpu_index_memory_bytes=1 << 20,
+        performance_stats=stats,
     )
     keys = torch.arange(8, dtype=torch.float32, device="cuda").view(1, 2, 4)
     values = keys + 10
@@ -513,5 +518,7 @@ def test_cluster_summary_offloads_asynchronously_to_pinned_cpu_storage():
     assert staged.staging_slot is not None
     assert not staged.staging_slot.in_use
     assert manager._pinned_memory.allocated_bytes > 0
+    stats._drain_cuda_samples(wait_for_completion=True)
+    assert stats._cuda_times["prefill_summary_d2h"][1] == 1
     manager.close()
     assert manager._pinned_memory.allocated_bytes == 0

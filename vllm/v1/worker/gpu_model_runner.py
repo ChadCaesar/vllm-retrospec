@@ -956,6 +956,11 @@ class GPUModelRunner(
         new/resumed/paused/finished request in the batch.
         """
         drafter = getattr(self, "drafter", None)
+        previous_retrospec_request_ids = (
+            tuple(self._draft_token_req_ids or self.input_batch.req_ids)
+            if isinstance(drafter, RetroSpecProposer)
+            else ()
+        )
         if isinstance(drafter, RetroSpecProposer):
             removed_req_ids = scheduler_output.finished_req_ids | (
                 scheduler_output.preempted_req_ids or set()
@@ -1072,6 +1077,12 @@ class GPUModelRunner(
         # Wait until valid_sampled_tokens_count is copied to cpu,
         # then use it to update actual num_computed_tokens of each request.
         valid_sampled_token_count = self._get_valid_sampled_token_count()
+        if isinstance(drafter, RetroSpecProposer):
+            drafter.record_previous_proposal_outcomes(
+                previous_retrospec_request_ids,
+                valid_sampled_token_count,
+                scheduler_output.finished_req_ids,
+            )
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -3037,6 +3048,13 @@ class GPUModelRunner(
                 if i not in invalid_req_indices_set
             }
 
+        drafter = getattr(self, "drafter", None)
+        if isinstance(drafter, RetroSpecProposer) and not self.use_async_scheduling:
+            drafter.record_sampled_proposal_outcomes(
+                req_ids_output_copy,
+                tuple(len(token_ids) for token_ids in valid_sampled_token_ids),
+            )
+
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
@@ -3254,6 +3272,26 @@ class GPUModelRunner(
         descriptor = scheduler_output.retrospec_layer_major_prefill
         if descriptor is None:
             raise RuntimeError("Missing layer-major prefill descriptor")
+        drafter = self.drafter
+        if not isinstance(drafter, RetroSpecProposer):
+            raise RuntimeError("Layer-major prefill requires RetroSpec")
+
+        stats = drafter.performance_stats
+        stats.add_counter("layer_prefill_requests")
+        stats.add_counter("layer_prefill_prompt_tokens", descriptor.prompt_num_tokens)
+        with stats.cpu_timer("layer_prefill_total_wall"):
+            return self._execute_retrospec_layer_major_prefill_impl(
+                scheduler_output, intermediate_tensors
+            )
+
+    def _execute_retrospec_layer_major_prefill_impl(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> IntermediateTensors | None:
+        descriptor = scheduler_output.retrospec_layer_major_prefill
+        if descriptor is None:
+            raise RuntimeError("Missing layer-major prefill descriptor")
 
         drafter = self.drafter
         if not isinstance(drafter, RetroSpecProposer):
@@ -3373,6 +3411,7 @@ class GPUModelRunner(
                     )
 
                 workspace.begin_layer(layer_name)
+                compute_timer = stats.start_cuda_timer("layer_prefill_compute")
                 try:
                     if tile_plan is None:
                         tile_plan, full_prompt_tile = (
@@ -3418,6 +3457,9 @@ class GPUModelRunner(
                             tile_hidden = tile_hidden + tile_residual
                         hidden_states[tile_start:tile_end].copy_(tile_hidden)
 
+                    stats.stop_cuda_timer(compute_timer)
+                    compute_timer = None
+
                     assert full_prompt_tile is not None
                     key_cache, value_cache = workspace.kv_cache.unbind(0)
                     reuse_ready_event = drafter.stage_layer_major_prefill_layer(
@@ -3437,10 +3479,12 @@ class GPUModelRunner(
                     )
                     workspace.end_layer(reuse_ready_event)
                 except BaseException:
+                    stats.stop_cuda_timer(compute_timer)
                     workspace.abort_layer()
                     raise
 
-            drafter.commit_layer_major_prefill(descriptor.request_id)
+            with stats.cpu_timer("layer_prefill_commit_wall"):
+                drafter.commit_layer_major_prefill(descriptor.request_id)
         except BaseException:
             drafter.abort_layer_major_prefill()
             raise
@@ -4812,6 +4856,11 @@ class GPUModelRunner(
             )
 
         return draft_token_ids
+
+    def shutdown(self) -> None:
+        drafter = getattr(self, "drafter", None)
+        if isinstance(drafter, RetroSpecProposer):
+            drafter.close()
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         allowed_config_names = {"load_config", "model_config"}

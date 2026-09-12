@@ -2725,6 +2725,9 @@ def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
         cluster_start=0,
         staged=staged,
     )
+    stats._drain_cuda_samples(wait_for_completion=True)
+    assert stats._cuda_times["prefill_token_kv_d2h"][1] == 1
+    assert stats._cuda_times["prefill_cluster_metadata_d2h"][1] == 1
     pool = store._layer_pools["layer"]
     metadata = store.get_cluster_block_metadata(
         "layer",

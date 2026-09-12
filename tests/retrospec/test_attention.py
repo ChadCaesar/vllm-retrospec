@@ -189,6 +189,10 @@ def test_segmented_attention_shares_enabled_performance_stats():
     assert (
         controller.index.cluster_store.performance_stats is controller.performance_stats
     )
+    assert (
+        controller.index._gpu_index_residency.performance_stats
+        is controller.performance_stats
+    )
 
 
 def test_segmented_attention_does_not_instrument_deep_paths_by_default():
@@ -720,6 +724,49 @@ def test_full_verification_context_prepares_and_restores_attention_state():
     )
     assert controller.mode == RetroSpecAttentionMode.PASSTHROUGH
     assert controller.full_verification_batch is None
+
+
+def test_full_verification_context_records_transaction_and_query_tokens():
+    controller = make_controller(stats_interval_seconds=60.0)
+    mark_installed(controller)
+    observed_wall_counts: list[int] = []
+    controller.performance_stats.maybe_log = Mock(
+        side_effect=lambda: observed_wall_counts.append(
+            controller.performance_stats._cpu_times["full_verify_transaction_wall"][1]
+        )
+    )
+
+    with controller.full_verification_context(
+        request_ids=["request"], context_lens=[5], query_lens=[3]
+    ):
+        pass
+
+    assert controller.performance_stats._cpu_counters["full_verify_requests"] == 1
+    assert controller.performance_stats._cpu_counters["full_verify_query_tokens"] == 3
+    assert (
+        controller.performance_stats._cpu_times["full_verify_transaction_wall"][1] == 1
+    )
+    assert observed_wall_counts == [1]
+
+
+def test_full_verification_prepare_failure_does_not_end_inactive_residency():
+    controller = make_controller(stats_interval_seconds=60.0)
+    mark_installed(controller)
+    controller.index.prepare_full_verification = Mock(
+        side_effect=RuntimeError("prepare failed")
+    )
+    controller.index.end_full_verification_residency = Mock()
+
+    with (
+        pytest.raises(RuntimeError, match="prepare failed"),
+        controller.full_verification_context(
+            request_ids=["request"], context_lens=[5], query_lens=[1]
+        ),
+    ):
+        pass
+
+    controller.index.end_full_verification_residency.assert_not_called()
+    assert controller.mode == RetroSpecAttentionMode.PASSTHROUGH
 
 
 def test_full_verification_context_restores_state_after_exception():

@@ -12,11 +12,13 @@ from vllm.forward_context import BatchDescriptor
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.outputs import KVCacheRetirement
 from vllm.v1.spec_decode.retrospec import RetroSpecProposer
+from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.gpu_model_runner import (
     GPUModelRunner,
     RetroSpecPipelineProposalState,
 )
+from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 
 def test_retrospec_registers_capture_sizes_before_spec_decode_rounding():
@@ -348,6 +350,52 @@ def test_layer_major_prefill_copies_only_resident_workspace_blocks():
     torch.testing.assert_close(native_cache[:, 5], workspace_cache[:, 3])
     torch.testing.assert_close(native_cache[:, 7], workspace_cache[:, 4])
     assert torch.all(native_cache[:, [0, 1, 3, 4, 6]] == -1)
+
+
+def test_layer_major_prefill_wrapper_records_request_tokens_and_wall_time():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    drafter = RetroSpecProposer.__new__(RetroSpecProposer)
+    drafter.performance_stats = RetroSpecPerformanceStats(
+        device=torch.device("cpu"), log_interval_seconds=60.0
+    )
+    runner.drafter = drafter
+    runner._execute_retrospec_layer_major_prefill_impl = Mock(return_value="output")
+    scheduler_output = SimpleNamespace(
+        retrospec_layer_major_prefill=SimpleNamespace(prompt_num_tokens=8192)
+    )
+
+    result = runner._execute_retrospec_layer_major_prefill(scheduler_output, None)
+
+    assert result == "output"
+    assert drafter.performance_stats._cpu_counters["layer_prefill_requests"] == 1
+    assert (
+        drafter.performance_stats._cpu_counters["layer_prefill_prompt_tokens"] == 8192
+    )
+    assert drafter.performance_stats._cpu_times["layer_prefill_total_wall"][1] == 1
+
+
+def test_shutdown_closes_retrospec_drafter():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.drafter = RetroSpecProposer.__new__(RetroSpecProposer)
+    runner.drafter.close = Mock()
+
+    runner.shutdown()
+
+    runner.drafter.close.assert_called_once_with()
+
+
+def test_gpu_worker_shutdown_closes_model_runner():
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.model_runner = Mock()
+    worker.profiler = None
+
+    with patch(
+        "vllm.v1.worker.gpu_worker.ensure_kv_transfer_shutdown"
+    ) as ensure_shutdown:
+        worker.shutdown()
+
+    worker.model_runner.shutdown.assert_called_once_with()
+    ensure_shutdown.assert_called_once_with()
 
 
 def test_estimate_layer_prefill_activation_bytes_uses_tp_local_widths():

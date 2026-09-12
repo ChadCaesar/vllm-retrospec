@@ -849,6 +849,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             max_gpu_index_memory_bytes=max_gpu_index_memory_bytes,
             pinned_memory=self._pinned_memory,
             max_summary_slots=max_pending_cluster_builds,
+            performance_stats=performance_stats,
         )
 
         # layer_name -> request_id -> token-level index
@@ -1657,8 +1658,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 self._release_built_segments(built_segments)
                 raise first_error
 
+            publish_context = (
+                nullcontext()
+                if self.performance_stats is None
+                else self.performance_stats.cpu_timer("cluster_publish_wall")
+            )
             try:
-                self._publish_built_segments(built_segments)
+                with publish_context:
+                    self._publish_built_segments(built_segments)
             except BaseException:
                 self._release_built_segments(built_segments)
                 raise

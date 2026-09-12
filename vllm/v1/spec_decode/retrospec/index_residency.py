@@ -7,6 +7,7 @@ from threading import Lock
 
 import torch
 
+from .performance import RetroSpecPerformanceStats
 from .pinned_memory import RetroSpecPinnedMemoryManager
 
 
@@ -242,6 +243,7 @@ class RetroSpecGPUIndexResidencyManager:
         max_gpu_index_memory_bytes: int = 4 << 30,
         pinned_memory: RetroSpecPinnedMemoryManager | None = None,
         max_summary_slots: int = 2,
+        performance_stats: RetroSpecPerformanceStats | None = None,
     ) -> None:
         if max_summary_slots <= 0:
             raise ValueError("max_summary_slots must be positive")
@@ -263,6 +265,7 @@ class RetroSpecGPUIndexResidencyManager:
         self.max_summary_slots = max_summary_slots
         self.max_resident_requests = max_resident_requests
         self.max_gpu_index_memory_bytes = max_gpu_index_memory_bytes
+        self.performance_stats = performance_stats
         self._allocated_gpu_index_bytes = 0
 
         self._active_request_ids: tuple[str, ...] | None = None
@@ -1324,9 +1327,20 @@ class RetroSpecGPUIndexResidencyManager:
             transfer_stream.wait_stream(current_stream)
 
             with torch.cuda.stream(transfer_stream):
-                host_keys.copy_(cluster_keys, non_blocking=True)
-                host_values.copy_(cluster_values, non_blocking=True)
-                host_counts.copy_(cluster_token_counts, non_blocking=True)
+                timer = (
+                    None
+                    if self.performance_stats is None
+                    else self.performance_stats.start_cuda_timer(
+                        "prefill_summary_d2h", transfer_stream
+                    )
+                )
+                try:
+                    host_keys.copy_(cluster_keys, non_blocking=True)
+                    host_values.copy_(cluster_values, non_blocking=True)
+                    host_counts.copy_(cluster_token_counts, non_blocking=True)
+                finally:
+                    if self.performance_stats is not None:
+                        self.performance_stats.stop_cuda_timer(timer, transfer_stream)
                 ready_event = torch.cuda.Event()
                 ready_event.record(transfer_stream)
         except BaseException:

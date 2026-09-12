@@ -283,11 +283,70 @@ class RetroSpecProposer:
         )
         self._proposal_token_budgets.cpu.fill_(self.num_speculative_tokens)
         self._proposal_token_budgets.gpu.fill_(self.num_speculative_tokens)
+        self._seen_proposal_request_ids: set[str] = set()
+        self._last_proposed_counts: dict[str, int] = {}
+        self._last_committed_proposal_counts: dict[str, int] = {}
+        self._closed = False
 
     def remove_requests(self, request_ids: Collection[str]) -> None:
         request_ids = tuple(request_ids)
         self.index_update_state.remove_requests(request_ids)
         self.sparse_attention.remove_requests(request_ids)
+
+    def record_previous_proposal_outcomes(
+        self,
+        previous_request_ids: Sequence[str],
+        valid_sampled_token_counts: Sequence[int],
+        finished_request_ids: Collection[str],
+    ) -> None:
+        if not self.performance_stats.enabled:
+            return
+
+        finished_request_ids = set(finished_request_ids)
+        for request_id, valid_count in zip(
+            previous_request_ids, valid_sampled_token_counts
+        ):
+            proposed_count = self._last_proposed_counts.get(request_id)
+            if proposed_count is None:
+                continue
+            self._last_committed_proposal_counts[request_id] = min(
+                proposed_count, max(int(valid_count) - 1, 0)
+            )
+
+        for request_id in finished_request_ids:
+            proposed_count = self._last_proposed_counts.pop(request_id, None)
+            committed_count = self._last_committed_proposal_counts.pop(request_id, None)
+            if proposed_count is None or committed_count is None:
+                continue
+            self.performance_stats.add_counter(
+                "terminal_proposal_tokens", proposed_count
+            )
+            self.performance_stats.add_counter(
+                "terminal_committed_proposal_tokens", committed_count
+            )
+            self.performance_stats.add_counter(
+                "terminal_wasted_proposal_tokens", proposed_count - committed_count
+            )
+
+        for request_id in finished_request_ids:
+            self._seen_proposal_request_ids.discard(request_id)
+        if finished_request_ids:
+            self.performance_stats.flush("request_finished")
+
+    def record_sampled_proposal_outcomes(
+        self,
+        request_ids: Sequence[str],
+        valid_sampled_token_counts: Sequence[int],
+    ) -> None:
+        if not self.performance_stats.enabled:
+            return
+        for request_id, valid_count in zip(request_ids, valid_sampled_token_counts):
+            proposed_count = self._last_proposed_counts.get(request_id)
+            if proposed_count is None:
+                continue
+            self._last_committed_proposal_counts[request_id] = min(
+                proposed_count, max(int(valid_count) - 1, 0)
+            )
 
     @property
     def uses_full_verification_offload(self) -> bool:
@@ -383,6 +442,12 @@ class RetroSpecProposer:
 
     def abort_layer_major_prefill(self) -> None:
         self.sparse_attention.abort_layer_major_prefill()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.sparse_attention.uninstall()
+        self._closed = True
 
     def get_attention_metadata_builder(self) -> AttentionMetadataBuilder:
         return self._get_attention_metadata_builder()
@@ -1724,6 +1789,9 @@ class RetroSpecProposer:
         )
         run_expanded.logical_and_(boundary_request_mask)
         run_expanded.masked_fill_(require_full, False)
+        self.performance_stats.add_gpu_histogram(
+            "sparse_to_expanded_prefix", verified_counts, run_expanded
+        )
 
         # Expanded verification changes the number of target-model rows, so
         # only this request-level subset still needs a host-visible length.
@@ -1822,6 +1890,11 @@ class RetroSpecProposer:
                 0,
                 expanded.request_indices,
                 expanded_decision.require_full,
+            )
+            self.performance_stats.add_gpu_histogram(
+                "expanded_to_full_prefix",
+                verified_counts,
+                run_expanded & require_full,
             )
             self.performance_stats.stop_cuda_timer(expanded_boundary_timer)
 
@@ -1961,6 +2034,14 @@ class RetroSpecProposer:
                         generation_limit_reached=generation_limit_reached,
                         index_update_required=index_update_required,
                     )
+                    draft_to_sparse = draft_stage_mask & (
+                        decision.next_stage == int(RetroSpecStage.SPARSE_VERIFY)
+                    )
+                    self.performance_stats.add_gpu_histogram(
+                        "draft_to_sparse_tokens",
+                        self.state.draft_counts,
+                        draft_to_sparse,
+                    )
                     self.state.set_stages(decision.next_stage)
                     sampled_token_ids = self._synchronize_pipeline_control(
                         batch_size, sampled_token_ids
@@ -2081,9 +2162,22 @@ class RetroSpecProposer:
             for token_ids, pending_count in zip(pending_token_ids, pending_counts_cpu)
         ]
         if self.performance_stats.enabled:
-            self.performance_stats.record_cpu_time(
-                "proposal_wall",
-                perf_counter() - proposal_started_at,
-            )
+            elapsed_seconds = perf_counter() - proposal_started_at
+            first_request_count = 0
+            for request_id, pending_count in zip(request_ids, pending_counts_cpu):
+                if pending_count > 0:
+                    self._last_proposed_counts[request_id] = pending_count
+                    self._last_committed_proposal_counts.pop(request_id, None)
+                    if request_id not in self._seen_proposal_request_ids:
+                        self._seen_proposal_request_ids.add(request_id)
+                        first_request_count += 1
+            if first_request_count:
+                self.performance_stats.add_counter(
+                    "first_proposal_requests", first_request_count
+                )
+                self.performance_stats.record_cpu_time(
+                    "first_proposal_batch_wall", elapsed_seconds
+                )
+            self.performance_stats.record_cpu_time("proposal_wall", elapsed_seconds)
         self.performance_stats.maybe_log()
         return result
