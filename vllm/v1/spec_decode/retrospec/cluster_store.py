@@ -505,6 +505,7 @@ class _StagedResidentPrefetchWave:
     """One draft step's cross-layer resident access records."""
 
     records: tuple[_StagedResidentPrefetchRecord, ...]
+    device: torch.device
     metadata_ready_event: torch.cuda.Event
     execution_stream: torch.cuda.Stream
     progress: _ResidentPrefetchWaveProgress = field(repr=False, compare=False)
@@ -3752,6 +3753,7 @@ class RetroSpecClusterPageStore:
                         count_cpu,
                     ) in zip(records, cpu_views)
                 ),
+                device=device,
                 metadata_ready_event=metadata_ready_event,
                 execution_stream=stream,
                 progress=progress,
@@ -3905,6 +3907,17 @@ class RetroSpecClusterPageStore:
                 current.records, slot, current.source_ready_events
             )
             return True
+
+    def _auto_submit_deferred_resident_prefetch(
+        self,
+        device: torch.device,
+    ) -> None:
+        """Use a newly released command slot without blocking the worker."""
+        submitted = self._try_submit_deferred_resident_prefetch(
+            device, wait_for_slot=False
+        )
+        if submitted and self.performance_stats is not None:
+            self.performance_stats.add_counter("prefetch_worker_auto_submits")
 
     def flush_resident_prefetch_commands(self) -> None:
         """Submit deferred commands and seal their GPU workspace lifetime."""
@@ -4113,6 +4126,7 @@ class RetroSpecClusterPageStore:
             ordered_records = self._order_resident_prefetch_wave(staged.records)
             self._release_resident_prefetch_slot(staged.slot)
             slot_released = True
+            self._auto_submit_deferred_resident_prefetch(staged.device)
 
             for staged_record, ordered_cluster_ids in zip(
                 staged.records, ordered_records

@@ -1528,6 +1528,29 @@ def test_resident_prefetch_bounded_wait_is_device_local():
     store.close()
 
 
+@pytest.mark.parametrize("submitted", (False, True))
+def test_resident_prefetch_worker_auto_submit_is_nonblocking(submitted: bool):
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cpu"), log_interval_seconds=60.0
+    )
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        performance_stats=stats,
+    )
+    try_submit = Mock(return_value=submitted)
+    store._try_submit_deferred_resident_prefetch = try_submit
+    device = torch.device("cuda:1")
+
+    try:
+        store._auto_submit_deferred_resident_prefetch(device)
+
+        try_submit.assert_called_once_with(device, wait_for_slot=False)
+        expected = 1 if submitted else 0
+        assert stats._cpu_counters["prefetch_worker_auto_submits"] == expected
+    finally:
+        store.close()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not is_pin_memory_available(),
     reason="CUDA pinned memory is required for asynchronous resident prefetch",
@@ -1681,6 +1704,98 @@ def test_resident_prefetch_releases_metadata_slot_before_descriptor_preparation(
 
     store.wait_for_resident_prefetches()
     store.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA pinned memory is required for resident-prefetch auto drain",
+)
+def test_resident_prefetch_worker_auto_drains_deferred_wave_without_flush():
+    device = torch.device("cuda", torch.cuda.current_device())
+    stats = RetroSpecPerformanceStats(device=device, log_interval_seconds=60.0)
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        pin_memory=True,
+        cache_ratio=0.5,
+        performance_stats=stats,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    cluster_ids = table.cluster_ids.to(device).reshape(-1)
+    metadata = get_block_metadata(store, table, device=device)
+    with torch.inference_mode():
+        store.resolve_cluster_blocks(
+            "layer",
+            table.cluster_ids.to(device),
+            metadata.page_ids,
+            mode="resident_only",
+        )
+
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    auto_submit_finished = threading.Event()
+    auto_submit_devices: list[torch.device] = []
+    original_finish = store._finish_resident_prefetch_wave
+    original_auto_submit = store._auto_submit_deferred_resident_prefetch
+
+    def blocking_finish(staged):
+        worker_started.set()
+        assert release_worker.wait(timeout=10.0)
+        original_finish(staged)
+
+    def observed_auto_submit(target_device):
+        previous_submits = stats._cpu_counters["prefetch_worker_auto_submits"]
+        original_auto_submit(target_device)
+        current_submits = stats._cpu_counters["prefetch_worker_auto_submits"]
+        if current_submits > previous_submits:
+            auto_submit_devices.append(target_device)
+            auto_submit_finished.set()
+
+    store._finish_resident_prefetch_wave = blocking_finish
+    store._auto_submit_deferred_resident_prefetch = observed_auto_submit
+
+    def make_record(offset: int) -> RetroSpecResidentPrefetchInput:
+        return RetroSpecResidentPrefetchInput(
+            layer_name="layer",
+            miss_cluster_ids=torch.roll(cluster_ids, offset),
+            miss_positions=torch.arange(
+                cluster_ids.numel(), dtype=torch.int64, device=device
+            ),
+            miss_count=torch.tensor(
+                [cluster_ids.numel()], dtype=torch.int32, device=device
+            ),
+            num_groups=table.cluster_ids.shape[0],
+            num_ranks=table.cluster_ids.shape[1],
+        )
+
+    assert store.prefetch_resident_cluster_wave((make_record(0),))
+    assert worker_started.wait(timeout=10.0)
+    assert store.prefetch_resident_cluster_wave((make_record(1),))
+    assert store.prefetch_resident_cluster_wave((make_record(2),))
+    assert store._resident_prefetch_deferred
+
+    try:
+        release_worker.set()
+        assert auto_submit_finished.wait(timeout=10.0)
+        assert auto_submit_devices == [device]
+        assert not store._resident_prefetch_deferred
+        assert stats._cpu_counters["prefetch_worker_auto_submits"] == 1
+
+        store.wait_for_resident_prefetches()
+        assert not store._resident_prefetch_futures
+        assert stats._cpu_counters["prefetch_waves_submitted"] == 3
+        assert stats._cpu_counters["prefetch_waves_deferred"] == 1
+        assert stats._cpu_counters["prefetch_worker_completed"] == 3
+    finally:
+        release_worker.set()
+        store.close()
 
 
 @pytest.mark.skipif(
