@@ -632,52 +632,313 @@ def emit_ranked_draft_plan(
 
 
 @triton.jit
-def _add_indexed_values_kernel(
-    destination,
-    source,
-    row_indices,
-    num_rows,
-    destination_stride,
-    source_stride,
-    BLOCK_SIZE: tl.constexpr,
+def _pack_indexed_verification_plan_kernel(
+    request_indices,
+    token_indices,
+    valid_rows,
+    request_slot_ids,
+    request_slot_generations,
+    exact_cluster_indices,
+    estimation_cluster_indices,
+    attention_mass,
+    output_plan_row_indices,
+    output_plan_valid_rows,
+    output_request_slot_ids,
+    output_request_slot_generations,
+    output_exact_cluster_indices,
+    output_estimation_cluster_indices,
+    output_estimation_cluster_mask,
+    output_attention_mass,
+    valid_row_stride_0,
+    valid_row_stride_1,
+    exact_stride_0,
+    exact_stride_1,
+    exact_stride_2,
+    estimation_stride_0,
+    estimation_stride_1,
+    estimation_stride_2,
+    output_exact_stride_0,
+    output_exact_stride_1,
+    output_exact_stride_2,
+    output_estimation_stride_0,
+    output_estimation_stride_1,
+    output_estimation_stride_2,
+    NUM_STEPS: tl.constexpr,
+    BATCH_CAPACITY: tl.constexpr,
+    EXACT_WIDTH: tl.constexpr,
+    ESTIMATION_WIDTH: tl.constexpr,
+    BLOCK_RANK: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    valid = offsets < num_rows
-    source_rows = tl.load(row_indices + offsets, mask=valid, other=0)
-    values = tl.load(source + source_rows * source_stride, mask=valid, other=0.0)
-    current = tl.load(destination + offsets * destination_stride, mask=valid, other=0.0)
-    tl.store(destination + offsets * destination_stride, current + values, mask=valid)
+    pair_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+    ranks = tl.arange(0, BLOCK_RANK)
+
+    request_idx = tl.load(request_indices + pair_idx).to(tl.int64)
+    token_idx = tl.load(token_indices + pair_idx).to(tl.int64)
+    indices_in_bounds = (
+        (request_idx >= 0)
+        & (request_idx < BATCH_CAPACITY)
+        & (token_idx >= 0)
+        & (token_idx < NUM_STEPS)
+    )
+    safe_request_idx = tl.where(indices_in_bounds, request_idx, 0)
+    safe_token_idx = tl.where(indices_in_bounds, token_idx, 0)
+    plan_row = safe_token_idx * BATCH_CAPACITY + safe_request_idx
+    row_valid = tl.load(
+        valid_rows
+        + safe_token_idx * valid_row_stride_0
+        + safe_request_idx * valid_row_stride_1,
+        mask=indices_in_bounds,
+        other=0,
+    ).to(tl.int1)
+    plan_valid = indices_in_bounds & row_valid
+
+    request_slot = tl.load(
+        request_slot_ids + safe_request_idx, mask=plan_valid, other=-1
+    ).to(tl.int64)
+    request_generation = tl.load(
+        request_slot_generations + safe_request_idx, mask=plan_valid, other=-1
+    ).to(tl.int64)
+    packed_attention = tl.load(
+        attention_mass + plan_row, mask=plan_valid, other=1.0
+    ).to(tl.float32)
+    scalar_writer = kv_head_idx == 0
+    tl.store(output_plan_row_indices + pair_idx, plan_row, mask=scalar_writer)
+    tl.store(output_plan_valid_rows + pair_idx, plan_valid, mask=scalar_writer)
+    tl.store(output_request_slot_ids + pair_idx, request_slot, mask=scalar_writer)
+    tl.store(
+        output_request_slot_generations + pair_idx,
+        request_generation,
+        mask=scalar_writer,
+    )
+    tl.store(output_attention_mass + pair_idx, packed_attention, mask=scalar_writer)
+
+    exact_rank_valid = ranks < EXACT_WIDTH
+    exact_source_offsets = (
+        plan_row * exact_stride_0
+        + kv_head_idx * exact_stride_1
+        + ranks * exact_stride_2
+    )
+    exact_indices = tl.load(
+        exact_cluster_indices + exact_source_offsets,
+        mask=plan_valid & exact_rank_valid,
+        other=-1,
+    )
+    exact_output_offsets = (
+        pair_idx * output_exact_stride_0
+        + kv_head_idx * output_exact_stride_1
+        + ranks * output_exact_stride_2
+    )
+    tl.store(
+        output_exact_cluster_indices + exact_output_offsets,
+        exact_indices,
+        mask=exact_rank_valid,
+    )
+
+    estimation_rank_valid = ranks < ESTIMATION_WIDTH
+    estimation_source_offsets = (
+        plan_row * estimation_stride_0
+        + kv_head_idx * estimation_stride_1
+        + ranks * estimation_stride_2
+    )
+    estimation_indices = tl.load(
+        estimation_cluster_indices + estimation_source_offsets,
+        mask=plan_valid & estimation_rank_valid,
+        other=-1,
+    )
+    estimation_output_offsets = (
+        pair_idx * output_estimation_stride_0
+        + kv_head_idx * output_estimation_stride_1
+        + ranks * output_estimation_stride_2
+    )
+    tl.store(
+        output_estimation_cluster_indices + estimation_output_offsets,
+        estimation_indices,
+        mask=estimation_rank_valid,
+    )
+    tl.store(
+        output_estimation_cluster_mask + estimation_output_offsets,
+        plan_valid & (estimation_indices >= 0),
+        mask=estimation_rank_valid,
+    )
 
 
-def add_indexed_values(
-    destination: torch.Tensor,
-    source: torch.Tensor,
-    row_indices: torch.Tensor,
+def pack_indexed_verification_plan(
+    *,
+    request_indices: torch.Tensor,
+    token_indices: torch.Tensor,
+    valid_rows: torch.Tensor,
+    request_slot_ids: torch.Tensor,
+    request_slot_generations: torch.Tensor,
+    exact_cluster_indices: torch.Tensor,
+    estimation_cluster_indices: torch.Tensor,
+    attention_mass: torch.Tensor,
+    output_plan_row_indices: torch.Tensor,
+    output_plan_valid_rows: torch.Tensor,
+    output_request_slot_ids: torch.Tensor,
+    output_request_slot_generations: torch.Tensor,
+    output_exact_cluster_indices: torch.Tensor,
+    output_estimation_cluster_indices: torch.Tensor,
+    output_estimation_cluster_mask: torch.Tensor,
+    output_attention_mass: torch.Tensor,
 ) -> None:
-    if destination.device.type != "cuda":
-        raise ValueError("Indexed accumulation requires CUDA tensors")
-    if destination.ndim != 1 or source.ndim != 1 or row_indices.ndim != 1:
-        raise ValueError("Indexed accumulation expects one-dimensional tensors")
-    if destination.shape != row_indices.shape:
-        raise ValueError("Destination and indexed rows must have equal shapes")
-    if row_indices.dtype not in (torch.int32, torch.int64):
-        raise ValueError("Indexed rows must be integral")
-    if destination.dtype != source.dtype:
-        raise ValueError("Indexed accumulation dtypes must match")
-    if any(tensor.device != destination.device for tensor in (source, row_indices)):
-        raise ValueError("Indexed accumulation tensors must use one device")
-    if destination.numel() == 0:
+    """Pack persistent verification-plan rows into query-row descriptors."""
+    if request_indices.ndim != 1 or token_indices.ndim != 1:
+        raise ValueError("Indexed verification inputs must be one-dimensional")
+    if request_indices.shape != token_indices.shape:
+        raise ValueError("Indexed verification inputs must have equal shapes")
+    if valid_rows.ndim != 2:
+        raise ValueError("Plan validity must have shape [steps, batch]")
+    if request_slot_ids.shape != request_slot_generations.shape:
+        raise ValueError("Request slot descriptors must have equal shapes")
+    if request_slot_ids.shape != (valid_rows.shape[1],):
+        raise ValueError("Request slot descriptors do not match plan capacity")
+    if exact_cluster_indices.ndim != 3 or estimation_cluster_indices.ndim != 3:
+        raise ValueError("Cluster plans must have shape [rows, heads, width]")
+
+    num_pairs = request_indices.numel()
+    num_plan_rows = valid_rows.numel()
+    num_kv_heads = exact_cluster_indices.shape[1]
+    if exact_cluster_indices.shape[0] != num_plan_rows:
+        raise ValueError("Exact cluster plan has the wrong row capacity")
+    if estimation_cluster_indices.shape[:2] != (num_plan_rows, num_kv_heads):
+        raise ValueError("Estimation cluster plan has the wrong row shape")
+    if attention_mass.shape != (num_plan_rows,):
+        raise ValueError("Attention plan has the wrong row capacity")
+    if output_plan_row_indices.shape != (num_pairs,):
+        raise ValueError("Packed plan rows have the wrong shape")
+    if output_plan_valid_rows.shape != (num_pairs,):
+        raise ValueError("Packed plan validity has the wrong shape")
+    if output_request_slot_ids.shape != (num_pairs,):
+        raise ValueError("Packed request slots have the wrong shape")
+    if output_request_slot_generations.shape != (num_pairs,):
+        raise ValueError("Packed request generations have the wrong shape")
+    if output_exact_cluster_indices.shape != (
+        num_pairs,
+        num_kv_heads,
+        exact_cluster_indices.shape[2],
+    ):
+        raise ValueError("Packed exact clusters have the wrong shape")
+    expected_estimation_shape = (
+        num_pairs,
+        num_kv_heads,
+        estimation_cluster_indices.shape[2],
+    )
+    if output_estimation_cluster_indices.shape != expected_estimation_shape:
+        raise ValueError("Packed estimation clusters have the wrong shape")
+    if output_estimation_cluster_mask.shape != expected_estimation_shape:
+        raise ValueError("Packed estimation mask has the wrong shape")
+    if output_attention_mass.shape != (num_pairs,):
+        raise ValueError("Packed attention mass has the wrong shape")
+
+    integer_inputs = (
+        request_indices,
+        token_indices,
+        request_slot_ids,
+        request_slot_generations,
+        exact_cluster_indices,
+        estimation_cluster_indices,
+    )
+    if any(tensor.dtype not in (torch.int32, torch.int64) for tensor in integer_inputs):
+        raise ValueError("Indexed verification descriptors must be integral")
+    if valid_rows.dtype != torch.bool or output_plan_valid_rows.dtype != torch.bool:
+        raise ValueError("Plan validity tensors must be boolean")
+    if output_estimation_cluster_mask.dtype != torch.bool:
+        raise ValueError("Packed estimation mask must be boolean")
+    outputs = (
+        output_plan_row_indices,
+        output_plan_valid_rows,
+        output_request_slot_ids,
+        output_request_slot_generations,
+        output_exact_cluster_indices,
+        output_estimation_cluster_indices,
+        output_estimation_cluster_mask,
+        output_attention_mass,
+    )
+    tensors = (*integer_inputs, valid_rows, attention_mass, *outputs)
+    if any(tensor.device != request_indices.device for tensor in tensors):
+        raise ValueError("Indexed verification tensors must use one device")
+    if num_pairs == 0:
         return
 
-    block_size = 256
-    _add_indexed_values_kernel[(triton.cdiv(destination.numel(), block_size),)](
-        destination,
-        source,
-        row_indices,
-        destination.numel(),
-        destination.stride(0),
-        source.stride(0),
-        BLOCK_SIZE=block_size,
+    if request_indices.device.type != "cuda":
+        request_indices_i64 = request_indices.to(torch.int64)
+        token_indices_i64 = token_indices.to(torch.int64)
+        in_bounds = (
+            (request_indices_i64 >= 0)
+            & (request_indices_i64 < valid_rows.shape[1])
+            & (token_indices_i64 >= 0)
+            & (token_indices_i64 < valid_rows.shape[0])
+        )
+        safe_requests = request_indices_i64.masked_fill(~in_bounds, 0)
+        safe_tokens = token_indices_i64.masked_fill(~in_bounds, 0)
+        plan_rows = safe_tokens * valid_rows.shape[1] + safe_requests
+        plan_valid = in_bounds & valid_rows.flatten().index_select(0, plan_rows)
+        output_plan_row_indices.copy_(plan_rows)
+        output_plan_valid_rows.copy_(plan_valid)
+        output_request_slot_ids.copy_(
+            request_slot_ids.index_select(0, safe_requests).masked_fill(~plan_valid, -1)
+        )
+        output_request_slot_generations.copy_(
+            request_slot_generations.index_select(0, safe_requests).masked_fill(
+                ~plan_valid, -1
+            )
+        )
+        exact = exact_cluster_indices.index_select(0, plan_rows)
+        estimation = estimation_cluster_indices.index_select(0, plan_rows)
+        output_exact_cluster_indices.copy_(
+            exact.masked_fill(~plan_valid[:, None, None], -1)
+        )
+        output_estimation_cluster_indices.copy_(
+            estimation.masked_fill(~plan_valid[:, None, None], -1)
+        )
+        output_estimation_cluster_mask.copy_(
+            plan_valid[:, None, None] & (estimation >= 0)
+        )
+        output_attention_mass.copy_(
+            attention_mass.index_select(0, plan_rows).masked_fill(~plan_valid, 1.0)
+        )
+        return
+
+    block_rank = triton.next_power_of_2(
+        max(exact_cluster_indices.shape[2], estimation_cluster_indices.shape[2], 1)
+    )
+    _pack_indexed_verification_plan_kernel[(num_pairs, num_kv_heads)](
+        request_indices,
+        token_indices,
+        valid_rows,
+        request_slot_ids,
+        request_slot_generations,
+        exact_cluster_indices,
+        estimation_cluster_indices,
+        attention_mass,
+        output_plan_row_indices,
+        output_plan_valid_rows,
+        output_request_slot_ids,
+        output_request_slot_generations,
+        output_exact_cluster_indices,
+        output_estimation_cluster_indices,
+        output_estimation_cluster_mask,
+        output_attention_mass,
+        valid_rows.stride(0),
+        valid_rows.stride(1),
+        exact_cluster_indices.stride(0),
+        exact_cluster_indices.stride(1),
+        exact_cluster_indices.stride(2),
+        estimation_cluster_indices.stride(0),
+        estimation_cluster_indices.stride(1),
+        estimation_cluster_indices.stride(2),
+        output_exact_cluster_indices.stride(0),
+        output_exact_cluster_indices.stride(1),
+        output_exact_cluster_indices.stride(2),
+        output_estimation_cluster_indices.stride(0),
+        output_estimation_cluster_indices.stride(1),
+        output_estimation_cluster_indices.stride(2),
+        NUM_STEPS=valid_rows.shape[0],
+        BATCH_CAPACITY=valid_rows.shape[1],
+        EXACT_WIDTH=exact_cluster_indices.shape[2],
+        ESTIMATION_WIDTH=estimation_cluster_indices.shape[2],
+        BLOCK_RANK=block_rank,
     )
 
 

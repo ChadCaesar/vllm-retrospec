@@ -45,7 +45,6 @@ from .segmented_index import (
     RetroSpecSegmentedTokenIndex,
     RetroSpecTokenAttentionSelection,
 )
-from .selection_kernels import add_indexed_values
 from .workspace import exact_attention_query_capacity
 
 RetroSpecSelection = (
@@ -742,8 +741,6 @@ class RetroSpecSparseAttention:
             raise ValueError("A parallel verification step cannot be empty.")
         if num_tokens > self.max_parallel_tokens:
             raise ValueError("Parallel verification exceeds the configured capacity.")
-        self.index.prepare_indexed_plan_workspace(num_tokens)
-
         self.mode = mode
         self.step_index = -1
         self.batch_size = num_tokens
@@ -1565,14 +1562,7 @@ class RetroSpecSparseAttention:
                     estimation_lse,
                 )
 
-        if isinstance(selection, RetroSpecIndexedTokenAttentionSelection):
-            add_indexed_values(
-                self.attention_mass_sum[: self.batch_size],
-                selection.attention_mass,
-                selection.plan_row_indices,
-            )
-        else:
-            self.attention_mass_sum[: self.batch_size].add_(selection.attention_mass)
+        self.attention_mass_sum[: self.batch_size].add_(selection.attention_mass)
         self.attention_mass_layer_count += 1
 
         if self.mode == RetroSpecAttentionMode.DRAFT:

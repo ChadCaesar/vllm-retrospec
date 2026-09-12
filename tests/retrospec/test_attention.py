@@ -1485,20 +1485,21 @@ def test_indexed_verification_source_uses_compact_query_row_pages():
     selection = RetroSpecIndexedTokenAttentionSelection(
         layer_name="layer",
         plan_row_indices=plan_rows,
+        plan_valid_rows=torch.ones(1, dtype=torch.bool, device=device),
         request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
         request_slot_generations=torch.ones(1, dtype=torch.int64, device=device),
         primary_exact_token_indices=torch.zeros(
             2, 1, 1, dtype=torch.int64, device=device
         ),
         primary_exact_token_mask=torch.ones(2, 1, 1, dtype=torch.bool, device=device),
-        exact_cluster_indices=torch.zeros(2, 1, 1, dtype=torch.int32, device=device),
+        exact_cluster_indices=torch.zeros(1, 1, 1, dtype=torch.int32, device=device),
         estimation_cluster_indices=torch.empty(
             1, 1, 0, dtype=torch.int32, device=device
         ),
         estimation_keys=torch.empty(1, 1, 0, 1, device=device),
         estimation_values=torch.empty(1, 1, 0, 1, device=device),
         estimation_token_counts=torch.empty(1, 1, 0, dtype=torch.int32, device=device),
-        attention_mass=torch.ones(2, device=device),
+        attention_mass=torch.ones(1, device=device),
     )
     resident_page_ids = torch.tensor([[[2, -1]]], dtype=torch.int64, device=device)
     staging_page_ids = torch.tensor([[[-1, 0]]], dtype=torch.int64, device=device)
@@ -2017,24 +2018,25 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         )
         assert isinstance(selection, RetroSpecIndexedTokenAttentionSelection)
         assert selection.plan_row_indices.tolist() == [1, 2, 3]
+        assert selection.plan_valid_rows.tolist() == [True, True, True]
 
         table = controller.index._selection_plan_tables["layer"]
         indexed_fields = {
-            "primary_exact_token_indices": table.primary_exact_token_indices,
-            "primary_exact_token_mask": table.primary_exact_token_mask,
             "exact_cluster_indices": table.expanded_exact_cluster_indices,
             "attention_mass": table.expanded_attn,
         }
         for field_name, source in indexed_fields.items():
             actual = getattr(selection, field_name)
-            assert (
-                actual.untyped_storage().data_ptr()
-                == source.untyped_storage().data_ptr()
-            )
             expected = source.flatten(0, 1).index_select(0, selection.plan_row_indices)
-            torch.testing.assert_close(
-                actual.index_select(0, selection.plan_row_indices), expected
-            )
+            torch.testing.assert_close(actual, expected)
+        assert selection.request_slot_ids.tolist() == [1, 0, 1]
+        assert selection.request_slot_generations.tolist() == [0, 0, 0]
+        assert selection.primary_exact_token_indices.untyped_storage().data_ptr() == (
+            table.primary_exact_token_indices.untyped_storage().data_ptr()
+        )
+        assert selection.primary_exact_token_mask.untyped_storage().data_ptr() == (
+            table.primary_exact_token_mask.untyped_storage().data_ptr()
+        )
         expected_estimation_indices = table.expanded_estimation_cluster_indices.flatten(
             0, 1
         ).index_select(0, selection.plan_row_indices)
@@ -2053,10 +2055,8 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         other_selection = controller._get_indexed_selection(
             "other", RetroSpecAttentionLevel.EXPANDED
         )
-        assert other_selection.exact_cluster_indices.shape == (4, 1, 2)
-        assert other_selection.exact_cluster_indices.index_select(
-            0, other_selection.plan_row_indices
-        ).tolist() == [
+        assert other_selection.exact_cluster_indices.shape == (3, 1, 2)
+        assert other_selection.exact_cluster_indices.tolist() == [
             [[162, 163]],
             [[160, 161]],
             [[162, 163]],
@@ -2064,7 +2064,7 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         assert other_selection.estimation_keys.shape == (3, 1, 2, 1)
         grown_estimation_pointer = other_selection.estimation_keys.data_ptr()
         assert grown_estimation_pointer != first_estimation_pointer
-        first_row_pointer = selection.plan_row_indices.data_ptr()
+        grown_row_pointer = other_selection.plan_row_indices.data_ptr()
 
         controller.attention_mass_layer_count = 1
         controller.end_step()
@@ -2077,8 +2077,9 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         reused = controller._get_indexed_selection(
             "layer", RetroSpecAttentionLevel.SPARSE
         )
-        assert reused.plan_row_indices.data_ptr() == first_row_pointer
+        assert reused.plan_row_indices.data_ptr() == grown_row_pointer
         assert reused.plan_row_indices.tolist() == [2, 1]
+        assert reused.exact_cluster_indices.tolist() == [[[60, 61]], [[12, 13]]]
         assert reused.primary_exact_token_indices.index_select(
             0, reused.plan_row_indices
         ).tolist() == [
@@ -2112,8 +2113,12 @@ def test_parallel_verification_rejects_missing_token_plan():
             token_indices=torch.tensor([1], dtype=torch.int64),
         )
 
+        selection = controller._get_indexed_selection(
+            "layer", RetroSpecAttentionLevel.SPARSE
+        )
+        assert selection.plan_valid_rows.tolist() == [False]
         with pytest.raises(RuntimeError, match="selection plan is missing"):
-            controller._get_indexed_selection("layer", RetroSpecAttentionLevel.SPARSE)
+            controller.index.materialize_indexed_reference(selection)
 
 
 def test_end_step_requires_completed_attention_layer():

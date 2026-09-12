@@ -1945,7 +1945,7 @@ def test_gpu_verification_resolution_deduplicates_miss_pages_before_h2d():
     resolved = store.resolve_verification_cluster_blocks(
         layer_name="layer",
         selected_cluster_indices=selected_cluster_indices,
-        plan_row_indices=torch.zeros(1, dtype=torch.int64, device=device),
+        plan_valid_rows=torch.ones(1, dtype=torch.bool, device=device),
         request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
         request_slot_generations=torch.ones(1, dtype=torch.int64, device=device),
         arena=arena,
@@ -2027,7 +2027,7 @@ def test_gpu_verification_resolution_all_hit_skips_staging_and_admission():
         selected_cluster_indices=torch.arange(
             cluster_ids.shape[-1], dtype=torch.int32, device=device
         )[None, None, :].expand(1, cluster_ids.shape[0], -1),
-        plan_row_indices=torch.zeros(1, dtype=torch.int64, device=device),
+        plan_valid_rows=torch.ones(1, dtype=torch.bool, device=device),
         request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
         request_slot_generations=torch.ones(1, dtype=torch.int64, device=device),
         arena=arena,
@@ -2048,7 +2048,7 @@ def test_gpu_verification_resolution_all_hit_skips_staging_and_admission():
     not torch.cuda.is_available(),
     reason="CUDA is required for indexed verification resolution",
 )
-def test_gpu_verification_resolution_indexes_persistent_plan_rows():
+def test_gpu_verification_resolution_accepts_packed_query_rows():
     device = torch.device("cuda", torch.cuda.current_device())
     store = RetroSpecClusterPageStore(page_size=2, pin_memory=True, cache_ratio=1.0)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -2077,12 +2077,13 @@ def test_gpu_verification_resolution_indexes_persistent_plan_rows():
         )
     )
     plan_rows = torch.tensor([1, 0, 1], dtype=torch.int64, device=device)
+    packed = table_cluster_indices.index_select(0, plan_rows)
     indexed = store.resolve_verification_cluster_blocks(
         layer_name="layer",
-        selected_cluster_indices=table_cluster_indices,
-        plan_row_indices=plan_rows,
-        request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
-        request_slot_generations=torch.ones(1, dtype=torch.int64, device=device),
+        selected_cluster_indices=packed,
+        plan_valid_rows=torch.ones(3, dtype=torch.bool, device=device),
+        request_slot_ids=torch.zeros(3, dtype=torch.int64, device=device),
+        request_slot_generations=torch.ones(3, dtype=torch.int64, device=device),
         arena=arena,
         max_pages_per_cluster=metadata.page_ids.shape[-1],
     )
@@ -2090,10 +2091,10 @@ def test_gpu_verification_resolution_indexes_persistent_plan_rows():
 
     gathered = store.resolve_verification_cluster_blocks(
         layer_name="layer",
-        selected_cluster_indices=table_cluster_indices.index_select(0, plan_rows),
-        plan_row_indices=torch.arange(3, dtype=torch.int64, device=device),
-        request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
-        request_slot_generations=torch.ones(1, dtype=torch.int64, device=device),
+        selected_cluster_indices=packed.clone(),
+        plan_valid_rows=torch.ones(3, dtype=torch.bool, device=device),
+        request_slot_ids=torch.zeros(3, dtype=torch.int64, device=device),
+        request_slot_generations=torch.ones(3, dtype=torch.int64, device=device),
         arena=arena,
         max_pages_per_cluster=metadata.page_ids.shape[-1],
     )

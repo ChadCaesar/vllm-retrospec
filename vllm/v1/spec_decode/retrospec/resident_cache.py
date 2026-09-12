@@ -1393,7 +1393,7 @@ class RetroSpecResidentClusterCache:
     def lookup_compact_verification_gpu(
         self,
         selected_cluster_indices: torch.Tensor,
-        plan_row_indices: torch.Tensor,
+        plan_valid_rows: torch.Tensor,
         request_slot_ids: torch.Tensor,
         request_slot_generations: torch.Tensor,
         arena_cluster_ids: torch.Tensor,
@@ -1429,7 +1429,7 @@ class RetroSpecResidentClusterCache:
             self._next_access_epoch += 1
             resolve_compact_verification_pages(
                 selected_cluster_indices=selected_cluster_indices,
-                plan_row_indices=plan_row_indices,
+                plan_valid_rows=plan_valid_rows,
                 request_slot_ids=request_slot_ids,
                 request_slot_generations=request_slot_generations,
                 arena_cluster_ids=arena_cluster_ids,

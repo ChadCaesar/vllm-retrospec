@@ -728,14 +728,18 @@ def _compact_verification_outputs(
 
 def _resolve_compact_verification(
     selected_cluster_indices: torch.Tensor,
-    plan_row_indices: torch.Tensor,
+    request_slot_ids: torch.Tensor,
     request_slot_generations: torch.Tensor,
     table: tuple[torch.Tensor, ...],
+    plan_valid_rows: torch.Tensor | None = None,
     miss_page_stride: int | None = None,
 ) -> tuple[torch.Tensor, ...]:
     device = selected_cluster_indices.device
+    num_queries = selected_cluster_indices.shape[0]
+    if plan_valid_rows is None:
+        plan_valid_rows = torch.ones(num_queries, dtype=torch.bool, device=device)
     outputs = _compact_verification_outputs(
-        plan_row_indices.numel(),
+        num_queries,
         selected_cluster_indices.shape[1],
         selected_cluster_indices.shape[2],
         2,
@@ -743,8 +747,8 @@ def _resolve_compact_verification(
     )
     resolve_compact_verification_pages(
         selected_cluster_indices=selected_cluster_indices,
-        plan_row_indices=plan_row_indices,
-        request_slot_ids=torch.tensor([0, 1], dtype=torch.int64, device=device),
+        plan_valid_rows=plan_valid_rows,
+        request_slot_ids=request_slot_ids,
         request_slot_generations=request_slot_generations,
         arena_cluster_ids=torch.tensor(
             [[10, 11, 20, 21]], dtype=torch.int64, device=device
@@ -809,9 +813,11 @@ def test_compact_verification_resolver_preserves_ranked_pages_and_emits_misses()
         device=device,
     )
     outputs = _resolve_compact_verification(
-        selected,
-        torch.tensor([3, 0, 1], dtype=torch.int64, device=device),
-        torch.tensor([5, 7], dtype=torch.int64, device=device),
+        selected.index_select(
+            0, torch.tensor([3, 0, 1], dtype=torch.int64, device=device)
+        ),
+        torch.tensor([1, 0, 1], dtype=torch.int64, device=device),
+        torch.tensor([7, 5, 7], dtype=torch.int64, device=device),
         table,
     )
 
@@ -884,6 +890,19 @@ def test_compact_verification_resolver_reports_stale_request_generation():
 
     assert outputs[3].cpu().tolist() == [[0], [0]]
     assert outputs[11].item() == 0
+    assert outputs[12].item() == 1
+
+
+def test_compact_verification_resolver_reports_missing_plan_row():
+    device = torch.device("cuda")
+    outputs = _resolve_compact_verification(
+        torch.full((2, 1, 1), -1, dtype=torch.int32, device=device),
+        torch.tensor([0, -1], dtype=torch.int64, device=device),
+        torch.tensor([5, -1], dtype=torch.int64, device=device),
+        _make_table(max_pages=2),
+        plan_valid_rows=torch.tensor([True, False], device=device),
+    )
+
     assert outputs[12].item() == 1
 
 

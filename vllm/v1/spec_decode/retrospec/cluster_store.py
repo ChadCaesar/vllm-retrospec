@@ -4712,7 +4712,7 @@ class RetroSpecClusterPageStore:
         self,
         layer_name: str,
         selected_cluster_indices: torch.Tensor,
-        plan_row_indices: torch.Tensor,
+        plan_valid_rows: torch.Tensor,
         request_slot_ids: torch.Tensor,
         request_slot_generations: torch.Tensor,
         arena: RetroSpecResidentLayerArena,
@@ -4723,10 +4723,10 @@ class RetroSpecClusterPageStore:
             raise ValueError("GPU verification lookup requires CUDA")
         if selected_cluster_indices.ndim != 3:
             raise ValueError("Verification cluster indices must be three-dimensional")
-        if plan_row_indices.ndim != 1:
-            raise ValueError("plan_row_indices must be one-dimensional")
-        if plan_row_indices.device != selected_cluster_indices.device:
-            raise ValueError("Indexed plan rows must use the lookup device")
+        if plan_valid_rows.ndim != 1 or plan_valid_rows.dtype != torch.bool:
+            raise ValueError("plan_valid_rows must be one-dimensional and boolean")
+        if plan_valid_rows.device != selected_cluster_indices.device:
+            raise ValueError("Plan validity must use the lookup device")
         if request_slot_ids.shape != request_slot_generations.shape:
             raise ValueError("Request slot descriptors must have equal shapes")
         if max_pages_per_cluster < 0:
@@ -4738,7 +4738,9 @@ class RetroSpecClusterPageStore:
 
         current_stream = torch.cuda.current_stream(selected_cluster_indices.device)
         resident_cache.wait_for_pending_copies(current_stream)
-        num_queries = plan_row_indices.shape[0]
+        num_queries = selected_cluster_indices.shape[0]
+        if plan_valid_rows.shape != (num_queries,):
+            raise ValueError("Plan validity must contain one entry per query")
         num_kv_heads = selected_cluster_indices.shape[1]
         retrieval_width = selected_cluster_indices.shape[2]
         page_width = retrieval_width * max_pages_per_cluster
@@ -4821,7 +4823,7 @@ class RetroSpecClusterPageStore:
             )
             access = resident_cache.lookup_compact_verification_gpu(
                 selected_cluster_indices=selected_cluster_indices,
-                plan_row_indices=plan_row_indices,
+                plan_valid_rows=plan_valid_rows,
                 request_slot_ids=request_slot_ids,
                 request_slot_generations=request_slot_generations,
                 arena_cluster_ids=arena.cluster_ids,
@@ -4930,7 +4932,7 @@ class RetroSpecClusterPageStore:
             invalid_descriptors = int(slot.invalid_descriptor_count_storage.item())
             if invalid_descriptors:
                 raise RuntimeError(
-                    "Verification selected a stale request-slot descriptor"
+                    "Verification selected a missing or stale request descriptor"
                 )
             num_misses = int(slot.miss_count_storage.item())
             if num_misses < 0 or num_misses > cluster_capacity:

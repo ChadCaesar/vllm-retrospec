@@ -11,11 +11,11 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecSegmentedTokenIndex,
 )
 from vllm.v1.spec_decode.retrospec.selection_kernels import (
-    add_indexed_values,
     emit_primary_exact_token_plan,
     emit_ranked_draft_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
+    pack_indexed_verification_plan,
 )
 
 
@@ -147,17 +147,74 @@ def test_emit_primary_exact_token_plan_clears_slots_past_logical_width():
     torch.testing.assert_close(output_mask.cpu(), expected_mask)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_add_indexed_values_reads_persistent_rows_without_gather():
-    device = torch.device("cuda")
-    destination = torch.tensor([1.0, 2.0, 3.0], device=device)
-    source = torch.tensor([0.25, 0.5, 1.0, 2.0, 4.0], device=device)
-    rows = torch.tensor([4, 0, 3], dtype=torch.int64, device=device)
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_pack_indexed_verification_plan_matches_query_rows(device_type: str):
+    if device_type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    device = torch.device(device_type)
+    valid_rows = torch.tensor([[True, True], [True, False]], device=device)
+    request_slots = torch.tensor([3, 7], dtype=torch.int64, device=device)
+    request_generations = torch.tensor([11, 13], dtype=torch.int64, device=device)
+    exact = torch.arange(4 * 2 * 3, dtype=torch.int32, device=device).view(4, 2, 3)
+    estimation = torch.tensor(
+        [
+            [[0, 1], [2, -1]],
+            [[3, 4], [-1, 5]],
+            [[6, 7], [8, 9]],
+            [[10, 11], [12, 13]],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    attention = torch.tensor([0.1, 0.2, 0.3, 0.4], device=device)
+    requests = torch.tensor([1, 0, 1, 2], dtype=torch.int64, device=device)
+    tokens = torch.tensor([0, 1, 1, 0], dtype=torch.int64, device=device)
+    num_pairs = requests.numel()
 
-    add_indexed_values(destination, source, rows)
+    plan_rows = torch.empty(num_pairs, dtype=torch.int64, device=device)
+    plan_valid = torch.empty(num_pairs, dtype=torch.bool, device=device)
+    packed_slots = torch.empty(num_pairs, dtype=torch.int64, device=device)
+    packed_generations = torch.empty(num_pairs, dtype=torch.int64, device=device)
+    packed_exact = torch.empty(num_pairs, 2, 3, dtype=torch.int32, device=device)
+    packed_estimation = torch.empty(num_pairs, 2, 2, dtype=torch.int32, device=device)
+    packed_mask = torch.empty_like(packed_estimation, dtype=torch.bool)
+    packed_attention = torch.empty(num_pairs, device=device)
 
+    pack_indexed_verification_plan(
+        request_indices=requests,
+        token_indices=tokens,
+        valid_rows=valid_rows,
+        request_slot_ids=request_slots,
+        request_slot_generations=request_generations,
+        exact_cluster_indices=exact,
+        estimation_cluster_indices=estimation,
+        attention_mass=attention,
+        output_plan_row_indices=plan_rows,
+        output_plan_valid_rows=plan_valid,
+        output_request_slot_ids=packed_slots,
+        output_request_slot_generations=packed_generations,
+        output_exact_cluster_indices=packed_exact,
+        output_estimation_cluster_indices=packed_estimation,
+        output_estimation_cluster_mask=packed_mask,
+        output_attention_mass=packed_attention,
+    )
+
+    assert plan_rows.cpu().tolist() == [1, 2, 3, 0]
+    assert plan_valid.cpu().tolist() == [True, True, False, False]
+    assert packed_slots.cpu().tolist() == [7, 3, -1, -1]
+    assert packed_generations.cpu().tolist() == [13, 11, -1, -1]
+    expected_exact = exact.index_select(0, torch.tensor([1, 2], device=device))
+    torch.testing.assert_close(packed_exact[:2], expected_exact)
+    assert (packed_exact[2:] == -1).all()
+    expected_estimation = estimation.index_select(
+        0, torch.tensor([1, 2], device=device)
+    )
+    torch.testing.assert_close(packed_estimation[:2], expected_estimation)
+    assert (packed_estimation[2:] == -1).all()
+    torch.testing.assert_close(packed_mask[:2], expected_estimation >= 0)
+    assert not packed_mask[2:].any()
     torch.testing.assert_close(
-        destination, torch.tensor([5.0, 2.25, 5.0], device=device)
+        packed_attention.cpu(), torch.tensor([0.2, 0.3, 1.0, 1.0])
     )
 
 

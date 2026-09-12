@@ -585,7 +585,7 @@ def _finalize_ranked_compact_draft_attention_kernel(
 @triton.jit
 def _resolve_compact_verification_pages_vector_kernel(
     selected_cluster_indices,
-    plan_row_indices,
+    plan_valid_rows,
     request_slot_ids,
     request_slot_generations,
     arena_cluster_ids,
@@ -620,7 +620,6 @@ def _resolve_compact_verification_pages_vector_kernel(
     selected_stride_0,
     selected_stride_1,
     selected_stride_2,
-    PLAN_BATCH_CAPACITY: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     NUM_CLUSTERS: tl.constexpr,
     MAX_PAGES: tl.constexpr,
@@ -635,16 +634,17 @@ def _resolve_compact_verification_pages_vector_kernel(
     row = tl.program_id(0)
     query_idx = row // NUM_KV_HEADS
     kv_head_idx = row % NUM_KV_HEADS
-    plan_row = tl.load(plan_row_indices + query_idx).to(tl.int64)
-    request_idx = plan_row % PLAN_BATCH_CAPACITY
-    request_slot = tl.load(request_slot_ids + request_idx).to(tl.int64)
-    expected_generation = tl.load(request_slot_generations + request_idx).to(tl.int64)
+    plan_valid = tl.load(plan_valid_rows + query_idx).to(tl.int1)
+    request_slot = tl.load(request_slot_ids + query_idx).to(tl.int64)
+    expected_generation = tl.load(request_slot_generations + query_idx).to(tl.int64)
     valid_slot = request_slot >= 0
     safe_slot = tl.maximum(request_slot, 0)
     actual_generation = tl.load(
         arena_generations + safe_slot, mask=valid_slot, other=-1
     ).to(tl.int64)
-    descriptor_valid = valid_slot & (actual_generation == expected_generation)
+    descriptor_valid = (
+        plan_valid & valid_slot & (actual_generation == expected_generation)
+    )
 
     output_offsets = tl.arange(0, BLOCK_OUTPUT_PAGES)
     valid_output = output_offsets < PAGE_CAPACITY
@@ -668,7 +668,7 @@ def _resolve_compact_verification_pages_vector_kernel(
     ranks = tl.arange(0, BLOCK_CLUSTERS)
     valid_ranks = ranks < NUM_CLUSTERS
     source_offsets = (
-        plan_row * selected_stride_0
+        query_idx * selected_stride_0
         + kv_head_idx * selected_stride_1
         + ranks * selected_stride_2
     )
@@ -826,7 +826,7 @@ def _resolve_compact_verification_pages_vector_kernel(
         mask=misses[:, None] & valid_page_offsets[None, :],
     )
 
-    invalid_descriptor = has_selected & ~descriptor_valid
+    invalid_descriptor = ~plan_valid | (has_selected & ~descriptor_valid)
     tl.atomic_add(
         output_invalid_descriptor_count,
         invalid_descriptor.to(tl.int32),
@@ -1700,7 +1700,7 @@ def resolve_compact_draft_pages(
 
 def resolve_compact_verification_pages(
     selected_cluster_indices: torch.Tensor,
-    plan_row_indices: torch.Tensor,
+    plan_valid_rows: torch.Tensor,
     request_slot_ids: torch.Tensor,
     request_slot_generations: torch.Tensor,
     arena_cluster_ids: torch.Tensor,
@@ -1735,14 +1735,18 @@ def resolve_compact_verification_pages(
         raise ValueError("Compact verification resolution requires CUDA")
     if selected_cluster_indices.ndim != 3:
         raise ValueError("Selected clusters must have shape [rows, heads, clusters]")
-    if plan_row_indices.ndim != 1:
-        raise ValueError("Plan rows must be one-dimensional")
+    if plan_valid_rows.ndim != 1 or plan_valid_rows.dtype != torch.bool:
+        raise ValueError("Plan validity must be one-dimensional and boolean")
     if request_slot_ids.shape != request_slot_generations.shape:
         raise ValueError("Request slot descriptors must have equal shapes")
     if request_slot_ids.ndim != 1:
         raise ValueError("Request slot descriptors must be one-dimensional")
 
-    num_queries = plan_row_indices.shape[0]
+    num_queries = selected_cluster_indices.shape[0]
+    if plan_valid_rows.shape != (num_queries,):
+        raise ValueError("Plan validity must contain one entry per query")
+    if request_slot_ids.shape != (num_queries,):
+        raise ValueError("Request slot descriptors must contain one entry per query")
     _, num_kv_heads, num_clusters = selected_cluster_indices.shape
     max_pages = output_miss_logical_page_ids.shape[1]
     page_capacity = num_clusters * max_pages
@@ -1779,7 +1783,7 @@ def resolve_compact_verification_pages(
 
     tensors = (
         selected_cluster_indices,
-        plan_row_indices,
+        plan_valid_rows,
         request_slot_ids,
         request_slot_generations,
         arena_cluster_ids,
@@ -1828,7 +1832,7 @@ def resolve_compact_verification_pages(
 
     _resolve_compact_verification_pages_vector_kernel[(num_queries * num_kv_heads,)](
         selected_cluster_indices,
-        plan_row_indices,
+        plan_valid_rows,
         request_slot_ids,
         request_slot_generations,
         arena_cluster_ids,
@@ -1863,7 +1867,6 @@ def resolve_compact_verification_pages(
         selected_cluster_indices.stride(0),
         selected_cluster_indices.stride(1),
         selected_cluster_indices.stride(2),
-        PLAN_BATCH_CAPACITY=request_slot_ids.shape[0],
         NUM_KV_HEADS=num_kv_heads,
         NUM_CLUSTERS=num_clusters,
         MAX_PAGES=max_pages,

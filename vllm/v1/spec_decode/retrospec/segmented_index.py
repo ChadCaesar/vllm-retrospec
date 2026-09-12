@@ -45,6 +45,7 @@ from .selection_kernels import (
     emit_ranked_draft_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
+    pack_indexed_verification_plan,
 )
 from .workspace import exact_attention_primary_token_capacity
 
@@ -100,6 +101,7 @@ class RetroSpecTokenAttentionSelection:
 class RetroSpecIndexedTokenAttentionSelection:
     layer_name: str
     plan_row_indices: torch.Tensor
+    plan_valid_rows: torch.Tensor
 
     request_slot_ids: torch.Tensor
     request_slot_generations: torch.Tensor
@@ -625,49 +627,68 @@ class _SelectionPlanTable:
 
 
 @dataclass(frozen=True)
-class _VerificationEstimationWorkspace:
-    selected_cluster_indices: torch.Tensor
-    selected_cluster_mask: torch.Tensor
+class _IndexedVerificationWorkspace:
+    plan_row_indices: torch.Tensor
+    plan_valid_rows: torch.Tensor
     request_slot_ids: torch.Tensor
     request_slot_generations: torch.Tensor
+    exact_cluster_indices: torch.Tensor
+    estimation_cluster_indices: torch.Tensor
+    estimation_cluster_mask: torch.Tensor
     keys: torch.Tensor
     values: torch.Tensor
     token_counts: torch.Tensor
+    attention_mass: torch.Tensor
 
     @classmethod
     def allocate(
         cls,
         pair_capacity: int,
         num_kv_heads: int,
+        exact_width: int,
         estimation_width: int,
         head_size: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> "_VerificationEstimationWorkspace":
-        cluster_shape = (pair_capacity, num_kv_heads, estimation_width)
-        summary_shape = (*cluster_shape, head_size)
+    ) -> "_IndexedVerificationWorkspace":
+        exact_shape = (pair_capacity, num_kv_heads, exact_width)
+        estimation_shape = (pair_capacity, num_kv_heads, estimation_width)
+        summary_shape = (*estimation_shape, head_size)
         return cls(
-            selected_cluster_indices=torch.empty(
-                cluster_shape, dtype=torch.int32, device=device
+            plan_row_indices=torch.empty(
+                pair_capacity, dtype=torch.int64, device=device
             ),
-            selected_cluster_mask=torch.empty(
-                cluster_shape, dtype=torch.bool, device=device
-            ),
+            plan_valid_rows=torch.empty(pair_capacity, dtype=torch.bool, device=device),
             request_slot_ids=torch.empty(
                 pair_capacity, dtype=torch.int64, device=device
             ),
             request_slot_generations=torch.empty(
                 pair_capacity, dtype=torch.int64, device=device
             ),
+            exact_cluster_indices=torch.empty(
+                exact_shape, dtype=torch.int32, device=device
+            ),
+            estimation_cluster_indices=torch.empty(
+                estimation_shape, dtype=torch.int32, device=device
+            ),
+            estimation_cluster_mask=torch.empty(
+                estimation_shape, dtype=torch.bool, device=device
+            ),
             keys=torch.empty(summary_shape, dtype=dtype, device=device),
             values=torch.empty(summary_shape, dtype=dtype, device=device),
-            token_counts=torch.empty(cluster_shape, dtype=torch.int32, device=device),
+            token_counts=torch.empty(
+                estimation_shape, dtype=torch.int32, device=device
+            ),
+            attention_mass=torch.empty(
+                pair_capacity, dtype=torch.float32, device=device
+            ),
         )
 
     def matches(
         self,
         pair_capacity: int,
         num_kv_heads: int,
+        exact_width: int,
         estimation_width: int,
         head_size: int,
         dtype: torch.dtype,
@@ -676,33 +697,11 @@ class _VerificationEstimationWorkspace:
         return (
             self.keys.shape[0] >= pair_capacity
             and self.keys.shape[1] == num_kv_heads
+            and self.exact_cluster_indices.shape[2] >= exact_width
             and self.keys.shape[2] >= estimation_width
             and self.keys.shape[3] == head_size
             and self.keys.dtype == dtype
             and self.keys.device == device
-        )
-
-
-@dataclass(frozen=True)
-class _IndexedPlanWorkspace:
-    plan_row_indices: torch.Tensor
-    valid_rows: torch.Tensor
-
-    @classmethod
-    def allocate(
-        cls, pair_capacity: int, device: torch.device
-    ) -> "_IndexedPlanWorkspace":
-        return cls(
-            plan_row_indices=torch.empty(
-                pair_capacity, dtype=torch.int64, device=device
-            ),
-            valid_rows=torch.empty(pair_capacity, dtype=torch.bool, device=device),
-        )
-
-    def matches(self, pair_capacity: int, device: torch.device) -> bool:
-        return (
-            self.plan_row_indices.shape[0] >= pair_capacity
-            and self.plan_row_indices.device == device
         )
 
 
@@ -858,11 +857,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         # without walking per-step Python dictionaries.
         self._selection_plan_tables: dict[str, _SelectionPlanTable] = {}
         self._selection_plan_written_layers: set[str] = set()
-        self._indexed_plan_workspace: _IndexedPlanWorkspace | None = None
         self._draft_selection_scratch: _DraftSelectionScratch | None = None
-        self._verification_estimation_workspace: (
-            _VerificationEstimationWorkspace | None
-        ) = None
+        self._indexed_verification_workspace: _IndexedVerificationWorkspace | None = (
+            None
+        )
 
         # CPU-offload construction is staged during layer execution and
         # committed after the complete prefill attention context.
@@ -2833,19 +2831,21 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self._draft_selection_scratch = scratch
         return scratch
 
-    def _get_verification_estimation_workspace(
+    def _get_indexed_verification_workspace(
         self,
         pair_capacity: int,
         num_kv_heads: int,
+        exact_width: int,
         estimation_width: int,
         head_size: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> _VerificationEstimationWorkspace:
-        workspace = self._verification_estimation_workspace
+    ) -> _IndexedVerificationWorkspace:
+        workspace = self._indexed_verification_workspace
         matches = workspace is not None and workspace.matches(
             pair_capacity=pair_capacity,
             num_kv_heads=num_kv_heads,
+            exact_width=exact_width,
             estimation_width=estimation_width,
             head_size=head_size,
             dtype=dtype,
@@ -2856,16 +2856,18 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         if workspace is not None:
             pair_capacity = max(pair_capacity, workspace.keys.shape[0])
+            exact_width = max(exact_width, workspace.exact_cluster_indices.shape[2])
             estimation_width = max(estimation_width, workspace.keys.shape[2])
-        workspace = _VerificationEstimationWorkspace.allocate(
+        workspace = _IndexedVerificationWorkspace.allocate(
             pair_capacity=pair_capacity,
             num_kv_heads=num_kv_heads,
+            exact_width=exact_width,
             estimation_width=estimation_width,
             head_size=head_size,
             dtype=dtype,
             device=device,
         )
-        self._verification_estimation_workspace = workspace
+        self._indexed_verification_workspace = workspace
         return workspace
 
     def _get_selection_plan_step(
@@ -3350,20 +3352,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             raise RuntimeError(f"No draft selection plan for layer {layer_name!r}")
         return table.plan(step_index, len(self._proposal_request_ids))
 
-    def prepare_indexed_plan_workspace(self, pair_capacity: int) -> None:
-        if pair_capacity <= 0:
-            raise ValueError("Indexed plan capacity must be positive")
-        if not self._selection_plan_written_layers:
-            return
-
-        reference_layer = next(iter(self._selection_plan_written_layers))
-        device = self._selection_plan_tables[reference_layer].valid_rows.device
-        workspace = self._indexed_plan_workspace
-        if workspace is None or not workspace.matches(pair_capacity, device):
-            self._indexed_plan_workspace = _IndexedPlanWorkspace.allocate(
-                pair_capacity, device
-            )
-
     @staticmethod
     def _flatten_plan_rows(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.flatten(0, 1)
@@ -3385,9 +3373,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         )
         num_kv_heads = cluster_indices.shape[1]
         estimation_width = cluster_indices.shape[2]
-        workspace = self._get_verification_estimation_workspace(
+        workspace = self._get_indexed_verification_workspace(
             pair_capacity=num_rows,
             num_kv_heads=num_kv_heads,
+            exact_width=0,
             estimation_width=estimation_width,
             head_size=head_size,
             dtype=dtype,
@@ -3398,10 +3387,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         summary_shape = (*cluster_shape, head_size)
         num_clusters = prod(cluster_shape)
         num_summary_items = prod(summary_shape)
-        selected_indices = workspace.selected_cluster_indices.view(-1)[
+        selected_indices = workspace.estimation_cluster_indices.view(-1)[
             :num_clusters
         ].view(cluster_shape)
-        selected_mask = workspace.selected_cluster_mask.view(-1)[:num_clusters].view(
+        selected_mask = workspace.estimation_cluster_mask.view(-1)[:num_clusters].view(
             cluster_shape
         )
         packed_slots = workspace.request_slot_ids[:num_rows]
@@ -3481,35 +3470,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         token_indices: torch.Tensor,
     ) -> RetroSpecIndexedTokenAttentionSelection:
         table = self._selection_plan_tables.get(layer_name)
-        workspace = self._indexed_plan_workspace
         if table is None:
             raise RuntimeError(
                 f"No draft selection plan exists for layer {layer_name!r}"
             )
-        if workspace is None:
-            raise RuntimeError("Indexed plan workspace was not prepared")
         if request_indices.shape != token_indices.shape:
             raise ValueError("Indexed plan indices must have equal shapes")
         if request_indices.device != table.valid_rows.device:
             raise ValueError("Indexed request indices use the wrong device")
         if token_indices.device != table.valid_rows.device:
             raise ValueError("Indexed token indices use the wrong device")
-
-        num_pairs = request_indices.numel()
-        if num_pairs > workspace.plan_row_indices.shape[0]:
-            raise ValueError("Indexed plan exceeds the prepared workspace")
-
-        plan_rows = workspace.plan_row_indices[:num_pairs]
-        plan_rows.copy_(token_indices)
-        plan_rows.mul_(table.batch_capacity)
-        plan_rows.add_(request_indices)
-
-        valid_rows = workspace.valid_rows[:num_pairs]
-        torch.index_select(table.valid_rows.view(-1), 0, plan_rows, out=valid_rows)
-        torch._assert_async(
-            valid_rows.all(),
-            f"A draft selection plan is missing for layer {layer_name!r}",
-        )
 
         if level == RetroSpecAttentionLevel.SPARSE:
             exact_cluster_indices = table.sparse_exact_cluster_indices
@@ -3522,29 +3492,98 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         else:
             raise ValueError(f"Unsupported RetroSpec attention level: {level}")
 
-        flatten = self._flatten_plan_rows
-        packed_indices, keys, values, counts = self._materialize_estimation_selection(
-            layer_name=layer_name,
-            cluster_indices=flatten(estimation_cluster_indices),
-            request_slot_ids=table.request_slot_ids,
-            request_slot_generations=table.request_slot_generations,
+        num_pairs = request_indices.numel()
+        num_kv_heads = exact_cluster_indices.shape[2]
+        exact_width = exact_cluster_indices.shape[3]
+        estimation_width = estimation_cluster_indices.shape[3]
+        workspace = self._get_indexed_verification_workspace(
+            pair_capacity=num_pairs,
+            num_kv_heads=num_kv_heads,
+            exact_width=exact_width,
+            estimation_width=estimation_width,
             head_size=table.head_size,
             dtype=table.dtype,
-            plan_row_indices=plan_rows,
+            device=request_indices.device,
         )
+
+        plan_rows = workspace.plan_row_indices[:num_pairs]
+        plan_valid_rows = workspace.plan_valid_rows[:num_pairs]
+        packed_slots = workspace.request_slot_ids[:num_pairs]
+        packed_generations = workspace.request_slot_generations[:num_pairs]
+        exact_shape = (num_pairs, num_kv_heads, exact_width)
+        estimation_shape = (num_pairs, num_kv_heads, estimation_width)
+        num_exact = prod(exact_shape)
+        num_estimation = prod(estimation_shape)
+        packed_exact = workspace.exact_cluster_indices.view(-1)[:num_exact].view(
+            exact_shape
+        )
+        packed_estimation = workspace.estimation_cluster_indices.view(-1)[
+            :num_estimation
+        ].view(estimation_shape)
+        packed_estimation_mask = workspace.estimation_cluster_mask.view(-1)[
+            :num_estimation
+        ].view(estimation_shape)
+        packed_attention = workspace.attention_mass[:num_pairs]
+
+        flatten = self._flatten_plan_rows
+        pack_indexed_verification_plan(
+            request_indices=request_indices,
+            token_indices=token_indices,
+            valid_rows=table.valid_rows,
+            request_slot_ids=table.request_slot_ids,
+            request_slot_generations=table.request_slot_generations,
+            exact_cluster_indices=flatten(exact_cluster_indices),
+            estimation_cluster_indices=flatten(estimation_cluster_indices),
+            attention_mass=attention_mass.view(-1),
+            output_plan_row_indices=plan_rows,
+            output_plan_valid_rows=plan_valid_rows,
+            output_request_slot_ids=packed_slots,
+            output_request_slot_generations=packed_generations,
+            output_exact_cluster_indices=packed_exact,
+            output_estimation_cluster_indices=packed_estimation,
+            output_estimation_cluster_mask=packed_estimation_mask,
+            output_attention_mass=packed_attention,
+        )
+
+        view = self._gpu_index_residency.get_active_view(
+            layer_name, self._proposal_request_ids, request_indices.device
+        )
+        summary_shape = (*estimation_shape, table.head_size)
+        num_summary = prod(summary_shape)
+        keys = workspace.keys.view(-1)[:num_summary].view(summary_shape)
+        values = workspace.values.view(-1)[:num_summary].view(summary_shape)
+        counts = workspace.token_counts.view(-1)[:num_estimation].view(estimation_shape)
+        if view.arena is None:
+            keys.zero_()
+            values.zero_()
+            counts.zero_()
+        else:
+            gather_resident_estimation(
+                cluster_keys=view.arena.cluster_keys,
+                cluster_values=view.arena.cluster_values,
+                cluster_token_counts=view.arena.cluster_token_counts,
+                cluster_offsets=view.arena.cluster_offsets,
+                request_slot_ids=packed_slots,
+                selected_indices=packed_estimation,
+                selected_mask=packed_estimation_mask,
+                output_keys=keys,
+                output_values=values,
+                output_token_counts=counts,
+            )
         return RetroSpecIndexedTokenAttentionSelection(
             layer_name=layer_name,
             plan_row_indices=plan_rows,
-            request_slot_ids=table.request_slot_ids,
-            request_slot_generations=table.request_slot_generations,
+            plan_valid_rows=plan_valid_rows,
+            request_slot_ids=packed_slots,
+            request_slot_generations=packed_generations,
             primary_exact_token_indices=flatten(table.primary_exact_token_indices),
             primary_exact_token_mask=flatten(table.primary_exact_token_mask),
-            exact_cluster_indices=flatten(exact_cluster_indices),
-            estimation_cluster_indices=packed_indices,
+            exact_cluster_indices=packed_exact,
+            estimation_cluster_indices=packed_estimation,
             estimation_keys=keys,
             estimation_values=values,
             estimation_token_counts=counts,
-            attention_mass=attention_mass.view(-1),
+            attention_mass=packed_attention,
         )
 
     def materialize_indexed_reference(
@@ -3552,23 +3591,24 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
     ) -> RetroSpecTokenAttentionSelection:
         rows = selection.plan_row_indices
 
+        if not selection.plan_valid_rows.all().item():
+            raise RuntimeError(
+                f"A draft selection plan is missing for layer {selection.layer_name!r}"
+            )
+
         def gather(tensor: torch.Tensor) -> torch.Tensor:
             return tensor.index_select(0, rows)
 
         primary_indices = gather(selection.primary_exact_token_indices)
         primary_mask = gather(selection.primary_exact_token_mask)
-        cluster_indices = gather(selection.exact_cluster_indices)
+        cluster_indices = selection.exact_cluster_indices
         estimation_indices = selection.estimation_cluster_indices
         estimation_keys = selection.estimation_keys
         estimation_values = selection.estimation_values
         estimation_counts = selection.estimation_token_counts
-        attention_mass = gather(selection.attention_mass)
-        batch_capacity = selection.request_slot_ids.shape[0]
-        request_rows = rows.remainder(batch_capacity)
-        request_slot_ids = selection.request_slot_ids.index_select(0, request_rows)
-        request_slot_generations = selection.request_slot_generations.index_select(
-            0, request_rows
-        )
+        attention_mass = selection.attention_mass
+        request_slot_ids = selection.request_slot_ids
+        request_slot_generations = selection.request_slot_generations
         cluster_ids, page_ids, page_counts = self._materialize_logical_selection(
             layer_name=selection.layer_name,
             cluster_indices=cluster_indices,
@@ -3612,7 +3652,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         return self.cluster_store.resolve_verification_cluster_blocks(
             layer_name=selection.layer_name,
             selected_cluster_indices=selection.exact_cluster_indices,
-            plan_row_indices=selection.plan_row_indices,
+            plan_valid_rows=selection.plan_valid_rows,
             request_slot_ids=selection.request_slot_ids,
             request_slot_generations=selection.request_slot_generations,
             arena=view.arena,
