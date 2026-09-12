@@ -12,10 +12,139 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 )
 from vllm.v1.spec_decode.retrospec.selection_kernels import (
     add_indexed_values,
+    emit_primary_exact_token_plan,
     emit_ranked_estimation_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
 )
+
+
+def _reference_primary_exact_token_plan(
+    seq_lens: torch.Tensor,
+    indexed_starts: torch.Tensor,
+    indexed_ends: torch.Tensor,
+    indexed_requests: torch.Tensor,
+    *,
+    num_kv_heads: int,
+    max_num_tokens: int,
+    block_size: int,
+    num_recent_blocks: int,
+    output_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    indices = torch.zeros(
+        (seq_lens.numel(), num_kv_heads, output_width), dtype=torch.int64
+    )
+    mask = torch.zeros_like(indices, dtype=torch.bool)
+    logical_tokens = torch.arange(max_num_tokens, dtype=torch.int64)
+
+    for request_idx, raw_seq_len in enumerate(seq_lens.tolist()):
+        seq_len = min(max(int(raw_seq_len), 1), max_num_tokens)
+        valid_blocks = (seq_len + block_size - 1) // block_size
+        recent_start = max(valid_blocks - num_recent_blocks, 0) * block_size
+        recent_start = min(recent_start, seq_len)
+        sink_end = min(block_size, seq_len)
+
+        if indexed_requests[request_idx]:
+            indexed_start = min(max(int(indexed_starts[request_idx]), 0), seq_len)
+            indexed_end = min(
+                max(int(indexed_ends[request_idx]), indexed_start), seq_len
+            )
+            exact = (
+                (logical_tokens < max(indexed_start, sink_end))
+                | (logical_tokens >= min(indexed_end, recent_start))
+            ) & (logical_tokens < seq_len)
+        else:
+            exact = logical_tokens < seq_len
+
+        selected = logical_tokens[exact][:output_width]
+        selected_width = selected.numel()
+        indices[request_idx, :, :selected_width] = selected
+        mask[request_idx, :, :selected_width] = True
+        invalid_width = min(output_width, max_num_tokens)
+        indices[request_idx, :, selected_width:invalid_width] = max_num_tokens - 1
+
+    return indices, mask
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_emit_primary_exact_token_plan_matches_dense_reference():
+    device = torch.device("cuda")
+    seq_lens = torch.tensor([3, 64, 73, 120, 96], dtype=torch.int32)
+    indexed_starts = torch.tensor([0, 16, 16, 32, -3], dtype=torch.int64)
+    indexed_ends = torch.tensor([0, 32, 48, 96, 200], dtype=torch.int64)
+    indexed_requests = torch.tensor([False, True, True, True, True])
+    num_kv_heads = 3
+    max_num_tokens = 128
+    output_width = 48
+    block_size = 16
+    num_recent_blocks = 3
+
+    padded_indices = torch.empty(
+        (seq_lens.numel(), num_kv_heads, output_width + 2),
+        dtype=torch.int64,
+        device=device,
+    )
+    padded_mask = torch.empty_like(padded_indices, dtype=torch.bool)
+    output_indices = padded_indices[..., :output_width]
+    output_mask = padded_mask[..., :output_width]
+
+    emit_primary_exact_token_plan(
+        seq_lens=seq_lens.to(device),
+        indexed_starts=indexed_starts.to(device),
+        indexed_ends=indexed_ends.to(device),
+        indexed_requests=indexed_requests.to(device),
+        num_kv_heads=num_kv_heads,
+        max_num_tokens=max_num_tokens,
+        block_size=block_size,
+        num_recent_blocks=num_recent_blocks,
+        output_indices=output_indices,
+        output_mask=output_mask,
+    )
+
+    expected_indices, expected_mask = _reference_primary_exact_token_plan(
+        seq_lens,
+        indexed_starts,
+        indexed_ends,
+        indexed_requests,
+        num_kv_heads=num_kv_heads,
+        max_num_tokens=max_num_tokens,
+        block_size=block_size,
+        num_recent_blocks=num_recent_blocks,
+        output_width=output_width,
+    )
+    torch.testing.assert_close(output_indices.cpu(), expected_indices)
+    torch.testing.assert_close(output_mask.cpu(), expected_mask)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_emit_primary_exact_token_plan_clears_slots_past_logical_width():
+    device = torch.device("cuda")
+    output_indices = torch.full((1, 2, 12), -7, dtype=torch.int64, device=device)
+    output_mask = torch.ones_like(output_indices, dtype=torch.bool)
+
+    emit_primary_exact_token_plan(
+        seq_lens=torch.tensor([3], dtype=torch.int32, device=device),
+        indexed_starts=torch.tensor([0], dtype=torch.int64, device=device),
+        indexed_ends=torch.tensor([0], dtype=torch.int64, device=device),
+        indexed_requests=torch.tensor([False], device=device),
+        num_kv_heads=2,
+        max_num_tokens=8,
+        block_size=4,
+        num_recent_blocks=2,
+        output_indices=output_indices,
+        output_mask=output_mask,
+    )
+
+    expected_indices = torch.tensor(
+        [[[0, 1, 2, 7, 7, 7, 7, 7, 0, 0, 0, 0]] * 2],
+        dtype=torch.int64,
+    )
+    expected_mask = torch.tensor(
+        [[[True, True, True] + [False] * 9] * 2],
+        dtype=torch.bool,
+    )
+    torch.testing.assert_close(output_indices.cpu(), expected_indices)
+    torch.testing.assert_close(output_mask.cpu(), expected_mask)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -382,6 +511,7 @@ def test_selection_plan_table_uses_one_shared_draft_scratch():
     assert same_table is table
     assert not hasattr(table, "draft_estimation_keys")
     assert not hasattr(table, "expanded_estimation_keys")
+    assert not hasattr(index._draft_selection_scratch, "primary_topk_order")
     assert table.sparse_estimation_cluster_indices.shape == (2, 1, 1, 1)
     assert table.expanded_estimation_cluster_indices.shape == (2, 1, 1, 1)
     assert first.draft_estimation_keys.data_ptr() == (

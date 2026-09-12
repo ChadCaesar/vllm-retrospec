@@ -921,32 +921,6 @@ def test_primary_exact_capacity_covers_every_up_to_date_layout():
         assert forced_exact_mask.sum().item() <= capacity
 
 
-def test_proposal_token_layout_is_reused_only_within_one_draft_generation():
-    index = make_index()
-    block_table = torch.empty(1, 4)
-    index.begin_proposal(["request"])
-    try:
-        first = index._get_proposal_token_layout(
-            1, block_table, torch.tensor([3], dtype=torch.int32)
-        )
-        same_generation = index._get_proposal_token_layout(
-            1, block_table, torch.tensor([7], dtype=torch.int32)
-        )
-        next_generation = index._get_proposal_token_layout(
-            2, block_table, torch.tensor([7], dtype=torch.int32)
-        )
-
-        assert same_generation is first
-        assert first.valid_token_mask.sum().item() == 3
-        assert next_generation is not first
-        assert next_generation.valid_token_mask.sum().item() == 7
-    finally:
-        index.end_proposal()
-
-    assert index._proposal_token_layout is None
-    assert index._proposal_token_layout_generation == -1
-
-
 def test_segmented_index_handles_mixed_long_and_short_requests():
     index = make_index(max_resident_requests=2)
     keys, values = make_cache()

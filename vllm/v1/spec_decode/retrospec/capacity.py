@@ -425,9 +425,6 @@ def build_retrospec_long_context_capacity(
             * draft_estimation_width
             * (2 * spec.head_size * dtype_bytes + 4)
         )
-        primary_order_bytes = (
-            planning_requests * spec.num_kv_heads * primary_exact_width * 8
-        )
         exact_descriptor_bytes = (
             planning_requests * spec.num_kv_heads * max_retrieval_clusters * 8
         )
@@ -442,7 +439,6 @@ def build_retrospec_long_context_capacity(
         draft_selection_scratch_bytes = max(
             draft_selection_scratch_bytes,
             summary_bytes
-            + primary_order_bytes
             + exact_descriptor_bytes
             + compact_descriptor_bytes
             + group_stat_bytes,

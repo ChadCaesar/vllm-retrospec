@@ -41,6 +41,7 @@ from .pinned_memory import RetroSpecPinnedMemoryManager
 from .resident_cache import RetroSpecResidentReadLease
 from .selection_kernels import (
     capture_request_descriptors,
+    emit_primary_exact_token_plan,
     emit_ranked_estimation_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
@@ -224,13 +225,6 @@ class _ClusterSelectionWorkspace:
 
 
 @dataclass(frozen=True)
-class _ProposalTokenLayout:
-    logical_token_ids: torch.Tensor
-    valid_token_mask: torch.Tensor
-    sink_recent_mask: torch.Tensor
-
-
-@dataclass(frozen=True)
 class _SelectionStepWorkspace:
     draft_exact_cluster_ids: torch.Tensor
 
@@ -273,14 +267,12 @@ class _DraftSelectionScratch:
     draft_estimation_keys: torch.Tensor
     draft_estimation_values: torch.Tensor
     draft_estimation_token_counts: torch.Tensor
-    primary_topk_order: torch.Tensor
 
     @classmethod
     def allocate(
         cls,
         batch_capacity: int,
         num_kv_heads: int,
-        primary_exact_width: int,
         sparse_retrieval_width: int,
         sparse_estimation_width: int,
         max_pages_per_cluster: int,
@@ -340,18 +332,12 @@ class _DraftSelectionScratch:
             draft_estimation_token_counts=torch.empty(
                 estimation_shape[:-1], dtype=torch.int32, device=device
             ),
-            primary_topk_order=torch.empty(
-                (batch_capacity, num_kv_heads, primary_exact_width),
-                dtype=torch.int64,
-                device=device,
-            ),
         )
 
     def matches(
         self,
         batch_size: int,
         num_kv_heads: int,
-        primary_exact_width: int,
         sparse_retrieval_width: int,
         sparse_estimation_width: int,
         max_pages_per_cluster: int,
@@ -368,7 +354,6 @@ class _DraftSelectionScratch:
             >= sparse_retrieval_width * max_pages_per_cluster
             and self.draft_estimation_keys.shape[2] >= estimation_width
             and self.draft_estimation_keys.shape[3] == head_size
-            and self.primary_topk_order.shape[2] >= primary_exact_width
             and self.draft_estimation_keys.dtype == dtype
             and self.draft_estimation_keys.device == device
         )
@@ -859,8 +844,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self._proposal_active = False
         self._proposal_request_ids: tuple[str, ...] = ()
         self._proposal_read_leases: list[RetroSpecResidentReadLease] = []
-        self._proposal_token_layout_generation = -1
-        self._proposal_token_layout: _ProposalTokenLayout | None = None
 
         # request_id -> layers that still need one query-guided resident
         # admission after the first real draft ranking.
@@ -1225,8 +1208,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             table.valid_rows.zero_()
         self._selection_plan_written_layers.clear()
         self._proposal_read_leases.clear()
-        self._proposal_token_layout_generation = -1
-        self._proposal_token_layout = None
         self._proposal_active = True
         self._proposal_request_ids = request_ids
 
@@ -1240,8 +1221,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             for lease in self._proposal_read_leases:
                 lease.release()
             self._proposal_read_leases.clear()
-            self._proposal_token_layout_generation = -1
-            self._proposal_token_layout = None
             self._selection_plan_written_layers.clear()
             self._proposal_active = False
             self._proposal_request_ids = ()
@@ -1961,37 +1940,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         )
 
         return logical_token_ids, valid_token_mask, forced_exact_mask
-
-    def _get_proposal_token_layout(
-        self,
-        layout_generation: int,
-        block_table: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> _ProposalTokenLayout:
-        """Reuse request-level token metadata across layers of one DRAFT call."""
-        if layout_generation < 0:
-            raise ValueError("DRAFT token-layout generation must be non-negative")
-
-        cached = self._proposal_token_layout
-        if self._proposal_token_layout_generation == layout_generation:
-            if cached is None:
-                raise RuntimeError("DRAFT token-layout cache is inconsistent")
-            expected_tokens = block_table.shape[1] * self.block_size
-            if cached.valid_token_mask.shape != (block_table.shape[0], expected_tokens):
-                raise RuntimeError("DRAFT token layout changed within one model call")
-            return cached
-
-        logical_token_ids, valid_token_mask, sink_recent_mask = (
-            self._build_token_layout(block_table, seq_lens)
-        )
-        cached = _ProposalTokenLayout(
-            logical_token_ids=logical_token_ids,
-            valid_token_mask=valid_token_mask,
-            sink_recent_mask=sink_recent_mask,
-        )
-        self._proposal_token_layout_generation = layout_generation
-        self._proposal_token_layout = cached
-        return cached
 
     @staticmethod
     def _compute_cluster_logits(
@@ -2824,7 +2772,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self,
         batch_size: int,
         num_kv_heads: int,
-        primary_exact_width: int,
         sparse_retrieval_width: int,
         sparse_estimation_width: int,
         max_pages_per_cluster: int,
@@ -2836,7 +2783,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         matches = scratch is not None and scratch.matches(
             batch_size=batch_size,
             num_kv_heads=num_kv_heads,
-            primary_exact_width=primary_exact_width,
             sparse_retrieval_width=sparse_retrieval_width,
             sparse_estimation_width=sparse_estimation_width,
             max_pages_per_cluster=max_pages_per_cluster,
@@ -2861,9 +2807,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 batch_capacity,
                 scratch.draft_exact_cluster_ids.shape[0],
             )
-            primary_exact_width = max(
-                primary_exact_width, scratch.primary_topk_order.shape[2]
-            )
             old_retrieval_width = scratch.draft_exact_cluster_ids.shape[2]
             old_estimation_width = (
                 scratch.draft_estimation_keys.shape[2] - old_retrieval_width
@@ -2880,7 +2823,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         scratch = _DraftSelectionScratch.allocate(
             batch_capacity=batch_capacity,
             num_kv_heads=num_kv_heads,
-            primary_exact_width=primary_exact_width,
             sparse_retrieval_width=sparse_retrieval_width,
             sparse_estimation_width=sparse_estimation_width,
             max_pages_per_cluster=max_pages_per_cluster,
@@ -3022,7 +2964,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         scratch = self._get_draft_selection_scratch(
             batch_size=batch_size,
             num_kv_heads=num_kv_heads,
-            primary_exact_width=primary_exact_width,
             sparse_retrieval_width=sparse_retrieval_width,
             sparse_estimation_width=sparse_estimation_width,
             max_pages_per_cluster=view.max_pages_per_cluster,
@@ -3210,8 +3151,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self,
         layer_name: str,
         plan_slot: int,
-        active_mask: torch.Tensor,
-        forced_exact_mask: torch.Tensor,
+        seq_lens: torch.Tensor,
+        indexed_starts: torch.Tensor,
+        indexed_ends: torch.Tensor,
+        indexed_requests: torch.Tensor,
+        max_num_tokens: int,
         view: RetroSpecResidentBatchView,
         num_kv_heads: int,
         head_size: int,
@@ -3225,27 +3169,24 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             layer_name=layer_name,
             plan_slot=plan_slot,
             view=view,
-            batch_size=forced_exact_mask.shape[0],
+            batch_size=seq_lens.shape[0],
             num_kv_heads=num_kv_heads,
             head_size=head_size,
             dtype=dtype,
-            device=forced_exact_mask.device,
+            device=seq_lens.device,
         )
 
-        per_head_forced_exact = forced_exact_mask.unsqueeze(1).expand(
-            -1, num_kv_heads, -1
-        )
-        scratch = self._draft_selection_scratch
-        if scratch is None:
-            raise RuntimeError("Draft selection scratch was not prepared")
-        self._pack_bounded_mask_indices(
-            per_head_forced_exact,
-            plan.primary_exact_token_indices.shape[-1],
-            plan.primary_exact_token_indices,
-            plan.primary_exact_token_mask,
-            scratch.primary_topk_order.view(-1)[
-                : plan.primary_exact_token_indices.numel()
-            ].view_as(plan.primary_exact_token_indices),
+        emit_primary_exact_token_plan(
+            seq_lens=seq_lens,
+            indexed_starts=indexed_starts,
+            indexed_ends=indexed_ends,
+            indexed_requests=indexed_requests,
+            num_kv_heads=num_kv_heads,
+            max_num_tokens=max_num_tokens,
+            block_size=self.block_size,
+            num_recent_blocks=self.num_recent_blocks,
+            output_indices=plan.primary_exact_token_indices,
+            output_mask=plan.primary_exact_token_mask,
         )
         return plan, output_workspace, table
 
@@ -3273,16 +3214,29 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         head_size: int,
         dtype: torch.dtype,
     ) -> tuple[RetroSpecTokenSelectionPlan, _SelectionStepWorkspace]:
-        plan, output_workspace, table = self._prepare_plan_step(
+        plan, output_workspace, table = self._get_selection_plan_step(
             layer_name=layer_name,
             plan_slot=plan_slot,
-            active_mask=active_mask,
-            forced_exact_mask=forced_exact_mask,
             view=view,
+            batch_size=forced_exact_mask.shape[0],
             num_kv_heads=num_kv_heads,
             head_size=head_size,
             dtype=dtype,
+            device=forced_exact_mask.device,
         )
+
+        per_head_forced_exact = forced_exact_mask.unsqueeze(1).expand(
+            -1, num_kv_heads, -1
+        )
+        packed_indices, packed_mask = self._pack_bounded_mask_indices(
+            per_head_forced_exact,
+            plan.primary_exact_token_indices.shape[-1],
+        )
+        plan.primary_exact_token_indices.zero_()
+        plan.primary_exact_token_mask.zero_()
+        packed_width = packed_indices.shape[-1]
+        plan.primary_exact_token_indices[..., :packed_width].copy_(packed_indices)
+        plan.primary_exact_token_mask[..., :packed_width].copy_(packed_mask)
 
         plan.request_slot_ids.copy_(view.request_slot_ids)
         if view.arena is None:
@@ -4650,7 +4604,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         scale: float,
         warm_first_draft: bool = False,
         plan_slot: int = 0,
-        layout_generation: int | None = None,
     ) -> RetroSpecTokenAttentionSelection:
         self._validate_inputs(
             query,
@@ -4668,34 +4621,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         with self._cuda_timer("draft_selection_layout"):
             view = self._get_resident_view(layer_name, request_ids, key_cache)
-
-            if layout_generation is None:
-                logical_token_ids, valid_token_mask, sink_recent_mask = (
-                    self._build_token_layout(block_table, seq_lens)
-                )
-                layout = _ProposalTokenLayout(
-                    logical_token_ids=logical_token_ids,
-                    valid_token_mask=valid_token_mask,
-                    sink_recent_mask=sink_recent_mask,
-                )
-            else:
-                layout = self._get_proposal_token_layout(
-                    layout_generation, block_table, seq_lens
-                )
-            logical_token_ids = layout.logical_token_ids
-            valid_token_mask = layout.valid_token_mask
-            forced_exact_mask = layout.sink_recent_mask.clone()
-
-            # All valid tokens not covered by a complete clustered segment
-            # remain in the exact steady zone.
             indexed_starts, indexed_ends, indexed_requests = (
                 self._get_resident_indexed_bounds(view, block_table.device)
             )
-            forced_exact_mask |= valid_token_mask & (
-                ~indexed_requests.unsqueeze(1)
-                | (logical_token_ids.unsqueeze(0) < indexed_starts.unsqueeze(1))
-                | (logical_token_ids.unsqueeze(0) >= indexed_ends.unsqueeze(1))
-            )
+            max_num_tokens = block_table.shape[1] * self.block_size
 
         num_kv_heads = key_cache.shape[2]
         first_draft_warmup_mask = self._get_first_draft_warmup_mask(
@@ -4741,8 +4670,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 plan, output_workspace, plan_table = self._prepare_plan_step(
                     layer_name=layer_name,
                     plan_slot=plan_slot,
-                    active_mask=active_mask,
-                    forced_exact_mask=forced_exact_mask,
+                    seq_lens=seq_lens,
+                    indexed_starts=indexed_starts,
+                    indexed_ends=indexed_ends,
+                    indexed_requests=indexed_requests,
+                    max_num_tokens=max_num_tokens,
                     view=view,
                     num_kv_heads=num_kv_heads,
                     head_size=key_cache.shape[3],
@@ -4765,6 +4697,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     view=view,
                 )
         else:
+            with self._cuda_timer("draft_selection_layout"):
+                logical_token_ids, valid_token_mask, sink_recent_mask = (
+                    self._build_token_layout(block_table, seq_lens)
+                )
+                forced_exact_mask = sink_recent_mask.clone()
+                forced_exact_mask |= valid_token_mask & (
+                    ~indexed_requests.unsqueeze(1)
+                    | (logical_token_ids.unsqueeze(0) < indexed_starts.unsqueeze(1))
+                    | (logical_token_ids.unsqueeze(0) >= indexed_ends.unsqueeze(1))
+                )
             with self._cuda_timer("draft_cluster_topk"):
                 cluster_zones = self._select_cluster_zones(
                     cluster_scores,

@@ -225,7 +225,6 @@ class RetroSpecSparseAttention:
         self.in_proposal = False
         self.step_active = False
         self.step_index = -1
-        self._draft_layout_generation = 0
         self.active_mask: torch.Tensor | None = None
         self.batch_size = 0
         self.parallel_request_indices: torch.Tensor | None = None
@@ -640,7 +639,6 @@ class RetroSpecSparseAttention:
             self.proposal_request_ids = request_ids
             self.proposal_context_lens = normalized_context_lens
             self._resident_prefetch_wave.clear()
-            self._draft_layout_generation = 0
 
             self.in_proposal = True
             yield
@@ -690,8 +688,6 @@ class RetroSpecSparseAttention:
 
         self.mode = mode
         self.step_index = step_index
-        if mode == RetroSpecAttentionMode.DRAFT:
-            self._draft_layout_generation += 1
         self.batch_size = active_mask.shape[0]
         self.active_mask = active_mask
         self.parallel_request_indices = None
@@ -1491,7 +1487,6 @@ class RetroSpecSparseAttention:
                     scale=impl.scale,
                     warm_first_draft=True,
                     plan_slot=self.step_index,
-                    layout_generation=self._draft_layout_generation,
                 )
         else:
             if self.mode == RetroSpecAttentionMode.SPARSE_VERIFY:

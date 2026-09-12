@@ -7,6 +7,102 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
+def _emit_primary_exact_token_plan_kernel(
+    seq_lens,
+    indexed_starts,
+    indexed_ends,
+    indexed_requests,
+    output_indices,
+    output_mask,
+    seq_len_stride,
+    indexed_start_stride,
+    indexed_end_stride,
+    indexed_request_stride,
+    output_index_stride_0,
+    output_index_stride_1,
+    output_index_stride_2,
+    output_mask_stride_0,
+    output_mask_stride_1,
+    output_mask_stride_2,
+    num_outputs,
+    NUM_KV_HEADS: tl.constexpr,
+    OUTPUT_WIDTH: tl.constexpr,
+    MAX_NUM_TOKENS: tl.constexpr,
+    CACHE_BLOCK_SIZE: tl.constexpr,
+    NUM_RECENT_BLOCKS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    output_valid = offsets < num_outputs
+
+    rank = offsets % OUTPUT_WIDTH
+    row = offsets // OUTPUT_WIDTH
+    batch_idx = row // NUM_KV_HEADS
+    kv_head_idx = row % NUM_KV_HEADS
+    rank64 = rank.to(tl.int64)
+
+    seq_len = tl.load(
+        seq_lens + batch_idx * seq_len_stride, mask=output_valid, other=1
+    ).to(tl.int64)
+    seq_len = tl.minimum(tl.maximum(seq_len, 1), MAX_NUM_TOKENS)
+
+    valid_blocks = (seq_len + CACHE_BLOCK_SIZE - 1) // CACHE_BLOCK_SIZE
+    recent_start_block = tl.maximum(valid_blocks - NUM_RECENT_BLOCKS, 0)
+    recent_start = tl.minimum(recent_start_block * CACHE_BLOCK_SIZE, seq_len)
+    sink_end = tl.minimum(CACHE_BLOCK_SIZE, seq_len)
+
+    indexed = tl.load(
+        indexed_requests + batch_idx * indexed_request_stride,
+        mask=output_valid,
+        other=0,
+    ).to(tl.int1)
+    indexed_start = tl.load(
+        indexed_starts + batch_idx * indexed_start_stride,
+        mask=output_valid,
+        other=0,
+    ).to(tl.int64)
+    indexed_end = tl.load(
+        indexed_ends + batch_idx * indexed_end_stride,
+        mask=output_valid,
+        other=0,
+    ).to(tl.int64)
+    indexed_start = tl.minimum(tl.maximum(indexed_start, 0), seq_len)
+    indexed_end = tl.minimum(tl.maximum(indexed_end, indexed_start), seq_len)
+
+    prefix_end = tl.where(indexed, tl.maximum(indexed_start, sink_end), seq_len)
+    suffix_start = tl.where(indexed, tl.minimum(indexed_end, recent_start), seq_len)
+    intervals_overlap = suffix_start <= prefix_end
+    exact_count = tl.where(
+        intervals_overlap, seq_len, prefix_end + seq_len - suffix_start
+    )
+    logical_token = tl.where(
+        intervals_overlap | (rank64 < prefix_end),
+        rank64,
+        suffix_start + rank64 - prefix_end,
+    )
+
+    inside_logical_width = rank64 < MAX_NUM_TOKENS
+    selected = output_valid & inside_logical_width & (rank64 < exact_count)
+    output_index_offset = (
+        batch_idx * output_index_stride_0
+        + kv_head_idx * output_index_stride_1
+        + rank * output_index_stride_2
+    )
+    output_mask_offset = (
+        batch_idx * output_mask_stride_0
+        + kv_head_idx * output_mask_stride_1
+        + rank * output_mask_stride_2
+    )
+    invalid_index = tl.where(inside_logical_width, MAX_NUM_TOKENS - 1, 0)
+    tl.store(
+        output_indices + output_index_offset,
+        tl.where(selected, logical_token, invalid_index),
+        mask=output_valid,
+    )
+    tl.store(output_mask + output_mask_offset, selected, mask=output_valid)
+
+
+@triton.jit
 def _capture_request_descriptors_kernel(
     request_slot_ids,
     arena_generations,
@@ -306,6 +402,107 @@ def _emit_ranked_estimation_plan_kernel(
             tl.where(expanded_valid, expanded_local_idx, -1),
             mask=output_idx < ESTIMATION_WIDTH,
         )
+
+
+def emit_primary_exact_token_plan(
+    *,
+    seq_lens: torch.Tensor,
+    indexed_starts: torch.Tensor,
+    indexed_ends: torch.Tensor,
+    indexed_requests: torch.Tensor,
+    num_kv_heads: int,
+    max_num_tokens: int,
+    block_size: int,
+    num_recent_blocks: int,
+    output_indices: torch.Tensor,
+    output_mask: torch.Tensor,
+) -> None:
+    """Emit ordered native exact-token descriptors from interval bounds."""
+    if seq_lens.device.type != "cuda":
+        raise ValueError("Primary exact-token plan emission requires CUDA")
+    if seq_lens.ndim != 1:
+        raise ValueError("Sequence lengths must be one-dimensional")
+    if any(
+        tensor.shape != seq_lens.shape
+        for tensor in (indexed_starts, indexed_ends, indexed_requests)
+    ):
+        raise ValueError("Indexed bounds must match sequence lengths")
+    if output_indices.ndim != 3 or output_mask.ndim != 3:
+        raise ValueError(
+            "Primary exact-token outputs must have shape [batch, heads, width]"
+        )
+
+    batch_size = seq_lens.shape[0]
+    output_width = output_indices.shape[2]
+    expected_shape = (batch_size, num_kv_heads, output_width)
+    if output_indices.shape != expected_shape:
+        raise ValueError("Primary exact-token indices have the wrong shape")
+    if output_mask.shape != expected_shape:
+        raise ValueError("Primary exact-token mask has the wrong shape")
+    if num_kv_heads <= 0:
+        raise ValueError("num_kv_heads must be positive")
+    if max_num_tokens <= 0:
+        raise ValueError("max_num_tokens must be positive")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if num_recent_blocks < 0:
+        raise ValueError("num_recent_blocks must be non-negative")
+    if output_indices.dtype != torch.int64:
+        raise ValueError("Primary exact-token indices must use int64")
+    if output_mask.dtype != torch.bool:
+        raise ValueError("Primary exact-token mask must use bool")
+    if indexed_requests.dtype != torch.bool:
+        raise ValueError("Indexed request mask must use bool")
+
+    integer_tensors = (seq_lens, indexed_starts, indexed_ends)
+    if any(
+        tensor.dtype not in (torch.int32, torch.int64) for tensor in integer_tensors
+    ):
+        raise ValueError(
+            "Sequence lengths and indexed bounds must use integral tensors"
+        )
+    tensors = (
+        seq_lens,
+        indexed_starts,
+        indexed_ends,
+        indexed_requests,
+        output_indices,
+        output_mask,
+    )
+    if any(tensor.device != seq_lens.device for tensor in tensors):
+        raise ValueError("Primary exact-token plan tensors must use one CUDA device")
+    if output_width == 0 or batch_size == 0:
+        return
+
+    num_outputs = batch_size * num_kv_heads * output_width
+    launch_block_size = 256
+    _emit_primary_exact_token_plan_kernel[
+        (triton.cdiv(num_outputs, launch_block_size),)
+    ](
+        seq_lens,
+        indexed_starts,
+        indexed_ends,
+        indexed_requests,
+        output_indices,
+        output_mask,
+        seq_lens.stride(0),
+        indexed_starts.stride(0),
+        indexed_ends.stride(0),
+        indexed_requests.stride(0),
+        output_indices.stride(0),
+        output_indices.stride(1),
+        output_indices.stride(2),
+        output_mask.stride(0),
+        output_mask.stride(1),
+        output_mask.stride(2),
+        num_outputs,
+        NUM_KV_HEADS=num_kv_heads,
+        OUTPUT_WIDTH=output_width,
+        MAX_NUM_TOKENS=max_num_tokens,
+        CACHE_BLOCK_SIZE=block_size,
+        NUM_RECENT_BLOCKS=num_recent_blocks,
+        BLOCK_SIZE=launch_block_size,
+    )
 
 
 def capture_request_descriptors(
