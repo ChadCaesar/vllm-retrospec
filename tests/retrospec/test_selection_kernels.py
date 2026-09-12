@@ -13,7 +13,7 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 from vllm.v1.spec_decode.retrospec.selection_kernels import (
     add_indexed_values,
     emit_primary_exact_token_plan,
-    emit_ranked_estimation_plan,
+    emit_ranked_draft_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
 )
@@ -428,23 +428,27 @@ def test_gather_resident_exact_pages_matches_request_slot_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_emit_ranked_estimation_plan_omits_exact_page_intermediates():
+def test_emit_ranked_draft_plan_packs_exact_handles_and_summaries():
     device = torch.device("cuda")
     cluster_keys = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]], device=device)
     cluster_values = cluster_keys * 10
+    cluster_ids = torch.tensor([[10, 11, 12]], dtype=torch.int64, device=device)
     cluster_counts = torch.tensor([[4, 5, 6]], dtype=torch.int32, device=device)
+    sparse_exact = torch.empty((1, 1, 2), dtype=torch.int32, device=device)
     expanded_exact = torch.empty((1, 1, 3), dtype=torch.int32, device=device)
     sparse_estimation = torch.empty((1, 1, 1), dtype=torch.int32, device=device)
     expanded_estimation = torch.empty_like(sparse_estimation)
     draft_keys = torch.empty((1, 1, 3, 2), device=device)
     draft_values = torch.empty_like(draft_keys)
     draft_counts = torch.empty((1, 1, 3), dtype=torch.int32, device=device)
+    draft_handles = torch.empty((1, 1, 2), dtype=torch.int64, device=device)
 
-    emit_ranked_estimation_plan(
+    emit_ranked_draft_plan(
         ranked_indices=torch.tensor([[[2, 0, 1]]], dtype=torch.int64, device=device),
         candidate_counts=torch.tensor([[3]], dtype=torch.int32, device=device),
         cluster_keys=cluster_keys,
         cluster_values=cluster_values,
+        cluster_ids=cluster_ids,
         cluster_token_counts=cluster_counts,
         cluster_offsets=torch.tensor([0], dtype=torch.int64, device=device),
         request_slot_ids=torch.tensor([0], dtype=torch.int64, device=device),
@@ -452,15 +456,19 @@ def test_emit_ranked_estimation_plan_omits_exact_page_intermediates():
         retrieval_ratio=0.34,
         estimation_ratio=0.34,
         sparse_exact_width=2,
+        sparse_exact_cluster_indices=sparse_exact,
         expanded_exact_cluster_indices=expanded_exact,
         sparse_estimation_cluster_indices=sparse_estimation,
         expanded_estimation_cluster_indices=expanded_estimation,
+        draft_exact_cluster_handles=draft_handles,
         draft_estimation_keys=draft_keys,
         draft_estimation_values=draft_values,
         draft_estimation_token_counts=draft_counts,
     )
 
+    assert sparse_exact.cpu().tolist() == [[[2, 0]]]
     assert expanded_exact.cpu().tolist() == [[[2, 0, 1]]]
+    assert draft_handles.cpu().tolist() == [[[12, 10]]]
     assert sparse_estimation.item() == 1
     assert expanded_estimation.item() == -1
     torch.testing.assert_close(

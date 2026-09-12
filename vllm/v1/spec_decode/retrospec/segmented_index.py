@@ -42,7 +42,7 @@ from .resident_cache import RetroSpecResidentReadLease
 from .selection_kernels import (
     capture_request_descriptors,
     emit_primary_exact_token_plan,
-    emit_ranked_estimation_plan,
+    emit_ranked_draft_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
 )
@@ -3289,7 +3289,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self._publish_plan_step(layer_name, plan_slot, active_mask, table)
         return plan, output_workspace
 
-    def _emit_cuda_estimation_plan(
+    def _emit_cuda_draft_plan(
         self,
         plan: RetroSpecTokenSelectionPlan,
         output_workspace: _SelectionStepWorkspace,
@@ -3315,11 +3315,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 ],
             )
 
-        emit_ranked_estimation_plan(
+        emit_ranked_draft_plan(
             ranked_indices=ranked_indices,
             candidate_counts=candidate_counts,
             cluster_keys=arena.cluster_keys,
             cluster_values=arena.cluster_values,
+            cluster_ids=arena.cluster_ids,
             cluster_token_counts=arena.cluster_token_counts,
             cluster_offsets=arena.cluster_offsets,
             request_slot_ids=view.request_slot_ids,
@@ -3327,11 +3328,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             retrieval_ratio=self.retrieval_ratio,
             estimation_ratio=self.estimation_ratio,
             sparse_exact_width=output_workspace.sparse_retrieval_width,
+            sparse_exact_cluster_indices=plan.sparse_exact_cluster_indices,
             expanded_exact_cluster_indices=plan.expanded_exact_cluster_indices,
             sparse_estimation_cluster_indices=(plan.sparse_estimation_cluster_indices),
             expanded_estimation_cluster_indices=(
                 plan.expanded_estimation_cluster_indices
             ),
+            draft_exact_cluster_handles=output_workspace.draft_exact_cluster_ids,
             draft_estimation_keys=output_workspace.draft_estimation_keys,
             draft_estimation_values=output_workspace.draft_estimation_values,
             draft_estimation_token_counts=(
@@ -4687,7 +4690,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     warmup_enabled=first_draft_warmup_mask is not None,
                 )
             with self._cuda_timer("draft_plan_build"):
-                self._emit_cuda_estimation_plan(
+                self._emit_cuda_draft_plan(
                     plan=plan,
                     output_workspace=output_workspace,
                     table=plan_table,

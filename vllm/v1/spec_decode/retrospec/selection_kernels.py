@@ -127,105 +127,28 @@ def _capture_request_descriptors_kernel(
 
 
 @triton.jit
-def _emit_expanded_exact_cluster_indices_kernel(
-    ranked_indices,
-    candidate_counts,
-    cluster_token_counts,
-    cluster_offsets,
-    request_slot_ids,
-    active_mask,
-    expanded_exact_cluster_indices,
-    num_outputs,
-    CLUSTER_CAPACITY: tl.constexpr,
-    NUM_KV_HEADS: tl.constexpr,
-    EXPANDED_WIDTH: tl.constexpr,
-    RANKED_STRIDE_0: tl.constexpr,
-    RANKED_STRIDE_1: tl.constexpr,
-    RANKED_STRIDE_2: tl.constexpr,
-    RETRIEVAL_RATIO: tl.constexpr,
-    ESTIMATION_RATIO: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    output_offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    output_valid = output_offsets < num_outputs
-
-    rank = output_offsets % EXPANDED_WIDTH
-    row = output_offsets // EXPANDED_WIDTH
-    batch_idx = row // NUM_KV_HEADS
-    kv_head_idx = row % NUM_KV_HEADS
-
-    candidate_count = tl.load(candidate_counts + row, mask=output_valid, other=0).to(
-        tl.int32
-    )
-    retrieval_count = tl.ceil(candidate_count.to(tl.float32) * RETRIEVAL_RATIO).to(
-        tl.int32
-    )
-    retrieval_count = tl.minimum(retrieval_count, candidate_count)
-    estimation_count = tl.ceil(candidate_count.to(tl.float32) * ESTIMATION_RATIO).to(
-        tl.int32
-    )
-    estimation_count = tl.minimum(estimation_count, candidate_count - retrieval_count)
-    expanded_count = tl.minimum(retrieval_count * 2, retrieval_count + estimation_count)
-
-    request_slot = tl.load(request_slot_ids + batch_idx, mask=output_valid, other=-1)
-    request_active = tl.load(active_mask + batch_idx, mask=output_valid, other=0).to(
-        tl.int1
-    )
-    request_valid = output_valid & request_active & (request_slot >= 0)
-    safe_slot = tl.maximum(request_slot, 0).to(tl.int64)
-    request_cluster_offset = tl.load(
-        cluster_offsets + safe_slot, mask=request_valid, other=0
-    ).to(tl.int64)
-
-    ranked_offset = (
-        batch_idx * RANKED_STRIDE_0
-        + kv_head_idx * RANKED_STRIDE_1
-        + rank * RANKED_STRIDE_2
-    )
-    cluster_valid = request_valid & (rank < expanded_count)
-    local_cluster_idx = tl.load(
-        ranked_indices + ranked_offset, mask=cluster_valid, other=-1
-    ).to(tl.int64)
-    cluster_valid &= local_cluster_idx >= 0
-
-    absolute_cluster_idx = (
-        kv_head_idx * CLUSTER_CAPACITY
-        + request_cluster_offset
-        + tl.maximum(local_cluster_idx, 0)
-    )
-    token_count = tl.load(
-        cluster_token_counts + absolute_cluster_idx,
-        mask=cluster_valid,
-        other=0,
-    ).to(tl.int32)
-    cluster_valid &= token_count > 0
-
-    tl.store(
-        expanded_exact_cluster_indices + output_offsets,
-        tl.where(cluster_valid, local_cluster_idx, -1),
-        mask=output_valid,
-    )
-
-
-@triton.jit
-def _emit_ranked_estimation_plan_kernel(
+def _emit_ranked_draft_plan_kernel(
     cluster_keys,
     cluster_values,
+    cluster_ids,
     cluster_token_counts,
     cluster_offsets,
     request_slot_ids,
     active_mask,
     ranked_indices,
     candidate_counts,
+    sparse_exact_cluster_indices,
+    expanded_exact_cluster_indices,
     sparse_estimation_cluster_indices,
     expanded_estimation_cluster_indices,
+    draft_exact_cluster_handles,
     draft_estimation_keys,
     draft_estimation_values,
     draft_estimation_token_counts,
     CLUSTER_CAPACITY: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
-    RANKING_WIDTH: tl.constexpr,
     SPARSE_WIDTH: tl.constexpr,
+    EXPANDED_WIDTH: tl.constexpr,
     ESTIMATION_WIDTH: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -264,28 +187,42 @@ def _emit_ranked_estimation_plan_kernel(
     head_mask = head_offsets < HEAD_SIZE
     draft_width = ESTIMATION_WIDTH + SPARSE_WIDTH
 
+    prefix_valid = request_valid & (output_idx < expanded_retrieval_count)
+    prefix_local_idx = tl.load(
+        ranked_indices
+        + batch_idx * RANKED_STRIDE_0
+        + kv_head_idx * RANKED_STRIDE_1
+        + output_idx * RANKED_STRIDE_2,
+        mask=prefix_valid,
+        other=-1,
+    ).to(tl.int64)
+    prefix_valid &= prefix_local_idx >= 0
+    prefix_cluster_idx = request_cluster_offset + tl.maximum(prefix_local_idx, 0)
+    prefix_storage_offset = kv_head_idx * CLUSTER_CAPACITY + prefix_cluster_idx
+    prefix_token_count = tl.load(
+        cluster_token_counts + prefix_storage_offset,
+        mask=prefix_valid,
+        other=0,
+    ).to(tl.int32)
+    prefix_cluster_handle = tl.load(
+        cluster_ids + prefix_storage_offset, mask=prefix_valid, other=-1
+    ).to(tl.int64)
+    prefix_valid &= (prefix_token_count > 0) & (prefix_cluster_handle >= 0)
+
     if SPARSE_WIDTH > 0:
-        retrieval_rank = output_idx
-        retrieval_valid = request_valid & (output_idx < retrieval_count)
-        retrieval_local_idx = tl.load(
-            ranked_indices
-            + batch_idx * RANKED_STRIDE_0
-            + kv_head_idx * RANKED_STRIDE_1
-            + retrieval_rank * RANKED_STRIDE_2,
-            mask=retrieval_valid,
-            other=0,
-        ).to(tl.int64)
-        retrieval_cluster_idx = request_cluster_offset + tl.maximum(
-            retrieval_local_idx, 0
+        retrieval_valid = prefix_valid & (output_idx < retrieval_count)
+        retrieval_plan_offset = group_offset * SPARSE_WIDTH + output_idx
+        tl.store(
+            sparse_exact_cluster_indices + retrieval_plan_offset,
+            tl.where(retrieval_valid, prefix_local_idx, -1),
+            mask=output_idx < SPARSE_WIDTH,
         )
-        retrieval_count_offset = kv_head_idx * CLUSTER_CAPACITY + retrieval_cluster_idx
-        retrieval_token_count = tl.load(
-            cluster_token_counts + retrieval_count_offset,
-            mask=retrieval_valid,
-            other=0,
-        ).to(tl.int32)
-        retrieval_valid &= retrieval_token_count > 0
-        retrieval_source_offsets = retrieval_count_offset * HEAD_SIZE + head_offsets
+        tl.store(
+            draft_exact_cluster_handles + retrieval_plan_offset,
+            tl.where(retrieval_valid, prefix_cluster_handle, -1),
+            mask=output_idx < SPARSE_WIDTH,
+        )
+        retrieval_source_offsets = prefix_storage_offset * HEAD_SIZE + head_offsets
         retrieval_output_idx = ESTIMATION_WIDTH + output_idx
         retrieval_output_offsets = (
             group_offset * draft_width + retrieval_output_idx
@@ -315,8 +252,16 @@ def _emit_ranked_estimation_plan_kernel(
             draft_estimation_token_counts
             + group_offset * draft_width
             + retrieval_output_idx,
-            tl.where(retrieval_valid, retrieval_token_count, 0),
+            tl.where(retrieval_valid, prefix_token_count, 0),
             mask=output_idx < SPARSE_WIDTH,
+        )
+
+    if EXPANDED_WIDTH > 0:
+        expanded_exact_plan_offset = group_offset * EXPANDED_WIDTH + output_idx
+        tl.store(
+            expanded_exact_cluster_indices + expanded_exact_plan_offset,
+            tl.where(prefix_valid, prefix_local_idx, -1),
+            mask=output_idx < EXPANDED_WIDTH,
         )
 
     if ESTIMATION_WIDTH > 0:
@@ -543,12 +488,13 @@ def capture_request_descriptors(
     )
 
 
-def emit_ranked_estimation_plan(
+def emit_ranked_draft_plan(
     *,
     ranked_indices: torch.Tensor,
     candidate_counts: torch.Tensor,
     cluster_keys: torch.Tensor,
     cluster_values: torch.Tensor,
+    cluster_ids: torch.Tensor,
     cluster_token_counts: torch.Tensor,
     cluster_offsets: torch.Tensor,
     request_slot_ids: torch.Tensor,
@@ -556,14 +502,16 @@ def emit_ranked_estimation_plan(
     retrieval_ratio: float,
     estimation_ratio: float,
     sparse_exact_width: int,
+    sparse_exact_cluster_indices: torch.Tensor,
     expanded_exact_cluster_indices: torch.Tensor,
     sparse_estimation_cluster_indices: torch.Tensor,
     expanded_estimation_cluster_indices: torch.Tensor,
+    draft_exact_cluster_handles: torch.Tensor,
     draft_estimation_keys: torch.Tensor,
     draft_estimation_values: torch.Tensor,
     draft_estimation_token_counts: torch.Tensor,
 ) -> None:
-    """Emit estimation journals and current-DRAFT summaries from ranked rows."""
+    """Emit exact descriptors, estimation journals, and DRAFT summaries."""
     if ranked_indices.device.type != "cuda":
         raise ValueError("Ranked estimation emission requires CUDA")
     if ranked_indices.ndim != 3:
@@ -585,6 +533,14 @@ def emit_ranked_estimation_plan(
         raise ValueError("Request slots do not match ranked indices")
     if active_mask.shape != (batch_size,):
         raise ValueError("Active mask does not match ranked indices")
+    if sparse_exact_cluster_indices.shape != (
+        batch_size,
+        num_kv_heads,
+        sparse_exact_width,
+    ):
+        raise ValueError("Sparse exact journal has the wrong shape")
+    if draft_exact_cluster_handles.shape != sparse_exact_cluster_indices.shape:
+        raise ValueError("Draft exact handles have the wrong shape")
     if draft_width != estimation_width + sparse_exact_width:
         raise ValueError("Draft estimation workspace has an invalid width")
     if expanded_exact_cluster_indices.shape[:2] != (
@@ -621,67 +577,49 @@ def emit_ranked_estimation_plan(
         candidate_counts,
         cluster_keys,
         cluster_values,
+        cluster_ids,
         cluster_token_counts,
         cluster_offsets,
         request_slot_ids,
         active_mask,
+        sparse_exact_cluster_indices,
         expanded_exact_cluster_indices,
         sparse_estimation_cluster_indices,
         expanded_estimation_cluster_indices,
+        draft_exact_cluster_handles,
         draft_estimation_keys,
         draft_estimation_values,
         draft_estimation_token_counts,
     )
     if any(tensor.device != ranked_indices.device for tensor in tensors):
-        raise ValueError("Ranked estimation tensors must use one device")
+        raise ValueError("Ranked draft-plan tensors must use one device")
 
-    if expanded_exact_width > 0:
-        num_outputs = batch_size * num_kv_heads * expanded_exact_width
-        block_size = 256
-        _emit_expanded_exact_cluster_indices_kernel[
-            (triton.cdiv(num_outputs, block_size),)
-        ](
-            ranked_indices,
-            candidate_counts,
-            cluster_token_counts,
-            cluster_offsets,
-            request_slot_ids,
-            active_mask,
-            expanded_exact_cluster_indices,
-            num_outputs,
-            CLUSTER_CAPACITY=cluster_token_counts.shape[1],
-            NUM_KV_HEADS=num_kv_heads,
-            EXPANDED_WIDTH=expanded_exact_width,
-            RANKED_STRIDE_0=ranked_indices.stride(0),
-            RANKED_STRIDE_1=ranked_indices.stride(1),
-            RANKED_STRIDE_2=ranked_indices.stride(2),
-            RETRIEVAL_RATIO=retrieval_ratio,
-            ESTIMATION_RATIO=estimation_ratio,
-            BLOCK_SIZE=block_size,
-        )
-
-    summary_width = max(sparse_exact_width, estimation_width)
-    if summary_width == 0:
+    output_width = max(sparse_exact_width, expanded_exact_width, estimation_width)
+    if output_width == 0:
         return
 
-    _emit_ranked_estimation_plan_kernel[(batch_size, num_kv_heads, summary_width)](
+    _emit_ranked_draft_plan_kernel[(batch_size, num_kv_heads, output_width)](
         cluster_keys,
         cluster_values,
+        cluster_ids,
         cluster_token_counts,
         cluster_offsets,
         request_slot_ids,
         active_mask,
         ranked_indices,
         candidate_counts,
+        sparse_exact_cluster_indices,
+        expanded_exact_cluster_indices,
         sparse_estimation_cluster_indices,
         expanded_estimation_cluster_indices,
+        draft_exact_cluster_handles,
         draft_estimation_keys,
         draft_estimation_values,
         draft_estimation_token_counts,
         CLUSTER_CAPACITY=cluster_keys.shape[1],
         NUM_KV_HEADS=num_kv_heads,
-        RANKING_WIDTH=ranking_width,
         SPARSE_WIDTH=sparse_exact_width,
+        EXPANDED_WIDTH=expanded_exact_width,
         ESTIMATION_WIDTH=estimation_width,
         HEAD_SIZE=head_size,
         BLOCK_D=triton.next_power_of_2(head_size),

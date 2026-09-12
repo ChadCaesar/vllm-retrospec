@@ -12,8 +12,8 @@ import torch
 from .cluster_identity import RetroSpecClusterGroup
 from .resident_kernels import (
     lookup_resident_handles,
+    resolve_compact_draft_pages,
     resolve_compact_verification_pages,
-    resolve_ranked_compact_draft_pages,
     resolve_ranked_warmup_misses,
     update_resident_handles,
 )
@@ -1329,11 +1329,9 @@ class RetroSpecResidentClusterCache:
                 emit_misses = False
             elif warmup_page_budgets is not None:
                 raise ValueError("Warmup page budgets require an active mask")
-            resolve_ranked_compact_draft_pages(
+            resolve_compact_draft_pages(
                 ranked_values=ranked_values,
-                ranked_indices=ranked_indices,
                 candidate_counts=candidate_counts,
-                arena_cluster_ids=arena_cluster_ids,
                 arena_resident_table_buckets=arena_resident_table_buckets,
                 arena_cluster_page_starts=arena_cluster_page_starts,
                 arena_cluster_page_counts=arena_cluster_page_counts,
@@ -1356,7 +1354,7 @@ class RetroSpecResidentClusterCache:
                 max_pages_per_cluster=max_pages_per_cluster,
                 fallback_token_counts=fallback_token_counts,
                 sparse_cluster_indices=sparse_cluster_indices,
-                output_cluster_handles=cluster_handles,
+                cluster_handles=cluster_handles,
                 output_page_slots=cache_page_ids,
                 output_page_token_counts=page_token_counts,
                 output_page_counts=page_counts,

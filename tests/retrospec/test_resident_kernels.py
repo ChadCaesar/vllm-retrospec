@@ -7,8 +7,8 @@ import torch
 from vllm.v1.spec_decode.retrospec.resident_kernels import (
     compact_resident_misses,
     lookup_resident_handles,
+    resolve_compact_draft_pages,
     resolve_compact_verification_pages,
-    resolve_ranked_compact_draft_pages,
     resolve_ranked_warmup_misses,
     scatter_compact_staging_page_ids,
     scatter_staging_page_ids,
@@ -240,15 +240,9 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
     )
 
     ranked_values = torch.tensor([[[0.6, 0.3, 0.1]], [[0.9, 0.1, 0.0]]], device=device)
-    ranked_indices = torch.tensor(
-        [[[0, 1, 2]], [[2, 1, 0]]], dtype=torch.int64, device=device
-    )
     candidate_counts = torch.tensor([[3], [0]], dtype=torch.int32, device=device)
-    arena_cluster_ids = torch.tensor(
-        [[10, 11, 12, -1]], dtype=torch.int64, device=device
-    )
     arena_resident_table_buckets = torch.full(
-        arena_cluster_ids.shape, -1, dtype=torch.int32, device=device
+        (1, 4), -1, dtype=torch.int32, device=device
     )
     arena_cluster_page_starts = torch.tensor(
         [[0, 2, 3, 0]], dtype=torch.int32, device=device
@@ -263,8 +257,12 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
         [[2, 1, 2, 2]], dtype=torch.int32, device=device
     )
 
-    sparse_indices = torch.empty((2, 1, 2), dtype=torch.int32, device=device)
-    cluster_handles = torch.empty((2, 1, 2), dtype=torch.int64, device=device)
+    sparse_indices = torch.tensor(
+        [[[0, 1]], [[-1, -1]]], dtype=torch.int32, device=device
+    )
+    cluster_handles = torch.tensor(
+        [[[10, 11]], [[-1, -1]]], dtype=torch.int64, device=device
+    )
     resident_page_ids = torch.empty((2, 1, 4), dtype=torch.int64, device=device)
     page_token_counts = torch.empty_like(resident_page_ids, dtype=torch.int32)
     row_shape = (2, 1)
@@ -285,11 +283,9 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
     sparse_attention = torch.empty(2, device=device)
     expanded_attention = torch.empty(2, device=device)
 
-    resolve_ranked_compact_draft_pages(
+    resolve_compact_draft_pages(
         ranked_values=ranked_values,
-        ranked_indices=ranked_indices,
         candidate_counts=candidate_counts,
-        arena_cluster_ids=arena_cluster_ids,
         arena_resident_table_buckets=arena_resident_table_buckets,
         arena_cluster_page_starts=arena_cluster_page_starts,
         arena_cluster_page_counts=arena_cluster_page_counts,
@@ -312,7 +308,7 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
         max_pages_per_cluster=2,
         fallback_token_counts=fallback_counts,
         sparse_cluster_indices=sparse_indices,
-        output_cluster_handles=cluster_handles,
+        cluster_handles=cluster_handles,
         output_page_slots=resident_page_ids,
         output_page_token_counts=page_token_counts,
         output_page_counts=page_counts,
@@ -371,10 +367,9 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
     )
 
     binding = torch.tensor([[3]], dtype=torch.int32, device=device)
-    arena_cluster_ids = torch.tensor([[10]], dtype=torch.int64, device=device)
     fallback_counts = torch.tensor([[[4]]], dtype=torch.int32, device=device)
-    sparse_indices = torch.empty((1, 1, 1), dtype=torch.int32, device=device)
-    handles = torch.empty((1, 1, 1), dtype=torch.int64, device=device)
+    sparse_indices = torch.tensor([[[0]]], dtype=torch.int32, device=device)
+    handles = torch.tensor([[[10]]], dtype=torch.int64, device=device)
     page_slots = torch.empty((1, 1, 1), dtype=torch.int64, device=device)
     page_token_counts = torch.empty((1, 1, 1), dtype=torch.int32, device=device)
     row_counts = torch.empty((1, 1), dtype=torch.int32, device=device)
@@ -392,11 +387,9 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
     expanded_attention = torch.empty(1, device=device)
 
     def resolve(emit_misses: bool = True) -> None:
-        resolve_ranked_compact_draft_pages(
+        resolve_compact_draft_pages(
             ranked_values=torch.tensor([[[1.0]]], device=device),
-            ranked_indices=torch.tensor([[[0]]], dtype=torch.int64, device=device),
             candidate_counts=torch.tensor([[1]], dtype=torch.int32, device=device),
-            arena_cluster_ids=arena_cluster_ids,
             arena_resident_table_buckets=binding,
             arena_cluster_page_starts=torch.tensor(
                 [[0]], dtype=torch.int32, device=device
@@ -425,7 +418,7 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
             max_pages_per_cluster=1,
             fallback_token_counts=fallback_counts,
             sparse_cluster_indices=sparse_indices,
-            output_cluster_handles=handles,
+            cluster_handles=handles,
             output_page_slots=page_slots,
             output_page_token_counts=page_token_counts,
             output_page_counts=row_counts,
@@ -504,7 +497,7 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
         table_page_slots=table[3],
         table_hit_gate_ready=table[4],
     )
-    arena_cluster_ids.fill_(11)
+    handles.fill_(11)
     fallback_counts.fill_(4)
     resolve()
     assert page_slots.item() == 5
