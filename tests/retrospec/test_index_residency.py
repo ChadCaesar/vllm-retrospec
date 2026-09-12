@@ -484,7 +484,10 @@ def test_cluster_summary_is_copied_to_cpu_authoritative_storage():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cluster_summary_offloads_asynchronously_to_pinned_cpu_storage():
     stats = RetroSpecPerformanceStats(
-        device=torch.device("cuda"), log_interval_seconds=60.0
+        device=torch.device("cuda"),
+        log_interval_seconds=60.0,
+        cuda_timing_level="detailed",
+        cuda_sample_interval=1,
     )
     manager = RetroSpecGPUIndexResidencyManager(
         pin_memory=True,

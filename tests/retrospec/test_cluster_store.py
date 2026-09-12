@@ -1790,6 +1790,8 @@ def test_cpu_backing_store_stages_before_updating_resident_cache():
     stats = RetroSpecPerformanceStats(
         device=device,
         log_interval_seconds=60.0,
+        cuda_timing_level="detailed",
+        cuda_sample_interval=1,
     )
     store = RetroSpecClusterPageStore(
         page_size=2,
@@ -2239,6 +2241,8 @@ def test_cpu_backing_store_reuses_full_verification_buffer_across_layers():
     stats = RetroSpecPerformanceStats(
         device=device,
         log_interval_seconds=60.0,
+        cuda_timing_level="detailed",
+        cuda_sample_interval=1,
     )
     store = RetroSpecClusterPageStore(
         page_size=2,
@@ -2668,6 +2672,8 @@ def test_cpu_backing_store_asynchronously_stages_cuda_inputs():
     stats = RetroSpecPerformanceStats(
         device=device,
         log_interval_seconds=60.0,
+        cuda_timing_level="detailed",
+        cuda_sample_interval=1,
     )
     store = RetroSpecClusterPageStore(
         page_size=2,

@@ -30,6 +30,8 @@ def test_benchmark_profile_controls_observation_interval():
         "min_draft_tokens": 1,
         "max_draft_tokens": 16,
         "stats_interval": 2.0,
+        "profile_level": "detailed",
+        "profile_sample_interval": 4,
         "graph": True,
         "sync_attention_gates": False,
     }
@@ -39,6 +41,8 @@ def test_benchmark_profile_controls_observation_interval():
 
     assert quiet["retrospec_stats_interval_seconds"] == 0.0
     assert profile["retrospec_stats_interval_seconds"] == 2.0
+    assert profile["retrospec_stats_cuda_timing_level"] == "detailed"
+    assert profile["retrospec_stats_cuda_sample_interval"] == 4
     assert profile["enforce_eager"] is False
 
 

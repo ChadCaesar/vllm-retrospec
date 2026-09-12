@@ -153,6 +153,16 @@ class RetroSpecSparseAttention:
                 0.0,
             ),
             histogram_max_value=config.num_speculative_tokens,
+            cuda_timing_level=getattr(
+                config,
+                "retrospec_stats_cuda_timing_level",
+                "coarse",
+            ),
+            cuda_sample_interval=getattr(
+                config,
+                "retrospec_stats_cuda_sample_interval",
+                8,
+            ),
         )
         cpu_page_slab_size_mib = getattr(
             config, "retrospec_cpu_page_slab_size_mib", 256

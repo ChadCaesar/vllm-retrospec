@@ -92,6 +92,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-gpu-index-memory", type=float, default=4.0)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--stats-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--profile-level", choices=("coarse", "detailed"), default="coarse"
+    )
+    parser.add_argument("--profile-sample-interval", type=int, default=8)
     parser.add_argument("--graph", action="store_true")
     parser.add_argument("--native", action="store_true")
     parser.add_argument("--sync-attention-gates", action="store_true")
@@ -129,6 +133,8 @@ def build_speculative_config(args: argparse.Namespace) -> dict[str, Any]:
         "retrospec_stats_interval_seconds": (
             args.stats_interval if args.profile else 0.0
         ),
+        "retrospec_stats_cuda_timing_level": args.profile_level,
+        "retrospec_stats_cuda_sample_interval": args.profile_sample_interval,
         "enforce_eager": not args.graph,
     }
     if args.sync_attention_gates:
@@ -199,6 +205,10 @@ def main() -> None:
         result = {
             "mode": "native" if args.native else "retrospec",
             "profile": args.profile,
+            "profile_level": args.profile_level if args.profile else "disabled",
+            "profile_sample_interval": (
+                args.profile_sample_interval if args.profile else 0
+            ),
             "graph": args.graph,
             "requested_context_len": args.context_len,
             "actual_prompt_tokens": len(output.prompt_token_ids),

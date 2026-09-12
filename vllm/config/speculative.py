@@ -247,6 +247,13 @@ class SpeculativeConfig:
     retrospec_stats_interval_seconds: float = Field(default=0.0, ge=0)
     """Interval for worker-side RetroSpec performance logs. Zero disables all
     RetroSpec performance counters and CUDA event timing."""
+    retrospec_stats_cuda_timing_level: Literal["coarse", "detailed"] = "coarse"
+    """CUDA timing detail recorded by RetroSpec statistics. Coarse mode records
+    only whole draft, verification, and full-verification transactions.
+    Detailed mode additionally samples layer- and operation-level timers."""
+    retrospec_stats_cuda_sample_interval: int = Field(default=8, gt=0)
+    """Record one out of every N detailed CUDA timing samples. Coarse timers
+    are always recorded while RetroSpec statistics are enabled."""
 
     def compute_hash(self) -> str:
         """
