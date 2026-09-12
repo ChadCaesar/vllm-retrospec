@@ -1234,16 +1234,17 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
     access_kinds = torch.full_like(cluster_ids, 2, dtype=torch.uint8)
     assert store.prefetch_resident_clusters("layer", cluster_ids, access_kinds)
     store.wait_for_resident_prefetches(("layer",))
+    store.wait_for_resident_prefetches()
     assert stats._cpu_counters["prefetch_submitted"] == 1
     assert stats._cpu_counters["prefetch_command_capacity"] == cluster_ids.numel()
     assert stats._cpu_counters["prefetch_worker_completed"] == 1
     assert stats._cpu_counters["prefetch_reaped_tasks"] == 1
-    assert stats._cpu_counters["prefetch_waited_tasks"] == 1
+    assert stats._cpu_counters["prefetch_waited_tasks"] >= 1
     assert stats._cpu_counters["prefetch_miss_commands"] == 4
     assert stats._cpu_counters["prefetch_duplicate_misses"] == 0
     assert stats._cpu_times["prefetch_metadata_wait"][1] == 1
     assert stats._cpu_times["prefetch_worker_wall"][1] == 1
-    assert stats._cpu_times["prefetch_wait_wall"][1] == 1
+    assert stats._cpu_times["prefetch_wait_wall"][1] >= 1
 
     access = store.lookup_resident_clusters(
         "layer", cluster_ids, metadata.page_ids, touch=False
@@ -1273,6 +1274,21 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
         resident_values.index_select(0, resident_slots).cpu(),
         backing_values,
     )
+
+    resident_cluster_ids = cluster_ids[access.hit_cluster_mask]
+    stats._cpu_counters.clear()
+    original_stage = store._stage_resident_pages
+    store._stage_resident_pages = Mock(wraps=original_stage)
+    assert store.prefetch_resident_clusters(
+        "layer",
+        resident_cluster_ids,
+        torch.full_like(resident_cluster_ids, 2, dtype=torch.uint8),
+    )
+    store.wait_for_resident_prefetches()
+    store._stage_resident_pages.assert_not_called()
+    assert stats._cpu_counters["prefetch_skipped_resident_clusters"] == 2
+    assert stats._cpu_counters.get("prefetch_skipped_pending_clusters", 0) == 0
+    store.close()
 
 
 def test_resident_prefetch_native_batch_preserves_rank_priority_and_miss():
@@ -1342,6 +1358,38 @@ def test_resident_prefetch_native_batch_rejects_invalid_commands(
         )
 
 
+def test_resident_prefetch_wave_progress_waits_only_for_requested_layer():
+    progress = cluster_store_module._ResidentPrefetchWaveProgress.create(
+        ("first", "second")
+    )
+    wait_completed = threading.Event()
+
+    def wait_for_first() -> None:
+        progress.wait_for(("first",))
+        wait_completed.set()
+
+    waiter = threading.Thread(target=wait_for_first)
+    waiter.start()
+    progress.complete_layer("second")
+    assert not wait_completed.wait(timeout=0.05)
+
+    progress.complete_layer("first")
+    waiter.join(timeout=1.0)
+    assert not waiter.is_alive()
+    assert wait_completed.is_set()
+
+
+def test_resident_prefetch_wave_progress_propagates_failure():
+    progress = cluster_store_module._ResidentPrefetchWaveProgress.create(("layer",))
+    failure = ValueError("worker failed")
+
+    progress.fail(failure)
+
+    with pytest.raises(RuntimeError, match="background processing") as exc_info:
+        progress.wait_for(("layer",))
+    assert exc_info.value.__cause__ is failure
+
+
 def test_resident_prefetch_bounded_wait_is_device_local():
     store = RetroSpecClusterPageStore(page_size=2)
     device_0 = torch.device("cuda:0")
@@ -1355,11 +1403,17 @@ def test_resident_prefetch_bounded_wait_is_device_local():
             cluster_store_module._ResidentPrefetchWaveFuture(
                 device=device_0,
                 layer_names=frozenset(("layer-0",)),
+                progress=cluster_store_module._ResidentPrefetchWaveProgress.create(
+                    ("layer-0",)
+                ),
                 future=future_0,
             ),
             cluster_store_module._ResidentPrefetchWaveFuture(
                 device=device_1,
                 layer_names=frozenset(("layer-1",)),
+                progress=cluster_store_module._ResidentPrefetchWaveProgress.create(
+                    ("layer-1",)
+                ),
                 future=future_1,
             ),
         )
@@ -1378,7 +1432,7 @@ def test_resident_prefetch_bounded_wait_is_device_local():
     not torch.cuda.is_available() or not is_pin_memory_available(),
     reason="CUDA pinned memory is required for asynchronous resident prefetch",
 )
-def test_resident_prefetch_wave_batches_layers_and_waits_once():
+def test_resident_prefetch_wave_batches_layers_and_waits_per_layer():
     device = torch.device("cuda", torch.cuda.current_device())
     stats = RetroSpecPerformanceStats(device=device, log_interval_seconds=60.0)
     store = RetroSpecClusterPageStore(
@@ -1425,21 +1479,107 @@ def test_resident_prefetch_wave_batches_layers_and_waits_once():
         )
     stats._cpu_counters.clear()
 
+    second_layer_started = threading.Event()
+    second_layer_completed = threading.Event()
+    release_second_layer = threading.Event()
+    original_process = store._process_prepared_resident_prefetch
+
+    def block_second_layer(prepared, execution_stream):
+        if prepared.layer_name == "second":
+            second_layer_started.set()
+            assert release_second_layer.wait(timeout=10.0)
+        original_process(prepared, execution_stream)
+        if prepared.layer_name == "second":
+            second_layer_completed.set()
+
+    store._process_prepared_resident_prefetch = block_second_layer
     store.configure_resident_prefetch_wave(2)
     assert store.prefetch_resident_cluster_wave(records)
-    store.wait_for_resident_prefetches(("first",))
+    try:
+        store.wait_for_resident_prefetches(("first",))
+        assert second_layer_started.wait(timeout=10.0)
 
-    assert not store._resident_prefetch_futures
-    assert store.num_resident_clusters("first") == 2
-    assert store.num_resident_clusters("second") == 2
-    assert stats._cpu_counters["prefetch_submitted"] == 2
-    assert stats._cpu_counters["prefetch_waves_submitted"] == 1
-    assert stats._cpu_counters["prefetch_wave_records"] == 2
-    assert stats._cpu_counters["prefetch_worker_completed"] == 1
-    assert stats._cpu_counters["prefetch_waited_waves"] == 1
-    store.wait_for_resident_prefetches(("second",))
-    assert stats._cpu_counters["prefetch_waited_waves"] == 1
+        assert store._resident_prefetch_futures
+        assert store.num_resident_clusters("first") == 2
+        assert not second_layer_completed.is_set()
+        assert stats._cpu_counters["prefetch_submitted"] == 2
+        assert stats._cpu_counters["prefetch_waves_submitted"] == 1
+        assert stats._cpu_counters["prefetch_wave_records"] == 2
+        assert stats._cpu_counters["prefetch_waited_waves"] == 1
+        assert stats._cpu_counters["prefetch_layer_waits"] == 1
+
+        release_second_layer.set()
+        store.wait_for_resident_prefetches(("second",))
+        assert second_layer_completed.is_set()
+        assert store.num_resident_clusters("second") == 2
+        assert stats._cpu_counters["prefetch_layer_waits"] == 2
+        store.wait_for_resident_prefetches()
+        assert not store._resident_prefetch_futures
+        assert stats._cpu_counters["prefetch_worker_completed"] == 1
+        assert stats._cpu_counters["prefetch_reaped_tasks"] == 1
+    finally:
+        release_second_layer.set()
     store.close()
+    store.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_pin_memory_available(),
+    reason="CUDA pinned memory is required for asynchronous resident prefetch",
+)
+def test_resident_prefetch_releases_metadata_slot_before_descriptor_preparation():
+    device = torch.device("cuda", torch.cuda.current_device())
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        pin_memory=True,
+        cache_ratio=0.5,
+    )
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys.to(device),
+        values.to(device),
+        assignments.to(device),
+        cluster_token_counts.to(device),
+    )
+    cluster_ids = table.cluster_ids.to(device).reshape(-1)
+    prepare_started = threading.Event()
+    release_prepare = threading.Event()
+    original_prepare = store._prepare_resident_prefetch_record
+
+    def blocking_prepare(staged, ordered_cluster_ids):
+        prepare_started.set()
+        assert release_prepare.wait(timeout=10.0)
+        return original_prepare(staged, ordered_cluster_ids)
+
+    store._prepare_resident_prefetch_record = blocking_prepare
+    store.configure_resident_prefetch_wave(1)
+    record = RetroSpecResidentPrefetchInput(
+        layer_name="layer",
+        miss_cluster_ids=cluster_ids,
+        miss_positions=torch.arange(
+            cluster_ids.numel(), dtype=torch.int64, device=device
+        ),
+        miss_count=torch.tensor(
+            [cluster_ids.numel()], dtype=torch.int32, device=device
+        ),
+        num_groups=table.cluster_ids.shape[0],
+        num_ranks=table.cluster_ids.shape[1],
+    )
+
+    assert store.prefetch_resident_cluster_wave((record,))
+    try:
+        assert prepare_started.wait(timeout=10.0)
+        assert all(
+            not slot.in_use
+            for slots in store._resident_prefetch_slots.values()
+            for slot in slots
+        )
+    finally:
+        release_prepare.set()
+
+    store.wait_for_resident_prefetches()
     store.close()
 
 

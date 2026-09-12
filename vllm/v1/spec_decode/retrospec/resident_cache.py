@@ -234,6 +234,30 @@ class RetroSpecResidentClusterCache:
         """Return the short guard shared by GPU readers and cache mutations."""
         return self._gpu_access_lock
 
+    def partition_admission_candidates(
+        self,
+        cluster_ids: Collection[_ClusterId],
+    ) -> tuple[tuple[_ClusterId, ...], int, int]:
+        """Separate absent clusters from resident and pending clusters.
+
+        The caller must hold ``mutation_guard()``. Input priority order is
+        preserved in the returned admission candidates.
+        """
+        self._reap_completed_copy_batches()
+
+        admission_candidates: list[_ClusterId] = []
+        resident_count = 0
+        pending_count = 0
+        for cluster_id in cluster_ids:
+            if cluster_id not in self._cluster_to_slots:
+                admission_candidates.append(cluster_id)
+            elif cluster_id in self._pending_cluster_events:
+                pending_count += 1
+            else:
+                resident_count += 1
+
+        return tuple(admission_candidates), resident_count, pending_count
+
     def _find_handle_bucket(self, cluster_id: _ClusterId) -> int | None:
         if self._handle_table_capacity == 0:
             return None

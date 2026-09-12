@@ -286,6 +286,30 @@ def test_pending_resident_cluster_can_be_hidden_from_draft_lookup():
     assert not cache._pending_cluster_events
 
 
+def test_partition_admission_candidates_preserves_priority_and_pending_state():
+    cache = make_cache(capacity=4)
+    backing_keys, backing_values = make_backing_pages()
+
+    cache._reap_completed_copy_batches = Mock()
+    cache.admit(
+        torch.tensor([[0], [1]], dtype=torch.int64),
+        set(range(4)),
+        backing_keys,
+        backing_values,
+    )
+    cache._pending_cluster_events.pop(0)
+
+    with cache.mutation_guard():
+        candidates, resident_count, pending_count = (
+            cache.partition_admission_candidates((3, 0, 1, 2))
+        )
+
+    assert candidates == (3, 2)
+    assert resident_count == 1
+    assert pending_count == 1
+    cache.synchronize_pending_copies()
+
+
 def test_completed_old_batch_does_not_clear_newer_pending_cluster_event():
     cache = make_cache(capacity=1)
     source_keys, source_values = make_backing_pages(num_pages=1)

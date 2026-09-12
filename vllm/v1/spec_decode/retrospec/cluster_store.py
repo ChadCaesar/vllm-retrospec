@@ -442,6 +442,52 @@ class _StagedResidentPrefetchRecord:
     num_ranks: int
 
 
+@dataclass
+class _ResidentPrefetchWaveProgress:
+    """Per-layer completion state for one resident-prefetch wave."""
+
+    layer_events: dict[str, ThreadEvent]
+    _failure: BaseException | None = field(default=None, init=False, repr=False)
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
+
+    @classmethod
+    def create(cls, layer_names: Sequence[str]) -> "_ResidentPrefetchWaveProgress":
+        return cls(
+            layer_events={layer_name: ThreadEvent() for layer_name in layer_names}
+        )
+
+    def complete_layer(self, layer_name: str) -> None:
+        event = self.layer_events.get(layer_name)
+        if event is None:
+            raise RuntimeError(f"Unknown resident-prefetch layer: {layer_name}")
+        event.set()
+
+    def fail(self, error: BaseException) -> None:
+        with self._lock:
+            if self._failure is None:
+                self._failure = error
+        for event in self.layer_events.values():
+            event.set()
+
+    def wait_for(self, layer_names: Sequence[str]) -> None:
+        events: list[ThreadEvent] = []
+        for layer_name in dict.fromkeys(layer_names):
+            event = self.layer_events.get(layer_name)
+            if event is None:
+                raise RuntimeError(f"Unknown resident-prefetch layer: {layer_name}")
+            events.append(event)
+
+        for event in events:
+            event.wait()
+
+        with self._lock:
+            failure = self._failure
+        if failure is not None:
+            raise RuntimeError(
+                "Resident-prefetch background processing failed"
+            ) from failure
+
+
 @dataclass(frozen=True)
 class _StagedResidentPrefetchWave:
     """One draft step's cross-layer resident access records."""
@@ -449,6 +495,7 @@ class _StagedResidentPrefetchWave:
     records: tuple[_StagedResidentPrefetchRecord, ...]
     metadata_ready_event: torch.cuda.Event
     execution_stream: torch.cuda.Stream
+    progress: _ResidentPrefetchWaveProgress = field(repr=False, compare=False)
     slot: _PinnedSelectionSlot = field(repr=False, compare=False)
 
 
@@ -478,6 +525,7 @@ class _ResidentPrefetchWaveFuture:
 
     device: torch.device
     layer_names: frozenset[str]
+    progress: _ResidentPrefetchWaveProgress = field(repr=False, compare=False)
     future: Future[None] = field(repr=False, compare=False)
 
 
@@ -3606,6 +3654,9 @@ class RetroSpecClusterPageStore:
     ) -> None:
         device = self._canonical_cuda_device(records[0].miss_cluster_ids.device)
         stream = self._get_resident_prefetch_stream(device)
+        progress = _ResidentPrefetchWaveProgress.create(
+            tuple(record.layer_name for record in records)
+        )
         ownership_transferred = False
         try:
             cpu_views = slot.reserve_wave(records)
@@ -3647,6 +3698,7 @@ class RetroSpecClusterPageStore:
                 ),
                 metadata_ready_event=metadata_ready_event,
                 execution_stream=stream,
+                progress=progress,
                 slot=slot,
             )
             future = self._resident_prefetch_executor.submit(
@@ -3662,6 +3714,7 @@ class RetroSpecClusterPageStore:
                     _ResidentPrefetchWaveFuture(
                         device=device,
                         layer_names=frozenset(record.layer_name for record in records),
+                        progress=progress,
                         future=future,
                     )
                 )
@@ -3796,10 +3849,10 @@ class RetroSpecClusterPageStore:
                 torch.cuda.current_stream(device).wait_event(metadata_event)
 
     @torch.inference_mode()
-    def _prepare_resident_prefetch_wave(
+    def _order_resident_prefetch_wave(
         self,
         records: tuple[_StagedResidentPrefetchRecord, ...],
-    ) -> tuple[_PreparedResidentPrefetchRecord, ...]:
+    ) -> tuple[torch.Tensor, ...]:
         ordered_records, raw_counts = ops.retrospec_order_prefetch_misses(
             tuple(record.miss_cluster_ids_cpu for record in records),
             tuple(record.miss_positions_cpu for record in records),
@@ -3819,44 +3872,61 @@ class RetroSpecClusterPageStore:
                 raw_command_count - unique_command_count,
             )
 
-        prepared: list[_PreparedResidentPrefetchRecord] = []
+        return tuple(ordered_records)
+
+    @torch.inference_mode()
+    def _prepare_resident_prefetch_record(
+        self,
+        staged: _StagedResidentPrefetchRecord,
+        ordered_cluster_ids: torch.Tensor,
+    ) -> _PreparedResidentPrefetchRecord | None:
+        if ordered_cluster_ids.numel() == 0:
+            return None
+
+        stats = self.performance_stats
         stale_commands = 0
+        skipped_resident = 0
+        skipped_pending = 0
         with self._resident_state_lock:
-            for staged, ordered_cluster_ids in zip(records, ordered_records):
-                if ordered_cluster_ids.numel() == 0:
-                    continue
+            pool, resident_cache = self._get_or_create_resident_cache(staged.layer_name)
+            descriptors = self._cluster_block_descriptors.get(staged.layer_name, {})
+            transfer_buffer = self._get_full_verification_buffer(pool)
+            page_capacity = transfer_buffer.cpu_slot_capacity(pool)
 
-                pool, resident_cache = self._get_or_create_resident_cache(
-                    staged.layer_name
+            known_cluster_ids: list[int] = []
+            for cluster_id in ordered_cluster_ids.tolist():
+                if cluster_id not in descriptors:
+                    stale_commands += 1
+                    continue
+                known_cluster_ids.append(cluster_id)
+
+            with resident_cache.mutation_guard():
+                (
+                    admission_candidates,
+                    skipped_resident,
+                    skipped_pending,
+                ) = resident_cache.partition_admission_candidates(known_cluster_ids)
+
+            selected_cluster_ids: list[int] = []
+            selected_descriptors: list[_ClusterBlockDescriptor] = []
+            selected_pages: set[int] = set()
+            for cluster_id in admission_candidates:
+                descriptor = descriptors[cluster_id]
+                new_pages = tuple(
+                    page_id
+                    for page_id in descriptor.page_ids
+                    if page_id not in selected_pages
                 )
-                descriptors = self._cluster_block_descriptors.get(staged.layer_name, {})
-                transfer_buffer = self._get_full_verification_buffer(pool)
-                page_capacity = transfer_buffer.cpu_slot_capacity(pool)
+                if len(selected_pages) + len(new_pages) > page_capacity:
+                    break
 
-                selected_cluster_ids: list[int] = []
-                selected_descriptors: list[_ClusterBlockDescriptor] = []
-                selected_pages: set[int] = set()
-                for cluster_id in ordered_cluster_ids.tolist():
-                    descriptor = descriptors.get(cluster_id)
-                    if descriptor is None:
-                        stale_commands += 1
-                        continue
+                selected_cluster_ids.append(cluster_id)
+                selected_descriptors.append(descriptor)
+                selected_pages.update(new_pages)
 
-                    new_pages = tuple(
-                        page_id
-                        for page_id in descriptor.page_ids
-                        if page_id not in selected_pages
-                    )
-                    if len(selected_pages) + len(new_pages) > page_capacity:
-                        break
-
-                    selected_cluster_ids.append(cluster_id)
-                    selected_descriptors.append(descriptor)
-                    selected_pages.update(new_pages)
-
-                if not selected_cluster_ids:
-                    continue
-
+            if not selected_cluster_ids:
+                prepared = None
+            else:
                 max_pages = max(
                     len(descriptor.page_ids) for descriptor in selected_descriptors
                 )
@@ -3876,22 +3946,25 @@ class RetroSpecClusterPageStore:
                     )
                     cluster_groups[cluster_id] = descriptor.identity.group
 
-                prepared.append(
-                    _PreparedResidentPrefetchRecord(
-                        layer_name=staged.layer_name,
-                        pool=pool,
-                        resident_cache=resident_cache,
-                        cluster_ids_cpu=cluster_ids_cpu,
-                        page_ids_cpu=page_ids_cpu,
-                        cluster_groups=cluster_groups,
-                    )
+                prepared = _PreparedResidentPrefetchRecord(
+                    layer_name=staged.layer_name,
+                    pool=pool,
+                    resident_cache=resident_cache,
+                    cluster_ids_cpu=cluster_ids_cpu,
+                    page_ids_cpu=page_ids_cpu,
+                    cluster_groups=cluster_groups,
                 )
 
-        if self.performance_stats is not None and stale_commands:
-            self.performance_stats.add_counter(
-                "prefetch_stale_commands", stale_commands
-            )
-        return tuple(prepared)
+        if stats is not None:
+            if stale_commands:
+                stats.add_counter("prefetch_stale_commands", stale_commands)
+            if skipped_resident:
+                stats.add_counter(
+                    "prefetch_skipped_resident_clusters", skipped_resident
+                )
+            if skipped_pending:
+                stats.add_counter("prefetch_skipped_pending_clusters", skipped_pending)
+        return prepared
 
     @torch.inference_mode()
     def _process_prepared_resident_prefetch(
@@ -3946,6 +4019,7 @@ class RetroSpecClusterPageStore:
         background_started_at = (
             perf_counter() if stats is not None and stats.enabled else None
         )
+        slot_released = False
         completed = False
         try:
             metadata_wait_started_at = (
@@ -3958,12 +4032,25 @@ class RetroSpecClusterPageStore:
                     perf_counter() - metadata_wait_started_at,
                 )
 
-            prepared_records = self._prepare_resident_prefetch_wave(staged.records)
-            for prepared in prepared_records:
-                self._process_prepared_resident_prefetch(
-                    prepared, staged.execution_stream
+            ordered_records = self._order_resident_prefetch_wave(staged.records)
+            self._release_resident_prefetch_slot(staged.slot)
+            slot_released = True
+
+            for staged_record, ordered_cluster_ids in zip(
+                staged.records, ordered_records
+            ):
+                prepared = self._prepare_resident_prefetch_record(
+                    staged_record, ordered_cluster_ids
                 )
+                if prepared is not None:
+                    self._process_prepared_resident_prefetch(
+                        prepared, staged.execution_stream
+                    )
+                staged.progress.complete_layer(staged_record.layer_name)
             completed = True
+        except BaseException as error:
+            staged.progress.fail(error)
+            raise
         finally:
             if stats is not None:
                 stats.add_counter(
@@ -3976,7 +4063,8 @@ class RetroSpecClusterPageStore:
                         "prefetch_worker_wall",
                         perf_counter() - background_started_at,
                     )
-            self._release_resident_prefetch_slot(staged.slot)
+            if not slot_released:
+                self._release_resident_prefetch_slot(staged.slot)
 
     def _reap_resident_prefetches(
         self,
@@ -3984,7 +4072,8 @@ class RetroSpecClusterPageStore:
         wait: bool = False,
     ) -> None:
         requested_layers = None if layer_names is None else frozenset(layer_names)
-        ready: list[_ResidentPrefetchWaveFuture] = []
+        completed: list[_ResidentPrefetchWaveFuture] = []
+        layer_waits: list[tuple[_ResidentPrefetchWaveFuture, tuple[str, ...]]] = []
         with self._resident_prefetch_lock:
             retained: deque[_ResidentPrefetchWaveFuture] = deque()
             while self._resident_prefetch_futures:
@@ -3992,30 +4081,51 @@ class RetroSpecClusterPageStore:
                 matches = requested_layers is None or not wave.layer_names.isdisjoint(
                     requested_layers
                 )
-                if matches and (wait or wave.future.done()):
-                    ready.append(wave)
-                else:
+                if not matches:
                     retained.append(wave)
+                    continue
+                if wave.future.done() or (wait and requested_layers is None):
+                    completed.append(wave)
+                    continue
+                if wait:
+                    matched_layers = tuple(
+                        layer_name
+                        for layer_name in requested_layers
+                        if layer_name in wave.layer_names
+                    )
+                    layer_waits.append((wave, matched_layers))
+                retained.append(wave)
             self._resident_prefetch_futures = retained
 
+        layer_wait_count = sum(len(waited_layers) for _, waited_layers in layer_waits)
         if self.performance_stats is not None:
-            self.performance_stats.add_counter("prefetch_reaped_tasks", len(ready))
-            self.performance_stats.add_counter("prefetch_reaped_waves", len(ready))
+            self.performance_stats.add_counter("prefetch_reaped_tasks", len(completed))
+            self.performance_stats.add_counter("prefetch_reaped_waves", len(completed))
             if wait:
-                self.performance_stats.add_counter("prefetch_waited_tasks", len(ready))
-                self.performance_stats.add_counter("prefetch_waited_waves", len(ready))
+                waited_waves = len(completed) + len(layer_waits)
+                self.performance_stats.add_counter(
+                    "prefetch_waited_tasks", waited_waves
+                )
+                self.performance_stats.add_counter(
+                    "prefetch_waited_waves", waited_waves
+                )
+                self.performance_stats.add_counter(
+                    "prefetch_layer_waits", layer_wait_count
+                )
 
         wait_started_at = (
             perf_counter()
             if wait
-            and ready
+            and (completed or layer_waits)
             and self.performance_stats is not None
             and self.performance_stats.enabled
             else None
         )
         try:
-            for wave in ready:
+            for wave in completed:
                 wave.future.result()
+            for wave, waited_layers in layer_waits:
+                wave.progress.wait_for(waited_layers)
         finally:
             if wait_started_at is not None:
                 self.performance_stats.record_cpu_time(
