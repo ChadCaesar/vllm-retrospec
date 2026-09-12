@@ -203,7 +203,8 @@ void retrospec_gather_compact_kv(const std::vector<torch::Tensor>& key_slabs,
                                  const torch::Tensor& token_offsets,
                                  int64_t destination_token_start,
                                  torch::Tensor& key_output,
-                                 torch::Tensor& value_output);
+                                 torch::Tensor& value_output,
+                                 int64_t num_workers);
 
 std::tuple<std::vector<torch::Tensor>, torch::Tensor>
 retrospec_order_prefetch_misses(

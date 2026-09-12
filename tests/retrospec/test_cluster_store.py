@@ -96,6 +96,40 @@ def test_full_verification_ticket_reports_ready_and_signals_cancellation():
     assert completed_ticket.ready()
 
 
+def test_full_verification_staging_ring_waits_for_released_slot():
+    buffer = cluster_store_module._FullVerificationTransferBuffer.__new__(
+        cluster_store_module._FullVerificationTransferBuffer
+    )
+    buffer._closed = False
+    buffer._cpu_slot_lock = threading.Lock()
+    buffer._cpu_slot_available = threading.Condition(buffer._cpu_slot_lock)
+    buffer._cpu_slot_cursor = 0
+    first_slot = SimpleNamespace(in_use=True, reuse_ready_event=None)
+    second_slot = SimpleNamespace(in_use=True, reuse_ready_event=None)
+    buffer._cpu_slots = [first_slot, second_slot]
+
+    acquire_started = threading.Event()
+    acquired_slots = []
+
+    def acquire_slot():
+        acquire_started.set()
+        acquired_slots.append(buffer._acquire_cpu_slot())
+
+    waiter = threading.Thread(target=acquire_slot)
+    waiter.start()
+    assert acquire_started.wait(timeout=1)
+    waiter.join(timeout=0.1)
+    assert waiter.is_alive()
+
+    buffer.release_cpu_slot(first_slot, None)
+    waiter.join(timeout=1)
+
+    assert not waiter.is_alive()
+    assert acquired_slots == [first_slot]
+    assert first_slot.in_use
+    buffer.release_cpu_slot(first_slot, None)
+
+
 def test_full_verification_descriptor_compacts_partial_pages():
     store = RetroSpecClusterPageStore(page_size=2)
     keys, values, assignments, cluster_token_counts = make_cluster_data()
@@ -155,7 +189,8 @@ def test_full_verification_descriptor_packs_head_local_range_offsets():
     )
 
 
-def test_native_compact_gather_clips_multi_request_ranges_to_chunk():
+@pytest.mark.parametrize("num_workers", [1, 2, 4])
+def test_native_compact_gather_clips_multi_request_ranges_to_chunk(num_workers):
     key_slab = torch.arange(32, dtype=torch.float32).view(8, 2, 2)
     value_slab = key_slab + 100
     range_tables = (
@@ -196,10 +231,75 @@ def test_native_compact_gather_clips_multi_request_ranges_to_chunk():
         2,
         key_output,
         value_output,
+        num_workers,
     )
 
     torch.testing.assert_close(key_output, expected_keys[2:7])
     torch.testing.assert_close(value_output, expected_keys[2:7] + 100)
+
+
+@pytest.mark.parametrize("num_workers", [1, 2, 4])
+def test_native_compact_gather_parallelizes_across_slabs(num_workers):
+    key_slabs = (
+        torch.arange(16, dtype=torch.float32).view(2, 4, 2),
+        torch.arange(100, 116, dtype=torch.float32).view(2, 4, 2),
+    )
+    value_slabs = tuple(key_slab + 1000 for key_slab in key_slabs)
+    range_tables = (
+        torch.tensor(
+            [
+                [0, 0, 1, 3, 0],
+                [0, 1, 0, 2, 3],
+                [1, 1, 2, 4, 0],
+            ],
+            dtype=torch.int64,
+        ),
+    )
+    token_offsets = torch.tensor([[0, 5]], dtype=torch.int64)
+    expected_keys = torch.cat(
+        (
+            key_slabs[0].view(-1, 2)[1:4],
+            key_slabs[1].view(-1, 2)[0:2],
+            key_slabs[1].view(-1, 2)[2:6],
+        )
+    )
+    key_output = torch.empty(6, 2)
+    value_output = torch.empty_like(key_output)
+
+    ops.retrospec_gather_compact_kv(
+        key_slabs,
+        value_slabs,
+        range_tables,
+        token_offsets,
+        2,
+        key_output,
+        value_output,
+        num_workers,
+    )
+
+    torch.testing.assert_close(key_output, expected_keys[2:8])
+    torch.testing.assert_close(value_output, expected_keys[2:8] + 1000)
+
+
+def test_native_compact_gather_rejects_non_positive_worker_count():
+    key_slab = torch.arange(4, dtype=torch.float32).view(1, 2, 2)
+    value_slab = key_slab + 100
+    range_table = torch.tensor([[0, 0, 0, 2, 0]], dtype=torch.int64)
+    token_offsets = torch.tensor([[0]], dtype=torch.int64)
+    key_output = torch.empty(2, 2)
+    value_output = torch.empty_like(key_output)
+
+    with pytest.raises(RuntimeError, match="worker count must be positive"):
+        ops.retrospec_gather_compact_kv(
+            (key_slab,),
+            (value_slab,),
+            (range_table,),
+            token_offsets,
+            0,
+            key_output,
+            value_output,
+            0,
+        )
 
 
 def store_cluster_data(
@@ -3060,3 +3160,8 @@ def test_cluster_store_rejects_non_positive_page_size(page_size):
 def test_cluster_store_rejects_non_positive_page_build_workers():
     with pytest.raises(ValueError, match="cpu_page_build_workers"):
         RetroSpecClusterPageStore(page_size=2, cpu_page_build_workers=0)
+
+
+def test_cluster_store_rejects_non_positive_full_verify_gather_workers():
+    with pytest.raises(ValueError, match="full_verify_gather_workers"):
+        RetroSpecClusterPageStore(page_size=2, full_verify_gather_workers=0)

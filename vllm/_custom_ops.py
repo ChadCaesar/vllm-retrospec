@@ -53,6 +53,7 @@ def retrospec_gather_compact_kv(
     destination_token_start: int,
     key_output: torch.Tensor,
     value_output: torch.Tensor,
+    num_workers: int,
 ) -> None:
     torch.ops._C.retrospec_gather_compact_kv(
         key_slabs,
@@ -62,6 +63,7 @@ def retrospec_gather_compact_kv(
         destination_token_start,
         key_output,
         value_output,
+        num_workers,
     )
 
 

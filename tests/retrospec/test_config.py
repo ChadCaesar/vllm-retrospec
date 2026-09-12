@@ -33,6 +33,7 @@ def test_retrospec_defaults():
     assert config.retrospec_kmeans_iterations == 10
     assert config.retrospec_max_pending_cluster_builds == 2
     assert config.retrospec_cpu_page_build_workers == 4
+    assert config.retrospec_full_verify_gather_workers == 4
     assert config.retrospec_cpu_page_initial_slab_size_mib == 8
     assert config.retrospec_cpu_page_slab_size_mib == 256
     assert config.retrospec_max_pinned_memory == pytest.approx(1.0)
@@ -131,6 +132,7 @@ def test_retrospec_inherits_target_enforce_eager(target_enforce_eager: bool):
         ("retrospec_kmeans_iterations", 0),
         ("retrospec_max_pending_cluster_builds", 0),
         ("retrospec_cpu_page_build_workers", 0),
+        ("retrospec_full_verify_gather_workers", 0),
         ("retrospec_cpu_page_initial_slab_size_mib", 0),
         ("retrospec_cpu_page_slab_size_mib", 0),
         ("retrospec_max_pinned_memory", 0.0),
@@ -242,6 +244,7 @@ def test_retrospec_hash_tracks_execution_structure(field: str, value: Any):
         ("retrospec_expanded_attn_threshold", 0.1),
         ("retrospec_max_pending_cluster_builds", 4),
         ("retrospec_cpu_page_build_workers", 8),
+        ("retrospec_full_verify_gather_workers", 8),
         ("retrospec_cpu_page_initial_slab_size_mib", 16),
         ("retrospec_cpu_page_slab_size_mib", 512),
         ("retrospec_max_pinned_memory", 2.0),

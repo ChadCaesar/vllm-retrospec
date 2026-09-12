@@ -2325,6 +2325,7 @@ def test_segmented_index_builds_and_selects_on_cuda():
         ({"num_kmeans_iterations": 0}, "positive"),
         ({"max_pending_cluster_builds": 0}, "positive"),
         ({"cpu_page_build_workers": 0}, "positive"),
+        ({"full_verify_gather_workers": 0}, "positive"),
     ],
 )
 def test_segmented_index_rejects_invalid_configuration(kwargs, message):

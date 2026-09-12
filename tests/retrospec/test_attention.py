@@ -48,6 +48,7 @@ def make_controller(
     cache_ratio: float = 0.0,
     max_pending_cluster_builds: int = 2,
     cpu_page_build_workers: int = 4,
+    full_verify_gather_workers: int = 4,
     cpu_page_slab_size_mib: int = 1,
     max_pinned_memory: float = 0.0625,
     max_gpu_index_memory: float = 0.125,
@@ -73,6 +74,7 @@ def make_controller(
                 retrospec_kmeans_iterations=2,
                 retrospec_max_pending_cluster_builds=max_pending_cluster_builds,
                 retrospec_cpu_page_build_workers=cpu_page_build_workers,
+                retrospec_full_verify_gather_workers=full_verify_gather_workers,
                 retrospec_cpu_page_slab_size_mib=cpu_page_slab_size_mib,
                 retrospec_max_pinned_memory=max_pinned_memory,
                 retrospec_max_gpu_index_memory=max_gpu_index_memory,
@@ -136,6 +138,7 @@ def test_segmented_attention_configures_cluster_backing_store(
     )
     assert controller.index.max_pending_cluster_builds == 2
     assert controller.index.cluster_store.cpu_page_build_workers == 4
+    assert controller.index.cluster_store.full_verify_gather_workers == 4
     assert controller.index.cluster_store.cpu_page_slab_bytes == 1 << 20
     assert controller.index.cluster_store.max_pinned_memory_bytes == 64 << 20
     assert controller.index._gpu_index_residency.max_gpu_index_memory_bytes == 128 << 20
@@ -154,6 +157,12 @@ def test_segmented_attention_configures_cpu_page_build_workers():
     controller = make_controller(cpu_page_build_workers=2)
 
     assert controller.index.cluster_store.cpu_page_build_workers == 2
+
+
+def test_segmented_attention_configures_full_verify_gather_workers():
+    controller = make_controller(full_verify_gather_workers=3)
+
+    assert controller.index.cluster_store.full_verify_gather_workers == 3
 
 
 def test_exact_attention_workspace_covers_mixed_verification_batch():

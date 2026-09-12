@@ -743,6 +743,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         max_model_len: int,
         max_pending_cluster_builds: int = 2,
         cpu_page_build_workers: int = 4,
+        full_verify_gather_workers: int = 4,
         cache_ratio: float = 0.0,
         pin_memory: bool = False,
         max_resident_requests: int = 1,
@@ -776,6 +777,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             raise ValueError("max_pending_cluster_builds must be positive")
         if cpu_page_build_workers <= 0:
             raise ValueError("cpu_page_build_workers must be positive")
+        if full_verify_gather_workers <= 0:
+            raise ValueError("full_verify_gather_workers must be positive")
         if first_draft_warmup_multiplier <= 0:
             raise ValueError("first_draft_warmup_multiplier must be positive")
         if cpu_page_slab_bytes <= 0:
@@ -836,6 +839,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             cpu_page_slab_bytes=cpu_page_slab_bytes,
             max_pending_cluster_builds=max_pending_cluster_builds,
             cpu_page_build_workers=cpu_page_build_workers,
+            full_verify_gather_workers=full_verify_gather_workers,
             performance_stats=performance_stats,
             pinned_memory=self._pinned_memory,
         )

@@ -7,8 +7,8 @@ from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from math import ceil
+from threading import Condition, Lock, RLock
 from threading import Event as ThreadEvent
-from threading import Lock, RLock
 from time import perf_counter
 from typing import Literal
 
@@ -1386,6 +1386,7 @@ class _FullVerificationTransferBuffer:
         device: torch.device,
         max_pinned_memory_bytes: int,
         pinned_memory: RetroSpecPinnedMemoryManager,
+        gather_workers: int,
         performance_stats: RetroSpecPerformanceStats | None = None,
     ) -> None:
         if page_size <= 0:
@@ -1394,6 +1395,8 @@ class _FullVerificationTransferBuffer:
             raise ValueError("Full-verification transfer buffer requires CUDA")
         if max_pinned_memory_bytes <= 0:
             raise ValueError("max_pinned_memory_bytes must be positive")
+        if gather_workers <= 0:
+            raise ValueError("gather_workers must be positive")
 
         if device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -1404,6 +1407,7 @@ class _FullVerificationTransferBuffer:
         self.max_pinned_memory_bytes = max_pinned_memory_bytes
         self._pinned_memory = pinned_memory
         self.pin_memory = pinned_memory.enabled
+        self.gather_workers = gather_workers
 
         self._gpu_arenas = [
             _FullVerificationGPUArena(),
@@ -1417,6 +1421,7 @@ class _FullVerificationTransferBuffer:
         self._cpu_slot_capacity = 0
         self._cpu_slot_cursor = 0
         self._cpu_slot_lock = Lock()
+        self._cpu_slot_available = Condition(self._cpu_slot_lock)
         self._gather_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix=f"retrospec-full-verify-{device.index}",
@@ -1547,10 +1552,11 @@ class _FullVerificationTransferBuffer:
             self._cpu_slot_cursor = 0
 
     def close(self) -> None:
-        if self._closed:
-            return
-
-        self._closed = True
+        with self._cpu_slot_available:
+            if self._closed:
+                return
+            self._closed = True
+            self._cpu_slot_available.notify_all()
         self._gather_executor.shutdown(wait=True)
 
         for slot in self._cpu_slots:
@@ -1567,25 +1573,29 @@ class _FullVerificationTransferBuffer:
         self._cpu_slot_capacity = 0
 
     def _acquire_cpu_slot(self) -> _PinnedPageTransferSlot:
-        with self._cpu_slot_lock:
-            num_slots = len(self._cpu_slots)
-            if num_slots == 0:
-                raise RuntimeError(
-                    "RetroSpec pinned H2D staging ring is not initialized"
-                )
+        with self._cpu_slot_available:
+            while True:
+                if self._closed:
+                    raise RuntimeError("Full-verification transfer buffer is closed")
+                num_slots = len(self._cpu_slots)
+                if num_slots == 0:
+                    raise RuntimeError(
+                        "RetroSpec pinned H2D staging ring is not initialized"
+                    )
 
-            slot = None
-            for offset in range(num_slots):
-                slot_index = (self._cpu_slot_cursor + offset) % num_slots
-                candidate = self._cpu_slots[slot_index]
-                if candidate.in_use:
-                    continue
-                slot = candidate
-                self._cpu_slot_cursor = (slot_index + 1) % num_slots
-                slot.in_use = True
-                break
-            if slot is None:
-                raise RuntimeError("RetroSpec pinned H2D staging ring is exhausted")
+                slot = None
+                for offset in range(num_slots):
+                    slot_index = (self._cpu_slot_cursor + offset) % num_slots
+                    candidate = self._cpu_slots[slot_index]
+                    if candidate.in_use:
+                        continue
+                    slot = candidate
+                    self._cpu_slot_cursor = (slot_index + 1) % num_slots
+                    slot.in_use = True
+                    break
+                if slot is not None:
+                    break
+                self._cpu_slot_available.wait()
 
         if slot.reuse_ready_event is not None:
             slot.reuse_ready_event.synchronize()
@@ -1648,6 +1658,7 @@ class _FullVerificationTransferBuffer:
                 token_start,
                 key_tokens,
                 value_tokens,
+                self.gather_workers,
             )
         except BaseException:
             self.release_cpu_slot(slot, None)
@@ -1659,11 +1670,12 @@ class _FullVerificationTransferBuffer:
         slot: _PinnedPageTransferSlot,
         reuse_ready_event: torch.cuda.Event | None,
     ) -> None:
-        with self._cpu_slot_lock:
+        with self._cpu_slot_available:
             if not slot.in_use:
                 raise RuntimeError("RetroSpec pinned H2D slot was already released")
             slot.reuse_ready_event = reuse_ready_event
             slot.in_use = False
+            self._cpu_slot_available.notify()
 
     def submit(
         self,
@@ -1870,6 +1882,7 @@ class RetroSpecClusterPageStore:
         max_pinned_memory_bytes: int = 64 << 20,
         max_pending_cluster_builds: int = 2,
         cpu_page_build_workers: int = 4,
+        full_verify_gather_workers: int = 4,
         performance_stats: RetroSpecPerformanceStats | None = None,
         pinned_memory: RetroSpecPinnedMemoryManager | None = None,
     ) -> None:
@@ -1893,6 +1906,8 @@ class RetroSpecClusterPageStore:
             raise ValueError("max_pending_cluster_builds must be positive")
         if cpu_page_build_workers <= 0:
             raise ValueError("cpu_page_build_workers must be positive")
+        if full_verify_gather_workers <= 0:
+            raise ValueError("full_verify_gather_workers must be positive")
 
         if pinned_memory is None:
             pinned_memory = RetroSpecPinnedMemoryManager(
@@ -1911,6 +1926,7 @@ class RetroSpecClusterPageStore:
         self.max_pinned_memory_bytes = pinned_memory.max_bytes
         self.max_pending_cluster_builds = max_pending_cluster_builds
         self.cpu_page_build_workers = cpu_page_build_workers
+        self.full_verify_gather_workers = full_verify_gather_workers
         self.performance_stats = performance_stats
 
         self._layer_pools: dict[str, _LayerClusterPagePool] = {}
@@ -3266,6 +3282,7 @@ class RetroSpecClusterPageStore:
                 device=device,
                 max_pinned_memory_bytes=self.max_pinned_memory_bytes,
                 pinned_memory=self._pinned_memory,
+                gather_workers=self.full_verify_gather_workers,
                 performance_stats=self.performance_stats,
             )
             self._full_verification_buffers[device] = buffer

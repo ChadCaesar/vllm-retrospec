@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-#include <ATen/Parallel.h>
 #include <torch/all.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -19,6 +20,59 @@ struct CopySpan {
   char* value_destination;
   size_t num_bytes;
 };
+
+void copy_span(const CopySpan& span) {
+  std::memcpy(span.key_destination, span.key_source, span.num_bytes);
+  std::memcpy(span.value_destination, span.value_source, span.num_bytes);
+}
+
+void parallel_copy_spans(const std::vector<CopySpan>& spans,
+                         int64_t num_workers) {
+  TORCH_CHECK(num_workers > 0, "Compact gather worker count must be positive");
+  if (spans.empty()) {
+    return;
+  }
+
+  const int64_t worker_count =
+      std::min<int64_t>(num_workers, static_cast<int64_t>(spans.size()));
+  if (worker_count == 1) {
+    for (const CopySpan& span : spans) {
+      copy_span(span);
+    }
+    return;
+  }
+
+  std::atomic<int64_t> next_span{0};
+  auto worker = [&]() {
+    while (true) {
+      const int64_t span_index =
+          next_span.fetch_add(1, std::memory_order_relaxed);
+      if (span_index >= static_cast<int64_t>(spans.size())) {
+        return;
+      }
+      copy_span(spans[span_index]);
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(worker_count - 1);
+  try {
+    for (int64_t worker_index = 1; worker_index < worker_count;
+         ++worker_index) {
+      threads.emplace_back(worker);
+    }
+  } catch (...) {
+    for (std::thread& thread : threads) {
+      thread.join();
+    }
+    throw;
+  }
+
+  worker();
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+}
 
 void validate_slab_pair(const torch::Tensor& key_slab,
                         const torch::Tensor& value_slab,
@@ -43,7 +97,8 @@ void retrospec_gather_compact_kv(const std::vector<torch::Tensor>& key_slabs,
                                  const torch::Tensor& token_offsets,
                                  int64_t destination_token_start,
                                  torch::Tensor& key_output,
-                                 torch::Tensor& value_output) {
+                                 torch::Tensor& value_output,
+                                 int64_t num_workers) {
   TORCH_CHECK(key_slabs.size() == value_slabs.size(),
               "Key/value slab counts differ");
   TORCH_CHECK(range_tables.size() == static_cast<size_t>(token_offsets.size(0)),
@@ -51,6 +106,7 @@ void retrospec_gather_compact_kv(const std::vector<torch::Tensor>& key_slabs,
   TORCH_CHECK(!key_slabs.empty(), "Compact gather requires source slabs");
   TORCH_CHECK(destination_token_start >= 0,
               "Destination token start must be non-negative");
+  TORCH_CHECK(num_workers > 0, "Compact gather worker count must be positive");
 
   TORCH_CHECK(token_offsets.device().is_cpu(),
               "Token offsets must reside on CPU");
@@ -173,14 +229,5 @@ void retrospec_gather_compact_kv(const std::vector<torch::Tensor>& key_slabs,
     }
   }
 
-  at::parallel_for(0, static_cast<int64_t>(spans.size()), 16,
-                   [&](int64_t begin, int64_t end) {
-                     for (int64_t index = begin; index < end; ++index) {
-                       const CopySpan& span = spans[index];
-                       std::memcpy(span.key_destination, span.key_source,
-                                   span.num_bytes);
-                       std::memcpy(span.value_destination, span.value_source,
-                                   span.num_bytes);
-                     }
-                   });
+  parallel_copy_spans(spans, num_workers);
 }

@@ -193,6 +193,10 @@ class SpeculativeConfig:
     """Maximum number of native CPU workers used by one cluster-page build.
     Builds remain serialized by the Python background executor, while independent
     KV heads within one build may be processed in parallel."""
+    retrospec_full_verify_gather_workers: int = Field(default=4, gt=0)
+    """Maximum number of native CPU workers used by one full-verification
+    compact gather. This is independent of the cluster-page builder workers
+    and the global Torch/OMP thread count."""
     retrospec_cpu_page_initial_slab_size_mib: int = Field(default=8, gt=0)
     """Initial pageable CPU cluster-page slab size in MiB for each layer.
     Later slabs grow geometrically up to retrospec_cpu_page_slab_size_mib."""

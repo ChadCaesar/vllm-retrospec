@@ -48,7 +48,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "retrospec_gather_compact_kv("
       "Tensor[] key_slabs, Tensor[] value_slabs, Tensor[] range_tables, "
       "Tensor token_offsets, int destination_token_start, "
-      "Tensor! key_output, Tensor! value_output) -> ()");
+      "Tensor! key_output, Tensor! value_output, int num_workers) -> ()");
   ops.impl("retrospec_gather_compact_kv", torch::kCPU,
            &retrospec_gather_compact_kv);
 
