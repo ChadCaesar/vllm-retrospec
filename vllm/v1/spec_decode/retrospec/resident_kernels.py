@@ -95,6 +95,7 @@ def _resolve_compact_draft_pages_kernel(
     output_miss_handles,
     output_miss_positions,
     output_miss_count,
+    statistics_buffer,
     ranked_stride_0,
     ranked_stride_1,
     ranked_stride_2,
@@ -111,6 +112,11 @@ def _resolve_compact_draft_pages_kernel(
     BLOCK_OUTPUT_PAGES: tl.constexpr,
     BLOCK_SPARSE: tl.constexpr,
     EMIT_MISSES: tl.constexpr,
+    UPDATE_STATISTICS: tl.constexpr,
+    RESIDENT_HIT_COUNTER_INDEX: tl.constexpr,
+    RESIDENT_MISS_COUNTER_INDEX: tl.constexpr,
+    RESIDENT_PAGE_COUNTER_INDEX: tl.constexpr,
+    SELECTED_CLUSTER_COUNTER_INDEX: tl.constexpr,
 ):
     row = tl.program_id(0)
     batch_idx = row // NUM_KV_HEADS
@@ -299,9 +305,12 @@ def _resolve_compact_draft_pages_kernel(
         mask=valid_ranks,
     )
 
+    num_selected = tl.sum(selected.to(tl.int32), axis=0)
+    num_hits = tl.sum(stable_hits.to(tl.int32), axis=0)
+    num_misses = tl.sum(misses.to(tl.int32), axis=0)
+
     if EMIT_MISSES:
         miss_prefix = tl.cumsum(misses.to(tl.int32), axis=0)
-        num_misses = tl.sum(misses.to(tl.int32), axis=0)
         miss_base = tl.atomic_add(output_miss_count, num_misses)
         miss_slots = miss_base + miss_prefix - 1
         tl.store(
@@ -315,19 +324,40 @@ def _resolve_compact_draft_pages_kernel(
         tl.where(stable_hits[:, None] & valid_logical_pages, logical_token_counts, 0),
         axis=1,
     )
-    tl.store(output_page_counts + row, tl.sum(selected_page_counts, axis=0))
-    tl.store(
-        output_clustered_token_counts + row,
-        tl.sum(clustered_tokens_by_rank, axis=0),
-    )
+    num_resident_pages = tl.sum(selected_page_counts, axis=0)
+    num_clustered_tokens = tl.sum(clustered_tokens_by_rank, axis=0)
+    tl.store(output_page_counts + row, num_resident_pages)
+    tl.store(output_clustered_token_counts + row, num_clustered_tokens)
     tl.store(output_hit_attention_by_head + row, hit_attention)
-    tl.store(output_selected_counts + row, tl.sum(selected.to(tl.int32), axis=0))
-    tl.store(output_hit_counts + row, tl.sum(stable_hits.to(tl.int32), axis=0))
-    tl.store(output_miss_counts + row, tl.sum(misses.to(tl.int32), axis=0))
+    tl.store(output_selected_counts + row, num_selected)
+    tl.store(output_hit_counts + row, num_hits)
+    tl.store(output_miss_counts + row, num_misses)
     tl.store(
         output_gate_ready + row,
         tl.sum((stable_hits & cluster_gate_ready).to(tl.int32), axis=0) > 0,
     )
+
+    if UPDATE_STATISTICS:
+        tl.atomic_add(
+            statistics_buffer + RESIDENT_HIT_COUNTER_INDEX,
+            num_hits.to(tl.int64),
+            sem="relaxed",
+        )
+        tl.atomic_add(
+            statistics_buffer + RESIDENT_MISS_COUNTER_INDEX,
+            num_misses.to(tl.int64),
+            sem="relaxed",
+        )
+        tl.atomic_add(
+            statistics_buffer + RESIDENT_PAGE_COUNTER_INDEX,
+            num_resident_pages.to(tl.int64),
+            sem="relaxed",
+        )
+        tl.atomic_add(
+            statistics_buffer + SELECTED_CLUSTER_COUNTER_INDEX,
+            num_selected.to(tl.int64),
+            sem="relaxed",
+        )
 
 
 @triton.jit
@@ -1316,6 +1346,8 @@ def resolve_compact_draft_pages(
     sparse_attention: torch.Tensor,
     expanded_attention: torch.Tensor,
     emit_misses: bool = True,
+    statistics_buffer: torch.Tensor | None = None,
+    statistics_indices: tuple[int, ...] | None = None,
 ) -> None:
     """Resolve a prepacked DRAFT plan into resident page descriptors."""
     if ranked_values.device.type != "cuda":
@@ -1388,6 +1420,38 @@ def resolve_compact_draft_pages(
         if output.shape != (batch_size,):
             raise ValueError("Attention output has the wrong shape")
 
+    update_statistics = statistics_buffer is not None
+    if update_statistics != (statistics_indices is not None):
+        raise ValueError(
+            "Statistics buffer and counter indices must be provided together"
+        )
+
+    if statistics_buffer is None:
+        statistics_buffer = output_miss_count
+        statistics_indices = (0, 0, 0, 0)
+    else:
+        if statistics_buffer.ndim != 1:
+            raise ValueError("Statistics buffer must be one-dimensional")
+        if statistics_buffer.dtype != torch.int64:
+            raise ValueError("Statistics buffer must use int64")
+        if statistics_buffer.device != ranked_values.device:
+            raise ValueError("Statistics buffer must use the resolve device")
+        if statistics_indices is None or len(statistics_indices) != 4:
+            raise ValueError("DRAFT resolve requires four counter indices")
+        if any(
+            index < 0 or index >= statistics_buffer.numel()
+            for index in statistics_indices
+        ):
+            raise ValueError("Statistics counter index is outside the buffer")
+
+    assert statistics_indices is not None
+    (
+        resident_hit_counter_index,
+        resident_miss_counter_index,
+        resident_page_counter_index,
+        selected_cluster_counter_index,
+    ) = statistics_indices
+
     tensors = (
         ranked_values,
         candidate_counts,
@@ -1422,6 +1486,7 @@ def resolve_compact_draft_pages(
         output_miss_handles,
         output_miss_positions,
         output_miss_count,
+        statistics_buffer,
         sparse_attention,
         expanded_attention,
     )
@@ -1478,6 +1543,7 @@ def resolve_compact_draft_pages(
         output_miss_handles,
         output_miss_positions,
         output_miss_count,
+        statistics_buffer,
         ranked_values.stride(0),
         ranked_values.stride(1),
         ranked_values.stride(2),
@@ -1494,6 +1560,11 @@ def resolve_compact_draft_pages(
         BLOCK_OUTPUT_PAGES=triton.next_power_of_2(page_capacity),
         BLOCK_SPARSE=triton.next_power_of_2(sparse_width),
         EMIT_MISSES=emit_misses,
+        UPDATE_STATISTICS=update_statistics,
+        RESIDENT_HIT_COUNTER_INDEX=resident_hit_counter_index,
+        RESIDENT_MISS_COUNTER_INDEX=resident_miss_counter_index,
+        RESIDENT_PAGE_COUNTER_INDEX=resident_page_counter_index,
+        SELECTED_CLUSTER_COUNTER_INDEX=selected_cluster_counter_index,
     )
     _finalize_ranked_compact_draft_attention_kernel[(batch_size,)](
         ranked_values,

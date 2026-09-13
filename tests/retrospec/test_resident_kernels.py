@@ -281,6 +281,9 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
     draft_attention = torch.empty(2, device=device)
     sparse_attention = torch.empty(2, device=device)
     expanded_attention = torch.empty(2, device=device)
+    statistics = torch.tensor(
+        [10, 20, 30, 40, 50, 60], dtype=torch.int64, device=device
+    )
 
     resolve_compact_draft_pages(
         ranked_values=ranked_values,
@@ -323,6 +326,8 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
         output_miss_count=miss_count,
         sparse_attention=sparse_attention,
         expanded_attention=expanded_attention,
+        statistics_buffer=statistics,
+        statistics_indices=(4, 1, 5, 2),
     )
 
     assert sparse_indices.cpu().tolist() == [[[0, 1]], [[-1, -1]]]
@@ -343,6 +348,7 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
     torch.testing.assert_close(draft_attention.cpu(), torch.tensor([0.6, 1.0]))
     torch.testing.assert_close(sparse_attention.cpu(), torch.tensor([0.9, 1.0]))
     torch.testing.assert_close(expanded_attention.cpu(), torch.tensor([1.0, 1.0]))
+    assert statistics.cpu().tolist() == [10, 21, 32, 40, 51, 62]
     assert table[5][2].item() == 9
 
 

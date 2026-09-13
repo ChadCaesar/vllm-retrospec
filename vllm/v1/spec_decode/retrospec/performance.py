@@ -170,6 +170,23 @@ class RetroSpecPerformanceStats:
         else:
             counter.add_(int(value))
 
+    def get_gpu_counter_buffer(
+        self,
+        names: tuple[str, ...],
+    ) -> tuple[torch.Tensor, tuple[int, ...]]:
+        """Return the shared GPU counter buffer and stable counter offsets."""
+        if not self.enabled:
+            raise RuntimeError("RetroSpec GPU counters are disabled")
+
+        indices: list[int] = []
+        for name in names:
+            counter_index = self._gpu_counter_indices.get(name)
+            if counter_index is None:
+                raise KeyError(f"Unknown RetroSpec GPU counter: {name}")
+            indices.append(counter_index)
+
+        return self._gpu_counters, tuple(indices)
+
     def add_gpu_histogram(
         self,
         name: str,

@@ -3790,7 +3790,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         view: RetroSpecResidentBatchView,
         active_mask: torch.Tensor,
         ranked_values: torch.Tensor | None = None,
-        ranked_indices: torch.Tensor | None = None,
         candidate_counts: torch.Tensor | None = None,
     ) -> RetroSpecTokenAttentionSelection:
         """Use resident retrieval clusters and estimate selected cache misses."""
@@ -3803,8 +3802,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 plan,
                 RetroSpecAttentionLevel.SPARSE,
             )
-        if ranked_values is None or ranked_indices is None:
-            raise RuntimeError("CUDA draft selection requires ranked clusters")
+        if ranked_values is None:
+            raise RuntimeError("CUDA draft selection requires ranked scores")
         if candidate_counts is None:
             raise RuntimeError("CUDA draft selection requires candidate counts")
 
@@ -3819,7 +3818,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         resolved_pages = self.cluster_store.resolve_ranked_compact_draft_cluster_blocks(
             layer_name=plan.layer_name,
             ranked_values=ranked_values,
-            ranked_indices=ranked_indices,
             candidate_counts=candidate_counts,
             arena=view.arena,
             request_slot_ids=view.request_slot_ids,
@@ -4852,7 +4850,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 view=view,
                 active_mask=active_mask,
                 ranked_values=ranked_values,
-                ranked_indices=ranked_indices,
                 candidate_counts=candidate_counts,
             )
         if plan_table is not None:

@@ -76,6 +76,34 @@ def test_invalid_cuda_observation_config_is_rejected():
         )
 
 
+def test_gpu_counter_buffer_returns_stable_named_offsets():
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cpu"),
+        log_interval_seconds=1.0,
+    )
+
+    names = (
+        "resident_cluster_hits",
+        "resident_cluster_misses",
+        "draft_compact_resident_pages",
+        "draft_compact_selected_clusters",
+    )
+    buffer, indices = stats.get_gpu_counter_buffer(names)
+
+    assert buffer.data_ptr() == stats._gpu_counters.data_ptr()
+    assert indices == tuple(stats._gpu_counter_indices[name] for name in names)
+
+    with pytest.raises(KeyError, match="unknown"):
+        stats.get_gpu_counter_buffer(("unknown",))
+
+    disabled = RetroSpecPerformanceStats(
+        device=torch.device("cpu"),
+        log_interval_seconds=0.0,
+    )
+    with pytest.raises(RuntimeError, match="disabled"):
+        disabled.get_gpu_counter_buffer(names)
+
+
 def test_cuda_timer_levels_and_sampling_weights():
     coarse = RetroSpecPerformanceStats(
         device=torch.device("cpu"), log_interval_seconds=1.0

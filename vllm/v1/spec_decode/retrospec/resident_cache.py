@@ -1251,9 +1251,7 @@ class RetroSpecResidentClusterCache:
         self,
         *,
         ranked_values: torch.Tensor,
-        ranked_indices: torch.Tensor,
         candidate_counts: torch.Tensor,
-        arena_cluster_ids: torch.Tensor,
         arena_resident_table_buckets: torch.Tensor,
         arena_cluster_page_starts: torch.Tensor,
         arena_cluster_page_counts: torch.Tensor,
@@ -1286,6 +1284,8 @@ class RetroSpecResidentClusterCache:
         sparse_attention: torch.Tensor,
         expanded_attention: torch.Tensor,
         emit_misses: bool = True,
+        statistics_buffer: torch.Tensor | None = None,
+        statistics_indices: tuple[int, ...] | None = None,
     ) -> RetroSpecCompactResidentPageAccess:
         """Resolve ranked DRAFT rows without logical-page intermediates."""
         if ranked_values.device != self.device:
@@ -1338,6 +1338,8 @@ class RetroSpecResidentClusterCache:
                 sparse_attention=sparse_attention,
                 expanded_attention=expanded_attention,
                 emit_misses=emit_misses,
+                statistics_buffer=statistics_buffer,
+                statistics_indices=statistics_indices,
             )
         except BaseException:
             self._gpu_access_lock.release()

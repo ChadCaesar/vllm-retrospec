@@ -1941,6 +1941,20 @@ class RetroSpecClusterPageStore:
         self.cpu_page_build_workers = cpu_page_build_workers
         self.full_verify_gather_workers = full_verify_gather_workers
         self.performance_stats = performance_stats
+        self._draft_resolve_counter_buffer: torch.Tensor | None = None
+        self._draft_resolve_counter_indices: tuple[int, ...] | None = None
+        if performance_stats is not None and performance_stats.enabled:
+            (
+                self._draft_resolve_counter_buffer,
+                self._draft_resolve_counter_indices,
+            ) = performance_stats.get_gpu_counter_buffer(
+                (
+                    "resident_cluster_hits",
+                    "resident_cluster_misses",
+                    "draft_compact_resident_pages",
+                    "draft_compact_selected_clusters",
+                )
+            )
 
         self._layer_pools: dict[str, _LayerClusterPagePool] = {}
         self._resident_caches: dict[str, RetroSpecResidentClusterCache] = {}
@@ -4639,7 +4653,6 @@ class RetroSpecClusterPageStore:
         *,
         layer_name: str,
         ranked_values: torch.Tensor,
-        ranked_indices: torch.Tensor,
         candidate_counts: torch.Tensor,
         arena: RetroSpecResidentLayerArena,
         request_slot_ids: torch.Tensor,
@@ -4677,9 +4690,7 @@ class RetroSpecClusterPageStore:
 
         access = resident_cache.lookup_ranked_compact_draft_gpu(
             ranked_values=ranked_values,
-            ranked_indices=ranked_indices,
             candidate_counts=candidate_counts,
-            arena_cluster_ids=arena.cluster_ids,
             arena_resident_table_buckets=arena.resident_table_buckets,
             arena_cluster_page_starts=arena.cluster_page_starts,
             arena_cluster_page_counts=arena.cluster_page_counts,
@@ -4712,20 +4723,9 @@ class RetroSpecClusterPageStore:
             sparse_attention=sparse_attention,
             expanded_attention=expanded_attention,
             emit_misses=emit_misses,
+            statistics_buffer=self._draft_resolve_counter_buffer,
+            statistics_indices=self._draft_resolve_counter_indices,
         )
-        if self.performance_stats is not None:
-            self.performance_stats.add_gpu_counter(
-                "resident_cluster_hits", access.hit_cluster_counts
-            )
-            self.performance_stats.add_gpu_counter(
-                "resident_cluster_misses", access.miss_cluster_counts
-            )
-            self.performance_stats.add_gpu_counter(
-                "draft_compact_resident_pages", access.page_counts
-            )
-            self.performance_stats.add_gpu_counter(
-                "draft_compact_selected_clusters", access.selected_cluster_counts
-            )
 
         return RetroSpecCompactResolvedClusterPages(
             resident_page_ids=access.cache_page_ids,
