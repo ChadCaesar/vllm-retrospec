@@ -480,18 +480,45 @@ class RetroSpecProposer:
             )
         return self.pipeline_stage
 
+    def _get_pipeline_receive_destination(
+        self,
+        stage: RetroSpecPipelineStage,
+        num_tokens: int,
+        cudagraph_mode: CUDAGraphMode,
+    ) -> IntermediateTensors | None:
+        if stage.is_first or cudagraph_mode == CUDAGraphMode.NONE:
+            return None
+
+        if cudagraph_mode != CUDAGraphMode.PIECEWISE:
+            raise RuntimeError(
+                f"Unsupported RetroSpec proposal CUDA Graph mode: {cudagraph_mode}"
+            )
+        if self.runner.intermediate_tensors is None:
+            raise RuntimeError(
+                "RetroSpec PP PIECEWISE CUDA Graph replay requires the runner "
+                "intermediate-tensor workspace"
+            )
+
+        return self.runner.sync_and_slice_intermediate_tensors(
+            num_tokens, intermediate_tensors=None, sync_self=False
+        )
+
     def _run_pipeline_stage_model(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         num_tokens: int,
+        cudagraph_mode: CUDAGraphMode,
     ) -> torch.Tensor | None:
         if self.model is None:
             raise RuntimeError("RetroSpec target model is not loaded")
 
         stage = self._require_pipeline_stage()
+        receive_destination = self._get_pipeline_receive_destination(
+            stage, num_tokens, cudagraph_mode
+        )
         intermediate_tensors = self.pipeline_protocol.receive_model_input(
-            stage, num_tokens
+            stage, num_tokens, receive_destination
         )
         model_output = self.model(
             input_ids=input_ids if stage.is_first else None,
@@ -969,6 +996,7 @@ class RetroSpecProposer:
                 model_input_ids,
                 model_positions,
                 batch_descriptor.num_tokens,
+                cudagraph_mode,
             )
 
         with self.performance_stats.cuda_timer("draft_end_step"):
@@ -1582,6 +1610,7 @@ class RetroSpecProposer:
                 model_input_ids,
                 model_positions,
                 batch_descriptor.num_tokens,
+                cudagraph_mode,
             )
 
         with self.performance_stats.cuda_timer(f"{stage_name}_end_step"):

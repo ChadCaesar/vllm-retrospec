@@ -12,6 +12,7 @@ import torch
 
 from vllm.config import CUDAGraphMode, SpeculativeConfig, VllmConfig
 from vllm.forward_context import BatchDescriptor
+from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -309,6 +310,119 @@ def test_initialize_cudagraph_keys_requires_runner_input_workspace():
 
     dispatcher.register_piecewise_cudagraph_sizes.assert_not_called()
     assert proposer._cudagraph_registration_failure == "missing_input_workspace"
+
+
+def test_pipeline_graph_receive_destination_uses_runner_workspace():
+    workspace = IntermediateTensors(
+        {
+            "hidden_states": torch.empty(8, 4),
+            "residual": torch.empty(8, 4),
+        }
+    )
+    destination = workspace[:4]
+    slice_workspace = Mock(return_value=destination)
+    proposer = RetroSpecProposer(
+        make_vllm_config(enforce_eager=False),
+        torch.device("cpu"),
+        make_runner(
+            intermediate_tensors=workspace,
+            sync_and_slice_intermediate_tensors=slice_workspace,
+        ),
+    )
+    stage = RetroSpecPipelineStage(1, 2, 1, 2)
+
+    result = proposer._get_pipeline_receive_destination(
+        stage, num_tokens=4, cudagraph_mode=CUDAGraphMode.PIECEWISE
+    )
+
+    assert result is destination
+    slice_workspace.assert_called_once_with(
+        4, intermediate_tensors=None, sync_self=False
+    )
+
+
+def test_pipeline_receive_destination_is_unused_for_first_or_eager_stage():
+    slice_workspace = Mock()
+    proposer = RetroSpecProposer(
+        make_vllm_config(),
+        torch.device("cpu"),
+        make_runner(
+            intermediate_tensors=None,
+            sync_and_slice_intermediate_tensors=slice_workspace,
+        ),
+    )
+
+    assert (
+        proposer._get_pipeline_receive_destination(
+            RetroSpecPipelineStage(0, 2, 0, 1),
+            num_tokens=4,
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        )
+        is None
+    )
+    assert (
+        proposer._get_pipeline_receive_destination(
+            RetroSpecPipelineStage(1, 2, 1, 2),
+            num_tokens=4,
+            cudagraph_mode=CUDAGraphMode.NONE,
+        )
+        is None
+    )
+    slice_workspace.assert_not_called()
+
+
+def test_pipeline_graph_receive_destination_requires_runner_workspace():
+    proposer = RetroSpecProposer(
+        make_vllm_config(enforce_eager=False),
+        torch.device("cpu"),
+        make_runner(intermediate_tensors=None),
+    )
+
+    with pytest.raises(RuntimeError, match="requires the runner"):
+        proposer._get_pipeline_receive_destination(
+            RetroSpecPipelineStage(1, 2, 1, 2),
+            num_tokens=4,
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        )
+
+
+def test_pipeline_stage_model_receives_into_graph_workspace():
+    workspace = IntermediateTensors(
+        {
+            "hidden_states": torch.empty(4, 4),
+            "residual": torch.empty(4, 4),
+        }
+    )
+    slice_workspace = Mock(return_value=workspace)
+    proposer = RetroSpecProposer(
+        make_vllm_config(enforce_eager=False),
+        torch.device("cpu"),
+        make_runner(
+            intermediate_tensors=workspace,
+            sync_and_slice_intermediate_tensors=slice_workspace,
+        ),
+    )
+    proposer.pipeline_stage = RetroSpecPipelineStage(1, 2, 1, 2)
+    proposer.pipeline_protocol.receive_model_input = Mock(return_value=workspace)
+    proposer.model = Mock(return_value=torch.ones(4, 4))
+    positions = torch.arange(4)
+
+    output = proposer._run_pipeline_stage_model(
+        torch.zeros(4, dtype=torch.int32),
+        positions,
+        num_tokens=4,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+    )
+
+    proposer.pipeline_protocol.receive_model_input.assert_called_once_with(
+        proposer.pipeline_stage, 4, workspace
+    )
+    model_kwargs = proposer.model.call_args.kwargs
+    assert model_kwargs["input_ids"] is None
+    assert model_kwargs["positions"] is positions
+    assert model_kwargs["intermediate_tensors"] is workspace
+    assert model_kwargs["inputs_embeds"] is None
+    torch.testing.assert_close(output, torch.ones(4, 4))
 
 
 def test_piecewise_model_inputs_preserve_eager_views():

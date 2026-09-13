@@ -430,6 +430,74 @@ def test_nonfinal_pipeline_stage_receives_model_input():
     assert pp_group.recv_into.call_count == 4
 
 
+def test_nonfinal_pipeline_stage_receives_model_input_into_destination():
+    protocol = make_protocol()
+    pp_group = make_pp_group(rank=1, world_size=3, is_last_rank=False)
+    destination = IntermediateTensors(
+        {
+            "hidden_states": torch.empty(3, 4),
+            "residual": torch.empty(3, 4),
+        }
+    )
+
+    def receive_tensor(tensor: torch.Tensor) -> None:
+        tensor.fill_(float(pp_group.recv_into.call_count))
+
+    pp_group.recv_into.side_effect = receive_tensor
+    stage = RetroSpecPipelineStage(1, 3, 2, 4)
+
+    with patch(
+        "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+        return_value=pp_group,
+    ):
+        output = protocol.receive_model_input(
+            stage, num_tokens=3, destination=destination
+        )
+
+    assert output is destination
+    torch.testing.assert_close(destination["hidden_states"], torch.ones(3, 4))
+    torch.testing.assert_close(destination["residual"], torch.full((3, 4), 2.0))
+    assert pp_group.recv_into.call_count == 2
+
+
+def test_pipeline_stage_rejects_invalid_model_input_destination():
+    protocol = make_protocol()
+    stage = RetroSpecPipelineStage(1, 2, 2, 4)
+
+    with pytest.raises(RuntimeError, match="must contain exactly"):
+        protocol.receive_model_input(
+            stage,
+            num_tokens=3,
+            destination=IntermediateTensors({"hidden_states": torch.empty(3, 4)}),
+        )
+
+    with pytest.raises(ValueError, match="has shape"):
+        protocol.receive_model_input(
+            stage,
+            num_tokens=3,
+            destination=IntermediateTensors(
+                {
+                    "hidden_states": torch.empty(2, 4),
+                    "residual": torch.empty(3, 4),
+                }
+            ),
+        )
+
+
+def test_first_pipeline_stage_rejects_model_input_destination():
+    protocol = make_protocol()
+    stage = RetroSpecPipelineStage(0, 2, 0, 2)
+    destination = IntermediateTensors(
+        {
+            "hidden_states": torch.empty(3, 4),
+            "residual": torch.empty(3, 4),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="must not receive model input"):
+        protocol.receive_model_input(stage, num_tokens=3, destination=destination)
+
+
 def test_nonfinal_pipeline_stage_sends_model_output():
     protocol = make_protocol()
     pp_group = make_pp_group(rank=0, world_size=2, is_last_rank=False)

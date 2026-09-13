@@ -397,11 +397,39 @@ class RetroSpecPipelineProtocol:
         self,
         stage: RetroSpecPipelineStage,
         num_tokens: int,
+        destination: IntermediateTensors | None = None,
     ) -> IntermediateTensors | None:
         if stage.is_first:
+            if destination is not None:
+                raise RuntimeError(
+                    "The first RetroSpec PP stage must not receive model input"
+                )
             return None
 
-        descriptor, residual_scattered = self._proposal_input_descriptor(num_tokens)
+        if destination is None:
+            descriptor, residual_scattered = self._proposal_input_descriptor(num_tokens)
+        else:
+            descriptor = destination
+            if frozenset(descriptor.tensors) != self._MODEL_TENSOR_KEYS:
+                raise RuntimeError(
+                    "RetroSpec PP receive destination must contain exactly "
+                    "'hidden_states' and 'residual'"
+                )
+
+            hidden_shape, residual_shape, residual_scattered = (
+                self._proposal_activation_shapes(num_tokens)
+            )
+            self._validate_proposal_tensor(
+                self._MODEL_HIDDEN_STATES_KEY,
+                descriptor[self._MODEL_HIDDEN_STATES_KEY],
+                hidden_shape,
+            )
+            self._validate_proposal_tensor(
+                self._MODEL_RESIDUAL_KEY,
+                descriptor[self._MODEL_RESIDUAL_KEY],
+                residual_shape,
+            )
+
         hidden_states = descriptor[self._MODEL_HIDDEN_STATES_KEY]
         residual = descriptor[self._MODEL_RESIDUAL_KEY]
 
