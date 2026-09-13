@@ -31,7 +31,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from .attention import RetroSpecAttentionMode, RetroSpecSparseAttention
-from .decision import RetroSpecDecisionPolicy, RetroSpecMetrics
+from .decision import RetroSpecDecision, RetroSpecDecisionPolicy, RetroSpecMetrics
 from .pipeline import (
     RetroSpecPipelineControlState,
     RetroSpecPipelineProtocol,
@@ -39,6 +39,7 @@ from .pipeline import (
 )
 from .prefill import resolve_retrospec_layer_model
 from .state import RetroSpecBatchState, RetroSpecIndexUpdateState, RetroSpecStage
+from .transition_trace import RetroSpecTransitionTracer
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -115,6 +116,9 @@ class RetroSpecProposer:
         self.block_size = block_size
 
         self.policy = RetroSpecDecisionPolicy(config)
+        self.transition_tracer = RetroSpecTransitionTracer(
+            config.retrospec_trace_transitions
+        )
         self.state = RetroSpecBatchState(self.max_batch_size, device)
         self.sparse_attention = RetroSpecSparseAttention(vllm_config, device)
         self.performance_stats = self.sparse_attention.performance_stats
@@ -1667,9 +1671,242 @@ class RetroSpecProposer:
             attention_mass=attention_mass,
         )
 
+    def _trace_draft_transition(
+        self,
+        request_ids: Sequence[str],
+        proposal_round: int,
+        transition_mask: torch.Tensor,
+        decision: RetroSpecDecision,
+        draft_margin: torch.Tensor | None,
+        hit_attn: torch.Tensor,
+        projected_pending_counts: torch.Tensor,
+        generation_limit_reached: torch.Tensor,
+        index_update_required: torch.Tensor,
+    ) -> None:
+        if not self.transition_tracer.enabled:
+            return
+
+        batch_size = len(request_ids)
+        self.transition_tracer.record_masked(
+            request_ids=request_ids,
+            phase="draft_to_sparse",
+            proposal_round=proposal_round,
+            mask=transition_mask,
+            integer_fields={
+                "position": self.positions[:batch_size] + 1,
+                "request_stage": self.state.stage,
+                "next_stage": decision.next_stage,
+                "draft_count": self.state.draft_counts,
+                "pending_count": projected_pending_counts,
+                "stop_draft": decision.stop_draft,
+                "require_expanded": decision.require_expanded,
+                "require_full": decision.require_full,
+                "reasons": decision.reasons,
+                "pending_limit_reached": (
+                    projected_pending_counts >= self.policy.pending_limit
+                ),
+                "generation_limit_reached": generation_limit_reached,
+                "index_update_required": index_update_required,
+            },
+            float_fields={
+                "draft_margin": draft_margin,
+                "hit_attention": hit_attn,
+            },
+        )
+
+    def _trace_sparse_transitions(
+        self,
+        request_ids: Sequence[str],
+        proposal_round: int,
+        verification_active: torch.Tensor,
+        round_start_counts: torch.Tensor,
+        sparse: RetroSpecParallelVerificationOutput,
+        expected_token_ids: torch.Tensor,
+        sparse_token_changed: torch.Tensor,
+        sparse_decision: RetroSpecDecision,
+        candidate_positions: torch.Tensor,
+        candidate_pending_counts: torch.Tensor,
+        pair_draft_counts: torch.Tensor,
+        pair_stages: torch.Tensor,
+        generation_limit_reached: torch.Tensor,
+        index_update_required: torch.Tensor,
+        boundary_request_mask: torch.Tensor,
+        safe_boundary_indices: torch.Tensor,
+        verified_counts: torch.Tensor,
+    ) -> None:
+        if not self.transition_tracer.enabled:
+            return
+
+        boundary_request_indices = torch.nonzero(
+            boundary_request_mask, as_tuple=False
+        ).flatten()
+        if boundary_request_indices.numel() > 0:
+            boundary_pair_indices = safe_boundary_indices.index_select(
+                0, boundary_request_indices
+            )
+            self.transition_tracer.record_compact(
+                request_ids=request_ids,
+                phase="sparse_boundary",
+                proposal_round=proposal_round,
+                request_indices=boundary_request_indices,
+                integer_fields={
+                    "position": candidate_positions.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "request_stage": pair_stages.index_select(0, boundary_pair_indices),
+                    "next_stage": sparse_decision.next_stage.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "token_index": sparse.token_indices.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "draft_token_id": expected_token_ids.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "sparse_token_id": sparse.token_ids.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "draft_count": pair_draft_counts.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "pending_count": candidate_pending_counts.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "verified_count": verified_counts.index_select(
+                        0, boundary_request_indices
+                    ),
+                    "stop_draft": sparse_decision.stop_draft.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "require_expanded": sparse_decision.require_expanded.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "require_full": sparse_decision.require_full.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "reasons": sparse_decision.reasons.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "token_changed": sparse_token_changed.index_select(
+                        0, boundary_pair_indices
+                    ),
+                    "pending_limit_reached": (
+                        candidate_pending_counts.index_select(0, boundary_pair_indices)
+                        >= self.policy.pending_limit
+                    ),
+                    "generation_limit_reached": (
+                        generation_limit_reached.index_select(0, boundary_pair_indices)
+                    ),
+                    "index_update_required": index_update_required.index_select(
+                        0, boundary_pair_indices
+                    ),
+                },
+                float_fields={
+                    "sparse_margin": (
+                        None
+                        if sparse.margin is None
+                        else sparse.margin.index_select(0, boundary_pair_indices)
+                    ),
+                    "retrieval_attention": sparse.attention_mass.index_select(
+                        0, boundary_pair_indices
+                    ),
+                },
+            )
+
+        no_boundary_mask = verification_active & ~boundary_request_mask
+        batch_size = len(request_ids)
+        no_boundary_pending_counts = round_start_counts + verified_counts
+        sparse_stages = torch.full_like(
+            self.state.stage, int(RetroSpecStage.SPARSE_VERIFY)
+        )
+        draft_stages = torch.full_like(self.state.stage, int(RetroSpecStage.DRAFT))
+        false_values = torch.zeros_like(no_boundary_mask)
+        no_reasons = torch.zeros_like(self.state.draft_counts, dtype=torch.int32)
+
+        self.transition_tracer.record_masked(
+            request_ids=request_ids,
+            phase="sparse_complete",
+            proposal_round=proposal_round,
+            mask=no_boundary_mask,
+            integer_fields={
+                "position": (
+                    self.proposal_start_positions[:batch_size]
+                    + no_boundary_pending_counts
+                ),
+                "request_stage": sparse_stages,
+                "next_stage": draft_stages,
+                "draft_count": self.state.draft_counts,
+                "pending_count": no_boundary_pending_counts,
+                "verified_count": verified_counts,
+                "stop_draft": false_values,
+                "require_expanded": false_values,
+                "require_full": false_values,
+                "reasons": no_reasons,
+                "token_changed": false_values,
+                "pending_limit_reached": false_values,
+                "generation_limit_reached": false_values,
+                "index_update_required": false_values,
+            },
+        )
+
+    def _trace_expanded_transition(
+        self,
+        request_ids: Sequence[str],
+        proposal_round: int,
+        expanded: RetroSpecParallelVerificationOutput,
+        sparse_token_ids: torch.Tensor,
+        expanded_token_changed: torch.Tensor,
+        expanded_decision: RetroSpecDecision,
+        expanded_positions: torch.Tensor,
+        expanded_pending_counts: torch.Tensor,
+        expanded_draft_counts: torch.Tensor,
+        expanded_stages: torch.Tensor,
+        expanded_generation_limit: torch.Tensor,
+        expanded_index_update: torch.Tensor,
+        verified_counts: torch.Tensor,
+    ) -> None:
+        if not self.transition_tracer.enabled:
+            return
+
+        self.transition_tracer.record_compact(
+            request_ids=request_ids,
+            phase="expanded_boundary",
+            proposal_round=proposal_round,
+            request_indices=expanded.request_indices,
+            integer_fields={
+                "position": expanded_positions,
+                "request_stage": expanded_stages,
+                "next_stage": expanded_decision.next_stage,
+                "token_index": expanded.token_indices,
+                "sparse_token_id": sparse_token_ids,
+                "expanded_token_id": expanded.token_ids,
+                "draft_count": expanded_draft_counts,
+                "pending_count": expanded_pending_counts,
+                "verified_count": verified_counts.index_select(
+                    0, expanded.request_indices
+                ),
+                "stop_draft": expanded_decision.stop_draft,
+                "require_expanded": expanded_decision.require_expanded,
+                "require_full": expanded_decision.require_full,
+                "reasons": expanded_decision.reasons,
+                "token_changed": expanded_token_changed,
+                "pending_limit_reached": (
+                    expanded_pending_counts >= self.policy.pending_limit
+                ),
+                "generation_limit_reached": expanded_generation_limit,
+                "index_update_required": expanded_index_update,
+            },
+            float_fields={
+                "expanded_margin": expanded.margin,
+                "expanded_attention": expanded.attention_mass,
+            },
+        )
+
     def _verify_draft_tokens(
         self,
         batch_size: int,
+        request_ids: Sequence[str],
+        proposal_round: int,
         round_start_counts: torch.Tensor,
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
@@ -1827,6 +2064,25 @@ class RetroSpecProposer:
         self.performance_stats.add_gpu_histogram(
             "sparse_to_expanded_prefix", verified_counts, run_expanded
         )
+        self._trace_sparse_transitions(
+            request_ids=request_ids,
+            proposal_round=proposal_round,
+            verification_active=verification_active,
+            round_start_counts=round_start_counts,
+            sparse=sparse,
+            expected_token_ids=expected_token_ids,
+            sparse_token_changed=sparse_token_changed,
+            sparse_decision=sparse_decision,
+            candidate_positions=candidate_positions,
+            candidate_pending_counts=candidate_pending_counts,
+            pair_draft_counts=pair_draft_counts,
+            pair_stages=pair_stages,
+            generation_limit_reached=generation_limit_reached,
+            index_update_required=index_update_required,
+            boundary_request_mask=boundary_request_mask,
+            safe_boundary_indices=safe_boundary_indices,
+            verified_counts=verified_counts,
+        )
 
         # Expanded verification changes the number of target-model rows, so
         # only this request-level subset still needs a host-visible length.
@@ -1918,6 +2174,21 @@ class RetroSpecProposer:
                 generation_limit_reached=expanded_generation_limit,
                 index_update_required=expanded_index_update,
             )
+            self._trace_expanded_transition(
+                request_ids=request_ids,
+                proposal_round=proposal_round,
+                expanded=expanded,
+                sparse_token_ids=sparse_boundary_token_ids,
+                expanded_token_changed=expanded_token_changed,
+                expanded_decision=expanded_decision,
+                expanded_positions=expanded_positions,
+                expanded_pending_counts=expanded_pending_counts,
+                expanded_draft_counts=expanded_draft_counts,
+                expanded_stages=expanded_stages,
+                expanded_generation_limit=expanded_generation_limit,
+                expanded_index_update=expanded_index_update,
+                verified_counts=verified_counts,
+            )
             self._draft_token_ids[expanded.request_indices, expanded.token_indices] = (
                 expanded.token_ids
             )
@@ -1998,8 +2269,10 @@ class RetroSpecProposer:
         self.input_ids[:batch_size].copy_(next_token_ids)
         self.proposal_input_ids[:batch_size].copy_(next_token_ids)
 
+        proposal_round = 0
         with self.sparse_attention.proposal_context(request_ids, committed_positions):
             while True:
+                proposal_round += 1
                 draft_round_mask, round_start_counts = self._begin_draft_round(
                     batch_size
                 )
@@ -2072,6 +2345,17 @@ class RetroSpecProposer:
                     draft_to_sparse = draft_stage_mask & (
                         decision.next_stage == int(RetroSpecStage.SPARSE_VERIFY)
                     )
+                    self._trace_draft_transition(
+                        request_ids=request_ids,
+                        proposal_round=proposal_round,
+                        transition_mask=draft_to_sparse,
+                        decision=decision,
+                        draft_margin=draft_margin,
+                        hit_attn=hit_attn,
+                        projected_pending_counts=projected_pending_counts,
+                        generation_limit_reached=generation_limit_reached,
+                        index_update_required=index_update_required,
+                    )
                     self.performance_stats.add_gpu_histogram(
                         "draft_to_sparse_tokens",
                         self.state.draft_counts,
@@ -2105,6 +2389,8 @@ class RetroSpecProposer:
 
                 verification = self._verify_draft_tokens(
                     batch_size,
+                    request_ids,
+                    proposal_round,
                     round_start_counts,
                     common_attn_metadata,
                     sampling_metadata,

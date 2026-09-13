@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -23,7 +24,9 @@ from vllm.v1.spec_decode.retrospec import (
     RetroSpecAttentionMode,
     RetroSpecPipelineStage,
     RetroSpecProposer,
+    transition_trace,
 )
+from vllm.v1.spec_decode.retrospec.decision import RetroSpecMetrics
 from vllm.v1.spec_decode.retrospec.proposer import (
     RetroSpecParallelVerificationOutput,
     RetroSpecVerificationResult,
@@ -218,11 +221,60 @@ def test_retrospec_proposer_initialization():
     assert proposer.pipeline_protocol.max_batch_size == 8
     assert proposer.pipeline_protocol.device == device
     assert proposer.policy.max_draft_tokens == 4
+    assert proposer.transition_tracer.enabled is False
     assert proposer.state.max_batch_size == 8
     assert proposer.state.device == device
     assert proposer.attn_metadata_builder is None
     assert proposer.attn_layer_names == []
     assert proposer._cudagraph_registration_failure == "uninitialized"
+
+
+def test_draft_transition_trace_records_only_stopping_requests(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(
+            retrospec_max_draft_tokens=2,
+            retrospec_trace_transitions=True,
+        ),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer.state.begin_batch(2)
+    proposer.state.add_draft_counts(torch.tensor([1, 2], dtype=torch.int32))
+    proposer.positions[:2].copy_(torch.tensor([10, 20]))
+    projected_pending_counts = proposer.state.draft_counts.clone()
+    generation_limit_reached = torch.zeros(2, dtype=torch.bool)
+    index_update_required = torch.zeros(2, dtype=torch.bool)
+    decision = proposer.policy.evaluate(
+        current_stage=RetroSpecStage.DRAFT,
+        request_stages=proposer.state.stage,
+        metrics=RetroSpecMetrics(hit_attn=torch.ones(2)),
+        draft_counts=proposer.state.draft_counts,
+        pending_counts=projected_pending_counts,
+        active_mask=proposer.state.active_mask,
+        generation_limit_reached=generation_limit_reached,
+        index_update_required=index_update_required,
+    )
+    transition_mask = decision.next_stage == int(RetroSpecStage.SPARSE_VERIFY)
+    logger_info = Mock()
+    monkeypatch.setattr(transition_trace.logger, "info", logger_info)
+
+    proposer._trace_draft_transition(
+        request_ids=["request-0", "request-1"],
+        proposal_round=4,
+        transition_mask=transition_mask,
+        decision=decision,
+        draft_margin=None,
+        hit_attn=torch.ones(2),
+        projected_pending_counts=projected_pending_counts,
+        generation_limit_reached=generation_limit_reached,
+        index_update_required=index_update_required,
+    )
+
+    payload = json.loads(logger_info.call_args.args[1])
+    assert payload["proposal_round"] == 4
+    assert payload["records"][0]["request_id"] == "request-1"
+    assert payload["records"][0]["position"] == 21
+    assert payload["records"][0]["reason_names"] == ["MAX_DRAFT_TOKENS"]
 
 
 def test_initialize_cudagraph_keys_registers_original_piecewise_buckets():
@@ -1643,6 +1695,8 @@ def test_sparse_verification_requires_full_at_index_update_boundary(monkeypatch)
 
     verification = proposer._verify_draft_tokens(
         1,
+        ["request-0"],
+        1,
         torch.zeros(1, dtype=torch.int32),
         make_common_metadata([1]),
         make_sampling_metadata(all_greedy=True),
@@ -1691,6 +1745,8 @@ def test_sparse_full_trigger_skips_expanded_verification(monkeypatch):
         fake_run_parallel_verification,
     )
     verification = proposer._verify_draft_tokens(
+        1,
+        ["request-0"],
         1,
         torch.zeros(1, dtype=torch.int32),
         make_common_metadata([1]),
@@ -1819,6 +1875,8 @@ def test_verify_unchanged_sparse_tokens_keeps_complete_prefix(monkeypatch):
     )
     verification = proposer._verify_draft_tokens(
         1,
+        ["request-0"],
+        1,
         torch.zeros(1, dtype=torch.int32),
         make_common_metadata([1]),
         make_sampling_metadata(all_greedy=True),
@@ -1863,6 +1921,8 @@ def test_sparse_token_change_is_corrected_and_truncates_prefix(monkeypatch):
         fake_run_parallel_verification,
     )
     verification = proposer._verify_draft_tokens(
+        1,
+        ["request-0"],
         1,
         torch.zeros(1, dtype=torch.int32),
         make_common_metadata([1]),
@@ -1922,6 +1982,8 @@ def test_expanded_verification_preserves_sparse_boundary_across_shared_workspace
     )
 
     verification = proposer._verify_draft_tokens(
+        1,
+        ["request-0"],
         1,
         torch.zeros(1, dtype=torch.int32),
         make_common_metadata([1]),
@@ -1988,6 +2050,8 @@ def test_expanded_verification_passes_or_stops_requests_independently(
     monkeypatch.setattr(proposer, "_compact_mask_indices", track_compaction)
     verification = proposer._verify_draft_tokens(
         2,
+        ["request-0", "request-1"],
+        1,
         torch.zeros(2, dtype=torch.int32),
         make_common_metadata([1, 1]),
         make_sampling_metadata(all_greedy=True),
@@ -2004,6 +2068,70 @@ def test_expanded_verification_passes_or_stops_requests_independently(
         int(RetroSpecStage.DRAFT),
         int(RetroSpecStage.FULL_VERIFY),
     ]
+
+
+def test_verification_trace_records_request_boundaries(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(
+            retrospec_sparse_margin_threshold=0.5,
+            retrospec_expanded_margin_threshold=0.5,
+            retrospec_trace_transitions=True,
+        ),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    initialize_verification(
+        proposer,
+        torch.tensor([[10, 20, -1, -1], [11, 21, -1, -1]], dtype=torch.int32),
+        torch.tensor([2, 2], dtype=torch.int32),
+    )
+
+    def fake_run_parallel_verification(
+        batch_size,
+        request_indices,
+        token_indices,
+        common_attn_metadata,
+        sampling_metadata,
+        attention_mode,
+    ):
+        if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
+            return make_parallel_verification_output(
+                [0, 0, 1, 1],
+                [0, 1, 0, 1],
+                [10, 20, 11, 21],
+                margin=[0.9, 0.9, 0.1, 0.9],
+            )
+        return make_parallel_verification_output([1], [0], [11], margin=[0.1])
+
+    logger_info = Mock()
+    monkeypatch.setattr(
+        proposer, "_run_parallel_verification", fake_run_parallel_verification
+    )
+    monkeypatch.setattr(transition_trace.logger, "info", logger_info)
+
+    verification = proposer._verify_draft_tokens(
+        2,
+        ["request-0", "request-1"],
+        3,
+        torch.zeros(2, dtype=torch.int32),
+        make_common_metadata([1, 1]),
+        make_sampling_metadata(all_greedy=True),
+    )
+
+    assert verification.verified_counts.tolist() == [2, 1]
+    payloads = [json.loads(call.args[1]) for call in logger_info.call_args_list]
+    assert [payload["phase"] for payload in payloads] == [
+        "sparse_boundary",
+        "sparse_complete",
+        "expanded_boundary",
+    ]
+    assert all(payload["proposal_round"] == 3 for payload in payloads)
+    assert payloads[0]["records"][0]["request_id"] == "request-1"
+    assert payloads[0]["records"][0]["reason_names"] == ["SPARSE_MARGIN"]
+    assert payloads[1]["records"][0]["request_id"] == "request-0"
+    assert payloads[1]["records"][0]["next_stage_name"] == "DRAFT"
+    assert payloads[2]["records"][0]["request_id"] == "request-1"
+    assert payloads[2]["records"][0]["reason_names"] == ["EXPANDED_MARGIN"]
 
 
 def test_expanded_token_change_replaces_current_token_before_truncation(
@@ -2040,6 +2168,8 @@ def test_expanded_token_change_replaces_current_token_before_truncation(
         fake_run_parallel_verification,
     )
     verification = proposer._verify_draft_tokens(
+        1,
+        ["request-0"],
         1,
         torch.zeros(1, dtype=torch.int32),
         make_common_metadata([1]),
@@ -2082,6 +2212,8 @@ def test_verify_only_processes_current_logical_draft_interval(monkeypatch):
     )
     verification = proposer._verify_draft_tokens(
         1,
+        ["request-0"],
+        1,
         torch.tensor([2], dtype=torch.int32),
         make_common_metadata([1]),
         make_sampling_metadata(all_greedy=True),
@@ -2118,10 +2250,14 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
 
     def fake_verify(
         batch_size,
+        request_ids,
+        proposal_round,
         round_start_counts,
         common_attn_metadata,
         sampling_metadata,
     ):
+        assert request_ids == ["request-0"]
+        assert proposal_round == len(round_starts) + 1
         round_starts.append(round_start_counts.tolist())
         verified_counts = proposer.state.draft_counts.clone()
         require_full = (
@@ -2211,10 +2347,14 @@ def test_propose_handles_different_round_offsets_in_one_buffer(monkeypatch):
 
     def fake_verify(
         batch_size,
+        request_ids,
+        proposal_round,
         round_start_counts,
         common_attn_metadata,
         sampling_metadata,
     ):
+        assert request_ids == ["request-0", "request-1"]
+        assert proposal_round == len(round_starts) + 1
         round_index = len(round_starts)
         round_starts.append(round_start_counts.tolist())
         verified_counts = verified_by_round[round_index]

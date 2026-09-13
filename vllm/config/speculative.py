@@ -244,6 +244,11 @@ class SpeculativeConfig:
     """Trigger full verification when expanded-zone attention mass is
     below this value."""
 
+    retrospec_trace_transitions: bool = False
+    """Emit request-level RetroSpec stage-transition diagnostics. This option
+    synchronizes compact decision tensors to CPU and must remain disabled
+    during performance measurements."""
+
     retrospec_stats_interval_seconds: float = Field(default=0.0, ge=0)
     """Interval for worker-side RetroSpec performance logs. Zero disables all
     RetroSpec performance counters and CUDA event timing."""

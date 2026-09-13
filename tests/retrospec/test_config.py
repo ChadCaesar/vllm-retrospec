@@ -48,6 +48,7 @@ def test_retrospec_defaults():
     assert config.retrospec_hit_attn_threshold is None
     assert config.retrospec_retrieval_attn_threshold is None
     assert config.retrospec_expanded_attn_threshold is None
+    assert config.retrospec_trace_transitions is False
     assert config.retrospec_stats_interval_seconds == pytest.approx(0.0)
     assert config.retrospec_stats_cuda_timing_level == "coarse"
     assert config.retrospec_stats_cuda_sample_interval == 8
@@ -254,6 +255,7 @@ def test_retrospec_hash_tracks_execution_structure(field: str, value: Any):
         ("retrospec_max_pinned_memory", 2.0),
         ("retrospec_max_gpu_index_memory", 8.0),
         ("retrospec_prefill_warmup_multiplier", 8),
+        ("retrospec_trace_transitions", True),
         ("retrospec_stats_interval_seconds", 5.0),
         ("retrospec_stats_cuda_timing_level", "detailed"),
         ("retrospec_stats_cuda_sample_interval", 1),
