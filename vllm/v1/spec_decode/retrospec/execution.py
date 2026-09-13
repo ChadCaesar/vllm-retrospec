@@ -71,6 +71,28 @@ class RetroSpecEstimationKVSource:
 
 
 @dataclass(frozen=True)
+class RetroSpecRankedDraftKVSource:
+    """GPU index and resident-table views for one ranked DRAFT selection."""
+
+    primary: RetroSpecExactPrimaryKVSource
+    request_slot_ids: torch.Tensor
+    exact_cluster_indices: torch.Tensor
+    estimation_cluster_indices: torch.Tensor
+    resident_bucket_ids: torch.Tensor
+    cluster_keys: torch.Tensor
+    cluster_values: torch.Tensor
+    cluster_token_counts: torch.Tensor
+    cluster_page_starts: torch.Tensor
+    cluster_page_counts: torch.Tensor
+    page_token_counts: torch.Tensor
+    cluster_offsets: torch.Tensor
+    page_offsets: torch.Tensor
+    resident_table_page_slots: torch.Tensor
+    resident_key_pages: torch.Tensor
+    resident_value_pages: torch.Tensor
+
+
+@dataclass(frozen=True)
 class RetroSpecCompactKVSource:
     """Token-contiguous clustered KV staged for full verification."""
 
@@ -334,6 +356,341 @@ def _multi_source_exact_partition_kernel(
         )
         running_sum = running_sum * old_scale + chunk_sum
         running_max = new_max
+
+    normalized_output = tl.where(running_sum > 0.0, running_output / running_sum, 0.0)
+    output_offsets = (
+        query_idx * output_stride_0
+        + query_head_idx * output_stride_1
+        + partition_idx * output_stride_2
+        + dimension_offsets * output_stride_3
+    )
+    stats_offset = (
+        query_idx * stats_stride_0
+        + query_head_idx * stats_stride_1
+        + partition_idx * stats_stride_2
+    )
+    tl.store(partial_output + output_offsets, normalized_output, mask=dimension_mask)
+    tl.store(partial_max + stats_offset, running_max)
+    tl.store(partial_sum + stats_offset, running_sum)
+
+
+@triton.jit
+def _ranked_draft_attention_partition_kernel(
+    query,
+    key_cache,
+    value_cache,
+    block_table,
+    primary_token_indices,
+    primary_token_mask,
+    request_slot_ids,
+    exact_cluster_indices,
+    estimation_cluster_indices,
+    resident_bucket_ids,
+    cluster_keys,
+    cluster_values,
+    cluster_token_counts,
+    cluster_page_starts,
+    cluster_page_counts,
+    page_token_counts,
+    cluster_offsets,
+    page_offsets,
+    resident_table_page_slots,
+    resident_key_pages,
+    resident_value_pages,
+    partial_output,
+    partial_max,
+    partial_sum,
+    query_stride_0,
+    query_stride_1,
+    query_stride_2,
+    key_stride_0,
+    key_stride_1,
+    key_stride_2,
+    key_stride_3,
+    value_stride_0,
+    value_stride_1,
+    value_stride_2,
+    value_stride_3,
+    block_table_stride_0,
+    block_table_stride_1,
+    resident_key_stride_0,
+    resident_key_stride_1,
+    resident_key_stride_2,
+    resident_value_stride_0,
+    resident_value_stride_1,
+    resident_value_stride_2,
+    output_stride_0,
+    output_stride_1,
+    output_stride_2,
+    output_stride_3,
+    stats_stride_0,
+    stats_stride_1,
+    stats_stride_2,
+    scale,
+    source_partition_offset,
+    NUM_KV_HEADS: tl.constexpr,
+    QUERIES_PER_KV_HEAD: tl.constexpr,
+    MAX_PRIMARY_TOKENS: tl.constexpr,
+    RETRIEVAL_WIDTH: tl.constexpr,
+    ESTIMATION_WIDTH: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    CLUSTER_CAPACITY: tl.constexpr,
+    PAGE_CAPACITY: tl.constexpr,
+    RESIDENT_PAGE_STRIDE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    PARTITION_SIZE: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    query_head_idx = tl.program_id(1)
+    partition_idx = tl.program_id(2)
+    kv_head_idx = query_head_idx // QUERIES_PER_KV_HEAD
+
+    dimension_offsets = tl.arange(0, BLOCK_D)
+    dimension_mask = dimension_offsets < HEAD_SIZE
+    query_offsets = (
+        query_idx * query_stride_0
+        + query_head_idx * query_stride_1
+        + dimension_offsets * query_stride_2
+    )
+    query_vector = tl.load(query + query_offsets, mask=dimension_mask, other=0.0)
+    query_vector = query_vector.to(tl.float32)
+
+    request_slot = tl.load(request_slot_ids + query_idx).to(tl.int64)
+    request_valid = request_slot >= 0
+    safe_request_slot = tl.maximum(request_slot, 0)
+    request_cluster_offset = tl.load(
+        cluster_offsets + safe_request_slot, mask=request_valid, other=0
+    ).to(tl.int64)
+    request_page_offset = tl.load(
+        page_offsets + safe_request_slot, mask=request_valid, other=0
+    ).to(tl.int64)
+
+    resident_region_start = MAX_PRIMARY_TOKENS
+    resident_cluster_stride = MAX_PAGES * PAGE_SIZE
+    resident_region_end = (
+        resident_region_start + RETRIEVAL_WIDTH * resident_cluster_stride
+    )
+    estimation_region_end = resident_region_end + ESTIMATION_WIDTH
+    source_capacity = estimation_region_end + RETRIEVAL_WIDTH
+
+    running_max = float("-inf")
+    running_sum = 0.0
+    running_output = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    partition_start = (source_partition_offset + partition_idx) * PARTITION_SIZE
+
+    for chunk_start in tl.range(0, PARTITION_SIZE, BLOCK_TOKENS):
+        token_offsets = partition_start + chunk_start + tl.arange(0, BLOCK_TOKENS)
+        source_valid = token_offsets < source_capacity
+
+        primary_valid = source_valid & (token_offsets < MAX_PRIMARY_TOKENS)
+        primary_metadata_offsets = (
+            query_idx * NUM_KV_HEADS + kv_head_idx
+        ) * MAX_PRIMARY_TOKENS + token_offsets
+        primary_valid &= tl.load(
+            primary_token_mask + primary_metadata_offsets,
+            mask=primary_valid,
+            other=0,
+        ).to(tl.int1)
+        logical_token_indices = tl.load(
+            primary_token_indices + primary_metadata_offsets,
+            mask=primary_valid,
+            other=0,
+        ).to(tl.int64)
+        logical_block_indices = logical_token_indices // PAGE_SIZE
+        primary_block_offsets = logical_token_indices % PAGE_SIZE
+        physical_block_indices = tl.load(
+            block_table
+            + query_idx * block_table_stride_0
+            + logical_block_indices * block_table_stride_1,
+            mask=primary_valid,
+            other=0,
+        ).to(tl.int64)
+        primary_key_offsets = (
+            physical_block_indices[:, None] * key_stride_0
+            + primary_block_offsets[:, None] * key_stride_1
+            + kv_head_idx * key_stride_2
+            + dimension_offsets[None, :] * key_stride_3
+        )
+        primary_value_offsets = (
+            physical_block_indices[:, None] * value_stride_0
+            + primary_block_offsets[:, None] * value_stride_1
+            + kv_head_idx * value_stride_2
+            + dimension_offsets[None, :] * value_stride_3
+        )
+        primary_vector_mask = primary_valid[:, None] & dimension_mask[None, :]
+        key_vectors = tl.load(
+            key_cache + primary_key_offsets,
+            mask=primary_vector_mask,
+            other=0.0,
+        ).to(tl.float32)
+        value_vectors = tl.load(
+            value_cache + primary_value_offsets,
+            mask=primary_vector_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        resident_linear_offsets = token_offsets - resident_region_start
+        resident_ranks = resident_linear_offsets // resident_cluster_stride
+        resident_inner_offsets = resident_linear_offsets % resident_cluster_stride
+        resident_page_offsets = resident_inner_offsets // PAGE_SIZE
+        resident_token_offsets = resident_inner_offsets % PAGE_SIZE
+        resident_valid = (
+            source_valid
+            & (token_offsets >= resident_region_start)
+            & (token_offsets < resident_region_end)
+        )
+        safe_resident_ranks = tl.maximum(resident_ranks, 0)
+        exact_row_offset = (query_idx * NUM_KV_HEADS + kv_head_idx) * RETRIEVAL_WIDTH
+        local_cluster_indices = tl.load(
+            exact_cluster_indices + exact_row_offset + safe_resident_ranks,
+            mask=resident_valid,
+            other=-1,
+        ).to(tl.int64)
+        resident_buckets = tl.load(
+            resident_bucket_ids + exact_row_offset + safe_resident_ranks,
+            mask=resident_valid,
+            other=-1,
+        ).to(tl.int64)
+        resident_valid &= (local_cluster_indices >= 0) & (resident_buckets >= 0)
+        cluster_storage_offsets = (
+            kv_head_idx * CLUSTER_CAPACITY
+            + request_cluster_offset
+            + tl.maximum(local_cluster_indices, 0)
+        )
+        logical_page_starts = tl.load(
+            cluster_page_starts + cluster_storage_offsets,
+            mask=resident_valid,
+            other=0,
+        ).to(tl.int64)
+        logical_page_counts = tl.load(
+            cluster_page_counts + cluster_storage_offsets,
+            mask=resident_valid,
+            other=0,
+        ).to(tl.int32)
+        resident_valid &= resident_page_offsets < logical_page_counts
+        page_storage_offsets = (
+            kv_head_idx * PAGE_CAPACITY
+            + request_page_offset
+            + logical_page_starts
+            + resident_page_offsets
+        )
+        valid_page_token_counts = tl.load(
+            page_token_counts + page_storage_offsets,
+            mask=resident_valid,
+            other=0,
+        ).to(tl.int32)
+        resident_valid &= resident_token_offsets < valid_page_token_counts
+        resident_page_slots = tl.load(
+            resident_table_page_slots
+            + tl.maximum(resident_buckets, 0) * RESIDENT_PAGE_STRIDE
+            + resident_page_offsets,
+            mask=resident_valid,
+            other=-1,
+        ).to(tl.int64)
+        resident_valid &= resident_page_slots >= 0
+        resident_key_offsets = (
+            resident_page_slots[:, None] * resident_key_stride_0
+            + resident_token_offsets[:, None] * resident_key_stride_1
+            + dimension_offsets[None, :] * resident_key_stride_2
+        )
+        resident_value_offsets = (
+            resident_page_slots[:, None] * resident_value_stride_0
+            + resident_token_offsets[:, None] * resident_value_stride_1
+            + dimension_offsets[None, :] * resident_value_stride_2
+        )
+        resident_vector_mask = resident_valid[:, None] & dimension_mask[None, :]
+        key_vectors += tl.load(
+            resident_key_pages + resident_key_offsets,
+            mask=resident_vector_mask,
+            other=0.0,
+        ).to(tl.float32)
+        value_vectors += tl.load(
+            resident_value_pages + resident_value_offsets,
+            mask=resident_vector_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        estimation_ranks = token_offsets - resident_region_end
+        fallback_ranks = token_offsets - estimation_region_end
+        estimation_valid = (
+            source_valid
+            & (token_offsets >= resident_region_end)
+            & (token_offsets < estimation_region_end)
+        )
+        fallback_valid = source_valid & (token_offsets >= estimation_region_end)
+        safe_estimation_ranks = tl.maximum(estimation_ranks, 0)
+        safe_fallback_ranks = tl.maximum(fallback_ranks, 0)
+        estimation_row_offset = (
+            query_idx * NUM_KV_HEADS + kv_head_idx
+        ) * ESTIMATION_WIDTH
+        estimation_local_indices = tl.load(
+            estimation_cluster_indices + estimation_row_offset + safe_estimation_ranks,
+            mask=estimation_valid,
+            other=-1,
+        ).to(tl.int64)
+        fallback_local_indices = tl.load(
+            exact_cluster_indices + exact_row_offset + safe_fallback_ranks,
+            mask=fallback_valid,
+            other=-1,
+        ).to(tl.int64)
+        fallback_buckets = tl.load(
+            resident_bucket_ids + exact_row_offset + safe_fallback_ranks,
+            mask=fallback_valid,
+            other=-1,
+        ).to(tl.int64)
+        summary_local_indices = tl.where(
+            estimation_valid, estimation_local_indices, fallback_local_indices
+        )
+        summary_valid = (estimation_valid & (estimation_local_indices >= 0)) | (
+            fallback_valid & (fallback_local_indices >= 0) & (fallback_buckets < 0)
+        )
+        summary_storage_offsets = (
+            kv_head_idx * CLUSTER_CAPACITY
+            + request_cluster_offset
+            + tl.maximum(summary_local_indices, 0)
+        )
+        summary_token_counts = tl.load(
+            cluster_token_counts + summary_storage_offsets,
+            mask=summary_valid,
+            other=0,
+        ).to(tl.int32)
+        summary_valid &= summary_token_counts > 0
+        summary_offsets = (
+            summary_storage_offsets[:, None] * HEAD_SIZE + dimension_offsets[None, :]
+        )
+        summary_vector_mask = summary_valid[:, None] & dimension_mask[None, :]
+        key_vectors += tl.load(
+            cluster_keys + summary_offsets,
+            mask=summary_vector_mask,
+            other=0.0,
+        ).to(tl.float32)
+        value_vectors += tl.load(
+            cluster_values + summary_offsets,
+            mask=summary_vector_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        valid_tokens = primary_valid | resident_valid | summary_valid
+        scores = tl.sum(key_vectors * query_vector[None, :], axis=1) * scale
+        scores += tl.where(
+            summary_valid,
+            tl.log(tl.maximum(summary_token_counts.to(tl.float32), 1.0)),
+            0.0,
+        )
+        scores = tl.where(valid_tokens, scores, float("-inf"))
+        chunk_max = tl.max(scores, axis=0)
+        new_max = tl.maximum(running_max, chunk_max)
+        safe_new_max = tl.where(new_max == float("-inf"), 0.0, new_max)
+        old_scale = tl.where(running_sum > 0.0, tl.exp(running_max - safe_new_max), 0.0)
+        probabilities = tl.where(valid_tokens, tl.exp(scores - safe_new_max), 0.0)
+        running_output = running_output * old_scale + tl.sum(
+            probabilities[:, None] * value_vectors, axis=0
+        )
+        running_sum = running_sum * old_scale + tl.sum(probabilities, axis=0)
+        running_max = tl.where(running_sum > 0.0, new_max, float("-inf"))
 
     normalized_output = tl.where(running_sum > 0.0, running_output / running_sum, 0.0)
     output_offsets = (
@@ -1880,6 +2237,345 @@ class RetroSpecExactAttentionWorkspace:
             BLOCK_D=block_d,
         )
         return output, output_lse
+
+    def _validate_ranked_draft_source(
+        self,
+        source: RetroSpecRankedDraftKVSource,
+        query: torch.Tensor,
+        output: torch.Tensor,
+    ) -> tuple[int, int, int, int]:
+        if query.ndim != 3 or query.device.type != "cuda":
+            raise ValueError("Ranked DRAFT attention requires CUDA query rows")
+        if query.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("Ranked DRAFT attention requires FP16 or BF16")
+        if output.shape != query.shape or output.dtype != query.dtype:
+            raise ValueError("Ranked DRAFT output must match query")
+        if output.device != query.device:
+            raise ValueError("Ranked DRAFT output must use the query device")
+        if query.shape[0] > self.max_num_queries:
+            raise ValueError("Query count exceeds exact-attention capacity")
+
+        primary = source.primary
+        if primary.key_cache.shape != primary.value_cache.shape:
+            raise ValueError("Primary key and value cache shapes must match")
+        if primary.key_cache.ndim != 4:
+            raise ValueError("Primary KV cache must have four dimensions")
+        if primary.key_cache.dtype != query.dtype:
+            raise ValueError("Primary KV dtype must match query")
+        if primary.key_cache.shape[1] != self.page_size:
+            raise ValueError("Primary KV block size does not match page size")
+        if primary.token_indices.shape != primary.token_mask.shape:
+            raise ValueError("Primary token descriptors must have equal shapes")
+        if primary.token_indices.ndim != 3:
+            raise ValueError("Primary token descriptors must be three-dimensional")
+        if primary.token_mask.dtype != torch.bool:
+            raise ValueError("Primary token mask must be boolean")
+
+        batch_size, num_kv_heads, max_primary_tokens = primary.token_indices.shape
+        if batch_size != query.shape[0]:
+            raise ValueError("Ranked DRAFT requires one query per request")
+        if query.shape[1] % num_kv_heads != 0:
+            raise ValueError("Query heads must be divisible by KV heads")
+        if primary.key_cache.shape[2:] != (num_kv_heads, query.shape[2]):
+            raise ValueError("Primary KV shape does not match query")
+        if primary.block_table.shape[0] != batch_size:
+            raise ValueError("Block table batch does not match query")
+
+        retrieval_shape = source.exact_cluster_indices.shape
+        if source.resident_bucket_ids.shape != retrieval_shape:
+            raise ValueError("Resident buckets do not match exact clusters")
+        if retrieval_shape[:2] != (batch_size, num_kv_heads):
+            raise ValueError("Exact cluster rows do not match query")
+        if source.estimation_cluster_indices.shape[:2] != (
+            batch_size,
+            num_kv_heads,
+        ):
+            raise ValueError("Estimation cluster rows do not match query")
+        if source.request_slot_ids.shape != (batch_size,):
+            raise ValueError("Request slots do not match query")
+        if source.exact_cluster_indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Exact cluster indices must be integral")
+        if source.estimation_cluster_indices.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError("Estimation cluster indices must be integral")
+        if source.resident_bucket_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Resident buckets must be integral")
+
+        if source.cluster_keys.shape != source.cluster_values.shape:
+            raise ValueError("Cluster key and value summaries must match")
+        if source.cluster_keys.dtype != query.dtype:
+            raise ValueError("Cluster summary dtype must match query")
+        if source.cluster_keys.ndim != 3:
+            raise ValueError("Cluster summaries must have three dimensions")
+        if source.cluster_keys.shape[0] != num_kv_heads:
+            raise ValueError("Cluster summary KV heads do not match query")
+        if source.cluster_keys.shape[2] != query.shape[2]:
+            raise ValueError("Cluster summary head size does not match query")
+        cluster_shape = source.cluster_keys.shape[:2]
+        for tensor in (
+            source.cluster_token_counts,
+            source.cluster_page_starts,
+            source.cluster_page_counts,
+        ):
+            if tensor.shape != cluster_shape:
+                raise ValueError("Cluster descriptor shape is inconsistent")
+        if source.page_token_counts.ndim != 2:
+            raise ValueError("Page token counts must have two dimensions")
+        if source.page_token_counts.shape[0] != num_kv_heads:
+            raise ValueError("Page descriptors do not match KV heads")
+        if source.cluster_offsets.ndim != 1 or source.page_offsets.ndim != 1:
+            raise ValueError("Request offsets must be one-dimensional")
+        if source.resident_table_page_slots.ndim != 2:
+            raise ValueError("Resident page table must have two dimensions")
+        if source.resident_key_pages.shape != source.resident_value_pages.shape:
+            raise ValueError("Resident key and value pages must match")
+        if source.resident_key_pages.ndim != 3:
+            raise ValueError("Resident pages must have three dimensions")
+        if source.resident_key_pages.dtype != query.dtype:
+            raise ValueError("Resident page dtype must match query")
+        if source.resident_key_pages.shape[1:] != (
+            self.page_size,
+            query.shape[2],
+        ):
+            raise ValueError("Resident page shape does not match query")
+
+        tensors = (
+            primary.key_cache,
+            primary.value_cache,
+            primary.block_table,
+            primary.token_indices,
+            primary.token_mask,
+            source.request_slot_ids,
+            source.exact_cluster_indices,
+            source.estimation_cluster_indices,
+            source.resident_bucket_ids,
+            source.cluster_keys,
+            source.cluster_values,
+            source.cluster_token_counts,
+            source.cluster_page_starts,
+            source.cluster_page_counts,
+            source.page_token_counts,
+            source.cluster_offsets,
+            source.page_offsets,
+            source.resident_table_page_slots,
+            source.resident_key_pages,
+            source.resident_value_pages,
+        )
+        if any(tensor.device != query.device for tensor in tensors):
+            raise ValueError("Ranked DRAFT tensors must use the query device")
+        return (
+            num_kv_heads,
+            max_primary_tokens,
+            retrieval_shape[2],
+            source.estimation_cluster_indices.shape[2],
+        )
+
+    def _launch_ranked_draft_partitions(
+        self,
+        source: RetroSpecRankedDraftKVSource,
+        query: torch.Tensor,
+        scale: float,
+        num_kv_heads: int,
+        max_primary_tokens: int,
+        retrieval_width: int,
+        estimation_width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        num_queries, num_query_heads, head_size = query.shape
+        max_pages = source.resident_table_page_slots.shape[1]
+        source_capacity = (
+            max_primary_tokens
+            + retrieval_width * max_pages * self.page_size
+            + estimation_width
+            + retrieval_width
+        )
+        total_partitions = triton.cdiv(source_capacity, EXACT_ATTENTION_PARTITION_SIZE)
+        self._ensure_workspace(query)
+        assert self._partial_output is not None
+        assert self._partial_max is not None
+        assert self._partial_sum is not None
+        assert self._accumulated_output is not None
+        assert self._accumulated_max is not None
+        assert self._accumulated_sum is not None
+
+        primary = source.primary
+        block_d = triton.next_power_of_2(head_size)
+        partition_start = 0
+        wave_index = 0
+        while partition_start < total_partitions:
+            wave_partitions = min(
+                self._partition_capacity, total_partitions - partition_start
+            )
+            _ranked_draft_attention_partition_kernel[
+                (num_queries, num_query_heads, wave_partitions)
+            ](
+                query,
+                primary.key_cache,
+                primary.value_cache,
+                primary.block_table,
+                primary.token_indices,
+                primary.token_mask,
+                source.request_slot_ids,
+                source.exact_cluster_indices,
+                source.estimation_cluster_indices,
+                source.resident_bucket_ids,
+                source.cluster_keys,
+                source.cluster_values,
+                source.cluster_token_counts,
+                source.cluster_page_starts,
+                source.cluster_page_counts,
+                source.page_token_counts,
+                source.cluster_offsets,
+                source.page_offsets,
+                source.resident_table_page_slots,
+                source.resident_key_pages,
+                source.resident_value_pages,
+                self._partial_output,
+                self._partial_max,
+                self._partial_sum,
+                query.stride(0),
+                query.stride(1),
+                query.stride(2),
+                primary.key_cache.stride(0),
+                primary.key_cache.stride(1),
+                primary.key_cache.stride(2),
+                primary.key_cache.stride(3),
+                primary.value_cache.stride(0),
+                primary.value_cache.stride(1),
+                primary.value_cache.stride(2),
+                primary.value_cache.stride(3),
+                primary.block_table.stride(0),
+                primary.block_table.stride(1),
+                source.resident_key_pages.stride(0),
+                source.resident_key_pages.stride(1),
+                source.resident_key_pages.stride(2),
+                source.resident_value_pages.stride(0),
+                source.resident_value_pages.stride(1),
+                source.resident_value_pages.stride(2),
+                self._partial_output.stride(0),
+                self._partial_output.stride(1),
+                self._partial_output.stride(2),
+                self._partial_output.stride(3),
+                self._partial_max.stride(0),
+                self._partial_max.stride(1),
+                self._partial_max.stride(2),
+                scale,
+                partition_start,
+                NUM_KV_HEADS=num_kv_heads,
+                QUERIES_PER_KV_HEAD=num_query_heads // num_kv_heads,
+                MAX_PRIMARY_TOKENS=max_primary_tokens,
+                RETRIEVAL_WIDTH=retrieval_width,
+                ESTIMATION_WIDTH=estimation_width,
+                MAX_PAGES=max_pages,
+                PAGE_SIZE=self.page_size,
+                CLUSTER_CAPACITY=source.cluster_keys.shape[1],
+                PAGE_CAPACITY=source.page_token_counts.shape[1],
+                RESIDENT_PAGE_STRIDE=source.resident_table_page_slots.stride(0),
+                HEAD_SIZE=head_size,
+                BLOCK_D=block_d,
+                PARTITION_SIZE=EXACT_ATTENTION_PARTITION_SIZE,
+                BLOCK_TOKENS=_EXACT_ATTENTION_BLOCK_TOKENS,
+            )
+            partition_start += wave_partitions
+            if total_partitions <= self._partition_capacity:
+                return (
+                    self._partial_output,
+                    self._partial_max,
+                    self._partial_sum,
+                    wave_partitions,
+                )
+
+            _accumulate_exact_partition_wave_kernel[(num_queries, num_query_heads)](
+                self._partial_output,
+                self._partial_max,
+                self._partial_sum,
+                self._accumulated_output,
+                self._accumulated_max,
+                self._accumulated_sum,
+                self._partial_output.stride(0),
+                self._partial_output.stride(1),
+                self._partial_output.stride(2),
+                self._partial_output.stride(3),
+                self._partial_max.stride(0),
+                self._partial_max.stride(1),
+                self._partial_max.stride(2),
+                self._accumulated_output.stride(0),
+                self._accumulated_output.stride(1),
+                self._accumulated_output.stride(3),
+                self._accumulated_max.stride(0),
+                self._accumulated_max.stride(1),
+                self._accumulated_max.stride(2),
+                wave_partitions,
+                RESET=wave_index == 0,
+                HEAD_SIZE=head_size,
+                BLOCK_D=block_d,
+            )
+            wave_index += 1
+
+        return (
+            self._accumulated_output,
+            self._accumulated_max,
+            self._accumulated_sum,
+            1,
+        )
+
+    def run_ranked_draft_proposal(
+        self,
+        source: RetroSpecRankedDraftKVSource,
+        query: torch.Tensor,
+        scale: float,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run DRAFT attention directly from ranked index and resident buckets."""
+        (
+            num_kv_heads,
+            max_primary_tokens,
+            retrieval_width,
+            estimation_width,
+        ) = self._validate_ranked_draft_source(source, query, output)
+        partial_output, partial_max, partial_sum, num_partitions = (
+            self._launch_ranked_draft_partitions(
+                source,
+                query,
+                scale,
+                num_kv_heads,
+                max_primary_tokens,
+                retrieval_width,
+                estimation_width,
+            )
+        )
+        num_queries, num_query_heads, head_size = query.shape
+        if num_queries == 0:
+            return output
+
+        assert self._output_lse is not None
+        output_lse = self._output_lse[: num_queries * num_query_heads].view(
+            num_query_heads, num_queries
+        )
+        _reduce_exact_partitions_kernel[(num_queries, num_query_heads)](
+            partial_output,
+            partial_max,
+            partial_sum,
+            output,
+            output_lse,
+            partial_output.stride(0),
+            partial_output.stride(1),
+            partial_output.stride(2),
+            partial_output.stride(3),
+            partial_max.stride(0),
+            partial_max.stride(1),
+            partial_max.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            output_lse.stride(0),
+            output_lse.stride(1),
+            num_partitions,
+            HEAD_SIZE=head_size,
+            BLOCK_D=triton.next_power_of_2(head_size),
+        )
+        return output
 
     def run_proposal(
         self,

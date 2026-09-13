@@ -14,6 +14,7 @@ from .resident_kernels import (
     lookup_resident_handles,
     resolve_compact_draft_pages,
     resolve_compact_verification_pages,
+    resolve_ranked_draft_buckets,
     update_resident_handles,
 )
 
@@ -68,6 +69,25 @@ class RetroSpecCompactResidentPageAccess:
     miss_cluster_counts: torch.Tensor
     hit_gate_ready: torch.Tensor
     access_kinds: torch.Tensor | None
+    read_lease: "RetroSpecResidentReadLease"
+
+
+@dataclass(frozen=True)
+class RetroSpecRankedDraftResidentAccess:
+    """Stable resident-table view for one ranked DRAFT selection."""
+
+    cluster_handles: torch.Tensor
+    resident_bucket_ids: torch.Tensor
+    clustered_token_counts: torch.Tensor
+    attention_mass: torch.Tensor
+    selected_cluster_counts: torch.Tensor
+    hit_cluster_counts: torch.Tensor
+    miss_cluster_counts: torch.Tensor
+    hit_gate_ready: torch.Tensor
+    resident_table_page_counts: torch.Tensor
+    resident_table_page_slots: torch.Tensor
+    resident_key_pages: torch.Tensor
+    resident_value_pages: torch.Tensor
     read_lease: "RetroSpecResidentReadLease"
 
 
@@ -1356,6 +1376,116 @@ class RetroSpecResidentClusterCache:
             miss_cluster_counts=miss_cluster_counts,
             hit_gate_ready=hit_gate_ready,
             access_kinds=None,
+            read_lease=RetroSpecResidentReadLease(self._gpu_access_lock),
+        )
+
+    def lookup_ranked_draft_gpu(
+        self,
+        *,
+        ranked_values: torch.Tensor,
+        candidate_counts: torch.Tensor,
+        arena_cluster_ids: torch.Tensor,
+        arena_resident_table_buckets: torch.Tensor,
+        arena_cluster_page_starts: torch.Tensor,
+        arena_cluster_page_counts: torch.Tensor,
+        arena_page_ids: torch.Tensor,
+        arena_page_token_counts: torch.Tensor,
+        arena_cluster_offsets: torch.Tensor,
+        arena_page_offsets: torch.Tensor,
+        request_slot_ids: torch.Tensor,
+        active_mask: torch.Tensor,
+        retrieval_ratio: float,
+        estimation_ratio: float,
+        expanded_retrieval_width: int,
+        max_pages_per_cluster: int,
+        sparse_cluster_indices: torch.Tensor,
+        cluster_handles: torch.Tensor,
+        resident_bucket_ids: torch.Tensor,
+        clustered_token_counts: torch.Tensor,
+        attention_mass: torch.Tensor,
+        hit_attention_by_head: torch.Tensor,
+        selected_cluster_counts: torch.Tensor,
+        hit_cluster_counts: torch.Tensor,
+        miss_cluster_counts: torch.Tensor,
+        hit_gate_ready: torch.Tensor,
+        miss_cluster_ids: torch.Tensor,
+        miss_positions: torch.Tensor,
+        miss_count: torch.Tensor,
+        sparse_attention: torch.Tensor,
+        expanded_attention: torch.Tensor,
+        emit_misses: bool = True,
+        statistics_buffer: torch.Tensor | None = None,
+        statistics_indices: tuple[int, ...] | None = None,
+    ) -> RetroSpecRankedDraftResidentAccess:
+        """Resolve ranked DRAFT clusters without compact page intermediates."""
+        if ranked_values.device != self.device:
+            raise ValueError("Ranked DRAFT lookup must use the cache device")
+
+        self._gpu_access_lock.acquire()
+        try:
+            self._ensure_handle_table(max_pages_per_cluster)
+            access_epoch = self._next_access_epoch
+            self._next_access_epoch += 1
+            resolve_ranked_draft_buckets(
+                ranked_values=ranked_values,
+                candidate_counts=candidate_counts,
+                arena_cluster_ids=arena_cluster_ids,
+                arena_resident_table_buckets=arena_resident_table_buckets,
+                arena_cluster_page_starts=arena_cluster_page_starts,
+                arena_cluster_page_counts=arena_cluster_page_counts,
+                arena_page_ids=arena_page_ids,
+                arena_page_token_counts=arena_page_token_counts,
+                arena_cluster_offsets=arena_cluster_offsets,
+                arena_page_offsets=arena_page_offsets,
+                request_slot_ids=request_slot_ids,
+                active_mask=active_mask,
+                table_handles=self._handle_table_handles,
+                table_versions=self._handle_table_versions,
+                table_page_counts=self._handle_table_page_counts,
+                table_page_slots=self._handle_table_page_slots,
+                table_hit_gate_ready=self._handle_table_hit_gate_ready,
+                table_last_access_epochs=self._handle_table_last_access_epochs,
+                access_epoch=access_epoch,
+                retrieval_ratio=retrieval_ratio,
+                estimation_ratio=estimation_ratio,
+                expanded_retrieval_width=expanded_retrieval_width,
+                max_pages_per_cluster=max_pages_per_cluster,
+                sparse_cluster_indices=sparse_cluster_indices,
+                output_cluster_handles=cluster_handles,
+                output_resident_buckets=resident_bucket_ids,
+                output_clustered_token_counts=clustered_token_counts,
+                output_attention=attention_mass,
+                output_hit_attention_by_head=hit_attention_by_head,
+                output_selected_counts=selected_cluster_counts,
+                output_hit_counts=hit_cluster_counts,
+                output_miss_counts=miss_cluster_counts,
+                output_gate_ready=hit_gate_ready,
+                output_miss_handles=miss_cluster_ids,
+                output_miss_positions=miss_positions,
+                output_miss_count=miss_count,
+                sparse_attention=sparse_attention,
+                expanded_attention=expanded_attention,
+                emit_misses=emit_misses,
+                statistics_buffer=statistics_buffer,
+                statistics_indices=statistics_indices,
+            )
+        except BaseException:
+            self._gpu_access_lock.release()
+            raise
+
+        return RetroSpecRankedDraftResidentAccess(
+            cluster_handles=cluster_handles,
+            resident_bucket_ids=resident_bucket_ids,
+            clustered_token_counts=clustered_token_counts,
+            attention_mass=attention_mass,
+            selected_cluster_counts=selected_cluster_counts,
+            hit_cluster_counts=hit_cluster_counts,
+            miss_cluster_counts=miss_cluster_counts,
+            hit_gate_ready=hit_gate_ready,
+            resident_table_page_counts=self._handle_table_page_counts,
+            resident_table_page_slots=self._handle_table_page_slots,
+            resident_key_pages=self.key_pages,
+            resident_value_pages=self.value_pages,
             read_lease=RetroSpecResidentReadLease(self._gpu_access_lock),
         )
 

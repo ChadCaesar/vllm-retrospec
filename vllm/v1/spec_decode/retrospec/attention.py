@@ -36,19 +36,23 @@ from .execution import (
     RetroSpecExactPageKVSource,
     RetroSpecExactPrimaryKVSource,
     RetroSpecFullVerificationKVSource,
+    RetroSpecRankedDraftKVSource,
 )
 from .index import RetroSpecAttentionLevel
 from .performance import RetroSpecPerformanceStats
 from .pipeline import RetroSpecAttentionMassStats
 from .segmented_index import (
     RetroSpecIndexedTokenAttentionSelection,
+    RetroSpecRankedDraftAttentionSelection,
     RetroSpecSegmentedTokenIndex,
     RetroSpecTokenAttentionSelection,
 )
 from .workspace import exact_attention_query_capacity
 
 RetroSpecSelection = (
-    RetroSpecTokenAttentionSelection | RetroSpecIndexedTokenAttentionSelection
+    RetroSpecTokenAttentionSelection
+    | RetroSpecIndexedTokenAttentionSelection
+    | RetroSpecRankedDraftAttentionSelection
 )
 
 
@@ -1254,6 +1258,10 @@ class RetroSpecSparseAttention:
         | RetroSpecCompactVerificationResolvedPages
         | None,
     ]:
+        if isinstance(selection, RetroSpecRankedDraftAttentionSelection):
+            raise RuntimeError(
+                "Ranked DRAFT selection must use run_ranked_draft_proposal()"
+            )
         indexed = isinstance(selection, RetroSpecIndexedTokenAttentionSelection)
         if indexed:
             layer_name = selection.layer_name
@@ -1446,6 +1454,50 @@ class RetroSpecSparseAttention:
         selection: RetroSpecSelection,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if isinstance(selection, RetroSpecRankedDraftAttentionSelection):
+            if self.mode != RetroSpecAttentionMode.DRAFT:
+                raise RuntimeError(
+                    "Ranked DRAFT selection cannot be used during verification"
+                )
+            resolved = selection.resolved_clusters
+            source = RetroSpecRankedDraftKVSource(
+                primary=RetroSpecExactPrimaryKVSource(
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_table=attn_metadata.block_table,
+                    token_indices=selection.plan.primary_exact_token_indices,
+                    token_mask=selection.plan.primary_exact_token_mask,
+                ),
+                request_slot_ids=selection.plan.request_slot_ids,
+                exact_cluster_indices=selection.plan.sparse_exact_cluster_indices,
+                estimation_cluster_indices=(
+                    selection.plan.sparse_estimation_cluster_indices
+                ),
+                resident_bucket_ids=resolved.resident_bucket_ids,
+                cluster_keys=selection.arena.cluster_keys,
+                cluster_values=selection.arena.cluster_values,
+                cluster_token_counts=selection.arena.cluster_token_counts,
+                cluster_page_starts=selection.arena.cluster_page_starts,
+                cluster_page_counts=selection.arena.cluster_page_counts,
+                page_token_counts=selection.arena.page_token_counts,
+                cluster_offsets=selection.arena.cluster_offsets,
+                page_offsets=selection.arena.page_offsets,
+                resident_table_page_slots=resolved.resident_table_page_slots,
+                resident_key_pages=resolved.resident_key_pages,
+                resident_value_pages=resolved.resident_value_pages,
+            )
+            try:
+                with self.performance_stats.cuda_timer("draft_ranked_attention"):
+                    self.exact_attention_workspace.run_ranked_draft_proposal(
+                        source=source,
+                        query=query,
+                        scale=impl.scale,
+                        output=output,
+                    )
+            finally:
+                resolved.read_lease.release()
+            return output
+
         stage_name = {
             RetroSpecAttentionMode.DRAFT: "draft",
             RetroSpecAttentionMode.SPARSE_VERIFY: "sparse_verify",

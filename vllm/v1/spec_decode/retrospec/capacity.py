@@ -424,35 +424,17 @@ def build_retrospec_long_context_capacity(
             + config.num_speculative_tokens * 4
         )
 
-    max_pages_per_cluster = cdiv(cluster_build_tokens, block_size)
     draft_selection_scratch_bytes = 0
     verification_estimation_workspace_bytes = 0
     for spec in attention_specs:
         dtype_bytes = get_dtype_size(spec.dtype)
-        draft_estimation_width = max_estimation_clusters + max_retrieval_clusters
-        summary_bytes = (
-            planning_requests
-            * spec.num_kv_heads
-            * draft_estimation_width
-            * (2 * spec.head_size * dtype_bytes + 4)
-        )
-        exact_descriptor_bytes = (
-            planning_requests * spec.num_kv_heads * max_retrieval_clusters * 8
-        )
-        compact_descriptor_bytes = (
-            planning_requests
-            * spec.num_kv_heads
-            * max_retrieval_clusters
-            * max_pages_per_cluster
-            * (8 + 4)
+        ranked_descriptor_bytes = (
+            planning_requests * spec.num_kv_heads * max_retrieval_clusters * (8 + 4)
         )
         group_stat_bytes = planning_requests * spec.num_kv_heads * 32
         draft_selection_scratch_bytes = max(
             draft_selection_scratch_bytes,
-            summary_bytes
-            + exact_descriptor_bytes
-            + compact_descriptor_bytes
-            + group_stat_bytes,
+            ranked_descriptor_bytes + group_stat_bytes,
         )
 
         per_estimation_entry_bytes = 4 + 1 + 2 * spec.head_size * dtype_bytes + 4

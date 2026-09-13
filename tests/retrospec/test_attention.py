@@ -24,6 +24,7 @@ from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecCompactVerificationResolvedPages,
     RetroSpecFullVerificationDescriptor,
     RetroSpecFullVerificationStaging,
+    RetroSpecRankedDraftResolvedClusters,
     RetroSpecResidentPrefetchInput,
     RetroSpecResolvedClusterPages,
     RetroSpecVerificationMissAdmission,
@@ -37,6 +38,7 @@ from vllm.v1.spec_decode.retrospec.index import RetroSpecAttentionLevel
 from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecFullVerificationPlan,
     RetroSpecIndexedTokenAttentionSelection,
+    RetroSpecRankedDraftAttentionSelection,
     RetroSpecSegmentedTokenIndex,
     RetroSpecTokenAttentionSelection,
     RetroSpecTokenSelectionPlan,
@@ -1756,6 +1758,89 @@ def test_fused_proposal_attention_releases_pages_before_miss_admission():
         miss_admission
     )
     assert call_order == ["attention", "release", "admit"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_ranked_draft_attention_consumes_arena_views_and_releases_lease():
+    controller = make_controller(cache_ratio=0.5)
+    controller.mode = RetroSpecAttentionMode.DRAFT
+    device = torch.device("cuda")
+    plan = make_token_plan(1, num_kv_heads=1, exact_width=1, estimation_width=1)
+    plan = replace(
+        plan,
+        request_slot_ids=plan.request_slot_ids.to(device),
+        primary_exact_token_indices=plan.primary_exact_token_indices.to(device),
+        primary_exact_token_mask=plan.primary_exact_token_mask.to(device),
+        sparse_exact_cluster_indices=plan.sparse_exact_cluster_indices.to(device),
+        sparse_estimation_cluster_indices=(
+            plan.sparse_estimation_cluster_indices.to(device)
+        ),
+    )
+    lease = SimpleNamespace(release=Mock())
+    resolved = RetroSpecRankedDraftResolvedClusters(
+        cluster_handles=torch.tensor([[[10]]], dtype=torch.int64, device=device),
+        resident_bucket_ids=torch.tensor([[[2]]], dtype=torch.int32, device=device),
+        clustered_token_counts=torch.tensor([[2]], dtype=torch.int32, device=device),
+        attention_mass=torch.ones(1, device=device),
+        selected_cluster_counts=torch.ones(1, 1, dtype=torch.int32, device=device),
+        hit_cluster_counts=torch.ones(1, 1, dtype=torch.int32, device=device),
+        miss_cluster_counts=torch.zeros(1, 1, dtype=torch.int32, device=device),
+        hit_gate_ready=torch.ones(1, 1, dtype=torch.bool, device=device),
+        resident_table_page_counts=torch.ones(8, dtype=torch.int32, device=device),
+        resident_table_page_slots=torch.zeros(8, 1, dtype=torch.int32, device=device),
+        resident_key_pages=torch.zeros(1, 2, 1, dtype=torch.float16, device=device),
+        resident_value_pages=torch.zeros(1, 2, 1, dtype=torch.float16, device=device),
+        read_lease=lease,
+    )
+    arena = SimpleNamespace(
+        cluster_keys=torch.zeros(1, 1, 1, dtype=torch.float16, device=device),
+        cluster_values=torch.zeros(1, 1, 1, dtype=torch.float16, device=device),
+        cluster_token_counts=torch.ones(1, 1, dtype=torch.int32, device=device),
+        cluster_page_starts=torch.zeros(1, 1, dtype=torch.int32, device=device),
+        cluster_page_counts=torch.ones(1, 1, dtype=torch.int32, device=device),
+        page_token_counts=torch.ones(1, 1, dtype=torch.int32, device=device),
+        cluster_offsets=torch.zeros(1, dtype=torch.int64, device=device),
+        page_offsets=torch.zeros(1, dtype=torch.int64, device=device),
+    )
+    selection = RetroSpecRankedDraftAttentionSelection(
+        plan=plan,
+        arena=arena,
+        resolved_clusters=resolved,
+        exact_token_counts=torch.tensor([[2]], dtype=torch.int32, device=device),
+        attention_mass=torch.ones(1, device=device),
+    )
+    run_ranked = Mock()
+    controller.exact_attention_workspace = SimpleNamespace(
+        run_ranked_draft_proposal=run_ranked
+    )
+    query = torch.zeros(1, 1, 1, dtype=torch.float16, device=device)
+    key_cache = torch.zeros(1, 2, 1, 1, dtype=torch.float16, device=device)
+    value_cache = torch.zeros_like(key_cache)
+    output = torch.empty_like(query)
+    metadata = cast(
+        FlashAttentionMetadata,
+        SimpleNamespace(
+            block_table=torch.zeros(1, 1, dtype=torch.int32, device=device)
+        ),
+    )
+
+    result = controller._run_fused_proposal_attention(
+        cast(FlashAttentionImpl, SimpleNamespace(scale=0.5)),
+        query,
+        key_cache,
+        value_cache,
+        metadata,
+        selection,
+        output,
+    )
+
+    assert result is output
+    run_ranked.assert_called_once()
+    source = run_ranked.call_args.kwargs["source"]
+    assert source.cluster_keys is arena.cluster_keys
+    assert source.resident_bucket_ids is resolved.resident_bucket_ids
+    assert source.resident_table_page_slots is resolved.resident_table_page_slots
+    lease.release.assert_called_once_with()
 
 
 def test_verification_reuses_draft_selection_plan_without_reranking():

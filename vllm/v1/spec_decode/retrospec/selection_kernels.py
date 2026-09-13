@@ -128,9 +128,6 @@ def _capture_request_descriptors_kernel(
 
 @triton.jit
 def _emit_ranked_draft_plan_kernel(
-    cluster_keys,
-    cluster_values,
-    cluster_ids,
     cluster_token_counts,
     cluster_offsets,
     request_slot_ids,
@@ -141,17 +138,11 @@ def _emit_ranked_draft_plan_kernel(
     expanded_exact_cluster_indices,
     sparse_estimation_cluster_indices,
     expanded_estimation_cluster_indices,
-    draft_exact_cluster_handles,
-    draft_estimation_keys,
-    draft_estimation_values,
-    draft_estimation_token_counts,
     CLUSTER_CAPACITY: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     SPARSE_WIDTH: tl.constexpr,
     EXPANDED_WIDTH: tl.constexpr,
     ESTIMATION_WIDTH: tl.constexpr,
-    HEAD_SIZE: tl.constexpr,
-    BLOCK_D: tl.constexpr,
     RANKED_STRIDE_0: tl.constexpr,
     RANKED_STRIDE_1: tl.constexpr,
     RANKED_STRIDE_2: tl.constexpr,
@@ -183,10 +174,6 @@ def _emit_ranked_draft_plan_kernel(
         cluster_offsets + safe_slot, mask=request_valid, other=0
     ).to(tl.int64)
 
-    head_offsets = tl.arange(0, BLOCK_D)
-    head_mask = head_offsets < HEAD_SIZE
-    draft_width = ESTIMATION_WIDTH + SPARSE_WIDTH
-
     prefix_valid = request_valid & (output_idx < expanded_retrieval_count)
     prefix_local_idx = tl.load(
         ranked_indices
@@ -204,10 +191,7 @@ def _emit_ranked_draft_plan_kernel(
         mask=prefix_valid,
         other=0,
     ).to(tl.int32)
-    prefix_cluster_handle = tl.load(
-        cluster_ids + prefix_storage_offset, mask=prefix_valid, other=-1
-    ).to(tl.int64)
-    prefix_valid &= (prefix_token_count > 0) & (prefix_cluster_handle >= 0)
+    prefix_valid &= prefix_token_count > 0
 
     if SPARSE_WIDTH > 0:
         retrieval_valid = prefix_valid & (output_idx < retrieval_count)
@@ -215,44 +199,6 @@ def _emit_ranked_draft_plan_kernel(
         tl.store(
             sparse_exact_cluster_indices + retrieval_plan_offset,
             tl.where(retrieval_valid, prefix_local_idx, -1),
-            mask=output_idx < SPARSE_WIDTH,
-        )
-        tl.store(
-            draft_exact_cluster_handles + retrieval_plan_offset,
-            tl.where(retrieval_valid, prefix_cluster_handle, -1),
-            mask=output_idx < SPARSE_WIDTH,
-        )
-        retrieval_source_offsets = prefix_storage_offset * HEAD_SIZE + head_offsets
-        retrieval_output_idx = ESTIMATION_WIDTH + output_idx
-        retrieval_output_offsets = (
-            group_offset * draft_width + retrieval_output_idx
-        ) * HEAD_SIZE + head_offsets
-        retrieval_copy_mask = retrieval_valid & head_mask
-        retrieval_keys = tl.load(
-            cluster_keys + retrieval_source_offsets,
-            mask=retrieval_copy_mask,
-            other=0.0,
-        )
-        retrieval_values = tl.load(
-            cluster_values + retrieval_source_offsets,
-            mask=retrieval_copy_mask,
-            other=0.0,
-        )
-        tl.store(
-            draft_estimation_keys + retrieval_output_offsets,
-            retrieval_keys,
-            mask=(output_idx < SPARSE_WIDTH) & head_mask,
-        )
-        tl.store(
-            draft_estimation_values + retrieval_output_offsets,
-            retrieval_values,
-            mask=(output_idx < SPARSE_WIDTH) & head_mask,
-        )
-        tl.store(
-            draft_estimation_token_counts
-            + group_offset * draft_width
-            + retrieval_output_idx,
-            tl.where(retrieval_valid, prefix_token_count, 0),
             mask=output_idx < SPARSE_WIDTH,
         )
 
@@ -289,37 +235,6 @@ def _emit_ranked_draft_plan_kernel(
             tl.where(sparse_valid, sparse_local_idx, -1),
             mask=output_idx < ESTIMATION_WIDTH,
         )
-        sparse_source_offsets = sparse_count_offset * HEAD_SIZE + head_offsets
-        sparse_output_offsets = (
-            group_offset * draft_width + output_idx
-        ) * HEAD_SIZE + head_offsets
-        sparse_copy_mask = sparse_valid & head_mask
-        sparse_keys = tl.load(
-            cluster_keys + sparse_source_offsets,
-            mask=sparse_copy_mask,
-            other=0.0,
-        )
-        sparse_values = tl.load(
-            cluster_values + sparse_source_offsets,
-            mask=sparse_copy_mask,
-            other=0.0,
-        )
-        tl.store(
-            draft_estimation_keys + sparse_output_offsets,
-            sparse_keys,
-            mask=(output_idx < ESTIMATION_WIDTH) & head_mask,
-        )
-        tl.store(
-            draft_estimation_values + sparse_output_offsets,
-            sparse_values,
-            mask=(output_idx < ESTIMATION_WIDTH) & head_mask,
-        )
-        tl.store(
-            draft_estimation_token_counts + group_offset * draft_width + output_idx,
-            tl.where(sparse_valid, sparse_token_count, 0),
-            mask=output_idx < ESTIMATION_WIDTH,
-        )
-
         expanded_rank = expanded_retrieval_count + output_idx
         expanded_count = total_compute_count - expanded_retrieval_count
         expanded_valid = request_valid & (output_idx < expanded_count)
@@ -492,9 +407,6 @@ def emit_ranked_draft_plan(
     *,
     ranked_indices: torch.Tensor,
     candidate_counts: torch.Tensor,
-    cluster_keys: torch.Tensor,
-    cluster_values: torch.Tensor,
-    cluster_ids: torch.Tensor,
     cluster_token_counts: torch.Tensor,
     cluster_offsets: torch.Tensor,
     request_slot_ids: torch.Tensor,
@@ -506,12 +418,8 @@ def emit_ranked_draft_plan(
     expanded_exact_cluster_indices: torch.Tensor,
     sparse_estimation_cluster_indices: torch.Tensor,
     expanded_estimation_cluster_indices: torch.Tensor,
-    draft_exact_cluster_handles: torch.Tensor,
-    draft_estimation_keys: torch.Tensor,
-    draft_estimation_values: torch.Tensor,
-    draft_estimation_token_counts: torch.Tensor,
 ) -> None:
-    """Emit exact descriptors, estimation journals, and DRAFT summaries."""
+    """Emit persistent verification journals from the current fresh top-k."""
     if ranked_indices.device.type != "cuda":
         raise ValueError("Ranked estimation emission requires CUDA")
     if ranked_indices.ndim != 3:
@@ -522,8 +430,6 @@ def emit_ranked_draft_plan(
     batch_size, num_kv_heads, ranking_width = ranked_indices.shape
     expanded_exact_width = expanded_exact_cluster_indices.shape[2]
     estimation_width = sparse_estimation_cluster_indices.shape[2]
-    draft_width = draft_estimation_token_counts.shape[2]
-    head_size = cluster_keys.shape[2]
 
     if candidate_counts.shape != (batch_size, num_kv_heads):
         raise ValueError("Candidate counts do not match ranked indices")
@@ -539,10 +445,6 @@ def emit_ranked_draft_plan(
         sparse_exact_width,
     ):
         raise ValueError("Sparse exact journal has the wrong shape")
-    if draft_exact_cluster_handles.shape != sparse_exact_cluster_indices.shape:
-        raise ValueError("Draft exact handles have the wrong shape")
-    if draft_width != estimation_width + sparse_exact_width:
-        raise ValueError("Draft estimation workspace has an invalid width")
     if expanded_exact_cluster_indices.shape[:2] != (
         batch_size,
         num_kv_heads,
@@ -554,30 +456,12 @@ def emit_ranked_draft_plan(
         estimation_width,
     ):
         raise ValueError("Expanded estimation journal has the wrong shape")
-    if draft_estimation_keys.shape != (
-        batch_size,
-        num_kv_heads,
-        draft_width,
-        head_size,
-    ):
-        raise ValueError("Draft estimation keys have the wrong shape")
-    if draft_estimation_values.shape != draft_estimation_keys.shape:
-        raise ValueError("Draft estimation values have the wrong shape")
-    if draft_estimation_token_counts.shape != (
-        batch_size,
-        num_kv_heads,
-        draft_width,
-    ):
-        raise ValueError("Draft estimation counts have the wrong shape")
     if ranking_width < max(expanded_exact_width, sparse_exact_width + estimation_width):
         raise ValueError("Ranked workspace is too narrow")
 
     tensors = (
         ranked_indices,
         candidate_counts,
-        cluster_keys,
-        cluster_values,
-        cluster_ids,
         cluster_token_counts,
         cluster_offsets,
         request_slot_ids,
@@ -586,10 +470,6 @@ def emit_ranked_draft_plan(
         expanded_exact_cluster_indices,
         sparse_estimation_cluster_indices,
         expanded_estimation_cluster_indices,
-        draft_exact_cluster_handles,
-        draft_estimation_keys,
-        draft_estimation_values,
-        draft_estimation_token_counts,
     )
     if any(tensor.device != ranked_indices.device for tensor in tensors):
         raise ValueError("Ranked draft-plan tensors must use one device")
@@ -599,9 +479,6 @@ def emit_ranked_draft_plan(
         return
 
     _emit_ranked_draft_plan_kernel[(batch_size, num_kv_heads, output_width)](
-        cluster_keys,
-        cluster_values,
-        cluster_ids,
         cluster_token_counts,
         cluster_offsets,
         request_slot_ids,
@@ -612,17 +489,11 @@ def emit_ranked_draft_plan(
         expanded_exact_cluster_indices,
         sparse_estimation_cluster_indices,
         expanded_estimation_cluster_indices,
-        draft_exact_cluster_handles,
-        draft_estimation_keys,
-        draft_estimation_values,
-        draft_estimation_token_counts,
-        CLUSTER_CAPACITY=cluster_keys.shape[1],
+        CLUSTER_CAPACITY=cluster_token_counts.shape[1],
         NUM_KV_HEADS=num_kv_heads,
         SPARSE_WIDTH=sparse_exact_width,
         EXPANDED_WIDTH=expanded_exact_width,
         ESTIMATION_WIDTH=estimation_width,
-        HEAD_SIZE=head_size,
-        BLOCK_D=triton.next_power_of_2(head_size),
         RANKED_STRIDE_0=ranked_indices.stride(0),
         RANKED_STRIDE_1=ranked_indices.stride(1),
         RANKED_STRIDE_2=ranked_indices.stride(2),

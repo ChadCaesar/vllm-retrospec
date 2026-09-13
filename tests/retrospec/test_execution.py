@@ -15,6 +15,7 @@ from vllm.v1.spec_decode.retrospec.execution import (
     RetroSpecExactPageKVSource,
     RetroSpecExactPrimaryKVSource,
     RetroSpecFullVerificationKVSource,
+    RetroSpecRankedDraftKVSource,
 )
 
 
@@ -562,6 +563,161 @@ def test_fused_proposal_attention_matches_multi_source_reference(
     assert result.data_ptr() == output.data_ptr()
     assert workspace._output is not None
     assert result.data_ptr() != workspace._output.data_ptr()
+    torch.testing.assert_close(result, expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_ranked_draft_attention_reads_resident_buckets_and_summary_misses(dtype):
+    device = torch.device("cuda")
+    torch.manual_seed(120)
+    page_size = 4
+    batch_size = 2
+    num_kv_heads = 2
+    num_query_heads = 4
+    head_size = 64
+    scale = head_size**-0.5
+
+    key_cache = torch.randn(
+        2, page_size, num_kv_heads, head_size, dtype=dtype, device=device
+    )
+    value_cache = torch.randn_like(key_cache)
+    primary_indices = torch.tensor(
+        [[[0, 2], [1, 3]], [[0, 1], [2, 3]]], dtype=torch.int64, device=device
+    )
+    primary_mask = torch.tensor(
+        [[[True, False], [True, True]], [[True, True], [False, True]]],
+        device=device,
+    )
+    cluster_keys = torch.randn(num_kv_heads, 6, head_size, dtype=dtype, device=device)
+    cluster_values = torch.randn_like(cluster_keys)
+    cluster_counts = torch.tensor(
+        [[2, 3, 4, 1, 2, 3], [3, 2, 1, 4, 3, 2]],
+        dtype=torch.int32,
+        device=device,
+    )
+    cluster_page_starts = torch.tensor(
+        [[0, 1, 2, 0, 1, 2], [0, 1, 2, 0, 1, 2]],
+        dtype=torch.int32,
+        device=device,
+    )
+    cluster_page_counts = torch.ones_like(cluster_page_starts)
+    page_token_counts = torch.zeros(num_kv_heads, 8, dtype=torch.int32, device=device)
+    page_token_counts[:, :3] = cluster_counts[:, :3]
+    page_token_counts[:, 4:7] = cluster_counts[:, 3:]
+
+    exact_indices = torch.tensor(
+        [[[0, 1], [1, 2]], [[0, 2], [2, 1]]],
+        dtype=torch.int32,
+        device=device,
+    )
+    estimation_indices = torch.tensor(
+        [[[2], [0]], [[1], [0]]], dtype=torch.int32, device=device
+    )
+    resident_buckets = torch.tensor(
+        [[[0, -1], [1, 2]], [[-1, 3], [4, -1]]],
+        dtype=torch.int32,
+        device=device,
+    )
+    table_page_slots = torch.full((8, 2), -1, dtype=torch.int32, device=device)
+    table_page_slots[:5, 0] = torch.arange(5, dtype=torch.int32, device=device)
+    resident_keys = torch.randn(5, page_size, head_size, dtype=dtype, device=device)
+    resident_values = torch.randn_like(resident_keys)
+    query = torch.randn(
+        batch_size, num_query_heads, head_size, dtype=dtype, device=device
+    )
+    source = RetroSpecRankedDraftKVSource(
+        primary=RetroSpecExactPrimaryKVSource(
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=torch.tensor([[0], [1]], dtype=torch.int32, device=device),
+            token_indices=primary_indices,
+            token_mask=primary_mask,
+        ),
+        request_slot_ids=torch.tensor([0, 1], dtype=torch.int64, device=device),
+        exact_cluster_indices=exact_indices,
+        estimation_cluster_indices=estimation_indices,
+        resident_bucket_ids=resident_buckets,
+        cluster_keys=cluster_keys,
+        cluster_values=cluster_values,
+        cluster_token_counts=cluster_counts,
+        cluster_page_starts=cluster_page_starts,
+        cluster_page_counts=cluster_page_counts,
+        page_token_counts=page_token_counts,
+        cluster_offsets=torch.tensor([0, 3], dtype=torch.int64, device=device),
+        page_offsets=torch.tensor([0, 4], dtype=torch.int64, device=device),
+        resident_table_page_slots=table_page_slots,
+        resident_key_pages=resident_keys,
+        resident_value_pages=resident_values,
+    )
+
+    expected = torch.empty_like(query)
+    queries_per_kv_head = num_query_heads // num_kv_heads
+    for batch_idx in range(batch_size):
+        cluster_offset = (0, 3)[batch_idx]
+        page_offset = (0, 4)[batch_idx]
+        for query_head_idx in range(num_query_heads):
+            kv_head_idx = query_head_idx // queries_per_kv_head
+            keys = []
+            values = []
+            logits_bias = []
+            for token_rank in range(primary_indices.shape[2]):
+                if not primary_mask[batch_idx, kv_head_idx, token_rank]:
+                    continue
+                token_idx = int(primary_indices[batch_idx, kv_head_idx, token_rank])
+                keys.append(key_cache[batch_idx, token_idx, kv_head_idx])
+                values.append(value_cache[batch_idx, token_idx, kv_head_idx])
+                logits_bias.append(0.0)
+            for retrieval_rank in range(exact_indices.shape[2]):
+                local_idx = int(exact_indices[batch_idx, kv_head_idx, retrieval_rank])
+                bucket = int(resident_buckets[batch_idx, kv_head_idx, retrieval_rank])
+                storage_idx = cluster_offset + local_idx
+                if bucket < 0:
+                    keys.append(cluster_keys[kv_head_idx, storage_idx])
+                    values.append(cluster_values[kv_head_idx, storage_idx])
+                    logits_bias.append(
+                        float(cluster_counts[kv_head_idx, storage_idx].log())
+                    )
+                    continue
+                page_start = int(cluster_page_starts[kv_head_idx, storage_idx])
+                num_pages = int(cluster_page_counts[kv_head_idx, storage_idx])
+                for page_rank in range(num_pages):
+                    page_slot = int(table_page_slots[bucket, page_rank])
+                    token_count = int(
+                        page_token_counts[
+                            kv_head_idx, page_offset + page_start + page_rank
+                        ]
+                    )
+                    for token_offset in range(token_count):
+                        keys.append(resident_keys[page_slot, token_offset])
+                        values.append(resident_values[page_slot, token_offset])
+                        logits_bias.append(0.0)
+            for estimation_rank in range(estimation_indices.shape[2]):
+                local_idx = int(
+                    estimation_indices[batch_idx, kv_head_idx, estimation_rank]
+                )
+                storage_idx = cluster_offset + local_idx
+                keys.append(cluster_keys[kv_head_idx, storage_idx])
+                values.append(cluster_values[kv_head_idx, storage_idx])
+                logits_bias.append(
+                    float(cluster_counts[kv_head_idx, storage_idx].log())
+                )
+
+            key_rows = torch.stack(keys).float()
+            value_rows = torch.stack(values).float()
+            logits = key_rows @ query[batch_idx, query_head_idx].float() * scale
+            logits += torch.tensor(logits_bias, device=device)
+            expected[batch_idx, query_head_idx] = (
+                torch.softmax(logits, dim=0) @ value_rows
+            ).to(dtype)
+
+    output = torch.empty_like(query)
+    result = RetroSpecExactAttentionWorkspace(
+        page_size, batch_size, 1
+    ).run_ranked_draft_proposal(source, query, scale, output)
+    torch.cuda.synchronize()
+
+    assert result.data_ptr() == output.data_ptr()
     torch.testing.assert_close(result, expected, atol=3e-2, rtol=3e-2)
 
 

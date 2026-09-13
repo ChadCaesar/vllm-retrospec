@@ -485,27 +485,16 @@ def test_gather_resident_exact_pages_matches_request_slot_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_emit_ranked_draft_plan_packs_exact_handles_and_summaries():
+def test_emit_ranked_draft_plan_writes_only_verification_journals():
     device = torch.device("cuda")
-    cluster_keys = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]], device=device)
-    cluster_values = cluster_keys * 10
-    cluster_ids = torch.tensor([[10, 11, 12]], dtype=torch.int64, device=device)
     cluster_counts = torch.tensor([[4, 5, 6]], dtype=torch.int32, device=device)
     sparse_exact = torch.empty((1, 1, 2), dtype=torch.int32, device=device)
     expanded_exact = torch.empty((1, 1, 3), dtype=torch.int32, device=device)
     sparse_estimation = torch.empty((1, 1, 1), dtype=torch.int32, device=device)
     expanded_estimation = torch.empty_like(sparse_estimation)
-    draft_keys = torch.empty((1, 1, 3, 2), device=device)
-    draft_values = torch.empty_like(draft_keys)
-    draft_counts = torch.empty((1, 1, 3), dtype=torch.int32, device=device)
-    draft_handles = torch.empty((1, 1, 2), dtype=torch.int64, device=device)
-
     emit_ranked_draft_plan(
         ranked_indices=torch.tensor([[[2, 0, 1]]], dtype=torch.int64, device=device),
         candidate_counts=torch.tensor([[3]], dtype=torch.int32, device=device),
-        cluster_keys=cluster_keys,
-        cluster_values=cluster_values,
-        cluster_ids=cluster_ids,
         cluster_token_counts=cluster_counts,
         cluster_offsets=torch.tensor([0], dtype=torch.int64, device=device),
         request_slot_ids=torch.tensor([0], dtype=torch.int64, device=device),
@@ -517,23 +506,12 @@ def test_emit_ranked_draft_plan_packs_exact_handles_and_summaries():
         expanded_exact_cluster_indices=expanded_exact,
         sparse_estimation_cluster_indices=sparse_estimation,
         expanded_estimation_cluster_indices=expanded_estimation,
-        draft_exact_cluster_handles=draft_handles,
-        draft_estimation_keys=draft_keys,
-        draft_estimation_values=draft_values,
-        draft_estimation_token_counts=draft_counts,
     )
 
     assert sparse_exact.cpu().tolist() == [[[2, 0]]]
     assert expanded_exact.cpu().tolist() == [[[2, 0, 1]]]
-    assert draft_handles.cpu().tolist() == [[[12, 10]]]
     assert sparse_estimation.item() == 1
     assert expanded_estimation.item() == -1
-    torch.testing.assert_close(
-        draft_keys.cpu(),
-        torch.tensor([[[[3.0, 4.0], [5.0, 6.0], [1.0, 2.0]]]]),
-    )
-    torch.testing.assert_close(draft_values.cpu(), draft_keys.cpu() * 10)
-    assert draft_counts.cpu().tolist() == [[[5, 6, 4]]]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -579,11 +557,11 @@ def test_selection_plan_table_uses_one_shared_draft_scratch():
     assert not hasattr(index._draft_selection_scratch, "primary_topk_order")
     assert table.sparse_estimation_cluster_indices.shape == (2, 1, 1, 1)
     assert table.expanded_estimation_cluster_indices.shape == (2, 1, 1, 1)
-    assert first.draft_estimation_keys.data_ptr() == (
-        second.draft_estimation_keys.data_ptr()
+    assert first.draft_exact_cluster_handles.data_ptr() == (
+        second.draft_exact_cluster_handles.data_ptr()
     )
-    assert same_first.draft_estimation_keys.data_ptr() == (
-        first.draft_estimation_keys.data_ptr()
+    assert same_first.draft_exact_cluster_handles.data_ptr() == (
+        first.draft_exact_cluster_handles.data_ptr()
     )
 
     index.begin_proposal(["request"])
@@ -595,8 +573,8 @@ def test_selection_plan_table_uses_one_shared_draft_scratch():
         index.end_proposal()
 
     assert reused_table is table
-    assert reused.draft_estimation_keys.data_ptr() == (
-        first.draft_estimation_keys.data_ptr()
+    assert reused.draft_exact_cluster_handles.data_ptr() == (
+        first.draft_exact_cluster_handles.data_ptr()
     )
 
 
@@ -643,10 +621,10 @@ def test_shared_draft_scratch_grows_and_returns_layer_sized_views():
     finally:
         index.end_proposal()
 
-    assert small_before_growth.draft_compact_page_ids.shape == (1, 1, 2)
-    assert large.draft_compact_page_ids.shape == (1, 1, 12)
-    assert small_after_growth.draft_compact_page_ids.shape == (1, 1, 2)
-    assert small_after_growth.draft_estimation_keys.shape == (1, 1, 3, 8)
-    assert large.draft_compact_page_ids.data_ptr() == (
-        small_after_growth.draft_compact_page_ids.data_ptr()
+    assert small_before_growth.draft_exact_cluster_handles.shape == (1, 1, 2)
+    assert large.draft_exact_cluster_handles.shape == (1, 1, 4)
+    assert small_after_growth.draft_exact_cluster_handles.shape == (1, 1, 2)
+    assert small_after_growth.draft_resident_bucket_ids.shape == (1, 1, 2)
+    assert large.draft_exact_cluster_handles.data_ptr() == (
+        small_after_growth.draft_exact_cluster_handles.data_ptr()
     )

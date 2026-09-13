@@ -762,7 +762,7 @@ def test_selection_plan_table_reuses_single_draft_step_scratch():
     ]
 
     scratch_ptrs = [
-        workspace.draft_estimation_keys.data_ptr() for workspace in workspaces
+        workspace.draft_exact_cluster_handles.data_ptr() for workspace in workspaces
     ]
     assert scratch_ptrs == [scratch_ptrs[0]] * 3
 

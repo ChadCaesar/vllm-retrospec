@@ -231,7 +231,7 @@ def test_draft_materialization_skips_resident_lookup_without_arena():
         sparse_attn=torch.ones(1, device=device),
         expanded_attn=torch.ones(1, device=device),
     )
-    index.cluster_store.resolve_ranked_compact_draft_cluster_blocks = Mock()
+    index.cluster_store.resolve_ranked_draft_clusters = Mock()
     index._selection_plan_tables["layer"] = SimpleNamespace(
         head_size=1,
         dtype=torch.float32,
@@ -251,7 +251,7 @@ def test_draft_materialization_skips_resident_lookup_without_arena():
 
     assert selection.resolved_pages is None
     assert selection.exact_token_counts.tolist() == [[2]]
-    index.cluster_store.resolve_ranked_compact_draft_cluster_blocks.assert_not_called()
+    index.cluster_store.resolve_ranked_draft_clusters.assert_not_called()
 
 
 def test_prefill_warmup_selection_obeys_page_budget():
@@ -2219,15 +2219,14 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
         assert persistent_view.arena.cluster_keys.data_ptr() == resident_key_ptr
     finally:
         index.end_proposal()
-    assert cold.resolved_pages is not None
+    assert cold.resolved_clusters is not None
     assert index.cluster_store.num_resident_pages("layer") == 0
     assert cold.exact_token_counts.tolist() == [[6]]
-    assert cold.estimation_token_counts.tolist() == [[[2, 2]]]
-    assert cold.estimation_keys[0, 0, :, 0].tolist() == pytest.approx([1.0, 2.0])
-    assert cold.estimation_values[0, 0, :, 0].tolist() == pytest.approx([10.0, 20.0])
+    assert cold.plan.sparse_estimation_cluster_indices.ge(0).all()
+    assert cold.resolved_clusters.resident_bucket_ids.tolist() == [[[-1]]]
     assert cold.hit_attn.item() == pytest.approx(1.0)
-    assert not cold.resolved_pages.hit_gate_ready.any()
-    assert not cold.exact_page_token_counts.any()
+    assert not cold.resolved_clusters.hit_gate_ready.any()
+    assert not cold.resolved_clusters.clustered_token_counts.any()
     scratch = index._draft_selection_scratch
     assert scratch is not None
 
@@ -2268,11 +2267,12 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     finally:
         index.end_proposal()
 
-    assert warm.resolved_pages is not None
+    assert warm.resolved_clusters is not None
     assert index.cluster_store.num_resident_pages("layer") == 1
     assert warm.exact_token_counts.tolist() == [[8]]
-    assert warm.estimation_token_counts.tolist() == [[[2, 0]]]
-    assert warm.resolved_pages.hit_gate_ready.all()
+    assert warm.plan.sparse_estimation_cluster_indices.ge(0).all()
+    assert warm.resolved_clusters.resident_bucket_ids.ge(0).all()
+    assert warm.resolved_clusters.hit_gate_ready.all()
     assert warm.hit_attn.item() == pytest.approx(warm.plan.sparse_attn.item())
 
     assert verification.resolved_pages is None
@@ -2317,9 +2317,9 @@ def test_ready_selected_replay_admits_current_topk_before_draft_attention():
         index.end_proposal()
 
     assert index.cluster_store.num_resident_pages("layer") == 1
-    assert selection.resolved_pages is not None
-    assert selection.resolved_pages.hit_gate_ready.all()
-    assert selection.resolved_pages.miss_cluster_counts.sum().item() == 0
+    assert selection.resolved_clusters is not None
+    assert selection.resolved_clusters.hit_gate_ready.all()
+    assert selection.resolved_clusters.miss_cluster_counts.sum().item() == 0
     assert selection.prefetch_miss_cluster_ids is None
     assert selection.prefetch_miss_positions is None
     assert selection.prefetch_miss_count is None
@@ -2378,10 +2378,10 @@ def test_segmented_index_builds_and_selects_on_cuda():
     finally:
         index.end_proposal()
 
-    assert selection.exact_cluster_ids.device.type == "cuda"
-    assert selection.exact_page_ids.device.type == "cuda"
+    assert selection.resolved_clusters.cluster_handles.device.type == "cuda"
+    assert selection.resolved_clusters.resident_bucket_ids.device.type == "cuda"
     assert selection.exact_token_counts.tolist() == [[6]]
-    assert selection.estimation_token_counts[0, 0, 0].item() == 2
+    assert selection.plan.sparse_estimation_cluster_indices[0, 0, 0].item() >= 0
 
 
 @pytest.mark.parametrize(
