@@ -99,6 +99,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph", action="store_true")
     parser.add_argument("--native", action="store_true")
     parser.add_argument("--sync-attention-gates", action="store_true")
+    parser.add_argument(
+        "--replay-mode",
+        choices=("off", "trace", "freeze_resident", "ready_selected"),
+        default="off",
+    )
     return parser.parse_args()
 
 
@@ -113,6 +118,7 @@ def load_sample(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_speculative_config(args: argparse.Namespace) -> dict[str, Any]:
+    replay_mode = getattr(args, "replay_mode", "off")
     config: dict[str, Any] = {
         "method": "retrospec",
         "num_speculative_tokens": args.num_speculative_tokens,
@@ -130,6 +136,8 @@ def build_speculative_config(args: argparse.Namespace) -> dict[str, Any]:
         "retrospec_max_gpu_index_memory": args.max_gpu_index_memory,
         "retrospec_min_draft_tokens": args.min_draft_tokens,
         "retrospec_max_draft_tokens": args.max_draft_tokens,
+        "retrospec_replay_mode": replay_mode,
+        "retrospec_trace_transitions": replay_mode != "off",
         "retrospec_stats_interval_seconds": (
             args.stats_interval if args.profile else 0.0
         ),
@@ -210,6 +218,7 @@ def main() -> None:
                 args.profile_sample_interval if args.profile else 0
             ),
             "graph": args.graph,
+            "replay_mode": args.replay_mode,
             "requested_context_len": args.context_len,
             "actual_prompt_tokens": len(output.prompt_token_ids),
             "requested_output_tokens": args.max_tokens,

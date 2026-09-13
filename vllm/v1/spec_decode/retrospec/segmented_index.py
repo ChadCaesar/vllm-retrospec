@@ -47,6 +47,10 @@ from .selection_kernels import (
     gather_resident_exact_pages,
     pack_indexed_verification_plan,
 )
+from .selection_provenance import (
+    RetroSpecReplayMode,
+    RetroSpecSelectionProvenanceTracer,
+)
 from .workspace import exact_attention_primary_token_capacity
 
 
@@ -733,6 +737,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         cpu_page_slab_bytes: int = 1 << 20,
         max_pinned_memory_bytes: int = 64 << 20,
         max_gpu_index_memory_bytes: int = 4 << 30,
+        replay_mode: RetroSpecReplayMode = "off",
         performance_stats: RetroSpecPerformanceStats | None = None,
     ) -> None:
         super().__init__(
@@ -800,6 +805,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self.prefill_warmup_multiplier = prefill_warmup_multiplier
         self.max_model_len = max_model_len
         self.performance_stats = performance_stats
+        self.replay_mode = replay_mode
+        self.selection_provenance = RetroSpecSelectionProvenanceTracer(replay_mode)
+        if replay_mode == "ready_selected" and not pin_memory:
+            raise ValueError("ready_selected replay requires pinned CPU staging memory")
         effective_cache_ratio = cache_ratio
         if cache_ratio == 0.0:
             # RetroInfer uses three sparse retrieval zones when an explicit
@@ -840,6 +849,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self._proposal_active = False
         self._proposal_request_ids: tuple[str, ...] = ()
         self._proposal_read_leases: list[RetroSpecResidentReadLease] = []
+        self._proposal_index_revisions: dict[tuple[str, str], int] = {}
+        self._proposal_resident_frozen = False
 
         # Shared across model layers. Selection results are copied into each
         # plan before the workspace is reused.
@@ -1105,6 +1116,38 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             for request_id in request_ids
         )
 
+    def _capture_proposal_index_revisions(self, request_ids: Sequence[str]) -> None:
+        self._proposal_index_revisions.clear()
+        if not self.selection_provenance.enabled:
+            return
+
+        for layer_name, layer_indices in self._indices.items():
+            for request_id in request_ids:
+                record = layer_indices.get(request_id)
+                self._proposal_index_revisions[(layer_name, request_id)] = (
+                    -1 if record is None else record.revision
+                )
+
+    def _get_proposal_index_revisions(
+        self, layer_name: str, request_ids: Sequence[str]
+    ) -> tuple[int, ...]:
+        if not self.selection_provenance.enabled:
+            return ()
+
+        layer_indices = self._indices.get(layer_name, {})
+        revisions: list[int] = []
+        for request_id in request_ids:
+            record = layer_indices.get(request_id)
+            current = -1 if record is None else record.revision
+            expected = self._proposal_index_revisions.get((layer_name, request_id), -1)
+            if current != expected:
+                raise RuntimeError(
+                    "RetroSpec logical cluster index changed inside a proposal: "
+                    f"{layer_name!r}, {request_id!r}, {expected} -> {current}"
+                )
+            revisions.append(current)
+        return tuple(revisions)
+
     def begin_proposal(self, request_ids: Sequence[str]) -> None:
         if self._proposal_active:
             raise RuntimeError("Segmented token index proposal is already active")
@@ -1113,7 +1156,20 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 "Cannot begin a proposal before staged index updates are flushed"
             )
         request_ids = tuple(request_ids)
-        self._gpu_index_residency.activate(request_ids)
+        self._capture_proposal_index_revisions(request_ids)
+        try:
+            if self.replay_mode == "freeze_resident":
+                self.cluster_store.begin_resident_replay(tuple(self._indices))
+                self._proposal_resident_frozen = True
+            self._gpu_index_residency.activate(request_ids)
+        except BaseException:
+            try:
+                if self._proposal_resident_frozen:
+                    self.cluster_store.end_resident_replay()
+            finally:
+                self._proposal_resident_frozen = False
+                self._proposal_index_revisions.clear()
+            raise
         for table in self._selection_plan_tables.values():
             table.valid_rows.zero_()
         self._selection_plan_written_layers.clear()
@@ -1128,12 +1184,18 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         try:
             self._gpu_index_residency.deactivate()
         finally:
-            for lease in self._proposal_read_leases:
-                lease.release()
-            self._proposal_read_leases.clear()
-            self._selection_plan_written_layers.clear()
-            self._proposal_active = False
-            self._proposal_request_ids = ()
+            try:
+                for lease in self._proposal_read_leases:
+                    lease.release()
+                self._proposal_read_leases.clear()
+                self._selection_plan_written_layers.clear()
+                self._proposal_index_revisions.clear()
+                self._proposal_active = False
+                self._proposal_request_ids = ()
+            finally:
+                if self._proposal_resident_frozen:
+                    self.cluster_store.end_resident_replay()
+                    self._proposal_resident_frozen = False
 
     def begin_full_verification_residency(
         self,
@@ -1217,6 +1279,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self,
         layer_name: str,
         request_id: str,
+        indexed_start: int,
+        indexed_end: int,
         cluster_start: int,
         staged_summary: RetroSpecStagedClusterSummary,
         staged_clusters: RetroSpecStagedClusterInput,
@@ -1228,6 +1292,21 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         except BaseException:
             self.cluster_store.discard_staged_clusters(staged_clusters)
             raise
+
+        if self.selection_provenance.enabled:
+            staged_clusters.wait()
+            self.selection_provenance.record_index_segment(
+                request_id=request_id,
+                layer_name=layer_name,
+                indexed_start=indexed_start,
+                indexed_end=indexed_end,
+                cluster_start=cluster_start,
+                assignments=staged_clusters.assignments,
+                cluster_sizes=cluster_summary.cluster_token_counts,
+                cluster_keys=cluster_summary.cluster_keys,
+                cluster_values=cluster_summary.cluster_values,
+                token_offsets_in_cluster=staged_clusters.token_offsets_in_cluster,
+            )
 
         cluster_blocks = self.cluster_store.store_staged_clusters(
             layer_name=layer_name,
@@ -1244,6 +1323,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self,
         layer_name: str,
         request_id: str,
+        indexed_start: int,
+        indexed_end: int,
         cluster_start: int,
         staged_summary: RetroSpecStagedClusterSummary,
         staged_clusters: RetroSpecStagedClusterInput,
@@ -1253,6 +1334,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             self._finish_cluster_build,
             layer_name,
             request_id,
+            indexed_start,
+            indexed_end,
             cluster_start,
             staged_summary,
             staged_clusters,
@@ -1336,10 +1419,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             self._gpu_index_residency.discard_cluster_summary(staged_summary)
             raise
 
+        indexed_end = indexed_start + token_keys.shape[1]
         try:
             build_future = self._submit_cluster_build(
                 layer_name=layer_name,
                 request_id=request_id,
+                indexed_start=indexed_start,
+                indexed_end=indexed_end,
                 cluster_start=cluster_start,
                 staged_summary=staged_summary,
                 staged_clusters=staged_clusters,
@@ -1349,7 +1435,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             self._gpu_index_residency.discard_cluster_summary(staged_summary)
             raise
 
-        indexed_end = indexed_start + token_keys.shape[1]
         self._staged_segments.append(
             _StagedRequestLayerSegment(
                 layer_name=layer_name,
@@ -3783,39 +3868,25 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         selected.masked_fill_(~token_mask.unsqueeze(-1), 0.0)
         return selected.contiguous()
 
-    def _materialize_draft_selection(
+    def _resolve_ranked_draft_pages(
         self,
         plan: RetroSpecTokenSelectionPlan,
-        output_workspace: _SelectionStepWorkspace | None,
+        output_workspace: _SelectionStepWorkspace,
         view: RetroSpecResidentBatchView,
         active_mask: torch.Tensor,
-        ranked_values: torch.Tensor | None = None,
-        candidate_counts: torch.Tensor | None = None,
-    ) -> RetroSpecTokenAttentionSelection:
-        """Use resident retrieval clusters and estimate selected cache misses."""
-        if (
-            view.arena is None
-            or output_workspace is None
-            or output_workspace.draft_exact_cluster_ids.device.type != "cuda"
-        ):
-            return self._materialize_token_selection(
-                plan,
-                RetroSpecAttentionLevel.SPARSE,
-            )
-        if ranked_values is None:
-            raise RuntimeError("CUDA draft selection requires ranked scores")
-        if candidate_counts is None:
-            raise RuntimeError("CUDA draft selection requires candidate counts")
+        ranked_values: torch.Tensor,
+        candidate_counts: torch.Tensor,
+        emit_misses: bool,
+    ) -> RetroSpecCompactResolvedClusterPages:
+        if view.arena is None:
+            raise RuntimeError("Ranked draft resolution requires a resident arena")
 
         sparse_width = output_workspace.sparse_estimation_width
         retrieval_width = output_workspace.sparse_retrieval_width
-        estimation_keys = output_workspace.draft_estimation_keys
-        estimation_values = output_workspace.draft_estimation_values
-        estimation_token_counts = output_workspace.draft_estimation_token_counts
-        retrieval_fallback_counts = estimation_token_counts[
+        fallback_counts = output_workspace.draft_estimation_token_counts[
             :, :, sparse_width : sparse_width + retrieval_width
         ]
-        resolved_pages = self.cluster_store.resolve_ranked_compact_draft_cluster_blocks(
+        return self.cluster_store.resolve_ranked_compact_draft_cluster_blocks(
             layer_name=plan.layer_name,
             ranked_values=ranked_values,
             candidate_counts=candidate_counts,
@@ -3826,7 +3897,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             estimation_ratio=self.estimation_ratio,
             expanded_retrieval_width=plan.expanded_exact_cluster_indices.shape[2],
             max_pages_per_cluster=view.max_pages_per_cluster,
-            fallback_token_counts=retrieval_fallback_counts,
+            fallback_token_counts=fallback_counts,
             sparse_cluster_indices=plan.sparse_exact_cluster_indices,
             cluster_handles=output_workspace.draft_exact_cluster_ids,
             cache_page_ids=output_workspace.draft_compact_page_ids,
@@ -3844,7 +3915,199 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             miss_count=output_workspace.draft_prefetch_miss_count,
             sparse_attention=plan.sparse_attn,
             expanded_attention=plan.expanded_attn,
+            emit_misses=emit_misses,
         )
+
+    def _trace_draft_selection(
+        self,
+        request_ids: Sequence[str],
+        query: torch.Tensor,
+        active_mask: torch.Tensor,
+        proposal_round: int,
+        draft_step: int,
+        snapshot: str,
+        physical_source: str,
+        index_revisions: Sequence[int],
+        plan: RetroSpecTokenSelectionPlan,
+        output_workspace: _SelectionStepWorkspace,
+        candidate_counts: torch.Tensor,
+    ) -> None:
+        self.selection_provenance.record_draft_selection(
+            request_ids=request_ids,
+            layer_name=plan.layer_name,
+            proposal_round=proposal_round,
+            draft_step=draft_step,
+            snapshot=snapshot,
+            physical_source=physical_source,
+            index_revisions=index_revisions,
+            active_mask=active_mask,
+            query=query,
+            request_slot_ids=plan.request_slot_ids,
+            request_slot_generations=plan.request_slot_generations,
+            sparse_exact_cluster_indices=plan.sparse_exact_cluster_indices,
+            sparse_estimation_cluster_indices=(plan.sparse_estimation_cluster_indices),
+            exact_cluster_handles=output_workspace.draft_exact_cluster_ids,
+            candidate_counts=candidate_counts,
+            selected_cluster_counts=(output_workspace.draft_selected_cluster_counts),
+            hit_cluster_counts=output_workspace.draft_hit_cluster_counts,
+            miss_cluster_counts=output_workspace.draft_miss_cluster_counts,
+            hit_gate_ready=output_workspace.draft_hit_gate_ready,
+        )
+
+    def _materialize_draft_selection(
+        self,
+        plan: RetroSpecTokenSelectionPlan,
+        output_workspace: _SelectionStepWorkspace | None,
+        view: RetroSpecResidentBatchView,
+        active_mask: torch.Tensor,
+        ranked_values: torch.Tensor | None = None,
+        candidate_counts: torch.Tensor | None = None,
+        request_ids: Sequence[str] = (),
+        query: torch.Tensor | None = None,
+        proposal_round: int = 0,
+        draft_step: int = 0,
+        index_revisions: Sequence[int] = (),
+    ) -> RetroSpecTokenAttentionSelection:
+        """Use resident retrieval clusters and estimate selected cache misses."""
+        native_only = (
+            view.arena is None
+            or output_workspace is None
+            or output_workspace.draft_exact_cluster_ids.device.type != "cuda"
+        )
+        if native_only:
+            if self.selection_provenance.enabled:
+                if query is None:
+                    raise RuntimeError("Selection provenance requires the draft query")
+                num_requests, num_kv_heads = query.shape[:2]
+                if candidate_counts is None:
+                    candidate_counts = torch.zeros(
+                        num_requests,
+                        num_kv_heads,
+                        dtype=torch.int32,
+                        device=query.device,
+                    )
+                selected_counts = (plan.sparse_exact_cluster_indices >= 0).sum(
+                    dim=2, dtype=torch.int32
+                )
+                zero_counts = torch.zeros_like(candidate_counts)
+                self.selection_provenance.record_draft_selection(
+                    request_ids=request_ids,
+                    layer_name=plan.layer_name,
+                    proposal_round=proposal_round,
+                    draft_step=draft_step,
+                    snapshot="used",
+                    physical_source="native_only",
+                    index_revisions=index_revisions,
+                    active_mask=active_mask,
+                    query=query,
+                    request_slot_ids=plan.request_slot_ids,
+                    request_slot_generations=plan.request_slot_generations,
+                    sparse_exact_cluster_indices=plan.sparse_exact_cluster_indices,
+                    sparse_estimation_cluster_indices=(
+                        plan.sparse_estimation_cluster_indices
+                    ),
+                    exact_cluster_handles=torch.full_like(
+                        plan.sparse_exact_cluster_indices, -1, dtype=torch.int64
+                    ),
+                    candidate_counts=candidate_counts,
+                    selected_cluster_counts=selected_counts,
+                    hit_cluster_counts=zero_counts,
+                    miss_cluster_counts=zero_counts,
+                    hit_gate_ready=torch.zeros_like(candidate_counts, dtype=torch.bool),
+                )
+            return self._materialize_token_selection(
+                plan,
+                RetroSpecAttentionLevel.SPARSE,
+            )
+        if ranked_values is None:
+            raise RuntimeError("CUDA draft selection requires ranked scores")
+        if candidate_counts is None:
+            raise RuntimeError("CUDA draft selection requires candidate counts")
+        if self.selection_provenance.enabled:
+            if query is None:
+                raise RuntimeError("Selection provenance requires the draft query")
+            if len(request_ids) != active_mask.shape[0]:
+                raise RuntimeError(
+                    "Selection provenance request IDs do not match the batch"
+                )
+
+        assert query is not None or not self.selection_provenance.enabled
+
+        estimation_keys = output_workspace.draft_estimation_keys
+        estimation_values = output_workspace.draft_estimation_values
+        estimation_token_counts = output_workspace.draft_estimation_token_counts
+        resolved_pages = self._resolve_ranked_draft_pages(
+            plan,
+            output_workspace,
+            view,
+            active_mask,
+            ranked_values,
+            candidate_counts,
+            emit_misses=True,
+        )
+        expose_prefetch = True
+
+        if self.replay_mode == "ready_selected":
+            try:
+                self._trace_draft_selection(
+                    request_ids=request_ids,
+                    query=query,
+                    active_mask=active_mask,
+                    proposal_round=proposal_round,
+                    draft_step=draft_step,
+                    snapshot="before_ready",
+                    physical_source="resident",
+                    index_revisions=index_revisions,
+                    plan=plan,
+                    output_workspace=output_workspace,
+                    candidate_counts=candidate_counts,
+                )
+            except BaseException:
+                resolved_pages.read_lease.release()
+                raise
+
+            resolved_pages.read_lease.release()
+            prefetch = RetroSpecResidentPrefetchInput(
+                layer_name=plan.layer_name,
+                miss_cluster_ids=output_workspace.draft_prefetch_miss_cluster_ids,
+                miss_positions=output_workspace.draft_prefetch_miss_positions,
+                miss_count=output_workspace.draft_prefetch_miss_count,
+                num_groups=(
+                    output_workspace.draft_exact_cluster_ids.shape[0]
+                    * output_workspace.draft_exact_cluster_ids.shape[1]
+                ),
+                num_ranks=output_workspace.draft_exact_cluster_ids.shape[2],
+            )
+            self.cluster_store.prefetch_resident_cluster_wave((prefetch,))
+            self.cluster_store.synchronize_resident_prefetches((plan.layer_name,))
+            resolved_pages = self._resolve_ranked_draft_pages(
+                plan,
+                output_workspace,
+                view,
+                active_mask,
+                ranked_values,
+                candidate_counts,
+                emit_misses=False,
+            )
+            expose_prefetch = False
+
+        try:
+            self._trace_draft_selection(
+                request_ids=request_ids,
+                query=query,
+                active_mask=active_mask,
+                proposal_round=proposal_round,
+                draft_step=draft_step,
+                snapshot="used",
+                physical_source="resident",
+                index_revisions=index_revisions,
+                plan=plan,
+                output_workspace=output_workspace,
+                candidate_counts=candidate_counts,
+            )
+        except BaseException:
+            resolved_pages.read_lease.release()
+            raise
         self._proposal_read_leases.append(resolved_pages.read_lease)
 
         primary_token_counts = plan.primary_exact_token_mask.sum(
@@ -3881,11 +4144,19 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             resolved_pages=resolved_pages,
             prefetch_miss_cluster_ids=(
                 output_workspace.draft_prefetch_miss_cluster_ids
+                if expose_prefetch
+                else None
             ),
-            prefetch_miss_positions=output_workspace.draft_prefetch_miss_positions,
-            prefetch_miss_count=output_workspace.draft_prefetch_miss_count,
-            prefetch_num_groups=num_prefetch_groups,
-            prefetch_num_ranks=prefetch_num_ranks,
+            prefetch_miss_positions=(
+                output_workspace.draft_prefetch_miss_positions
+                if expose_prefetch
+                else None
+            ),
+            prefetch_miss_count=(
+                output_workspace.draft_prefetch_miss_count if expose_prefetch else None
+            ),
+            prefetch_num_groups=num_prefetch_groups if expose_prefetch else 0,
+            prefetch_num_ranks=prefetch_num_ranks if expose_prefetch else 0,
         )
 
     def configure_sparse_prefetch_wave(self, max_layers: int) -> None:
@@ -4714,6 +4985,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         active_mask: torch.Tensor,
         scale: float,
         plan_slot: int = 0,
+        proposal_round: int = 0,
     ) -> RetroSpecTokenAttentionSelection:
         self._validate_inputs(
             query,
@@ -4728,6 +5000,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             raise RuntimeError(
                 "Segmented token index request order does not match proposal order"
             )
+        index_revisions = self._get_proposal_index_revisions(layer_name, request_ids)
 
         with self._cuda_timer("draft_selection_layout"):
             view = self._get_resident_view(layer_name, request_ids, key_cache)
@@ -4845,6 +5118,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
         with self._cuda_timer("draft_plan_materialize"):
             selection = self._materialize_draft_selection(
+                request_ids=request_ids,
+                query=query,
+                proposal_round=proposal_round,
+                draft_step=plan_slot,
+                index_revisions=index_revisions,
                 plan=plan,
                 output_workspace=output_workspace,
                 view=view,

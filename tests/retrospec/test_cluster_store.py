@@ -96,6 +96,27 @@ def test_full_verification_ticket_reports_ready_and_signals_cancellation():
     assert completed_ticket.ready()
 
 
+def test_resident_replay_freezes_prefetch_and_verification_admission(monkeypatch):
+    store = RetroSpecClusterPageStore(page_size=2)
+    synchronize = Mock()
+    monkeypatch.setattr(store, "synchronize_resident_prefetches", synchronize)
+
+    store.begin_resident_replay(("layer.0", "layer.0", "layer.1"))
+    synchronize.assert_called_once_with(("layer.0", "layer.0", "layer.1"))
+    assert store._resident_admission_frozen
+    assert not store.prefetch_resident_cluster_wave((Mock(),))
+    store.admit_verification_misses(Mock())
+
+    with pytest.raises(RuntimeError, match="already active"):
+        store.begin_resident_replay(("layer.0",))
+
+    store.end_resident_replay()
+    assert not store._resident_admission_frozen
+    with pytest.raises(RuntimeError, match="not active"):
+        store.end_resident_replay()
+    store.close()
+
+
 def test_full_verification_staging_ring_waits_for_released_slot():
     buffer = cluster_store_module._FullVerificationTransferBuffer.__new__(
         cluster_store_module._FullVerificationTransferBuffer

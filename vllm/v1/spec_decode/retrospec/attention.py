@@ -207,6 +207,7 @@ class RetroSpecSparseAttention:
             max_gpu_index_memory_bytes=int(
                 getattr(config, "retrospec_max_gpu_index_memory", 4.0) * GiB_bytes
             ),
+            replay_mode=getattr(config, "retrospec_replay_mode", "off"),
             performance_stats=(
                 self.performance_stats if self.performance_stats.enabled else None
             ),
@@ -223,6 +224,7 @@ class RetroSpecSparseAttention:
 
         self.proposal_request_ids: tuple[str, ...] = ()
         self.proposal_context_lens: tuple[int, ...] = ()
+        self.proposal_round = 0
 
         self.full_verification_batch: _RetroSpecFullVerificationBatch | None = None
 
@@ -722,6 +724,7 @@ class RetroSpecSparseAttention:
         try:
             self.proposal_request_ids = request_ids
             self.proposal_context_lens = normalized_context_lens
+            self.proposal_round = 0
             self._resident_prefetch_wave.clear()
 
             self.in_proposal = True
@@ -736,6 +739,7 @@ class RetroSpecSparseAttention:
             self.parallel_request_indices = None
             self.parallel_token_indices = None
             self.attention_mass_layer_count = 0
+            self.proposal_round = 0
             self._resident_prefetch_wave.clear()
 
             try:
@@ -744,6 +748,19 @@ class RetroSpecSparseAttention:
                 self.index.end_proposal()
                 self.proposal_request_ids = ()
                 self.proposal_context_lens = ()
+
+    def set_proposal_round(self, proposal_round: int) -> None:
+        if not self.in_proposal:
+            raise RuntimeError("Proposal round may be set only inside proposal_context")
+        if proposal_round <= 0:
+            raise ValueError("proposal_round must be positive")
+        if proposal_round < self.proposal_round:
+            raise ValueError("proposal_round must be monotonic")
+        self.proposal_round = proposal_round
+
+    @property
+    def selection_provenance_enabled(self) -> bool:
+        return self.index.selection_provenance.enabled
 
     def begin_step(
         self,
@@ -1568,6 +1585,7 @@ class RetroSpecSparseAttention:
                     active_mask=self.active_mask,
                     scale=impl.scale,
                     plan_slot=self.step_index,
+                    proposal_round=self.proposal_round,
                 )
         else:
             if self.mode == RetroSpecAttentionMode.SPARSE_VERIFY:

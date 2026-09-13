@@ -59,6 +59,7 @@ def make_controller(
     hit_attn_threshold: float | None = None,
     retrieval_attn_threshold: float | None = None,
     expanded_attn_threshold: float | None = None,
+    replay_mode: str = "off",
 ) -> RetroSpecSparseAttention:
     config = cast(
         VllmConfig,
@@ -84,6 +85,7 @@ def make_controller(
                 retrospec_hit_attn_threshold=hit_attn_threshold,
                 retrospec_retrieval_attn_threshold=retrieval_attn_threshold,
                 retrospec_expanded_attn_threshold=expanded_attn_threshold,
+                retrospec_replay_mode=replay_mode,
             ),
             scheduler_config=SimpleNamespace(
                 max_num_seqs=max_num_seqs,
@@ -97,6 +99,26 @@ def make_controller(
         ),
     )
     return RetroSpecSparseAttention(config, torch.device("cpu"))
+
+
+def test_proposal_round_is_scoped_and_monotonic():
+    controller = make_controller(replay_mode="trace")
+    assert controller.selection_provenance_enabled
+
+    with pytest.raises(RuntimeError, match="only inside proposal_context"):
+        controller.set_proposal_round(1)
+
+    controller.in_proposal = True
+    controller.set_proposal_round(1)
+    controller.set_proposal_round(3)
+    assert controller.proposal_round == 3
+    with pytest.raises(ValueError, match="monotonic"):
+        controller.set_proposal_round(2)
+    with pytest.raises(ValueError, match="positive"):
+        controller.set_proposal_round(0)
+
+    controller.in_proposal = False
+    controller.index.close()
 
 
 def mark_installed(controller: RetroSpecSparseAttention) -> None:

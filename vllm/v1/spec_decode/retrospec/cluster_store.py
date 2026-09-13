@@ -2017,6 +2017,7 @@ class RetroSpecClusterPageStore:
         self._verification_metadata_streams: dict[torch.device, torch.cuda.Stream] = {}
         self._verification_resolve_lock = Lock()
         self._resident_state_lock = RLock()
+        self._resident_admission_frozen = False
         self._closed = False
 
     def _allocate_cluster_ids(
@@ -4297,6 +4298,8 @@ class RetroSpecClusterPageStore:
         """Queue or coalesce one draft step's cross-layer miss commands."""
         if self._closed:
             raise RuntimeError("RetroSpec cluster page store is closed")
+        if self._resident_admission_frozen:
+            return False
         records = tuple(records)
         if not records:
             return False
@@ -4339,6 +4342,19 @@ class RetroSpecClusterPageStore:
 
         for resident_cache in resident_caches:
             resident_cache.synchronize_pending_copies()
+
+    def begin_resident_replay(self, layer_names: Sequence[str]) -> None:
+        """Drain resident mutations and freeze the physical source mapping."""
+        if self._resident_admission_frozen:
+            raise RuntimeError("Resident replay is already active")
+
+        self.synchronize_resident_prefetches(layer_names)
+        self._resident_admission_frozen = True
+
+    def end_resident_replay(self) -> None:
+        if not self._resident_admission_frozen:
+            raise RuntimeError("Resident replay is not active")
+        self._resident_admission_frozen = False
 
     def _get_verification_metadata_stream(
         self, device: torch.device
@@ -5428,6 +5444,8 @@ class RetroSpecClusterPageStore:
         admission: RetroSpecVerificationMissAdmission | None,
     ) -> None:
         """Admit compact verification misses without re-reading GPU metadata."""
+        if self._resident_admission_frozen:
+            return
         if admission is None or admission.cluster_ids_cpu.numel() == 0:
             return
 

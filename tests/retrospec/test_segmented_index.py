@@ -32,6 +32,7 @@ def make_index(
     max_resident_requests: int = 1,
     prefill_warmup_multiplier: int = 4,
     num_speculative_tokens: int = 1,
+    replay_mode: str = "off",
 ) -> RetroSpecSegmentedTokenIndex:
     return RetroSpecSegmentedTokenIndex(
         block_size=2,
@@ -48,6 +49,7 @@ def make_index(
         pin_memory=pin_memory,
         max_resident_requests=max_resident_requests,
         prefill_warmup_multiplier=prefill_warmup_multiplier,
+        replay_mode=replay_mode,
     )
 
 
@@ -1205,10 +1207,12 @@ def test_full_verification_plan_handles_request_without_cluster_pages():
 
 
 def test_cpu_offload_sparse_selection_handles_request_without_cluster_pages():
-    index = make_index()
+    index = make_index(replay_mode="trace")
     keys, values = make_cache()
     block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
     build_index(index, 3, keys, values, block_table)
+    record_selection = Mock()
+    index.selection_provenance.record_draft_selection = record_selection
 
     index.begin_proposal(["request"])
     try:
@@ -1222,6 +1226,7 @@ def test_cpu_offload_sparse_selection_handles_request_without_cluster_pages():
             seq_lens=torch.tensor([3], dtype=torch.int32),
             active_mask=torch.tensor([True]),
             scale=1.0,
+            proposal_round=2,
         )
     finally:
         index.end_proposal()
@@ -1233,6 +1238,9 @@ def test_cpu_offload_sparse_selection_handles_request_without_cluster_pages():
     assert primary_indices.tolist() == [0, 1, 2]
     assert selection.exact_page_ids.shape == (1, 1, 1, 0)
     assert selection.resolved_pages is None
+    record_selection.assert_called_once()
+    assert record_selection.call_args.kwargs["physical_source"] == "native_only"
+    assert record_selection.call_args.kwargs["proposal_round"] == 2
 
 
 def test_full_verification_plan_rejects_staged_index_updates():
@@ -1569,6 +1577,91 @@ def test_segmented_index_proposal_lifecycle_tracks_empty_batches():
 
     with pytest.raises(RuntimeError, match="not active"):
         index.end_proposal()
+
+
+def test_provenance_rejects_index_revision_changes_inside_proposal():
+    index = make_index(replay_mode="trace")
+    index._indices["layer"] = {"request": index._empty_index()}
+
+    index.begin_proposal(["request"])
+    try:
+        revisions = index._get_proposal_index_revisions("layer", ["request"])
+        assert revisions == (index._indices["layer"]["request"].revision,)
+
+        index._indices["layer"]["request"] = index._empty_index()
+        with pytest.raises(RuntimeError, match="changed inside a proposal"):
+            index._get_proposal_index_revisions("layer", ["request"])
+    finally:
+        index.end_proposal()
+
+    assert index._proposal_index_revisions == {}
+    index.close()
+
+
+def test_provenance_records_published_index_segment_ranges():
+    index = make_index(replay_mode="trace")
+    keys, values = make_cache()
+    block_table = torch.arange(7, dtype=torch.int32).view(1, -1)
+    record_segment = Mock()
+    index.selection_provenance.record_index_segment = record_segment
+
+    build_index(index, 10, keys, values, block_table)
+
+    record_segment.assert_called_once()
+    call = record_segment.call_args.kwargs
+    assert call["request_id"] == "request"
+    assert call["layer_name"] == "layer"
+    assert call["indexed_start"] == 2
+    assert call["indexed_end"] == 6
+    assert call["cluster_start"] == 0
+    assert call["assignments"].shape == (1, 4)
+    assert call["cluster_sizes"].shape == (1, 2)
+    index.close()
+
+
+def test_freeze_resident_replay_matches_proposal_lifetime(monkeypatch):
+    index = make_index(replay_mode="freeze_resident")
+    begin_replay = Mock()
+    end_replay = Mock()
+    monkeypatch.setattr(index.cluster_store, "begin_resident_replay", begin_replay)
+    monkeypatch.setattr(index.cluster_store, "end_resident_replay", end_replay)
+
+    index.begin_proposal(["request"])
+    begin_replay.assert_called_once_with(())
+    assert index._proposal_resident_frozen
+    index.end_proposal()
+
+    end_replay.assert_called_once_with()
+    assert not index._proposal_resident_frozen
+    index.close()
+
+
+def test_freeze_resident_replay_unwinds_failed_activation(monkeypatch):
+    index = make_index(replay_mode="freeze_resident")
+    begin_replay = Mock()
+    end_replay = Mock()
+    monkeypatch.setattr(index.cluster_store, "begin_resident_replay", begin_replay)
+    monkeypatch.setattr(index.cluster_store, "end_resident_replay", end_replay)
+    monkeypatch.setattr(
+        index._gpu_index_residency,
+        "activate",
+        Mock(side_effect=RuntimeError("activation failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="activation failed"):
+        index.begin_proposal(["request"])
+
+    begin_replay.assert_called_once_with(())
+    end_replay.assert_called_once_with()
+    assert not index._proposal_resident_frozen
+    assert index._proposal_index_revisions == {}
+    assert not index._proposal_active
+    index.close()
+
+
+def test_ready_selected_replay_requires_pinned_staging():
+    with pytest.raises(ValueError, match="requires pinned CPU staging memory"):
+        make_index(replay_mode="ready_selected")
 
 
 def test_cpu_offload_keeps_request_indices_after_batch_deactivation():
@@ -2188,6 +2281,58 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     assert verification.attention_mass.item() == pytest.approx(
         warm.plan.sparse_attn.item()
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_ready_selected_replay_admits_current_topk_before_draft_attention():
+    device = torch.device("cuda")
+    index = make_index(
+        cache_ratio=0.5,
+        pin_memory=True,
+        replay_mode="ready_selected",
+    )
+    keys, values = make_cache()
+    keys = keys.to(device=device, dtype=torch.bfloat16)
+    values = values.to(device=device, dtype=torch.bfloat16)
+    block_table = torch.arange(7, dtype=torch.int32, device=device).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+    record_selection = Mock()
+    index.selection_provenance.record_draft_selection = record_selection
+
+    index.begin_proposal(["request"])
+    try:
+        selection = index.select_segmented(
+            request_ids=["request"],
+            layer_name="layer",
+            query=torch.ones(1, 1, 1, device=device, dtype=torch.bfloat16),
+            key_cache=keys,
+            value_cache=values,
+            block_table=block_table,
+            seq_lens=torch.tensor([10], dtype=torch.int32, device=device),
+            active_mask=torch.tensor([True], device=device),
+            scale=1.0,
+            proposal_round=2,
+        )
+    finally:
+        index.end_proposal()
+
+    assert index.cluster_store.num_resident_pages("layer") == 1
+    assert selection.resolved_pages is not None
+    assert selection.resolved_pages.hit_gate_ready.all()
+    assert selection.resolved_pages.miss_cluster_counts.sum().item() == 0
+    assert selection.prefetch_miss_cluster_ids is None
+    assert selection.prefetch_miss_positions is None
+    assert selection.prefetch_miss_count is None
+    assert selection.prefetch_num_groups == 0
+    assert selection.prefetch_num_ranks == 0
+    assert [call.kwargs["snapshot"] for call in record_selection.call_args_list] == [
+        "before_ready",
+        "used",
+    ]
+    assert all(
+        call.kwargs["proposal_round"] == 2 for call in record_selection.call_args_list
+    )
+    index.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

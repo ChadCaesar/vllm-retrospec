@@ -249,6 +249,17 @@ class SpeculativeConfig:
     synchronizes compact decision tensors to CPU and must remain disabled
     during performance measurements."""
 
+    retrospec_replay_mode: Literal[
+        "off", "trace", "freeze_resident", "ready_selected"
+    ] = "off"
+    """Control RetroSpec selection provenance and deterministic replay.
+
+    ``off`` preserves the normal hot path. ``trace`` records provenance without
+    changing execution. ``freeze_resident`` drains and then freezes resident
+    admission for each proposal. ``ready_selected`` synchronously admits the
+    current fresh top-k misses before draft attention. Enabled modes are
+    diagnostic and must not be used for quiet performance measurements."""
+
     retrospec_stats_interval_seconds: float = Field(default=0.0, ge=0)
     """Interval for worker-side RetroSpec performance logs. Zero disables all
     RetroSpec performance counters and CUDA event timing."""

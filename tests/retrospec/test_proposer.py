@@ -2234,6 +2234,8 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
         make_runner(),
     )
     round_starts: list[list[int]] = []
+    set_proposal_round = Mock()
+    proposer.sparse_attention.index.selection_provenance.mode = "trace"
 
     def fake_run_draft_step(
         batch_size,
@@ -2270,6 +2272,11 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
         "proposal_context",
         lambda _request_ids, _context_lens=None: nullcontext(),
     )
+    monkeypatch.setattr(
+        proposer.sparse_attention,
+        "set_proposal_round",
+        set_proposal_round,
+    )
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)
 
@@ -2281,6 +2288,7 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
     )
 
     assert round_starts == [[0], [2]]
+    assert [call.args[0] for call in set_proposal_round.call_args_list] == [1, 2]
     assert result == [[1, 2, 3, 4]]
     assert proposer.state.pending_counts.tolist() == [4]
     assert proposer.state.stage.tolist() == [int(RetroSpecStage.FULL_VERIFY)]
