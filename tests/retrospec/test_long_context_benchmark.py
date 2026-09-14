@@ -70,7 +70,8 @@ def test_profile_summary_accumulates_intervals_by_rank(tmp_path):
                 "(reason=request_finished): counters={draft_tokens=3}; "
                 "peaks={none}; histograms={draft_to_sparse_tokens=[2:2,4:1]}; "
                 "derived={x=0}; cpu_avg={proposal_wall=5.000ms/1}; "
-                "cuda_avg={draft_model=1.000ms/2}",
+                "cuda_avg={draft_model=1.000ms/2}; "
+                "cuda_samples={draft_model=1}",
                 "RETROSPEC_BENCHMARK_RESULT=" + json.dumps(result),
             )
         ),
@@ -88,5 +89,35 @@ def test_profile_summary_accumulates_intervals_by_rank(tmp_path):
         "average_ms": 3.0,
     }
     assert rank["timings"]["draft_model"]["total_ms"] == 14.0
+    assert rank["cuda_samples"] == {"draft_model": 1}
     assert rank["histograms"]["draft_to_sparse_tokens"] == {"2": 3, "4": 1}
     assert rank["flush_reasons"] == {"interval": 1, "request_finished": 1}
+
+
+def test_profile_summary_keeps_pipeline_ranks_separate(tmp_path):
+    log = tmp_path / "pp-profile.log"
+    log.write_text(
+        "\n".join(
+            (
+                "(Worker_PP0 pid=1) RetroSpec performance over 1.00s "
+                "(reason=shutdown): counters={draft_tokens=2}; peaks={none}; "
+                "histograms={none}; derived={x=0}; cpu_avg={none}; "
+                "cuda_avg={draft_pipeline_send=2.000ms/2}; "
+                "cuda_samples={draft_pipeline_send=2}",
+                "(Worker_PP1 pid=2) RetroSpec performance over 1.00s "
+                "(reason=shutdown): counters={draft_tokens=3}; peaks={none}; "
+                "histograms={none}; derived={x=0}; cpu_avg={none}; "
+                "cuda_avg={draft_pipeline_receive=3.000ms/3}; "
+                "cuda_samples={draft_pipeline_receive=3}",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    output = summarize(log)
+
+    assert set(output["ranks"]) == {"0", "1"}
+    assert output["ranks"]["0"]["counters"]["draft_tokens"] == 2
+    assert output["ranks"]["0"]["cuda_samples"] == {"draft_pipeline_send": 2}
+    assert output["ranks"]["1"]["counters"]["draft_tokens"] == 3
+    assert output["ranks"]["1"]["cuda_samples"] == {"draft_pipeline_receive": 3}

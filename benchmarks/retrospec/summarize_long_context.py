@@ -14,10 +14,11 @@ RESULT_MARKER = "RETROSPEC_BENCHMARK_RESULT="
 COUNTER_PATTERN = re.compile(r"counters=\{([^}]*)\}")
 CPU_PATTERN = re.compile(r"cpu_avg=\{([^}]*)\}")
 CUDA_PATTERN = re.compile(r"cuda_avg=\{([^}]*)\}")
+CUDA_SAMPLE_PATTERN = re.compile(r"cuda_samples=\{([^}]*)\}")
 HISTOGRAM_PATTERN = re.compile(r"histograms=\{(.*?)\}; derived=")
 HISTOGRAM_ENTRY_PATTERN = re.compile(r"([A-Za-z0-9_]+)=\[([^]]*)\]")
 REASON_PATTERN = re.compile(r"reason=([^)]+)")
-RANK_PATTERN = re.compile(r"Worker_TP(\d+)")
+RANK_PATTERN = re.compile(r"Worker_(?:TP|PP)(\d+)")
 TIME_PATTERN = re.compile(r"([0-9.]+)ms/(\d+)")
 
 
@@ -50,6 +51,7 @@ def summarize(path: Path) -> dict[str, Any]:
     counters: dict[int, Counter[str]] = defaultdict(Counter)
     totals_ms: dict[int, Counter[str]] = defaultdict(Counter)
     timing_counts: dict[int, Counter[str]] = defaultdict(Counter)
+    cuda_samples: dict[int, Counter[str]] = defaultdict(Counter)
     histograms: dict[int, dict[str, Counter[int]]] = defaultdict(
         lambda: defaultdict(Counter)
     )
@@ -77,13 +79,26 @@ def summarize(path: Path) -> dict[str, Any]:
                         average_ms, count = parse_time(value)
                         totals_ms[rank][key] += average_ms * count
                         timing_counts[rank][key] += count
+            if match := CUDA_SAMPLE_PATTERN.search(line):
+                cuda_samples[rank].update(
+                    {
+                        key: int(value)
+                        for key, value in parse_named_pairs(match.group(1)).items()
+                    }
+                )
             if match := HISTOGRAM_PATTERN.search(line):
                 for name, histogram in parse_histograms(match.group(1)).items():
                     histograms[rank][name].update(histogram)
             if match := REASON_PATTERN.search(line):
                 reasons[rank][match.group(1)] += 1
 
-    ranks = sorted(set(counters) | set(totals_ms) | set(histograms) | set(reasons))
+    ranks = sorted(
+        set(counters)
+        | set(totals_ms)
+        | set(cuda_samples)
+        | set(histograms)
+        | set(reasons)
+    )
     return {
         "path": str(path),
         "result": benchmark_result,
@@ -98,6 +113,7 @@ def summarize(path: Path) -> dict[str, Any]:
                     }
                     for name, total in sorted(totals_ms[rank].items())
                 },
+                "cuda_samples": dict(sorted(cuda_samples[rank].items())),
                 "histograms": {
                     name: {
                         str(value): count for value, count in sorted(histogram.items())

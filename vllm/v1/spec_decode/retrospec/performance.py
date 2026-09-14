@@ -21,8 +21,14 @@ _CUDA_EVENT_POOL_SIZE = 128
 _COARSE_CUDA_TIMER_NAMES = frozenset(
     {
         "draft_model",
+        "draft_pipeline_receive",
+        "draft_pipeline_send",
         "sparse_verify_model",
+        "sparse_verify_pipeline_receive",
+        "sparse_verify_pipeline_send",
         "expanded_verify_model",
+        "expanded_verify_pipeline_receive",
+        "expanded_verify_pipeline_send",
         "full_verify_transaction",
     }
 )
@@ -34,6 +40,7 @@ class _CudaTimer:
     pair_index: int
     start_event: torch.cuda.Event
     end_event: torch.cuda.Event
+    stream: torch.cuda.Stream
     sample_weight: int
 
 
@@ -131,6 +138,7 @@ class RetroSpecPerformanceStats:
         self._cpu_times: dict[str, tuple[float, int]] = {}
         self._cuda_times: dict[str, tuple[float, int]] = {}
         self._cuda_timer_call_counts: Counter[str] = Counter()
+        self._cuda_sample_counts: Counter[str] = Counter()
         self._pending_cuda_samples: deque[_PendingCudaSample] = deque()
         self._cuda_event_pairs = (
             tuple(
@@ -236,12 +244,30 @@ class RetroSpecPerformanceStats:
             return 0
 
         with self._lock:
+            call_index = self._cuda_timer_call_counts[name]
             self._cuda_timer_call_counts[name] += 1
-            call_count = self._cuda_timer_call_counts[name]
 
-        if call_count % self.cuda_sample_interval != 0:
+        sample_window, sample_slot = divmod(call_index, self.cuda_sample_interval)
+        target_slot = sample_window % self.cuda_sample_interval
+        if sample_slot != target_slot:
             return 0
         return self.cuda_sample_interval
+
+    def _resolve_cuda_stream(
+        self, stream: torch.cuda.Stream | None
+    ) -> torch.cuda.Stream:
+        if stream is None:
+            return torch.cuda.current_stream(self.device)
+        if stream.device != self.device:
+            raise ValueError(
+                "RetroSpec CUDA timer stream must use the statistics device: "
+                f"expected {self.device}, got {stream.device}"
+            )
+        return stream
+
+    @staticmethod
+    def _same_cuda_stream(left: torch.cuda.Stream, right: torch.cuda.Stream) -> bool:
+        return left.device == right.device and left.cuda_stream == right.cuda_stream
 
     def _take_cuda_event_pair(
         self,
@@ -303,17 +329,19 @@ class RetroSpecPerformanceStats:
         if sample_weight == 0:
             return None
 
+        timer_stream = self._resolve_cuda_stream(stream)
         event_pair = self._take_cuda_event_pair()
         if event_pair is None:
             return None
 
         pair_index, start_event, end_event = event_pair
-        start_event.record(stream)
+        start_event.record(timer_stream)
         return _CudaTimer(
             name=name,
             pair_index=pair_index,
             start_event=start_event,
             end_event=end_event,
+            stream=timer_stream,
             sample_weight=sample_weight,
         )
 
@@ -325,7 +353,15 @@ class RetroSpecPerformanceStats:
         if timer is None:
             return
 
-        timer.end_event.record(stream)
+        stop_stream = (
+            timer.stream if stream is None else self._resolve_cuda_stream(stream)
+        )
+        if not self._same_cuda_stream(timer.stream, stop_stream):
+            raise RuntimeError(
+                "RetroSpec CUDA timer must stop on the stream where it started"
+            )
+
+        timer.end_event.record(timer.stream)
         with self._lock:
             self._pending_cuda_samples.append(
                 _PendingCudaSample(
@@ -379,6 +415,7 @@ class RetroSpecPerformanceStats:
                     total_ms + elapsed_ms * sample_weight,
                     count + sample_weight,
                 )
+                self._cuda_sample_counts[name] += 1
 
     @staticmethod
     def _format_counters(counters: dict[str, int]) -> str:
@@ -466,11 +503,13 @@ class RetroSpecPerformanceStats:
             peaks = dict(self._peaks)
             cpu_times = dict(self._cpu_times)
             cuda_times = dict(self._cuda_times)
+            cuda_sample_counts = dict(self._cuda_sample_counts)
 
             self._cpu_counters.clear()
             self._peaks.clear()
             self._cpu_times.clear()
             self._cuda_times.clear()
+            self._cuda_sample_counts.clear()
 
         self._last_log_time = now
 
@@ -509,7 +548,7 @@ class RetroSpecPerformanceStats:
             "draft_graph_replay=%.3f, "
             "sparse_verify_graph_replay=%.3f, "
             "expanded_verify_graph_replay=%.3f}; "
-            "cpu_avg={%s}; cuda_avg={%s}",
+            "cpu_avg={%s}; cuda_avg={%s}; cuda_samples={%s}",
             elapsed_seconds,
             reason,
             self._format_counters(counters),
@@ -535,4 +574,5 @@ class RetroSpecPerformanceStats:
             cudagraph_replay_rate("expanded_verify"),
             self._format_times(cpu_times),
             self._format_times(cuda_times),
+            self._format_counters(cuda_sample_counts),
         )

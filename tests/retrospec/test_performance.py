@@ -109,6 +109,8 @@ def test_cuda_timer_levels_and_sampling_weights():
         device=torch.device("cpu"), log_interval_seconds=1.0
     )
     assert coarse._cuda_timer_sample_weight("draft_model") == 1
+    assert coarse._cuda_timer_sample_weight("draft_pipeline_receive") == 1
+    assert coarse._cuda_timer_sample_weight("expanded_verify_pipeline_send") == 1
     assert coarse._cuda_timer_sample_weight("draft_plan_build") == 0
 
     detailed = RetroSpecPerformanceStats(
@@ -118,7 +120,27 @@ def test_cuda_timer_levels_and_sampling_weights():
         cuda_sample_interval=4,
     )
     weights = [detailed._cuda_timer_sample_weight("draft_plan_build") for _ in range(8)]
-    assert weights == [0, 0, 0, 4, 0, 0, 0, 4]
+    assert weights == [4, 0, 0, 0, 0, 4, 0, 0]
+
+
+def test_detailed_cuda_sampling_rotates_across_layer_slots():
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cpu"),
+        log_interval_seconds=1.0,
+        cuda_timing_level="detailed",
+        cuda_sample_interval=4,
+    )
+
+    sampled_slots = []
+    for window in range(8):
+        window_weights = [
+            stats._cuda_timer_sample_weight("draft_attention") for _ in range(4)
+        ]
+        sampled_slots.append(
+            next(i for i, weight in enumerate(window_weights) if weight)
+        )
+
+    assert sampled_slots == [0, 1, 2, 3, 0, 1, 2, 3]
 
 
 def test_cuda_event_pool_exhaustion_is_nonblocking(
@@ -314,8 +336,10 @@ def test_force_flush_waits_for_cuda_samples_and_does_not_repeat_cpu_data(
     assert "reason=request_finished" in first
     assert "proposal_calls=1" in first
     assert "transfer=7.500ms/4" in first
+    assert "cuda_samples={transfer=1}" in first
     assert "reason=shutdown" in second
     assert "proposal_calls=1" not in second
+    assert "cuda_samples={none}" in second
     assert list(stats._free_cuda_event_pairs) == [0]
 
 
@@ -412,8 +436,34 @@ def test_cuda_timer_is_drained_when_complete(monkeypatch: pytest.MonkeyPatch):
     message = messages[0][0] % messages[0][1:]
     assert "kernel=" in message
     assert "ms/1" in message
+    assert "cuda_samples={kernel=1}" in message
     assert len(stats._free_cuda_event_pairs) == initial_free_pairs
     assert not stats._pending_cuda_samples
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_timer_stops_on_captured_stream_and_rejects_another_stream():
+    device = torch.device("cuda", torch.cuda.current_device())
+    stats = RetroSpecPerformanceStats(
+        device=device,
+        log_interval_seconds=1.0,
+        cuda_timing_level="detailed",
+        cuda_sample_interval=1,
+    )
+    timer_stream = torch.cuda.Stream(device=device)
+    another_stream = torch.cuda.Stream(device=device)
+
+    timer = stats.start_cuda_timer("captured_stream", timer_stream)
+    assert timer is not None
+    with pytest.raises(RuntimeError, match="where it started"):
+        stats.stop_cuda_timer(timer, another_stream)
+
+    with torch.cuda.stream(another_stream):
+        stats.stop_cuda_timer(timer)
+
+    torch.cuda.synchronize(device)
+    stats._drain_cuda_samples(wait_for_completion=False)
+    assert stats._cuda_sample_counts["captured_stream"] == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -513,6 +513,7 @@ class RetroSpecProposer:
         positions: torch.Tensor,
         num_tokens: int,
         cudagraph_mode: CUDAGraphMode,
+        stage_name: str,
     ) -> torch.Tensor | None:
         if self.model is None:
             raise RuntimeError("RetroSpec target model is not loaded")
@@ -521,9 +522,18 @@ class RetroSpecProposer:
         receive_destination = self._get_pipeline_receive_destination(
             stage, num_tokens, cudagraph_mode
         )
-        intermediate_tensors = self.pipeline_protocol.receive_model_input(
-            stage, num_tokens, receive_destination
-        )
+        if stage.is_first:
+            intermediate_tensors = self.pipeline_protocol.receive_model_input(
+                stage, num_tokens, receive_destination
+            )
+        else:
+            with (
+                self.performance_stats.cpu_timer(f"{stage_name}_pipeline_receive_wall"),
+                self.performance_stats.cuda_timer(f"{stage_name}_pipeline_receive"),
+            ):
+                intermediate_tensors = self.pipeline_protocol.receive_model_input(
+                    stage, num_tokens, receive_destination
+                )
         model_output = self.model(
             input_ids=input_ids if stage.is_first else None,
             positions=positions,
@@ -536,7 +546,13 @@ class RetroSpecProposer:
                 raise RuntimeError(
                     "A non-final RetroSpec PP stage must return IntermediateTensors"
                 )
-            self.pipeline_protocol.send_model_output(stage, model_output, num_tokens)
+            with (
+                self.performance_stats.cpu_timer(f"{stage_name}_pipeline_send_wall"),
+                self.performance_stats.cuda_timer(f"{stage_name}_pipeline_send"),
+            ):
+                self.pipeline_protocol.send_model_output(
+                    stage, model_output, num_tokens
+                )
             return None
 
         if isinstance(model_output, tuple):
@@ -1001,6 +1017,7 @@ class RetroSpecProposer:
                 model_positions,
                 batch_descriptor.num_tokens,
                 cudagraph_mode,
+                "draft",
             )
 
         with self.performance_stats.cuda_timer("draft_end_step"):
@@ -1615,6 +1632,7 @@ class RetroSpecProposer:
                 model_positions,
                 batch_descriptor.num_tokens,
                 cudagraph_mode,
+                stage_name,
             )
 
         with self.performance_stats.cuda_timer(f"{stage_name}_end_step"):

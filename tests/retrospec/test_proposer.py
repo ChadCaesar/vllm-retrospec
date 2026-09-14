@@ -457,6 +457,8 @@ def test_pipeline_stage_model_receives_into_graph_workspace():
     proposer.pipeline_stage = RetroSpecPipelineStage(1, 2, 1, 2)
     proposer.pipeline_protocol.receive_model_input = Mock(return_value=workspace)
     proposer.model = Mock(return_value=torch.ones(4, 4))
+    proposer.performance_stats.cpu_timer = Mock(return_value=nullcontext())
+    proposer.performance_stats.cuda_timer = Mock(return_value=nullcontext())
     positions = torch.arange(4)
 
     output = proposer._run_pipeline_stage_model(
@@ -464,6 +466,7 @@ def test_pipeline_stage_model_receives_into_graph_workspace():
         positions,
         num_tokens=4,
         cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        stage_name="draft",
     )
 
     proposer.pipeline_protocol.receive_model_input.assert_called_once_with(
@@ -474,7 +477,48 @@ def test_pipeline_stage_model_receives_into_graph_workspace():
     assert model_kwargs["positions"] is positions
     assert model_kwargs["intermediate_tensors"] is workspace
     assert model_kwargs["inputs_embeds"] is None
+    proposer.performance_stats.cpu_timer.assert_called_once_with(
+        "draft_pipeline_receive_wall"
+    )
+    proposer.performance_stats.cuda_timer.assert_called_once_with(
+        "draft_pipeline_receive"
+    )
     torch.testing.assert_close(output, torch.ones(4, 4))
+
+
+def test_pipeline_stage_model_times_nonfinal_send_only():
+    output = IntermediateTensors(
+        {
+            "hidden_states": torch.ones(4, 4),
+            "residual": torch.ones(4, 4),
+        }
+    )
+    proposer = RetroSpecProposer(make_vllm_config(), torch.device("cpu"), make_runner())
+    proposer.pipeline_stage = RetroSpecPipelineStage(0, 2, 0, 1)
+    proposer.pipeline_protocol.receive_model_input = Mock(return_value=None)
+    proposer.pipeline_protocol.send_model_output = Mock()
+    proposer.model = Mock(return_value=output)
+    proposer.performance_stats.cpu_timer = Mock(return_value=nullcontext())
+    proposer.performance_stats.cuda_timer = Mock(return_value=nullcontext())
+
+    result = proposer._run_pipeline_stage_model(
+        torch.zeros(4, dtype=torch.int32),
+        torch.arange(4),
+        num_tokens=4,
+        cudagraph_mode=CUDAGraphMode.NONE,
+        stage_name="sparse_verify",
+    )
+
+    assert result is None
+    proposer.performance_stats.cpu_timer.assert_called_once_with(
+        "sparse_verify_pipeline_send_wall"
+    )
+    proposer.performance_stats.cuda_timer.assert_called_once_with(
+        "sparse_verify_pipeline_send"
+    )
+    proposer.pipeline_protocol.send_model_output.assert_called_once_with(
+        proposer.pipeline_stage, output, 4
+    )
 
 
 def test_piecewise_model_inputs_preserve_eager_views():
