@@ -726,6 +726,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "            int block_size_in_bytes, Tensor block_mapping) -> ()");
   cache_ops.impl("swap_blocks", torch::kCUDA, &swap_blocks);
 
+  cache_ops.def(
+      "copy_kv_blocks_coalesced(Tensor key_src, Tensor value_src,"
+      " Tensor! key_dst, Tensor! value_dst, int block_size_in_bytes,"
+      " Tensor block_mapping) -> int");
+  cache_ops.impl("copy_kv_blocks_coalesced", torch::kCUDA,
+                 &copy_kv_blocks_coalesced);
+
   // Reshape the key and value tensors and cache them.
   cache_ops.def(
       "reshape_and_cache(Tensor key, Tensor value,"

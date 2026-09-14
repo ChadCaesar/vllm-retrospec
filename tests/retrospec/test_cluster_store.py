@@ -3,6 +3,7 @@
 
 import threading
 from concurrent.futures import CancelledError, Future
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -978,7 +979,9 @@ def test_cluster_store_releases_pages_when_resident_resize_fails():
     clusters_before = store.num_allocated_clusters("layer")
     group_page_counts_before = dict(store._group_backing_page_counts["layer"])
     store._resident_caches["layer"] = Mock(
-        resize=Mock(side_effect=RuntimeError("resident resize failed"))
+        requires_resize=Mock(return_value=True),
+        mutation_guard=Mock(return_value=nullcontext()),
+        resize=Mock(side_effect=RuntimeError("resident resize failed")),
     )
 
     with pytest.raises(RuntimeError, match="resident resize failed"):
@@ -1350,6 +1353,7 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
         store.resolve_cluster_blocks(
             "layer", cluster_ids, metadata.page_ids, mode="resident_only"
         )
+    assert store._resident_caches["layer"].performance_stats is stats
     stats._cpu_counters.clear()
 
     access_kinds = torch.full_like(cluster_ids, 2, dtype=torch.uint8)

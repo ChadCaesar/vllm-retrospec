@@ -2819,10 +2819,9 @@ class RetroSpecClusterPageStore:
             layer_name,
             capacity,
         )
-        resident_cache.resize(
-            capacity,
-            group_targets=group_targets,
-        )
+        if resident_cache.requires_resize(capacity, group_targets):
+            with resident_cache.mutation_guard():
+                resident_cache.resize(capacity, group_targets=group_targets)
 
     def _get_or_create_resident_cache(
         self,
@@ -2846,17 +2845,15 @@ class RetroSpecClusterPageStore:
                 head_size=pool.head_size,
                 dtype=pool.dtype,
                 device=pool.metadata_device,
+                performance_stats=self.performance_stats,
             )
             self._resident_caches[layer_name] = resident_cache
 
         capacity = self._resident_target_capacity(pool)
-        resident_cache.resize(
-            capacity,
-            group_targets=self._resident_group_targets(
-                layer_name,
-                capacity,
-            ),
-        )
+        group_targets = self._resident_group_targets(layer_name, capacity)
+        if resident_cache.requires_resize(capacity, group_targets):
+            with resident_cache.mutation_guard():
+                resident_cache.resize(capacity, group_targets=group_targets)
         descriptor_arena = self._prefetch_descriptor_arenas.get(layer_name)
         if descriptor_arena is not None:
             resident_cache.reserve_prefetch_handle_states(descriptor_arena.capacity)

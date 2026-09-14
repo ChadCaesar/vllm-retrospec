@@ -10,6 +10,7 @@ from tests.kernels.utils import DEFAULT_OPCHECK_TEST_UTILS, opcheck
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.quant_utils import scaled_dequantize
 from vllm.platforms import current_platform
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import set_random_seed
 
 COPYING_DIRECTION = [("cuda", "cpu"), ("cuda", "cuda"), ("cpu", "cuda")]
@@ -469,6 +470,93 @@ def test_swap_blocks(
         torch.testing.assert_close(
             src_value_caches_clone[src].cpu(), dist_value_caches[0][dst].cpu()
         )
+
+
+@pytest.mark.parametrize(
+    "source_kind",
+    [
+        "pageable_cpu",
+        pytest.param(
+            "pinned_cpu",
+            marks=pytest.mark.skipif(
+                not is_pin_memory_available(), reason="Pinned memory is unavailable"
+            ),
+        ),
+        "cuda",
+    ],
+)
+@pytest.mark.parametrize(
+    ("mapping", "expected_spans"),
+    [
+        ((), 0),
+        (((0, 1), (1, 2), (2, 3)), 1),
+        (((0, 1), (1, 2), (3, 5), (4, 6), (6, 0)), 3),
+        (((0, 1), (2, 2), (4, 3)), 3),
+        (((0, 0), (1, 2)), 2),
+        (((0, 0), (2, 1)), 2),
+    ],
+)
+def test_copy_kv_blocks_coalesced_copies_kv_and_reports_span_count(
+    source_kind: str,
+    mapping: tuple[tuple[int, int], ...],
+    expected_spans: int,
+) -> None:
+    key_source_cpu = torch.arange(42, dtype=torch.float32).view(7, 2, 3)
+    value_source_cpu = key_source_cpu + 1000.0
+    if source_kind == "cuda":
+        key_source = key_source_cpu.cuda()
+        value_source = value_source_cpu.cuda()
+    else:
+        pin_memory = source_kind == "pinned_cpu"
+        key_source = key_source_cpu.pin_memory() if pin_memory else key_source_cpu
+        value_source = value_source_cpu.pin_memory() if pin_memory else value_source_cpu
+
+    key_destination = torch.full((8, 2, 3), -1.0, device="cuda")
+    value_destination = torch.full((8, 2, 3), -1.0, device="cuda")
+    block_mapping = torch.tensor(mapping, dtype=torch.int64).view(-1, 2)
+    block_size = 2 * 3 * key_source.element_size()
+
+    span_count = ops.copy_kv_blocks_coalesced(
+        key_source,
+        value_source,
+        key_destination,
+        value_destination,
+        block_size,
+        block_mapping,
+    )
+    torch.cuda.synchronize()
+
+    expected_keys = torch.full((8, 2, 3), -1.0)
+    expected_values = torch.full((8, 2, 3), -1.0)
+    for source_page, destination_page in mapping:
+        expected_keys[destination_page].copy_(key_source_cpu[source_page])
+        expected_values[destination_page].copy_(value_source_cpu[source_page])
+
+    assert span_count == expected_spans
+    torch.testing.assert_close(key_destination.cpu(), expected_keys)
+    torch.testing.assert_close(value_destination.cpu(), expected_values)
+
+
+def test_copy_kv_blocks_coalesced_validates_full_mapping_before_copy() -> None:
+    key_source = torch.arange(42, dtype=torch.float32).view(7, 2, 3)
+    value_source = key_source + 1000.0
+    key_destination = torch.full((8, 2, 3), -1.0, device="cuda")
+    value_destination = torch.full((8, 2, 3), -1.0, device="cuda")
+    block_mapping = torch.tensor([[0, 0], [7, 1]], dtype=torch.int64)
+
+    with pytest.raises(RuntimeError, match="source block index is out of range"):
+        ops.copy_kv_blocks_coalesced(
+            key_source,
+            value_source,
+            key_destination,
+            value_destination,
+            2 * 3 * key_source.element_size(),
+            block_mapping,
+        )
+    torch.cuda.synchronize()
+
+    assert torch.all(key_destination == -1.0)
+    assert torch.all(value_destination == -1.0)
 
 
 @pytest.mark.parametrize("num_heads", NUM_HEADS)

@@ -2593,6 +2593,25 @@ def swap_blocks(
     torch.ops._C_cache_ops.swap_blocks(src, dst, block_size_in_bytes, block_mapping)
 
 
+def copy_kv_blocks_coalesced(
+    key_src: torch.Tensor,
+    value_src: torch.Tensor,
+    key_dst: torch.Tensor,
+    value_dst: torch.Tensor,
+    block_size_in_bytes: int,
+    block_mapping: torch.Tensor,
+) -> int:
+    """Copy K/V blocks while merging adjacent source/destination spans."""
+    return torch.ops._C_cache_ops.copy_kv_blocks_coalesced(
+        key_src,
+        value_src,
+        key_dst,
+        value_dst,
+        block_size_in_bytes,
+        block_mapping,
+    )
+
+
 def convert_fp8(
     output: torch.Tensor, input: torch.Tensor, scale: float = 1.0, kv_dtype: str = "fp8"
 ) -> None:

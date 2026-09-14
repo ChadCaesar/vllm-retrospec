@@ -10,6 +10,13 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
                  int64_t block_size_in_bytes,
                  const torch::Tensor& block_mapping);
 
+int64_t copy_kv_blocks_coalesced(torch::Tensor& key_src,
+                                 torch::Tensor& value_src,
+                                 torch::Tensor& key_dst,
+                                 torch::Tensor& value_dst,
+                                 int64_t block_size_in_bytes,
+                                 const torch::Tensor& block_mapping);
+
 void reshape_and_cache(torch::Tensor& key, torch::Tensor& value,
                        torch::Tensor& key_cache, torch::Tensor& value_cache,
                        torch::Tensor& slot_mapping,

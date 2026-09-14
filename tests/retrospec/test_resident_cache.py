@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.v1.spec_decode.retrospec.cluster_identity import RetroSpecClusterGroup
+from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
 from vllm.v1.spec_decode.retrospec.resident_cache import (
     RetroSpecResidentClusterCache,
     _PendingCopyBatch,
@@ -152,15 +153,28 @@ def make_cache(
     capacity: int,
     *,
     group_targets: dict[RetroSpecClusterGroup, int] | None = None,
+    performance_stats: RetroSpecPerformanceStats | None = None,
 ) -> RetroSpecResidentClusterCache:
     cache = _ResidentCacheTestAdapter(
         page_size=2,
         head_size=1,
         dtype=torch.float32,
         device=torch.device("cuda"),
+        performance_stats=performance_stats,
     )
     cache.resize(capacity, group_targets=group_targets)
     return cache
+
+
+def resident_handle_state(
+    cache: RetroSpecResidentClusterCache, cluster_id: int
+) -> tuple[int, bool]:
+    torch.cuda.synchronize(cache.device)
+    bucket = cache._handle_to_bucket[cluster_id]
+    return (
+        int(cache._handle_table_versions[bucket].item()),
+        bool(cache._handle_table_hit_gate_ready[bucket].item()),
+    )
 
 
 def make_backing_pages(num_pages: int = 6) -> tuple[torch.Tensor, torch.Tensor]:
@@ -218,6 +232,39 @@ def test_resident_cache_records_copy_batch_and_retains_sources():
         backing_keys,
         backing_values,
     )
+
+
+@pytest.mark.parametrize("timing_level", ["coarse", "detailed"])
+def test_resident_copy_records_only_detailed_span_and_publication_counters(
+    timing_level: str,
+):
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cuda"),
+        log_interval_seconds=60.0,
+        cuda_timing_level=timing_level,
+    )
+    cache = make_cache(capacity=3, performance_stats=stats)
+    cache._ensure_handle_table(1)
+    backing_keys, backing_values = make_backing_pages(num_pages=3)
+    cache.admit(
+        torch.tensor([[0], [1], [2]]),
+        set(range(3)),
+        backing_keys,
+        backing_values,
+    )
+    cache.synchronize_pending_copies()
+
+    counter_names = {
+        "resident_copy_pages",
+        "resident_copy_spans",
+        "resident_handle_entries_published",
+    }
+    if timing_level == "detailed":
+        assert stats._cpu_counters["resident_copy_pages"] == 3
+        assert stats._cpu_counters["resident_copy_spans"] == 1
+        assert stats._cpu_counters["resident_handle_entries_published"] == 3
+    else:
+        assert counter_names.isdisjoint(stats._cpu_counters)
 
 
 def test_resident_cache_returns_latest_pending_copy_event():
@@ -720,6 +767,225 @@ def test_hit_gate_becomes_ready_at_each_group_soft_target():
         allocated_cluster_ids=set(cluster_groups),
     )
     assert access.hit_gate_ready_mask.tolist() == [False, False, True, True]
+
+
+def test_admission_publishes_new_handles_and_only_gate_changed_survivors():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=4, group_targets={group: 4})
+    cache._ensure_handle_table(1)
+    backing_keys, backing_values = make_backing_pages(num_pages=4)
+    cluster_groups = {cluster_id: group for cluster_id in (10, 11, 12, 13)}
+
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=torch.tensor([10, 11]),
+        page_ids=torch.tensor([[0], [1]]),
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+        allocated_page_ids=set(range(4)),
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    cache.synchronize_pending_copies()
+    survivor_versions = {
+        cluster_id: resident_handle_state(cache, cluster_id)[0]
+        for cluster_id in (10, 11)
+    }
+
+    publish = Mock(wraps=cache._publish_handle_entries)
+    cache._publish_handle_entries = publish
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=torch.tensor([12]),
+        page_ids=torch.tensor([[2]]),
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+        allocated_page_ids=set(range(4)),
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    cache.synchronize_pending_copies()
+
+    entries = publish.call_args.args[0]
+    assert [entry[0] for entry in entries] == [12]
+    assert {
+        cluster_id: resident_handle_state(cache, cluster_id)[0]
+        for cluster_id in (10, 11)
+    } == survivor_versions
+
+    publish.reset_mock()
+    previous_versions = {
+        cluster_id: resident_handle_state(cache, cluster_id)[0]
+        for cluster_id in (10, 11, 12)
+    }
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=torch.tensor([13]),
+        page_ids=torch.tensor([[3]]),
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+        allocated_page_ids=set(range(4)),
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    cache.synchronize_pending_copies()
+
+    entries = publish.call_args.args[0]
+    assert entries[0][0] == 13
+    assert {entry[0] for entry in entries} == {10, 11, 12, 13}
+    for cluster_id, previous_version in previous_versions.items():
+        version, gate_ready = resident_handle_state(cache, cluster_id)
+        assert version > previous_version
+        assert version % 2 == 0
+        assert gate_ready
+
+
+def test_eviction_and_admission_do_not_republish_unchanged_gate_survivor():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=2, group_targets={group: 2})
+    cache._ensure_handle_table(1)
+    backing_keys, backing_values = make_backing_pages(num_pages=3)
+    cluster_groups = {cluster_id: group for cluster_id in (10, 11, 12)}
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=torch.tensor([10, 11]),
+        page_ids=torch.tensor([[0], [1]]),
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+        allocated_page_ids=set(range(3)),
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    cache.synchronize_pending_copies()
+    cache._touch_cluster(11)
+    survivor_version = resident_handle_state(cache, 11)[0]
+    victim_bucket = cache._handle_to_bucket[10]
+
+    publish = Mock(wraps=cache._publish_handle_entries)
+    cache._publish_handle_entries = publish
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=torch.tensor([12]),
+        page_ids=torch.tensor([[2]]),
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+        allocated_page_ids=set(range(3)),
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    cache.synchronize_pending_copies()
+
+    assert [entry[0] for entry in publish.call_args.args[0]] == [12]
+    assert resident_handle_state(cache, 11) == (survivor_version, True)
+    assert resident_handle_state(cache, 12)[1]
+    assert cache._handle_table_handles[victim_bucket].item() == -2
+
+
+def test_resize_republishes_gate_changed_survivors_and_fast_returns():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=4, group_targets={group: 2})
+    cache._ensure_handle_table(1)
+    backing_keys, backing_values = make_backing_pages(num_pages=2)
+    cluster_groups = {10: group, 11: group}
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=torch.tensor([10, 11]),
+        page_ids=torch.tensor([[0], [1]]),
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+        allocated_page_ids={0, 1},
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    cache.synchronize_pending_copies()
+
+    publish = Mock(wraps=cache._publish_handle_entries)
+    cache._publish_handle_entries = publish
+    before_versions = {
+        cluster_id: resident_handle_state(cache, cluster_id)[0]
+        for cluster_id in cluster_groups
+    }
+    cache.resize(4, group_targets={group: 3})
+    assert {entry[0] for entry in publish.call_args.args[0]} == {10, 11}
+    for cluster_id, before_version in before_versions.items():
+        version, gate_ready = resident_handle_state(cache, cluster_id)
+        assert version > before_version
+        assert version % 2 == 0
+        assert not gate_ready
+
+    publish.reset_mock()
+    cache.resize(4, group_targets={group: 1})
+    assert {entry[0] for entry in publish.call_args.args[0]} == {10, 11}
+    assert all(resident_handle_state(cache, cluster_id)[1] for cluster_id in (10, 11))
+
+    publish.reset_mock()
+    synchronize = Mock(wraps=cache.synchronize_pending_copies)
+    cache.synchronize_pending_copies = synchronize
+    cache.resize(4, group_targets={group: 1})
+    publish.assert_not_called()
+    synchronize.assert_not_called()
+
+
+def test_group_target_change_waits_for_pending_copies():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=2, group_targets={group: 2})
+    backing_keys, backing_values = make_backing_pages(num_pages=1)
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=torch.tensor([10]),
+        page_ids=torch.tensor([[0]]),
+        cluster_groups={10: group},
+        allocated_cluster_ids={10},
+        allocated_page_ids={0},
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    assert cache._pending_cluster_events
+
+    synchronize = Mock(wraps=cache.synchronize_pending_copies)
+    cache.synchronize_pending_copies = synchronize
+    cache.resize(2, group_targets={group: 1})
+    synchronize.assert_called_once_with()
+
+
+def test_invalidate_batches_tombstones_and_republishes_gate_survivors():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=3, group_targets={group: 3})
+    cache._ensure_handle_table(1)
+    backing_keys, backing_values = make_backing_pages(num_pages=3)
+    cluster_groups = {cluster_id: group for cluster_id in (10, 11, 12)}
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=torch.tensor([10, 11, 12]),
+        page_ids=torch.tensor([[0], [1], [2]]),
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+        allocated_page_ids=set(range(3)),
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    cache.synchronize_pending_copies()
+    survivor_version = resident_handle_state(cache, 10)[0]
+    victim_buckets = {
+        cluster_id: cache._handle_to_bucket[cluster_id] for cluster_id in (11, 12)
+    }
+
+    erase = Mock(wraps=cache._erase_handle_entries)
+    publish = Mock(wraps=cache._publish_handle_entries)
+    cache._erase_handle_entries = erase
+    cache._publish_handle_entries = publish
+    cache.invalidate(torch.tensor([12, 11, 12, -1]))
+    torch.cuda.synchronize(cache.device)
+
+    assert erase.call_count == 1
+    assert erase.call_args.args[0] == (11, 12)
+    assert [entry[0] for entry in publish.call_args.args[0]] == [10]
+    version, gate_ready = resident_handle_state(cache, 10)
+    assert version > survivor_version
+    assert version % 2 == 0
+    assert not gate_ready
+    for bucket in victim_buckets.values():
+        assert cache._handle_table_handles[bucket].item() == -2
 
 
 def test_resident_cache_evicts_from_group_above_its_soft_target():
@@ -1271,6 +1537,45 @@ def test_gpu_handle_table_tracks_resident_admission_and_invalidation():
     invalidated = lookup_gpu()
     assert invalidated.miss_cluster_mask.item()
     assert invalidated.cache_page_ids.cpu().tolist() == [[[[-1, -1]]]]
+
+
+def test_handle_table_rebuild_preserves_pending_cluster_publication():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=1, group_targets={group: 1})
+    cache._ensure_handle_table(1)
+    backing_keys, backing_values = make_backing_pages(num_pages=1)
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=torch.tensor([7]),
+        page_ids=torch.tensor([[0]]),
+        cluster_groups={7: group},
+        allocated_cluster_ids={7},
+        allocated_page_ids={0},
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    assert cache._pending_cluster_events
+    cache._handle_table_needs_rebuild = True
+
+    cluster_ids = torch.tensor([[[7]]], dtype=torch.int64, device="cuda")
+    page_ids = torch.tensor([[[[0]]]], dtype=torch.int64, device="cuda")
+    access = cache.lookup_gpu(
+        cluster_ids=cluster_ids,
+        page_ids=page_ids,
+        active_mask=torch.tensor([True], device="cuda"),
+        cache_page_ids=torch.empty_like(page_ids),
+        hit_cluster_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+        miss_cluster_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+        hit_gate_ready_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+        access_kinds=torch.empty_like(cluster_ids, dtype=torch.uint8),
+    )
+    assert access.read_lease is not None
+    access.read_lease.release()
+    torch.cuda.synchronize(cache.device)
+
+    assert access.hit_cluster_mask.item()
+    assert access.hit_gate_ready_mask.item()
+    assert access.cache_page_ids.item() == 0
 
 
 def test_gpu_hit_epochs_refresh_group_lru_before_eviction():

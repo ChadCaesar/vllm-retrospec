@@ -71,6 +71,117 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
   }
 }
 
+int64_t copy_kv_blocks_coalesced(torch::Tensor& key_src,
+                                 torch::Tensor& value_src,
+                                 torch::Tensor& key_dst,
+                                 torch::Tensor& value_dst,
+                                 int64_t block_size_in_bytes,
+                                 const torch::Tensor& block_mapping) {
+  TORCH_CHECK(block_size_in_bytes > 0, "block_size_in_bytes must be positive");
+  TORCH_CHECK(block_mapping.device().is_cpu(), "block_mapping must be on CPU");
+  TORCH_CHECK(block_mapping.scalar_type() == torch::kInt64,
+              "block_mapping must use int64");
+  TORCH_CHECK(block_mapping.dim() == 2 && block_mapping.size(1) == 2,
+              "block_mapping must have shape [num_blocks, 2]");
+  TORCH_CHECK(block_mapping.is_contiguous(),
+              "block_mapping must be contiguous");
+  TORCH_CHECK(key_src.is_contiguous() && value_src.is_contiguous() &&
+                  key_dst.is_contiguous() && value_dst.is_contiguous(),
+              "K/V block tensors must be contiguous");
+  TORCH_CHECK(key_src.device() == value_src.device(),
+              "K/V sources must use one device");
+  TORCH_CHECK(key_dst.device() == value_dst.device(),
+              "K/V destinations must use one device");
+  TORCH_CHECK(key_dst.device().is_cuda(),
+              "K/V destinations must be CUDA tensors");
+  TORCH_CHECK(key_src.scalar_type() == key_dst.scalar_type() &&
+                  value_src.scalar_type() == value_dst.scalar_type() &&
+                  key_src.scalar_type() == value_src.scalar_type(),
+              "K/V source and destination dtypes must match");
+
+  const int64_t key_src_bytes = key_src.numel() * key_src.element_size();
+  const int64_t value_src_bytes = value_src.numel() * value_src.element_size();
+  const int64_t key_dst_bytes = key_dst.numel() * key_dst.element_size();
+  const int64_t value_dst_bytes = value_dst.numel() * value_dst.element_size();
+  TORCH_CHECK(key_src_bytes == value_src_bytes,
+              "K/V sources must have equal byte capacity");
+  TORCH_CHECK(key_dst_bytes == value_dst_bytes,
+              "K/V destinations must have equal byte capacity");
+  TORCH_CHECK(key_src_bytes % block_size_in_bytes == 0 &&
+                  key_dst_bytes % block_size_in_bytes == 0,
+              "K/V capacities must contain complete blocks");
+
+  const torch::Device src_device = key_src.device();
+  const torch::Device dst_device = key_dst.device();
+  cudaMemcpyKind memcpy_type;
+  if (src_device.is_cuda()) {
+    TORCH_CHECK(src_device.index() == dst_device.index(),
+                "CUDA K/V sources and destinations must use the same GPU");
+    memcpy_type = cudaMemcpyDeviceToDevice;
+  } else {
+    TORCH_CHECK(src_device.is_cpu(), "K/V sources must be CPU or CUDA tensors");
+    memcpy_type = cudaMemcpyHostToDevice;
+  }
+
+  const int64_t source_capacity = key_src_bytes / block_size_in_bytes;
+  const int64_t destination_capacity = key_dst_bytes / block_size_in_bytes;
+  const int64_t num_blocks = block_mapping.size(0);
+  const int64_t* mapping = block_mapping.data_ptr<int64_t>();
+  for (int64_t index = 0; index < num_blocks; ++index) {
+    const int64_t source_block = mapping[index * 2];
+    const int64_t destination_block = mapping[index * 2 + 1];
+    TORCH_CHECK(source_block >= 0 && source_block < source_capacity,
+                "source block index is out of range");
+    TORCH_CHECK(
+        destination_block >= 0 && destination_block < destination_capacity,
+        "destination block index is out of range");
+  }
+  if (num_blocks == 0) {
+    return 0;
+  }
+
+  const at::cuda::OptionalCUDAGuard device_guard(dst_device);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const char* key_src_ptr = static_cast<const char*>(key_src.data_ptr());
+  const char* value_src_ptr = static_cast<const char*>(value_src.data_ptr());
+  char* key_dst_ptr = static_cast<char*>(key_dst.data_ptr());
+  char* value_dst_ptr = static_cast<char*>(value_dst.data_ptr());
+
+  auto copy_span = [&](int64_t source_block, int64_t destination_block,
+                       int64_t block_count) {
+    const int64_t source_offset = source_block * block_size_in_bytes;
+    const int64_t destination_offset = destination_block * block_size_in_bytes;
+    const int64_t copy_bytes = block_count * block_size_in_bytes;
+    C10_CUDA_CHECK(cudaMemcpyAsync(key_dst_ptr + destination_offset,
+                                   key_src_ptr + source_offset, copy_bytes,
+                                   memcpy_type, stream));
+    C10_CUDA_CHECK(cudaMemcpyAsync(value_dst_ptr + destination_offset,
+                                   value_src_ptr + source_offset, copy_bytes,
+                                   memcpy_type, stream));
+  };
+
+  int64_t span_source = mapping[0];
+  int64_t span_destination = mapping[1];
+  int64_t span_blocks = 1;
+  int64_t span_count = 0;
+  for (int64_t index = 1; index < num_blocks; ++index) {
+    const int64_t source_block = mapping[index * 2];
+    const int64_t destination_block = mapping[index * 2 + 1];
+    if (source_block == span_source + span_blocks &&
+        destination_block == span_destination + span_blocks) {
+      ++span_blocks;
+      continue;
+    }
+    copy_span(span_source, span_destination, span_blocks);
+    ++span_count;
+    span_source = source_block;
+    span_destination = destination_block;
+    span_blocks = 1;
+  }
+  copy_span(span_source, span_destination, span_blocks);
+  return span_count + 1;
+}
+
 namespace vllm {
 
 // Grid: (num_layers, num_pairs)

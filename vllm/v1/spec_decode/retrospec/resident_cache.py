@@ -12,6 +12,7 @@ import torch
 from vllm import _custom_ops as ops
 
 from .cluster_identity import RetroSpecClusterGroup
+from .performance import RetroSpecPerformanceStats
 from .resident_kernels import (
     lookup_resident_handles,
     resolve_compact_draft_pages,
@@ -151,6 +152,7 @@ class RetroSpecResidentClusterCache:
         head_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        performance_stats: RetroSpecPerformanceStats | None = None,
     ) -> None:
         if page_size <= 0:
             raise ValueError("page_size must be positive")
@@ -165,6 +167,7 @@ class RetroSpecResidentClusterCache:
         self.head_size = head_size
         self.dtype = dtype
         self.device = device
+        self.performance_stats = performance_stats
 
         self.key_pages = torch.empty(
             0,
@@ -253,6 +256,14 @@ class RetroSpecResidentClusterCache:
         """Number of submitted copy batches not yet reaped by the host."""
         self._reap_completed_copy_batches()
         return len(self._pending_copy_batches)
+
+    def requires_resize(
+        self,
+        capacity: int,
+        group_targets: Mapping[RetroSpecClusterGroup, int] | None = None,
+    ) -> bool:
+        targets = self._group_targets if group_targets is None else group_targets
+        return capacity != self._logical_capacity or targets != self._group_targets
 
     @staticmethod
     def _next_power_of_two(value: int) -> int:
@@ -386,7 +397,9 @@ class RetroSpecResidentClusterCache:
         if not requires_rebuild:
             return
 
-        self._reap_completed_copy_batches()
+        # A pending publication targets the current table allocation. Complete
+        # it before replacing that allocation, then republish every live entry.
+        self.synchronize_pending_copies()
         current_stream = torch.cuda.current_stream(self.device)
         if self._handle_table_capacity and self._group_states:
             self._refresh_group_lru_from_gpu(self._group_states.keys(), current_stream)
@@ -401,7 +414,6 @@ class RetroSpecResidentClusterCache:
                 self._cluster_to_group[cluster_id],
             )
             for cluster_id in self._cluster_to_slots
-            if cluster_id not in self._pending_cluster_events
         )
         self._publish_handle_entries(
             entries,
@@ -412,10 +424,10 @@ class RetroSpecResidentClusterCache:
         self,
         entries: Collection[tuple[_ClusterId, tuple[int, ...], RetroSpecClusterGroup]],
         stream: torch.cuda.Stream,
-    ) -> None:
+    ) -> int:
         entries = tuple(entries)
         if not entries or self._handle_table_capacity == 0:
-            return
+            return 0
 
         bucket_ids: list[int] = []
         cluster_ids: list[int] = []
@@ -446,10 +458,12 @@ class RetroSpecResidentClusterCache:
             hit_gate_ready.append(self._is_group_hit_gate_ready(group))
 
         if not cluster_ids:
-            return
+            return 0
 
-        bucket_ids_gpu = torch.tensor(bucket_ids, dtype=torch.int32, device=self.device)
         with torch.cuda.stream(stream):
+            bucket_ids_gpu = torch.tensor(
+                bucket_ids, dtype=torch.int32, device=self.device
+            )
             update_resident_handles(
                 bucket_ids=bucket_ids_gpu,
                 cluster_handles=torch.tensor(
@@ -483,6 +497,8 @@ class RetroSpecResidentClusterCache:
                     0, new_bucket_ids.to(torch.int64), self._next_access_epoch
                 )
 
+        return len(cluster_ids)
+
     def _erase_handle_entries(
         self,
         cluster_ids: Collection[_ClusterId],
@@ -503,8 +519,10 @@ class RetroSpecResidentClusterCache:
             return
 
         num_entries = len(bucket_ids)
-        bucket_ids_gpu = torch.tensor(bucket_ids, dtype=torch.int32, device=self.device)
         with torch.cuda.stream(stream):
+            bucket_ids_gpu = torch.tensor(
+                bucket_ids, dtype=torch.int32, device=self.device
+            )
             update_resident_handles(
                 bucket_ids=bucket_ids_gpu,
                 cluster_handles=torch.full(
@@ -532,17 +550,53 @@ class RetroSpecResidentClusterCache:
                 0, bucket_ids_gpu.to(torch.int64), 0
             )
 
-    def _refresh_group_handle_entries(
+    def _snapshot_group_hit_gate_ready(
+        self, groups: Collection[RetroSpecClusterGroup]
+    ) -> dict[RetroSpecClusterGroup, bool]:
+        return {group: self._is_group_hit_gate_ready(group) for group in set(groups)}
+
+    def _publish_handle_delta(
         self,
-        groups: Collection[RetroSpecClusterGroup],
+        new_cluster_ids: Collection[_ClusterId],
+        previous_gate_ready: Mapping[RetroSpecClusterGroup, bool],
         stream: torch.cuda.Stream,
-    ) -> None:
-        entries = tuple(
-            (cluster_id, self._cluster_to_slots[cluster_id], group)
-            for group in set(groups)
-            for cluster_id in self._group_states.get(group, _ResidentGroupState()).lru
+    ) -> int:
+        entries: list[tuple[_ClusterId, tuple[int, ...], RetroSpecClusterGroup]] = []
+        seen: set[_ClusterId] = set()
+
+        for cluster_id in new_cluster_ids:
+            slots = self._cluster_to_slots.get(cluster_id)
+            group = self._cluster_to_group.get(cluster_id)
+            if slots is None or group is None or cluster_id in seen:
+                continue
+            entries.append((cluster_id, slots, group))
+            seen.add(cluster_id)
+
+        ordered_groups = sorted(
+            previous_gate_ready,
+            key=lambda group: (group.request_id, group.kv_head_index),
         )
-        self._publish_handle_entries(entries, stream)
+        for group in ordered_groups:
+            if previous_gate_ready[group] == self._is_group_hit_gate_ready(group):
+                continue
+            group_state = self._group_states.get(group)
+            if group_state is None:
+                continue
+            for cluster_id in group_state.lru:
+                if cluster_id in seen:
+                    continue
+                entries.append((cluster_id, self._cluster_to_slots[cluster_id], group))
+                seen.add(cluster_id)
+
+        published = self._publish_handle_entries(entries, stream)
+        stats = self.performance_stats
+        if (
+            stats is not None
+            and stats.enabled
+            and stats.cuda_timing_level == "detailed"
+        ):
+            stats.add_counter("resident_handle_entries_published", published)
+        return published
 
     def _reap_completed_copy_batches(self) -> None:
         """Release sources and pending markers for completed H2D batches."""
@@ -1064,45 +1118,52 @@ class RetroSpecResidentClusterCache:
         capacity: int,
         group_targets: Mapping[RetroSpecClusterGroup, int] | None = None,
     ) -> None:
-        """Change layer capacity and update group soft targets.
-
-        Physical storage grows when necessary but is not shrunk. Capacity
-        reductions evict clusters from groups exceeding their soft targets first,
-        using only each selected group's local LRU.
-        """
+        """Change layer capacity and update group soft targets."""
         if capacity < 0:
             raise ValueError("Resident cache capacity must be non-negative")
 
-        if group_targets is None:
-            new_group_targets = dict(self._group_targets)
-        else:
-            new_group_targets = dict(group_targets)
-
+        new_group_targets = (
+            dict(self._group_targets) if group_targets is None else dict(group_targets)
+        )
         for group, target_pages in new_group_targets.items():
             if target_pages < 0:
                 raise ValueError(
                     f"Resident target for group {group!r} must be non-negative"
                 )
-
         if sum(new_group_targets.values()) > capacity:
             raise ValueError("Resident group targets cannot exceed layer capacity")
+        if (
+            capacity == self._logical_capacity
+            and new_group_targets == self._group_targets
+        ):
+            return
 
+        affected_groups = (
+            set(self._group_states) | set(self._group_targets) | set(new_group_targets)
+        )
+        previous_gate_ready = self._snapshot_group_hit_gate_ready(affected_groups)
+        if self._pending_cluster_events:
+            self.synchronize_pending_copies()
+
+        current_stream = torch.cuda.current_stream(self.device)
         self._grow_storage(capacity)
         self._logical_capacity = capacity
         self._group_targets = new_group_targets
 
         if self.num_resident_pages > capacity:
-            self.synchronize_pending_copies()
             self._refresh_group_lru_from_gpu(
                 self._group_states.keys(),
-                torch.cuda.current_stream(self.device),
+                current_stream,
             )
         while self.num_resident_pages > capacity:
             if not self._evict_oldest_unprotected(
                 protected_clusters=set(),
                 incoming_group_pages={},
+                update_stream=current_stream,
             ):
                 raise RuntimeError("Resident cache cannot satisfy the reduced capacity")
+
+        self._publish_handle_delta((), previous_gate_ready, current_stream)
 
     @staticmethod
     def _parse_clusters(
@@ -1868,7 +1929,7 @@ class RetroSpecResidentClusterCache:
         source_key_pages: torch.Tensor,
         source_value_pages: torch.Tensor,
     ) -> None:
-        """Enqueue one batched page mapping on the dedicated copy stream."""
+        """Enqueue one coalesced K/V page mapping on the copy stream."""
         if len(source_page_ids) != len(slots):
             raise ValueError("Source page and destination slot counts must match")
         if not source_page_ids:
@@ -1881,18 +1942,23 @@ class RetroSpecResidentClusterCache:
         )
         block_size = self.page_size * self.head_size * source_key_pages.element_size()
         with torch.cuda.stream(self._copy_stream):
-            ops.swap_blocks(
+            span_count = ops.copy_kv_blocks_coalesced(
                 source_key_pages,
-                self.key_pages,
-                block_size,
-                block_mapping,
-            )
-            ops.swap_blocks(
                 source_value_pages,
+                self.key_pages,
                 self.value_pages,
                 block_size,
                 block_mapping,
             )
+
+        stats = self.performance_stats
+        if (
+            stats is not None
+            and stats.enabled
+            and stats.cuda_timing_level == "detailed"
+        ):
+            stats.add_counter("resident_copy_pages", len(source_page_ids))
+            stats.add_counter("resident_copy_spans", span_count)
 
     def _admit_from_sources(
         self,
@@ -2055,7 +2121,8 @@ class RetroSpecResidentClusterCache:
         if reuse_ready_event is not None:
             mutation_stream.wait_event(reuse_ready_event)
 
-        affected_groups = set(incoming_group_pages)
+        previous_gate_ready = self._snapshot_group_hit_gate_ready(incoming_group_pages)
+        victims: tuple[_ClusterId, ...] = ()
         if self.num_resident_pages + required_page_count > self._logical_capacity:
             self._reap_completed_copy_batches()
             self._refresh_group_lru_from_gpu(self._group_states.keys(), mutation_stream)
@@ -2094,20 +2161,23 @@ class RetroSpecResidentClusterCache:
                 raise RuntimeError(
                     "Resident cache cannot free enough slots for priority admission"
                 )
-            affected_groups.update(
-                self._evict_clusters(victims, update_stream=mutation_stream)
-            )
+            for cluster_id in victims:
+                group = self._cluster_to_group[cluster_id]
+                previous_gate_ready.setdefault(
+                    group, self._is_group_hit_gate_ready(group)
+                )
+            self._evict_clusters(victims, update_stream=mutation_stream)
 
         copy_scheduled = False
         copied_cluster_ids: tuple[_ClusterId, ...] = ()
         reserved_slots: tuple[int, ...] = ()
 
-        if missing_targets:
-            slots_released_event = torch.cuda.Event()
-            slots_released_event.record(mutation_stream)
-            self._copy_stream.wait_event(slots_released_event)
-
         try:
+            if missing_targets:
+                slots_released_event = torch.cuda.Event()
+                slots_released_event.record(mutation_stream)
+                self._copy_stream.wait_event(slots_released_event)
+
             registration_entries: list[
                 tuple[
                     _ClusterId,
@@ -2159,17 +2229,23 @@ class RetroSpecResidentClusterCache:
         finally:
             if copy_scheduled:
                 try:
-                    if copied_cluster_ids:
-                        self._refresh_group_handle_entries(
-                            affected_groups,
-                            self._copy_stream,
-                        )
+                    self._publish_handle_delta(
+                        copied_cluster_ids,
+                        previous_gate_ready,
+                        self._copy_stream,
+                    )
                 finally:
                     self._record_copy_batch(
                         cluster_ids=copied_cluster_ids,
                         source_key_pages=source_key_pages,
                         source_value_pages=source_value_pages,
                     )
+            elif victims:
+                self._publish_handle_delta(
+                    (),
+                    previous_gate_ready,
+                    mutation_stream,
+                )
 
         for cluster_id in reversed(requested_clusters):
             if cluster_id in self._cluster_to_slots:
@@ -2286,12 +2362,22 @@ class RetroSpecResidentClusterCache:
     ) -> None:
         """Evict released cluster IDs before their backing pages are reused."""
         self.synchronize_pending_copies()
-
         cluster_ids_cpu = cluster_ids.detach().to(
             device="cpu",
             dtype=torch.int64,
         )
-        released_cluster_ids = set(cluster_ids_cpu[cluster_ids_cpu >= 0].tolist())
-
-        for cluster_id in released_cluster_ids:
-            self._evict_cluster(cluster_id)
+        released_cluster_ids = tuple(
+            sorted(set(cluster_ids_cpu[cluster_ids_cpu >= 0].tolist()))
+        )
+        resident_cluster_ids = tuple(
+            cluster_id
+            for cluster_id in released_cluster_ids
+            if cluster_id in self._cluster_to_slots
+        )
+        affected_groups = {
+            self._cluster_to_group[cluster_id] for cluster_id in resident_cluster_ids
+        }
+        previous_gate_ready = self._snapshot_group_hit_gate_ready(affected_groups)
+        current_stream = torch.cuda.current_stream(self.device)
+        self._evict_clusters(resident_cluster_ids, update_stream=current_stream)
+        self._publish_handle_delta((), previous_gate_ready, current_stream)
