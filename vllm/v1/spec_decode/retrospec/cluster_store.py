@@ -4372,45 +4372,66 @@ class RetroSpecClusterPageStore:
         prepared: _PreparedResidentPrefetchRecord,
         execution_stream: torch.cuda.Stream,
     ) -> None:
-        (
-            source_page_ids,
-            source_key_pages,
-            source_value_pages,
-            transfer_buffer,
-            transfer_slot,
-        ) = self._stage_resident_pages(
-            prepared.pool,
-            prepared.source_page_ids_cpu,
-            prepared.unique_page_ids_cpu,
+        stats = self.performance_stats
+        gather_started_at = (
+            perf_counter() if stats is not None and stats.enabled else None
         )
-
-        with (
-            self._resident_state_lock,
-            prepared.resident_cache.mutation_guard(),
-            torch.cuda.device(prepared.pool.metadata_device),
-        ):
-            try:
-                access = prepared.resident_cache.admit_staged(
-                    cluster_ids=prepared.cluster_ids_cpu,
-                    page_ids=prepared.page_ids_cpu,
-                    cluster_groups=prepared.cluster_groups,
-                    allocated_cluster_ids=self._get_allocated_cluster_ids(
-                        prepared.layer_name
-                    ),
-                    allocated_page_ids=prepared.pool.allocated_page_ids,
-                    staging_page_ids=source_page_ids,
-                    staging_key_pages=source_key_pages,
-                    staging_value_pages=source_value_pages,
-                    cluster_ids_cpu=prepared.cluster_ids_cpu,
-                    page_ids_cpu=prepared.page_ids_cpu,
-                    mutation_stream=execution_stream,
-                    lookup_after_admit=False,
+        try:
+            (
+                source_page_ids,
+                source_key_pages,
+                source_value_pages,
+                transfer_buffer,
+                transfer_slot,
+            ) = self._stage_resident_pages(
+                prepared.pool,
+                prepared.source_page_ids_cpu,
+                prepared.unique_page_ids_cpu,
+            )
+        finally:
+            if gather_started_at is not None:
+                stats.record_cpu_time(
+                    "prefetch_page_gather_wall",
+                    perf_counter() - gather_started_at,
                 )
-            except BaseException:
-                prepared.resident_cache.synchronize_pending_copies()
-                if transfer_slot is not None:
-                    transfer_buffer.release_cpu_slot(transfer_slot, None)
-                raise
+
+        admission_started_at = (
+            perf_counter() if stats is not None and stats.enabled else None
+        )
+        try:
+            with (
+                self._resident_state_lock,
+                prepared.resident_cache.mutation_guard(),
+                torch.cuda.device(prepared.pool.metadata_device),
+            ):
+                try:
+                    access = prepared.resident_cache.admit_staged(
+                        cluster_ids=prepared.cluster_ids_cpu,
+                        page_ids=prepared.page_ids_cpu,
+                        cluster_groups=prepared.cluster_groups,
+                        allocated_cluster_ids=self._get_allocated_cluster_ids(
+                            prepared.layer_name
+                        ),
+                        allocated_page_ids=prepared.pool.allocated_page_ids,
+                        staging_page_ids=source_page_ids,
+                        staging_key_pages=source_key_pages,
+                        staging_value_pages=source_value_pages,
+                        cluster_ids_cpu=prepared.cluster_ids_cpu,
+                        page_ids_cpu=prepared.page_ids_cpu,
+                        mutation_stream=execution_stream,
+                        lookup_after_admit=False,
+                    )
+                except BaseException:
+                    prepared.resident_cache.synchronize_pending_copies()
+                    if transfer_slot is not None:
+                        transfer_buffer.release_cpu_slot(transfer_slot, None)
+                    raise
+        finally:
+            if admission_started_at is not None:
+                stats.record_cpu_time(
+                    "prefetch_resident_admission_wall",
+                    perf_counter() - admission_started_at,
+                )
         if transfer_slot is not None:
             transfer_buffer.release_cpu_slot(transfer_slot, access.ready_event)
 

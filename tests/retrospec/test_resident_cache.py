@@ -337,12 +337,121 @@ def test_completed_old_batch_does_not_clear_newer_pending_cluster_event():
         )
     )
     cache._pending_cluster_events[7] = second_event
+    cache._set_prefetch_handle_state((7,), 1)
 
     cache._reap_completed_copy_batches()
 
     assert len(cache._pending_copy_batches) == 1
     assert cache._pending_copy_batches[0].ready_event is second_event
     assert cache._pending_cluster_events[7] is second_event
+    assert cache._prefetch_handle_states[7].item() == 1
+
+
+def test_completed_copy_does_not_resurrect_an_evicted_cluster():
+    cache = make_cache(capacity=1)
+    source_keys, source_values = make_backing_pages(num_pages=1)
+    completed_event = Mock()
+    completed_event.query.return_value = True
+
+    cache._pending_copy_batches.append(
+        _PendingCopyBatch(
+            ready_event=completed_event,
+            cluster_ids=(7,),
+            source_key_pages=source_keys,
+            source_value_pages=source_values,
+        )
+    )
+    cache._set_prefetch_handle_state((7,), 0)
+
+    cache._reap_completed_copy_batches()
+
+    assert not cache._pending_copy_batches
+    assert cache._prefetch_handle_states[7].item() == 0
+
+
+def test_pending_cluster_cannot_be_evicted_before_its_copy_completes():
+    cache = make_cache(capacity=1)
+    backing_keys, backing_values = make_backing_pages(num_pages=1)
+    cache._reap_completed_copy_batches = Mock()
+    cache.admit(torch.tensor([[0]]), {0}, backing_keys, backing_values)
+
+    with pytest.raises(RuntimeError, match="Cannot evict pending"):
+        cache._evict_clusters((0,))
+
+    cache.synchronize_pending_copies()
+
+
+def test_resident_admission_batches_page_copy_and_cluster_registration():
+    cache = make_cache(capacity=3)
+    backing_keys, backing_values = make_backing_pages(num_pages=3)
+    page_ids = torch.tensor([[0], [1], [2]], dtype=torch.int64)
+    cache._copy_pages_to_slots = Mock(wraps=cache._copy_pages_to_slots)
+    cache._register_clusters = Mock(wraps=cache._register_clusters)
+
+    access = cache.admit(page_ids, {0, 1, 2}, backing_keys, backing_values)
+
+    cache._copy_pages_to_slots.assert_called_once()
+    assert cache._copy_pages_to_slots.call_args.args[:2] == ([0, 1, 2], [0, 1, 2])
+    cache._register_clusters.assert_called_once()
+    assert len(cache._register_clusters.call_args.args[0]) == 3
+    assert len(cache._pending_copy_batches) == 1
+    assert cache._pending_copy_batches[0].cluster_ids == (0, 1, 2)
+    assert_cached_pages_match_backing(
+        cache,
+        page_ids,
+        access.cache_page_ids,
+        backing_keys,
+        backing_values,
+    )
+
+
+def test_resident_admission_batches_victim_handle_erasure():
+    cache = make_cache(capacity=4)
+    backing_keys, backing_values = make_backing_pages(num_pages=8)
+    cache.admit(
+        torch.tensor([[0], [1], [2], [3]], dtype=torch.int64),
+        set(range(8)),
+        backing_keys,
+        backing_values,
+    )
+    cache.synchronize_pending_copies()
+    cache._erase_handle_entries = Mock(wraps=cache._erase_handle_entries)
+
+    access = cache.admit(
+        torch.tensor([[4], [5], [6], [7]], dtype=torch.int64),
+        set(range(8)),
+        backing_keys,
+        backing_values,
+    )
+
+    cache._erase_handle_entries.assert_called_once()
+    assert set(cache._erase_handle_entries.call_args.args[0]) == {0, 1, 2, 3}
+    assert set(cache._cluster_to_slots) == {4, 5, 6, 7}
+    assert_cached_pages_match_backing(
+        cache,
+        torch.tensor([[4], [5], [6], [7]], dtype=torch.int64),
+        access.cache_page_ids,
+        backing_keys,
+        backing_values,
+    )
+
+
+def test_capacity_reduction_waits_for_pending_resident_copies():
+    cache = make_cache(capacity=2)
+    backing_keys, backing_values = make_backing_pages(num_pages=2)
+    cache.admit(
+        torch.tensor([[0], [1]], dtype=torch.int64),
+        {0, 1},
+        backing_keys,
+        backing_values,
+    )
+    cache.synchronize_pending_copies = Mock(wraps=cache.synchronize_pending_copies)
+
+    cache.resize(1)
+
+    cache.synchronize_pending_copies.assert_called_once()
+    assert cache.num_resident_pages == 1
+    assert len(cache._free_slots) == 1
 
 
 def test_resident_cache_waits_on_explicit_consumer_stream():

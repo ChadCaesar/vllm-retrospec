@@ -1364,6 +1364,8 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
     assert stats._cpu_counters["prefetch_miss_commands"] == 4
     assert stats._cpu_counters["prefetch_duplicate_misses"] == 0
     assert stats._cpu_times["prefetch_metadata_wait"][1] == 1
+    assert stats._cpu_times["prefetch_page_gather_wall"][1] == 1
+    assert stats._cpu_times["prefetch_resident_admission_wall"][1] == 1
     assert stats._cpu_times["prefetch_worker_wall"][1] == 1
     assert stats._cpu_times["prefetch_wait_wall"][1] >= 1
 
