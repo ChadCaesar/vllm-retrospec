@@ -12,7 +12,6 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
 )
 from vllm.v1.spec_decode.retrospec.selection_kernels import (
     emit_primary_exact_token_plan,
-    emit_ranked_draft_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
     pack_indexed_verification_plan,
@@ -482,36 +481,6 @@ def test_gather_resident_exact_pages_matches_request_slot_reference():
     torch.testing.assert_close(output_cluster_ids, expected_cluster_ids)
     torch.testing.assert_close(output_page_ids, expected_page_ids)
     torch.testing.assert_close(output_page_counts, expected_page_counts)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_emit_ranked_draft_plan_writes_only_verification_journals():
-    device = torch.device("cuda")
-    cluster_counts = torch.tensor([[4, 5, 6]], dtype=torch.int32, device=device)
-    sparse_exact = torch.empty((1, 1, 2), dtype=torch.int32, device=device)
-    expanded_exact = torch.empty((1, 1, 3), dtype=torch.int32, device=device)
-    sparse_estimation = torch.empty((1, 1, 1), dtype=torch.int32, device=device)
-    expanded_estimation = torch.empty_like(sparse_estimation)
-    emit_ranked_draft_plan(
-        ranked_indices=torch.tensor([[[2, 0, 1]]], dtype=torch.int64, device=device),
-        candidate_counts=torch.tensor([[3]], dtype=torch.int32, device=device),
-        cluster_token_counts=cluster_counts,
-        cluster_offsets=torch.tensor([0], dtype=torch.int64, device=device),
-        request_slot_ids=torch.tensor([0], dtype=torch.int64, device=device),
-        active_mask=torch.tensor([True], device=device),
-        retrieval_ratio=0.34,
-        estimation_ratio=0.34,
-        sparse_exact_width=2,
-        sparse_exact_cluster_indices=sparse_exact,
-        expanded_exact_cluster_indices=expanded_exact,
-        sparse_estimation_cluster_indices=sparse_estimation,
-        expanded_estimation_cluster_indices=expanded_estimation,
-    )
-
-    assert sparse_exact.cpu().tolist() == [[[2, 0]]]
-    assert expanded_exact.cpu().tolist() == [[[2, 0, 1]]]
-    assert sparse_estimation.item() == 1
-    assert expanded_estimation.item() == -1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

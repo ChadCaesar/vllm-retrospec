@@ -353,7 +353,18 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
     assert table[5][2].item() == 9
 
 
-def test_ranked_draft_bucket_resolution_avoids_compact_page_outputs():
+@pytest.mark.parametrize(
+    ("capture_request_descriptors", "expected_slots", "expected_generations"),
+    [
+        (True, [0, -1], [7, -1]),
+        (False, [-99, -99], [-99, -99]),
+    ],
+)
+def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
+    capture_request_descriptors: bool,
+    expected_slots: list[int],
+    expected_generations: list[int],
+):
     device = torch.device("cuda")
     table = _make_table(capacity=8, max_pages=2)
     update_resident_handles(
@@ -370,9 +381,13 @@ def test_ranked_draft_bucket_resolution_avoids_compact_page_outputs():
     )
 
     row_shape = (2, 1)
-    sparse_indices = torch.tensor(
-        [[[0, 1]], [[-1, -1]]], dtype=torch.int32, device=device
-    )
+    sparse_indices = torch.empty((2, 1, 2), dtype=torch.int32, device=device)
+    expanded_indices = torch.empty((2, 1, 3), dtype=torch.int32, device=device)
+    sparse_estimation = torch.empty((2, 1, 1), dtype=torch.int32, device=device)
+    expanded_estimation = torch.empty_like(sparse_estimation)
+    valid_rows = torch.empty(2, dtype=torch.bool, device=device)
+    captured_slots = torch.full((2,), -99, dtype=torch.int64, device=device)
+    captured_generations = torch.full_like(captured_slots, -99)
     handles = torch.empty((2, 1, 2), dtype=torch.int64, device=device)
     buckets = torch.empty((2, 1, 2), dtype=torch.int32, device=device)
     clustered_counts = torch.empty(row_shape, dtype=torch.int32, device=device)
@@ -392,6 +407,9 @@ def test_ranked_draft_bucket_resolution_avoids_compact_page_outputs():
         ranked_values=torch.tensor(
             [[[0.6, 0.3, 0.1]], [[0.9, 0.1, 0.0]]], device=device
         ),
+        ranked_indices=torch.tensor(
+            [[[0, 1, 2]], [[0, 1, 2]]], dtype=torch.int64, device=device
+        ),
         candidate_counts=torch.tensor([[3], [0]], dtype=torch.int32, device=device),
         arena_cluster_ids=torch.tensor(
             [[10, 11, 12, -1]], dtype=torch.int64, device=device
@@ -399,20 +417,14 @@ def test_ranked_draft_bucket_resolution_avoids_compact_page_outputs():
         arena_resident_table_buckets=torch.full(
             (1, 4), -1, dtype=torch.int32, device=device
         ),
-        arena_cluster_page_starts=torch.tensor(
-            [[0, 2, 3, 0]], dtype=torch.int32, device=device
+        arena_cluster_token_counts=torch.tensor(
+            [[3, 2, 2, 0]], dtype=torch.int32, device=device
         ),
         arena_cluster_page_counts=torch.tensor(
             [[2, 1, 1, 0]], dtype=torch.int32, device=device
         ),
-        arena_page_ids=torch.tensor(
-            [[100, 101, 102, 103]], dtype=torch.int64, device=device
-        ),
-        arena_page_token_counts=torch.tensor(
-            [[2, 1, 2, 2]], dtype=torch.int32, device=device
-        ),
         arena_cluster_offsets=torch.tensor([0], dtype=torch.int64, device=device),
-        arena_page_offsets=torch.tensor([0], dtype=torch.int64, device=device),
+        arena_generations=torch.tensor([7], dtype=torch.int64, device=device),
         request_slot_ids=torch.tensor([0, -1], dtype=torch.int64, device=device),
         active_mask=torch.tensor([True, True], device=device),
         table_handles=table[0],
@@ -426,7 +438,13 @@ def test_ranked_draft_bucket_resolution_avoids_compact_page_outputs():
         estimation_ratio=0.34,
         expanded_retrieval_width=3,
         max_pages_per_cluster=2,
-        sparse_cluster_indices=sparse_indices,
+        sparse_exact_cluster_indices=sparse_indices,
+        expanded_exact_cluster_indices=expanded_indices,
+        sparse_estimation_cluster_indices=sparse_estimation,
+        expanded_estimation_cluster_indices=expanded_estimation,
+        output_valid_rows=valid_rows,
+        output_request_slot_ids=captured_slots,
+        output_request_slot_generations=captured_generations,
         output_cluster_handles=handles,
         output_resident_buckets=buckets,
         output_clustered_token_counts=clustered_counts,
@@ -441,9 +459,17 @@ def test_ranked_draft_bucket_resolution_avoids_compact_page_outputs():
         output_miss_count=miss_count,
         sparse_attention=sparse_attention,
         expanded_attention=expanded_attention,
+        capture_request_descriptors=capture_request_descriptors,
     )
 
     torch.cuda.synchronize()
+    assert sparse_indices.cpu().tolist() == [[[0, 1]], [[-1, -1]]]
+    assert expanded_indices.cpu().tolist() == [[[0, 1, 2]], [[-1, -1, -1]]]
+    assert sparse_estimation.cpu().tolist() == [[[2]], [[-1]]]
+    assert expanded_estimation.cpu().tolist() == [[[-1]], [[-1]]]
+    assert valid_rows.cpu().tolist() == [True, True]
+    assert captured_slots.cpu().tolist() == expected_slots
+    assert captured_generations.cpu().tolist() == expected_generations
     assert handles.cpu().tolist() == [[[10, 11]], [[-1, -1]]]
     assert buckets.cpu().tolist() == [[[2, -1]], [[-1, -1]]]
     assert clustered_counts.cpu().tolist() == [[3], [0]]

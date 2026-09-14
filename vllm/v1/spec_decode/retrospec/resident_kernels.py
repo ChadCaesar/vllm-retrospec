@@ -363,14 +363,14 @@ def _resolve_compact_draft_pages_kernel(
 @triton.jit
 def _resolve_ranked_draft_buckets_kernel(
     ranked_values,
+    ranked_indices,
+    candidate_counts,
     arena_cluster_ids,
     arena_resident_table_buckets,
-    arena_cluster_page_starts,
+    arena_cluster_token_counts,
     arena_cluster_page_counts,
-    arena_page_ids,
-    arena_page_token_counts,
     arena_cluster_offsets,
-    arena_page_offsets,
+    arena_generations,
     request_slot_ids,
     active_mask,
     table_handles,
@@ -380,7 +380,13 @@ def _resolve_ranked_draft_buckets_kernel(
     table_hit_gate_ready,
     table_last_access_epochs,
     access_epoch,
-    sparse_cluster_indices,
+    sparse_exact_cluster_indices,
+    expanded_exact_cluster_indices,
+    sparse_estimation_cluster_indices,
+    expanded_estimation_cluster_indices,
+    output_valid_rows,
+    output_request_slot_ids,
+    output_request_slot_generations,
     output_cluster_handles,
     output_resident_buckets,
     output_clustered_token_counts,
@@ -393,20 +399,28 @@ def _resolve_ranked_draft_buckets_kernel(
     output_miss_positions,
     output_miss_count,
     statistics_buffer,
-    ranked_stride_0,
-    ranked_stride_1,
-    ranked_stride_2,
+    ranked_value_stride_0,
+    ranked_value_stride_1,
+    ranked_value_stride_2,
+    ranked_index_stride_0,
+    ranked_index_stride_1,
+    ranked_index_stride_2,
     table_page_stride,
     ARENA_CLUSTER_CAPACITY: tl.constexpr,
-    ARENA_PAGE_CAPACITY: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     SPARSE_WIDTH: tl.constexpr,
+    EXPANDED_WIDTH: tl.constexpr,
+    ESTIMATION_WIDTH: tl.constexpr,
     MAX_PAGES: tl.constexpr,
     TABLE_CAPACITY: tl.constexpr,
+    BLOCK_PLAN: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
     BLOCK_SPARSE: tl.constexpr,
+    CAPTURE_REQUEST_DESCRIPTORS: tl.constexpr,
     EMIT_MISSES: tl.constexpr,
     UPDATE_STATISTICS: tl.constexpr,
+    RETRIEVAL_RATIO: tl.constexpr,
+    ESTIMATION_RATIO: tl.constexpr,
     RESIDENT_HIT_COUNTER_INDEX: tl.constexpr,
     RESIDENT_MISS_COUNTER_INDEX: tl.constexpr,
     RESIDENT_PAGE_COUNTER_INDEX: tl.constexpr,
@@ -415,6 +429,7 @@ def _resolve_ranked_draft_buckets_kernel(
     row = tl.program_id(0)
     batch_idx = row // NUM_KV_HEADS
     kv_head_idx = row % NUM_KV_HEADS
+    group_offset = batch_idx * NUM_KV_HEADS + kv_head_idx
 
     request_slot = tl.load(request_slot_ids + batch_idx)
     request_active = tl.load(active_mask + batch_idx).to(tl.int1)
@@ -423,32 +438,173 @@ def _resolve_ranked_draft_buckets_kernel(
     request_cluster_offset = tl.load(
         arena_cluster_offsets + safe_slot, mask=request_valid, other=0
     ).to(tl.int64)
-    request_page_offset = tl.load(
-        arena_page_offsets + safe_slot, mask=request_valid, other=0
+
+    publish_row = kv_head_idx == 0
+    tl.store(output_valid_rows + batch_idx, request_active, mask=publish_row)
+    if CAPTURE_REQUEST_DESCRIPTORS:
+        descriptor_valid = publish_row & (request_slot >= 0)
+        request_generation = tl.load(
+            arena_generations + safe_slot, mask=descriptor_valid, other=-1
+        )
+        tl.store(output_request_slot_ids + batch_idx, request_slot, mask=publish_row)
+        tl.store(
+            output_request_slot_generations + batch_idx,
+            tl.where(descriptor_valid, request_generation, -1),
+            mask=publish_row,
+        )
+
+    candidate_count = tl.load(candidate_counts + group_offset).to(tl.int32)
+    retrieval_count = tl.ceil(candidate_count.to(tl.float32) * RETRIEVAL_RATIO).to(
+        tl.int32
+    )
+    retrieval_count = tl.minimum(retrieval_count, candidate_count)
+    estimation_count = tl.ceil(candidate_count.to(tl.float32) * ESTIMATION_RATIO).to(
+        tl.int32
+    )
+    estimation_count = tl.minimum(estimation_count, candidate_count - retrieval_count)
+    total_compute_count = retrieval_count + estimation_count
+    expanded_retrieval_count = tl.minimum(retrieval_count * 2, total_compute_count)
+
+    plan_ranks = tl.arange(0, BLOCK_PLAN)
+    plan_ranked_offsets = (
+        batch_idx * ranked_index_stride_0
+        + kv_head_idx * ranked_index_stride_1
+        + plan_ranks * ranked_index_stride_2
+    )
+    prefix_valid = request_valid & (plan_ranks < expanded_retrieval_count)
+    prefix_local_indices = tl.load(
+        ranked_indices + plan_ranked_offsets, mask=prefix_valid, other=-1
     ).to(tl.int64)
+    prefix_valid &= prefix_local_indices >= 0
+    prefix_storage_offsets = (
+        kv_head_idx * ARENA_CLUSTER_CAPACITY
+        + request_cluster_offset
+        + tl.maximum(prefix_local_indices, 0)
+    )
+    prefix_token_counts = tl.load(
+        arena_cluster_token_counts + prefix_storage_offsets,
+        mask=prefix_valid,
+        other=0,
+    ).to(tl.int32)
+    prefix_valid &= prefix_token_counts > 0
+
+    if SPARSE_WIDTH > 0:
+        sparse_output_offsets = group_offset * SPARSE_WIDTH + plan_ranks
+        sparse_valid = prefix_valid & (plan_ranks < retrieval_count)
+        tl.store(
+            sparse_exact_cluster_indices + sparse_output_offsets,
+            tl.where(sparse_valid, prefix_local_indices, -1),
+            mask=plan_ranks < SPARSE_WIDTH,
+        )
+
+    if EXPANDED_WIDTH > 0:
+        expanded_output_offsets = group_offset * EXPANDED_WIDTH + plan_ranks
+        tl.store(
+            expanded_exact_cluster_indices + expanded_output_offsets,
+            tl.where(prefix_valid, prefix_local_indices, -1),
+            mask=plan_ranks < EXPANDED_WIDTH,
+        )
+
+    if ESTIMATION_WIDTH > 0:
+        sparse_estimation_ranks = retrieval_count + plan_ranks
+        sparse_estimation_offsets = (
+            batch_idx * ranked_index_stride_0
+            + kv_head_idx * ranked_index_stride_1
+            + sparse_estimation_ranks * ranked_index_stride_2
+        )
+        sparse_estimation_valid = request_valid & (plan_ranks < estimation_count)
+        sparse_estimation_local_indices = tl.load(
+            ranked_indices + sparse_estimation_offsets,
+            mask=sparse_estimation_valid,
+            other=-1,
+        ).to(tl.int64)
+        sparse_estimation_valid &= sparse_estimation_local_indices >= 0
+        sparse_estimation_storage_offsets = (
+            kv_head_idx * ARENA_CLUSTER_CAPACITY
+            + request_cluster_offset
+            + tl.maximum(sparse_estimation_local_indices, 0)
+        )
+        sparse_estimation_token_counts = tl.load(
+            arena_cluster_token_counts + sparse_estimation_storage_offsets,
+            mask=sparse_estimation_valid,
+            other=0,
+        ).to(tl.int32)
+        sparse_estimation_valid &= sparse_estimation_token_counts > 0
+        estimation_output_offsets = group_offset * ESTIMATION_WIDTH + plan_ranks
+        tl.store(
+            sparse_estimation_cluster_indices + estimation_output_offsets,
+            tl.where(sparse_estimation_valid, sparse_estimation_local_indices, -1),
+            mask=plan_ranks < ESTIMATION_WIDTH,
+        )
+
+        expanded_estimation_count = total_compute_count - expanded_retrieval_count
+        expanded_estimation_ranks = expanded_retrieval_count + plan_ranks
+        expanded_estimation_offsets = (
+            batch_idx * ranked_index_stride_0
+            + kv_head_idx * ranked_index_stride_1
+            + expanded_estimation_ranks * ranked_index_stride_2
+        )
+        expanded_estimation_valid = request_valid & (
+            plan_ranks < expanded_estimation_count
+        )
+        expanded_estimation_local_indices = tl.load(
+            ranked_indices + expanded_estimation_offsets,
+            mask=expanded_estimation_valid,
+            other=-1,
+        ).to(tl.int64)
+        expanded_estimation_valid &= expanded_estimation_local_indices >= 0
+        expanded_estimation_storage_offsets = (
+            kv_head_idx * ARENA_CLUSTER_CAPACITY
+            + request_cluster_offset
+            + tl.maximum(expanded_estimation_local_indices, 0)
+        )
+        expanded_estimation_token_counts = tl.load(
+            arena_cluster_token_counts + expanded_estimation_storage_offsets,
+            mask=expanded_estimation_valid,
+            other=0,
+        ).to(tl.int32)
+        expanded_estimation_valid &= expanded_estimation_token_counts > 0
+        tl.store(
+            expanded_estimation_cluster_indices + estimation_output_offsets,
+            tl.where(expanded_estimation_valid, expanded_estimation_local_indices, -1),
+            mask=plan_ranks < ESTIMATION_WIDTH,
+        )
 
     ranks = tl.arange(0, BLOCK_SPARSE)
     valid_ranks = ranks < SPARSE_WIDTH
     row_offsets = row * SPARSE_WIDTH + ranks
+    ranked_index_offsets = (
+        batch_idx * ranked_index_stride_0
+        + kv_head_idx * ranked_index_stride_1
+        + ranks * ranked_index_stride_2
+    )
     local_cluster_indices = tl.load(
-        sparse_cluster_indices + row_offsets, mask=valid_ranks, other=-1
+        ranked_indices + ranked_index_offsets,
+        mask=request_valid & valid_ranks & (ranks < retrieval_count),
+        other=-1,
     ).to(tl.int64)
-    selected = request_valid & valid_ranks & (local_cluster_indices >= 0)
+    selected = (
+        request_valid
+        & valid_ranks
+        & (ranks < retrieval_count)
+        & (local_cluster_indices >= 0)
+    )
     cluster_storage_offsets = (
         kv_head_idx * ARENA_CLUSTER_CAPACITY
         + request_cluster_offset
         + tl.maximum(local_cluster_indices, 0)
     )
+    cluster_token_counts = tl.load(
+        arena_cluster_token_counts + cluster_storage_offsets,
+        mask=selected,
+        other=0,
+    ).to(tl.int32)
+    selected &= cluster_token_counts > 0
     cluster_handles = tl.load(
         arena_cluster_ids + cluster_storage_offsets, mask=selected, other=-1
     ).to(tl.int64)
     selected &= cluster_handles >= 0
 
-    logical_page_starts = tl.load(
-        arena_cluster_page_starts + cluster_storage_offsets,
-        mask=selected,
-        other=0,
-    ).to(tl.int64)
     logical_page_counts = tl.load(
         arena_cluster_page_counts + cluster_storage_offsets,
         mask=selected,
@@ -483,28 +639,11 @@ def _resolve_ranked_draft_buckets_kernel(
     )
 
     page_offsets = tl.arange(0, BLOCK_PAGES)
-    valid_page_offsets = page_offsets < MAX_PAGES
-    arena_page_indices = (
-        request_page_offset + logical_page_starts[:, None] + page_offsets[None, :]
-    )
-    arena_page_storage_offsets = kv_head_idx * ARENA_PAGE_CAPACITY + arena_page_indices
     valid_logical_pages = (
         selected[:, None]
-        & valid_page_offsets[None, :]
+        & (page_offsets[None, :] < MAX_PAGES)
         & (page_offsets[None, :] < logical_page_counts[:, None])
     )
-    logical_page_ids = tl.load(
-        arena_page_ids + arena_page_storage_offsets,
-        mask=valid_logical_pages,
-        other=-1,
-    ).to(tl.int64)
-    logical_token_counts = tl.load(
-        arena_page_token_counts + arena_page_storage_offsets,
-        mask=valid_logical_pages,
-        other=0,
-    ).to(tl.int32)
-    valid_logical_pages &= (logical_page_ids >= 0) & (logical_token_counts > 0)
-    actual_page_counts = tl.sum(valid_logical_pages.to(tl.int32), axis=1)
 
     resident_slots = tl.load(
         table_page_slots
@@ -512,9 +651,8 @@ def _resolve_ranked_draft_buckets_kernel(
         + page_offsets[None, :],
         mask=(
             found[:, None]
-            & valid_page_offsets[None, :]
+            & valid_logical_pages
             & (page_offsets[None, :] < resident_page_counts[:, None])
-            & (page_offsets[None, :] < actual_page_counts[:, None])
         ),
         other=-1,
     )
@@ -530,9 +668,10 @@ def _resolve_ranked_draft_buckets_kernel(
         & (stored_handles == cluster_handles)
         & (versions_before == versions_after)
         & ((versions_before & 1) == 0)
-        & (actual_page_counts > 0)
-        & (resident_page_counts >= actual_page_counts)
-        & (resolved_page_counts == actual_page_counts)
+        & (logical_page_counts > 0)
+        & (logical_page_counts <= MAX_PAGES)
+        & (resident_page_counts >= logical_page_counts)
+        & (resolved_page_counts == logical_page_counts)
     )
     misses = selected & ~stable_hits
 
@@ -561,13 +700,11 @@ def _resolve_ranked_draft_buckets_kernel(
     num_selected = tl.sum(selected.to(tl.int32), axis=0)
     num_hits = tl.sum(stable_hits.to(tl.int32), axis=0)
     num_misses = tl.sum(misses.to(tl.int32), axis=0)
-    selected_page_counts = tl.where(stable_hits, actual_page_counts, 0)
+    selected_page_counts = tl.where(stable_hits, logical_page_counts, 0)
     num_resident_pages = tl.sum(selected_page_counts, axis=0)
-    clustered_tokens_by_rank = tl.sum(
-        tl.where(stable_hits[:, None] & valid_logical_pages, logical_token_counts, 0),
-        axis=1,
+    num_clustered_tokens = tl.sum(
+        tl.where(stable_hits, cluster_token_counts, 0), axis=0
     )
-    num_clustered_tokens = tl.sum(clustered_tokens_by_rank, axis=0)
 
     if EMIT_MISSES:
         miss_prefix = tl.cumsum(misses.to(tl.int32), axis=0)
@@ -576,12 +713,14 @@ def _resolve_ranked_draft_buckets_kernel(
         tl.store(output_miss_handles + miss_slots, cluster_handles, mask=misses)
         tl.store(output_miss_positions + miss_slots, row_offsets, mask=misses)
 
-    ranked_offsets = (
-        batch_idx * ranked_stride_0
-        + kv_head_idx * ranked_stride_1
-        + ranks * ranked_stride_2
+    ranked_value_offsets = (
+        batch_idx * ranked_value_stride_0
+        + kv_head_idx * ranked_value_stride_1
+        + ranks * ranked_value_stride_2
     )
-    ranked_scores = tl.load(ranked_values + ranked_offsets, mask=selected, other=0.0)
+    ranked_scores = tl.load(
+        ranked_values + ranked_value_offsets, mask=selected, other=0.0
+    )
     hit_attention = tl.sum(tl.where(stable_hits, ranked_scores, 0.0), axis=0)
     tl.store(output_clustered_token_counts + row, num_clustered_tokens)
     tl.store(output_hit_attention_by_head + row, hit_attention)
@@ -1847,15 +1986,14 @@ def resolve_compact_draft_pages(
 def resolve_ranked_draft_buckets(
     *,
     ranked_values: torch.Tensor,
+    ranked_indices: torch.Tensor,
     candidate_counts: torch.Tensor,
     arena_cluster_ids: torch.Tensor,
     arena_resident_table_buckets: torch.Tensor,
-    arena_cluster_page_starts: torch.Tensor,
+    arena_cluster_token_counts: torch.Tensor,
     arena_cluster_page_counts: torch.Tensor,
-    arena_page_ids: torch.Tensor,
-    arena_page_token_counts: torch.Tensor,
     arena_cluster_offsets: torch.Tensor,
-    arena_page_offsets: torch.Tensor,
+    arena_generations: torch.Tensor,
     request_slot_ids: torch.Tensor,
     active_mask: torch.Tensor,
     table_handles: torch.Tensor,
@@ -1869,7 +2007,13 @@ def resolve_ranked_draft_buckets(
     estimation_ratio: float,
     expanded_retrieval_width: int,
     max_pages_per_cluster: int,
-    sparse_cluster_indices: torch.Tensor,
+    sparse_exact_cluster_indices: torch.Tensor,
+    expanded_exact_cluster_indices: torch.Tensor,
+    sparse_estimation_cluster_indices: torch.Tensor,
+    expanded_estimation_cluster_indices: torch.Tensor,
+    output_valid_rows: torch.Tensor,
+    output_request_slot_ids: torch.Tensor,
+    output_request_slot_generations: torch.Tensor,
     output_cluster_handles: torch.Tensor,
     output_resident_buckets: torch.Tensor,
     output_clustered_token_counts: torch.Tensor,
@@ -1884,6 +2028,7 @@ def resolve_ranked_draft_buckets(
     output_miss_count: torch.Tensor,
     sparse_attention: torch.Tensor,
     expanded_attention: torch.Tensor,
+    capture_request_descriptors: bool,
     emit_misses: bool = True,
     statistics_buffer: torch.Tensor | None = None,
     statistics_indices: tuple[int, ...] | None = None,
@@ -1891,6 +2036,10 @@ def resolve_ranked_draft_buckets(
     """Resolve ranked DRAFT clusters into stable resident-table buckets."""
     if ranked_values.device.type != "cuda" or ranked_values.ndim != 3:
         raise ValueError("Ranked values must be CUDA [batch, heads, ranks]")
+    if ranked_indices.shape != ranked_values.shape:
+        raise ValueError("Ranked indices must match ranked values")
+    if ranked_indices.dtype != torch.int64:
+        raise ValueError("Ranked indices must use int64")
     if candidate_counts.dtype != torch.int32:
         raise ValueError("Candidate counts must use int32")
     if max_pages_per_cluster <= 0:
@@ -1898,26 +2047,44 @@ def resolve_ranked_draft_buckets(
 
     batch_size, num_kv_heads, ranking_width = ranked_values.shape
     row_shape = (batch_size, num_kv_heads)
-    sparse_width = sparse_cluster_indices.shape[2]
+    sparse_width = sparse_exact_cluster_indices.shape[2]
+    expanded_width = expanded_exact_cluster_indices.shape[2]
+    estimation_width = sparse_estimation_cluster_indices.shape[2]
     if candidate_counts.shape != row_shape:
         raise ValueError("Candidate counts do not match ranked rows")
     if request_slot_ids.shape != (batch_size,):
         raise ValueError("Request slots do not match ranked rows")
     if active_mask.shape != (batch_size,) or active_mask.dtype != torch.bool:
         raise ValueError("Active mask must be a one-dimensional bool tensor")
-    if sparse_cluster_indices.shape[:2] != row_shape:
-        raise ValueError("Sparse journal has the wrong row shape")
-    if output_cluster_handles.shape != sparse_cluster_indices.shape:
+    journal_tensors = (
+        sparse_exact_cluster_indices,
+        expanded_exact_cluster_indices,
+        sparse_estimation_cluster_indices,
+        expanded_estimation_cluster_indices,
+    )
+    if any(tensor.shape[:2] != row_shape for tensor in journal_tensors):
+        raise ValueError("Ranked journals have the wrong row shape")
+    if any(tensor.dtype != torch.int32 for tensor in journal_tensors):
+        raise ValueError("Ranked journals must use int32")
+    if expanded_estimation_cluster_indices.shape != (
+        batch_size,
+        num_kv_heads,
+        estimation_width,
+    ):
+        raise ValueError("Estimation journals must have equal shapes")
+    if output_cluster_handles.shape != sparse_exact_cluster_indices.shape:
         raise ValueError("Cluster-handle output has the wrong shape")
     if output_cluster_handles.dtype != torch.int64:
         raise ValueError("Cluster handles must use int64")
-    if output_resident_buckets.shape != sparse_cluster_indices.shape:
+    if output_resident_buckets.shape != sparse_exact_cluster_indices.shape:
         raise ValueError("Resident-bucket output has the wrong shape")
     if output_resident_buckets.dtype != torch.int32:
         raise ValueError("Resident buckets must use int32")
     if table_page_slots.shape[1] < max_pages_per_cluster:
         raise ValueError("Resident table has too few page slots")
-    if ranking_width < max(sparse_width, expanded_retrieval_width):
+    if expanded_width != expanded_retrieval_width:
+        raise ValueError("Expanded exact journal width does not match configuration")
+    if ranking_width < max(expanded_width, sparse_width + estimation_width):
         raise ValueError("Ranked workspace is too narrow")
     if output_miss_handles.numel() < output_cluster_handles.numel():
         raise ValueError("Miss-handle output has insufficient capacity")
@@ -1931,6 +2098,23 @@ def resolve_ranked_draft_buckets(
         raise ValueError("Resident handle-table capacity must be a power of two")
     if access_epoch <= 0:
         raise ValueError("Resident access epoch must be positive")
+    plan_row_outputs = (
+        output_valid_rows,
+        output_request_slot_ids,
+        output_request_slot_generations,
+    )
+    if any(output.shape != (batch_size,) for output in plan_row_outputs):
+        raise ValueError("Plan row outputs have the wrong shape")
+    if output_valid_rows.dtype != torch.bool:
+        raise ValueError("Plan valid rows must use bool")
+    if any(
+        output.dtype not in (torch.int32, torch.int64)
+        for output in (
+            output_request_slot_ids,
+            output_request_slot_generations,
+        )
+    ):
+        raise ValueError("Request descriptors must use integral tensors")
 
     row_outputs = (
         output_clustered_token_counts,
@@ -1961,18 +2145,22 @@ def resolve_ranked_draft_buckets(
             raise ValueError("Statistics buffer must use the resolve device")
         if statistics_indices is None or len(statistics_indices) != 4:
             raise ValueError("DRAFT resolve requires four counter indices")
+        if any(
+            index < 0 or index >= statistics_buffer.numel()
+            for index in statistics_indices
+        ):
+            raise ValueError("Statistics counter index is outside the buffer")
 
     tensors = (
         ranked_values,
+        ranked_indices,
         candidate_counts,
         arena_cluster_ids,
         arena_resident_table_buckets,
-        arena_cluster_page_starts,
+        arena_cluster_token_counts,
         arena_cluster_page_counts,
-        arena_page_ids,
-        arena_page_token_counts,
         arena_cluster_offsets,
-        arena_page_offsets,
+        arena_generations,
         request_slot_ids,
         active_mask,
         table_handles,
@@ -1981,7 +2169,8 @@ def resolve_ranked_draft_buckets(
         table_page_slots,
         table_hit_gate_ready,
         table_last_access_epochs,
-        sparse_cluster_indices,
+        *journal_tensors,
+        *plan_row_outputs,
         output_cluster_handles,
         output_resident_buckets,
         *row_outputs,
@@ -1998,27 +2187,17 @@ def resolve_ranked_draft_buckets(
 
     if emit_misses:
         output_miss_count.zero_()
-    if sparse_width == 0:
-        output_cluster_handles.fill_(-1)
-        output_resident_buckets.fill_(-1)
-        for output in row_outputs:
-            output.zero_()
-        output_attention.fill_(1.0)
-        sparse_attention.fill_(1.0)
-        expanded_attention.fill_(1.0)
-        return
-
     assert statistics_indices is not None
     _resolve_ranked_draft_buckets_kernel[(batch_size * num_kv_heads,)](
         ranked_values,
+        ranked_indices,
+        candidate_counts,
         arena_cluster_ids,
         arena_resident_table_buckets,
-        arena_cluster_page_starts,
+        arena_cluster_token_counts,
         arena_cluster_page_counts,
-        arena_page_ids,
-        arena_page_token_counts,
         arena_cluster_offsets,
-        arena_page_offsets,
+        arena_generations,
         request_slot_ids,
         active_mask,
         table_handles,
@@ -2028,7 +2207,13 @@ def resolve_ranked_draft_buckets(
         table_hit_gate_ready,
         table_last_access_epochs,
         access_epoch,
-        sparse_cluster_indices,
+        sparse_exact_cluster_indices,
+        expanded_exact_cluster_indices,
+        sparse_estimation_cluster_indices,
+        expanded_estimation_cluster_indices,
+        output_valid_rows,
+        output_request_slot_ids,
+        output_request_slot_generations,
         output_cluster_handles,
         output_resident_buckets,
         output_clustered_token_counts,
@@ -2044,17 +2229,27 @@ def resolve_ranked_draft_buckets(
         ranked_values.stride(0),
         ranked_values.stride(1),
         ranked_values.stride(2),
+        ranked_indices.stride(0),
+        ranked_indices.stride(1),
+        ranked_indices.stride(2),
         table_page_slots.stride(0),
         ARENA_CLUSTER_CAPACITY=arena_cluster_ids.shape[1],
-        ARENA_PAGE_CAPACITY=arena_page_ids.shape[1],
         NUM_KV_HEADS=num_kv_heads,
         SPARSE_WIDTH=sparse_width,
+        EXPANDED_WIDTH=expanded_width,
+        ESTIMATION_WIDTH=estimation_width,
         MAX_PAGES=max_pages_per_cluster,
         TABLE_CAPACITY=table_handles.numel(),
+        BLOCK_PLAN=triton.next_power_of_2(
+            max(sparse_width, expanded_width, estimation_width, 1)
+        ),
         BLOCK_PAGES=triton.next_power_of_2(max_pages_per_cluster),
-        BLOCK_SPARSE=triton.next_power_of_2(sparse_width),
+        BLOCK_SPARSE=triton.next_power_of_2(max(sparse_width, 1)),
+        CAPTURE_REQUEST_DESCRIPTORS=capture_request_descriptors,
         EMIT_MISSES=emit_misses,
         UPDATE_STATISTICS=update_statistics,
+        RETRIEVAL_RATIO=retrieval_ratio,
+        ESTIMATION_RATIO=estimation_ratio,
         RESIDENT_HIT_COUNTER_INDEX=statistics_indices[0],
         RESIDENT_MISS_COUNTER_INDEX=statistics_indices[1],
         RESIDENT_PAGE_COUNTER_INDEX=statistics_indices[2],

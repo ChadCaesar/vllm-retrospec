@@ -42,9 +42,7 @@ from .performance import RetroSpecPerformanceStats
 from .pinned_memory import RetroSpecPinnedMemoryManager
 from .resident_cache import RetroSpecResidentReadLease
 from .selection_kernels import (
-    capture_request_descriptors,
     emit_primary_exact_token_plan,
-    emit_ranked_draft_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
     pack_indexed_verification_plan,
@@ -3370,50 +3368,6 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self._publish_plan_step(layer_name, plan_slot, active_mask, table)
         return plan, output_workspace
 
-    def _emit_cuda_draft_plan(
-        self,
-        plan: RetroSpecTokenSelectionPlan,
-        output_workspace: _SelectionStepWorkspace,
-        table: _SelectionPlanTable,
-        active_mask: torch.Tensor,
-        ranked_indices: torch.Tensor,
-        candidate_counts: torch.Tensor,
-        view: RetroSpecResidentBatchView,
-    ) -> None:
-        arena = view.arena
-        if arena is None:
-            raise RuntimeError("CUDA plan emission requires a resident arena")
-
-        if plan.layer_name not in self._selection_plan_written_layers:
-            capture_request_descriptors(
-                request_slot_ids=view.request_slot_ids,
-                arena_generations=arena.generations,
-                output_slot_ids=table.request_slot_ids[
-                    : view.request_slot_ids.shape[0]
-                ],
-                output_generations=table.request_slot_generations[
-                    : view.request_slot_ids.shape[0]
-                ],
-            )
-
-        emit_ranked_draft_plan(
-            ranked_indices=ranked_indices,
-            candidate_counts=candidate_counts,
-            cluster_token_counts=arena.cluster_token_counts,
-            cluster_offsets=arena.cluster_offsets,
-            request_slot_ids=view.request_slot_ids,
-            active_mask=active_mask,
-            retrieval_ratio=self.retrieval_ratio,
-            estimation_ratio=self.estimation_ratio,
-            sparse_exact_width=output_workspace.sparse_retrieval_width,
-            sparse_exact_cluster_indices=plan.sparse_exact_cluster_indices,
-            expanded_exact_cluster_indices=plan.expanded_exact_cluster_indices,
-            sparse_estimation_cluster_indices=(plan.sparse_estimation_cluster_indices),
-            expanded_estimation_cluster_indices=(
-                plan.expanded_estimation_cluster_indices
-            ),
-        )
-
     def get_selection_plan(
         self, layer_name: str, step_index: int
     ) -> RetroSpecTokenSelectionPlan:
@@ -3780,7 +3734,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         view: RetroSpecResidentBatchView,
         active_mask: torch.Tensor,
         ranked_values: torch.Tensor,
+        ranked_indices: torch.Tensor,
         candidate_counts: torch.Tensor,
+        plan_valid_rows: torch.Tensor,
+        capture_request_descriptors: bool,
         emit_misses: bool,
     ) -> RetroSpecRankedDraftResolvedClusters:
         if view.arena is None:
@@ -3789,6 +3746,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         return self.cluster_store.resolve_ranked_draft_clusters(
             layer_name=plan.layer_name,
             ranked_values=ranked_values,
+            ranked_indices=ranked_indices,
             candidate_counts=candidate_counts,
             arena=view.arena,
             request_slot_ids=view.request_slot_ids,
@@ -3797,7 +3755,15 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             estimation_ratio=self.estimation_ratio,
             expanded_retrieval_width=plan.expanded_exact_cluster_indices.shape[2],
             max_pages_per_cluster=view.max_pages_per_cluster,
-            sparse_cluster_indices=plan.sparse_exact_cluster_indices,
+            sparse_exact_cluster_indices=plan.sparse_exact_cluster_indices,
+            expanded_exact_cluster_indices=plan.expanded_exact_cluster_indices,
+            sparse_estimation_cluster_indices=(plan.sparse_estimation_cluster_indices),
+            expanded_estimation_cluster_indices=(
+                plan.expanded_estimation_cluster_indices
+            ),
+            plan_valid_rows=plan_valid_rows,
+            output_request_slot_ids=plan.request_slot_ids,
+            output_request_slot_generations=plan.request_slot_generations,
             cluster_handles=output_workspace.draft_exact_cluster_handles,
             resident_bucket_ids=output_workspace.draft_resident_bucket_ids,
             clustered_token_counts=output_workspace.draft_clustered_token_counts,
@@ -3812,6 +3778,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             miss_count=output_workspace.draft_prefetch_miss_count,
             sparse_attention=plan.sparse_attn,
             expanded_attention=plan.expanded_attn,
+            capture_request_descriptors=capture_request_descriptors,
             emit_misses=emit_misses,
         )
 
@@ -3858,7 +3825,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         view: RetroSpecResidentBatchView,
         active_mask: torch.Tensor,
         ranked_values: torch.Tensor | None = None,
+        ranked_indices: torch.Tensor | None = None,
         candidate_counts: torch.Tensor | None = None,
+        plan_valid_rows: torch.Tensor | None = None,
+        capture_request_descriptors: bool = False,
         request_ids: Sequence[str] = (),
         query: torch.Tensor | None = None,
         proposal_round: int = 0,
@@ -3918,8 +3888,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             )
         if ranked_values is None:
             raise RuntimeError("CUDA draft selection requires ranked scores")
+        if ranked_indices is None:
+            raise RuntimeError("CUDA draft selection requires ranked indices")
         if candidate_counts is None:
             raise RuntimeError("CUDA draft selection requires candidate counts")
+        if plan_valid_rows is None:
+            raise RuntimeError("CUDA draft selection requires plan valid rows")
         if self.selection_provenance.enabled:
             if query is None:
                 raise RuntimeError("Selection provenance requires the draft query")
@@ -3936,7 +3910,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             view,
             active_mask,
             ranked_values,
+            ranked_indices,
             candidate_counts,
+            plan_valid_rows,
+            capture_request_descriptors,
             emit_misses=True,
         )
         expose_prefetch = True
@@ -3980,7 +3957,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 view,
                 active_mask,
                 ranked_values,
+                ranked_indices,
                 candidate_counts,
+                plan_valid_rows,
+                False,
                 emit_misses=False,
             )
             expose_prefetch = False
@@ -4913,6 +4893,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         ranked_indices = None
         cluster_zones = None
         plan_table = None
+        plan_valid_rows = None
+        capture_request_descriptors = False
         if direct_cuda_plan:
             with self._cuda_timer("draft_plan_prepare"):
                 plan, output_workspace, plan_table = self._prepare_plan_step(
@@ -4933,16 +4915,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     cluster_scores,
                     workspace,
                 )
-            with self._cuda_timer("draft_plan_build"):
-                self._emit_cuda_draft_plan(
-                    plan=plan,
-                    output_workspace=output_workspace,
-                    table=plan_table,
-                    active_mask=active_mask,
-                    ranked_indices=ranked_indices,
-                    candidate_counts=candidate_counts,
-                    view=view,
-                )
+            plan_valid_rows = plan_table.valid_rows[plan_slot, : active_mask.shape[0]]
+            capture_request_descriptors = (
+                layer_name not in self._selection_plan_written_layers
+            )
         else:
             with self._cuda_timer("draft_selection_layout"):
                 logical_token_ids, valid_token_mask, sink_recent_mask = (
@@ -5026,15 +5002,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 view=view,
                 active_mask=active_mask,
                 ranked_values=ranked_values,
+                ranked_indices=ranked_indices,
                 candidate_counts=candidate_counts,
+                plan_valid_rows=plan_valid_rows,
+                capture_request_descriptors=capture_request_descriptors,
             )
         if plan_table is not None:
-            self._publish_plan_step(
-                layer_name,
-                plan_slot,
-                active_mask,
-                plan_table,
-            )
+            self._selection_plan_written_layers.add(layer_name)
         return selection
 
     def materialize(
