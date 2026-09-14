@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import ceil
-from threading import Condition, Lock, RLock
+from queue import PriorityQueue
+from threading import Condition, Lock, RLock, Thread
 from threading import Event as ThreadEvent
 from time import perf_counter
 from typing import Literal
@@ -40,6 +41,13 @@ RetroSpecClusterResolveMode = Literal[
     "resident_pending",
     "verification",
 ]
+
+RetroSpecResidentPrefetchSource = Literal["prefill_hint", "draft"]
+
+_PREFETCH_SOURCE_PRIORITY: dict[RetroSpecResidentPrefetchSource, int] = {
+    "prefill_hint": 0,
+    "draft": 1,
+}
 
 
 @dataclass
@@ -168,6 +176,8 @@ class RetroSpecResidentPrefetchInput:
     miss_count: torch.Tensor
     num_groups: int
     num_ranks: int
+    source: RetroSpecResidentPrefetchSource = "draft"
+    sequence: int = 0
 
 
 @dataclass
@@ -453,6 +463,8 @@ class _StagedResidentPrefetchRecord:
     miss_count_cpu: torch.Tensor
     num_groups: int
     num_ranks: int
+    source: RetroSpecResidentPrefetchSource
+    sequence: int
 
 
 @dataclass
@@ -521,6 +533,63 @@ class _DeferredResidentPrefetchWave:
     source_ready_events: tuple[torch.cuda.Event, ...]
 
 
+class _ResidentPrefetchPriorityExecutor:
+    """One fixed worker that lets fresh DRAFT work overtake queued hints."""
+
+    def __init__(self) -> None:
+        self._queue = PriorityQueue()
+        self._lock = Lock()
+        self._next_sequence = 0
+        self._closed = False
+        self._thread = Thread(
+            target=self._run,
+            name="retrospec-resident-prefetch",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(
+        self, priority: int, function: Callable[..., None], *args: object
+    ) -> Future[None]:
+        future: Future[None] = Future()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Resident prefetch executor is closed")
+            sequence = self._next_sequence
+            self._next_sequence += 1
+            self._queue.put((-priority, sequence, function, args, future))
+        return future
+
+    def _run(self) -> None:
+        while True:
+            _, _, function, args, future = self._queue.get()
+            try:
+                if function is None:
+                    return
+                assert future is not None
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    function(*args)
+                except BaseException as error:
+                    future.set_exception(error)
+                else:
+                    future.set_result(None)
+            finally:
+                self._queue.task_done()
+
+    def shutdown(self, wait: bool = True) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            sequence = self._next_sequence
+            self._next_sequence += 1
+            self._queue.put((1 << 30, sequence, None, (), None))
+        if wait:
+            self._thread.join()
+
+
 @dataclass(frozen=True)
 class _PreparedResidentPrefetchRecord:
     """CPU descriptors prepared for one layer's resident admission."""
@@ -530,6 +599,8 @@ class _PreparedResidentPrefetchRecord:
     resident_cache: RetroSpecResidentClusterCache
     cluster_ids_cpu: torch.Tensor
     page_ids_cpu: torch.Tensor
+    source_page_ids_cpu: torch.Tensor
+    unique_page_ids_cpu: torch.Tensor
     cluster_groups: dict[int, RetroSpecClusterGroup]
 
 
@@ -634,6 +705,104 @@ class _ClusterBlockDescriptor:
     identity: RetroSpecClusterIdentity
     page_ids: tuple[int, ...]
     page_token_counts: tuple[int, ...]
+
+
+@dataclass
+class _LayerPrefetchDescriptorArena:
+    """Pageable CPU descriptors indexed directly by stable cluster handle."""
+
+    page_ids: torch.Tensor = field(
+        default_factory=lambda: torch.empty((0, 0), dtype=torch.int64)
+    )
+    page_counts: torch.Tensor = field(
+        default_factory=lambda: torch.empty(0, dtype=torch.int32)
+    )
+    group_ids: torch.Tensor = field(
+        default_factory=lambda: torch.empty(0, dtype=torch.int64)
+    )
+    groups: list[RetroSpecClusterGroup] = field(default_factory=list)
+    group_to_id: dict[RetroSpecClusterGroup, int] = field(default_factory=dict)
+
+    @property
+    def capacity(self) -> int:
+        return self.page_counts.numel()
+
+    @property
+    def max_pages(self) -> int:
+        return self.page_ids.shape[1]
+
+    def _group_id(self, group: RetroSpecClusterGroup) -> int:
+        group_id = self.group_to_id.get(group)
+        if group_id is not None:
+            return group_id
+        group_id = len(self.groups)
+        self.groups.append(group)
+        self.group_to_id[group] = group_id
+        return group_id
+
+    def reserve(self, required_capacity: int, required_pages: int) -> None:
+        if required_capacity <= self.capacity and required_pages <= self.max_pages:
+            return
+
+        capacity = 1 << (max(required_capacity, 1) - 1).bit_length()
+        capacity = max(capacity, self.capacity)
+        max_pages = max(required_pages, self.max_pages)
+        # Publish/free can run on a CPU worker after an inference-mode prefill.
+        # Persistent descriptor storage must therefore remain mutable outside
+        # the inference-mode scope in which it was first allocated.
+        with torch.inference_mode(False):
+            page_ids = torch.full((capacity, max_pages), -1, dtype=torch.int64)
+            page_counts = torch.zeros(capacity, dtype=torch.int32)
+            group_ids = torch.full((capacity,), -1, dtype=torch.int64)
+            if self.capacity:
+                page_ids[: self.capacity, : self.max_pages].copy_(self.page_ids)
+                page_counts[: self.capacity].copy_(self.page_counts)
+                group_ids[: self.capacity].copy_(self.group_ids)
+        self.page_ids = page_ids
+        self.page_counts = page_counts
+        self.group_ids = group_ids
+
+    def publish(self, descriptors: dict[int, _ClusterBlockDescriptor]) -> None:
+        if not descriptors:
+            return
+
+        ordered = tuple(sorted(descriptors.items()))
+        required_pages = max(len(descriptor.page_ids) for _, descriptor in ordered)
+        self.reserve(ordered[-1][0] + 1, required_pages)
+        cluster_ids = torch.tensor(
+            [cluster_id for cluster_id, _ in ordered], dtype=torch.int64
+        )
+        pages = torch.full((len(ordered), self.max_pages), -1, dtype=torch.int64)
+        counts = torch.empty(len(ordered), dtype=torch.int32)
+        groups = torch.empty(len(ordered), dtype=torch.int64)
+        for row, (_, descriptor) in enumerate(ordered):
+            page_count = len(descriptor.page_ids)
+            pages[row, :page_count] = torch.tensor(
+                descriptor.page_ids, dtype=torch.int64
+            )
+            counts[row] = page_count
+            groups[row] = self._group_id(descriptor.identity.group)
+        self.page_ids.index_copy_(0, cluster_ids, pages)
+        self.page_counts.index_copy_(0, cluster_ids, counts)
+        self.group_ids.index_copy_(0, cluster_ids, groups)
+
+    def invalidate(self, cluster_ids: set[int]) -> None:
+        if not cluster_ids:
+            return
+        indices = torch.tensor(sorted(cluster_ids), dtype=torch.int64)
+        self.page_ids.index_fill_(0, indices, -1)
+        self.page_counts.index_fill_(0, indices, 0)
+        self.group_ids.index_fill_(0, indices, -1)
+
+    def resolve_groups(
+        self, cluster_ids: torch.Tensor, group_ids: torch.Tensor
+    ) -> dict[int, RetroSpecClusterGroup]:
+        return {
+            cluster_id: self.groups[group_id]
+            for cluster_id, group_id in zip(
+                cluster_ids.tolist(), group_ids.tolist(), strict=True
+            )
+        }
 
 
 @dataclass(frozen=True)
@@ -1642,6 +1811,7 @@ class _FullVerificationTransferBuffer:
     ) -> tuple[torch.Tensor, torch.Tensor, _PinnedPageTransferSlot]:
         """Gather one bounded selection from pageable slabs into pinned CPU."""
         self._ensure_cpu_slots(pool.dtype, pool.head_size)
+        page_ids_cpu = page_ids_cpu.reshape(-1).contiguous()
         num_pages = page_ids_cpu.numel()
         if num_pages > self._cpu_slot_capacity:
             raise RuntimeError(
@@ -1652,8 +1822,17 @@ class _FullVerificationTransferBuffer:
         slot = self._acquire_cpu_slot()
         staged_keys = slot.key_pages[:num_pages]
         staged_values = slot.value_pages[:num_pages]
+        source = pool.snapshot_full_verification_sources()
         try:
-            pool.read_into(page_ids_cpu.reshape(-1), staged_keys, staged_values)
+            ops.retrospec_gather_cluster_pages(
+                source.key_slabs,
+                source.value_slabs,
+                page_ids_cpu,
+                pool.page_size,
+                staged_keys,
+                staged_values,
+                self.gather_workers,
+            )
         except BaseException:
             self.release_cpu_slot(slot, None)
             raise
@@ -1984,6 +2163,7 @@ class RetroSpecClusterPageStore:
         self._cluster_block_descriptors: dict[
             str, dict[int, _ClusterBlockDescriptor]
         ] = {}
+        self._prefetch_descriptor_arenas: dict[str, _LayerPrefetchDescriptorArena] = {}
 
         # layer_name -> group -> number of owned CPU backing pages
         self._group_backing_page_counts: dict[
@@ -2023,10 +2203,9 @@ class RetroSpecClusterPageStore:
             torch.device, torch.cuda.Event
         ] = {}
         self._resident_prefetch_lock = Lock()
-        self._resident_prefetch_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="retrospec-resident-prefetch",
-        )
+        self._resident_prefetch_executor = _ResidentPrefetchPriorityExecutor()
+        self._resident_prefetch_next_sequence = 1
+        self._resident_prefetch_latest: dict[str, tuple[int, int]] = {}
         self._verification_miss_slots: dict[
             torch.device, list[_PinnedVerificationMissSlot]
         ] = {}
@@ -2184,6 +2363,19 @@ class RetroSpecClusterPageStore:
                 descriptor.page_ids
             )
 
+        descriptor_arena = self._prefetch_descriptor_arenas.setdefault(
+            layer_name, _LayerPrefetchDescriptorArena()
+        )
+        if new_descriptors:
+            required_pages = max(
+                len(descriptor.page_ids) for descriptor in new_descriptors.values()
+            )
+            descriptor_arena.reserve(cluster_id_end, required_pages)
+        resident_cache = self._resident_caches.get(layer_name)
+        if resident_cache is not None:
+            resident_cache.reserve_prefetch_handle_states(descriptor_arena.capacity)
+        descriptor_arena.publish(new_descriptors)
+
         allocated.update(new_descriptors)
         descriptors.update(new_descriptors)
 
@@ -2231,6 +2423,9 @@ class RetroSpecClusterPageStore:
                 )
 
         allocated.difference_update(released)
+        descriptor_arena = self._prefetch_descriptor_arenas.get(layer_name)
+        if descriptor_arena is not None:
+            descriptor_arena.invalidate(released)
 
         for cluster_id in released:
             del descriptors[cluster_id]
@@ -2662,6 +2857,9 @@ class RetroSpecClusterPageStore:
                 capacity,
             ),
         )
+        descriptor_arena = self._prefetch_descriptor_arenas.get(layer_name)
+        if descriptor_arena is not None:
+            resident_cache.reserve_prefetch_handle_states(descriptor_arena.capacity)
         return pool, resident_cache
 
     @staticmethod
@@ -3410,7 +3608,8 @@ class RetroSpecClusterPageStore:
     def _stage_resident_pages(
         self,
         pool: _LayerClusterPagePool,
-        logical_page_ids_cpu: torch.Tensor,
+        source_page_ids_cpu: torch.Tensor,
+        unique_page_ids_cpu: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -3418,16 +3617,18 @@ class RetroSpecClusterPageStore:
         _FullVerificationTransferBuffer,
         _PinnedPageTransferSlot | None,
     ]:
-        source_page_ids = torch.full_like(logical_page_ids_cpu, -1)
-        transfer_buffer = self._get_full_verification_buffer(pool)
-        unique_logical_pages = tuple(
-            dict.fromkeys(
-                page_id
-                for page_id in logical_page_ids_cpu.reshape(-1).tolist()
-                if page_id >= 0
+        if unique_page_ids_cpu is None:
+            logical_page_ids_cpu = source_page_ids_cpu
+            valid_page_mask = logical_page_ids_cpu >= 0
+            valid_page_ids = logical_page_ids_cpu[valid_page_mask]
+            unique_page_ids_cpu, inverse = torch.unique(
+                valid_page_ids, sorted=False, return_inverse=True
             )
-        )
-        num_pages = len(unique_logical_pages)
+            source_page_ids_cpu = torch.full_like(logical_page_ids_cpu, -1)
+            source_page_ids_cpu.masked_scatter_(valid_page_mask, inverse)
+
+        transfer_buffer = self._get_full_verification_buffer(pool)
+        num_pages = unique_page_ids_cpu.numel()
         if num_pages > transfer_buffer.cpu_slot_capacity(pool):
             raise RuntimeError(
                 "RetroSpec resident staging selection exceeds one fixed H2D slot"
@@ -3437,27 +3638,23 @@ class RetroSpecClusterPageStore:
             empty_shape = (0, pool.page_size, pool.head_size)
             empty_keys = torch.empty(empty_shape, dtype=pool.dtype, device="cpu")
             return (
-                source_page_ids,
+                source_page_ids_cpu,
                 empty_keys,
                 empty_keys.clone(),
                 transfer_buffer,
                 None,
             )
 
-        logical_pages = torch.tensor(unique_logical_pages, dtype=torch.int64)
         staged_keys, staged_values, slot = transfer_buffer.stage_cpu_pages(
-            pool, logical_pages
+            pool, unique_page_ids_cpu
         )
-        staging_id_by_page = {
-            page_id: staging_id
-            for staging_id, page_id in enumerate(unique_logical_pages)
-        }
-        flat_source_page_ids = source_page_ids.reshape(-1)
-        for position, page_id in enumerate(logical_page_ids_cpu.reshape(-1).tolist()):
-            staging_id = staging_id_by_page.get(page_id)
-            if staging_id is not None:
-                flat_source_page_ids[position] = staging_id
-        return source_page_ids, staged_keys, staged_values, transfer_buffer, slot
+        return (
+            source_page_ids_cpu,
+            staged_keys,
+            staged_values,
+            transfer_buffer,
+            slot,
+        )
 
     def _stage_missing_pages(
         self,
@@ -3727,6 +3924,8 @@ class RetroSpecClusterPageStore:
                 raise ValueError("Resident miss count must use the command device")
             if record.num_groups <= 0 or record.num_ranks <= 0:
                 raise ValueError("Resident prefetch layout must be positive")
+            if record.source not in _PREFETCH_SOURCE_PRIORITY:
+                raise ValueError("Unknown resident prefetch source")
             if self._canonical_cuda_device(cluster_ids.device) != device:
                 raise ValueError("Resident prefetch wave must use one CUDA device")
         return device
@@ -3781,6 +3980,8 @@ class RetroSpecClusterPageStore:
                         miss_count_cpu=count_cpu,
                         num_groups=record.num_groups,
                         num_ranks=record.num_ranks,
+                        source=record.source,
+                        sequence=record.sequence,
                     )
                     for record, (
                         cluster_ids_cpu,
@@ -3794,8 +3995,11 @@ class RetroSpecClusterPageStore:
                 progress=progress,
                 slot=slot,
             )
+            priority = max(
+                _PREFETCH_SOURCE_PRIORITY[record.source] for record in records
+            )
             future = self._resident_prefetch_executor.submit(
-                self._finish_resident_prefetch_wave, staged
+                priority, self._finish_resident_prefetch_wave, staged
             )
             ownership_transferred = True
 
@@ -3827,6 +4031,65 @@ class RetroSpecClusterPageStore:
                 stream.synchronize()
                 self._release_resident_prefetch_slot(slot)
             raise
+
+    def _stamp_resident_prefetch_records(
+        self,
+        records: tuple[RetroSpecResidentPrefetchInput, ...],
+    ) -> tuple[RetroSpecResidentPrefetchInput, ...]:
+        accepted: list[RetroSpecResidentPrefetchInput] = []
+        with self._resident_prefetch_lock:
+            for record in records:
+                priority = _PREFETCH_SOURCE_PRIORITY[record.source]
+                previous = self._resident_prefetch_latest.get(record.layer_name)
+                if previous is not None and priority < previous[0]:
+                    if self.performance_stats is not None:
+                        self.performance_stats.add_counter(
+                            "prefetch_lower_priority_dropped"
+                        )
+                    continue
+                sequence = self._resident_prefetch_next_sequence
+                self._resident_prefetch_next_sequence += 1
+                stamped = replace(record, sequence=sequence)
+                self._resident_prefetch_latest[record.layer_name] = (
+                    priority,
+                    sequence,
+                )
+                accepted.append(stamped)
+        return tuple(accepted)
+
+    def _resident_prefetch_record_is_current(
+        self, record: _StagedResidentPrefetchRecord
+    ) -> bool:
+        priority = _PREFETCH_SOURCE_PRIORITY[record.source]
+        with self._resident_prefetch_lock:
+            return self._resident_prefetch_latest.get(record.layer_name) == (
+                priority,
+                record.sequence,
+            )
+
+    def _complete_resident_prefetch_record(
+        self, record: _StagedResidentPrefetchRecord
+    ) -> None:
+        priority = _PREFETCH_SOURCE_PRIORITY[record.source]
+        with self._resident_prefetch_lock:
+            if self._resident_prefetch_latest.get(record.layer_name) == (
+                priority,
+                record.sequence,
+            ):
+                self._resident_prefetch_latest.pop(record.layer_name)
+
+    def _discard_resident_prefetch_records(
+        self, records: Sequence[RetroSpecResidentPrefetchInput]
+    ) -> None:
+        """Forget commands that failed before ownership reached the worker."""
+        with self._resident_prefetch_lock:
+            for record in records:
+                priority = _PREFETCH_SOURCE_PRIORITY[record.source]
+                if self._resident_prefetch_latest.get(record.layer_name) == (
+                    priority,
+                    record.sequence,
+                ):
+                    self._resident_prefetch_latest.pop(record.layer_name)
 
     def _defer_resident_prefetch_wave(
         self,
@@ -3938,9 +4201,13 @@ class RetroSpecClusterPageStore:
                 self._release_resident_prefetch_slot(slot)
                 continue
 
-            self._submit_resident_prefetch_wave(
-                current.records, slot, current.source_ready_events
-            )
+            try:
+                self._submit_resident_prefetch_wave(
+                    current.records, slot, current.source_ready_events
+                )
+            except BaseException:
+                self._discard_resident_prefetch_records(current.records)
+                raise
             return True
 
     def _auto_submit_deferred_resident_prefetch(
@@ -3975,122 +4242,129 @@ class RetroSpecClusterPageStore:
                 torch.cuda.current_stream(device).wait_event(metadata_event)
 
     @torch.inference_mode()
-    def _order_resident_prefetch_wave(
+    def _prepare_resident_prefetch_wave(
         self,
         records: tuple[_StagedResidentPrefetchRecord, ...],
-    ) -> tuple[torch.Tensor, ...]:
-        ordered_records, raw_counts = ops.retrospec_order_prefetch_misses(
-            tuple(record.miss_cluster_ids_cpu for record in records),
-            tuple(record.miss_positions_cpu for record in records),
-            tuple(record.miss_count_cpu for record in records),
-            tuple(record.num_groups for record in records),
-            tuple(record.num_ranks for record in records),
-        )
-        raw_command_count = int(raw_counts.sum().item())
-        unique_command_count = sum(record.numel() for record in ordered_records)
-
-        if self.performance_stats is not None:
-            self.performance_stats.add_counter(
-                "prefetch_miss_commands", unique_command_count
-            )
-            self.performance_stats.add_counter(
-                "prefetch_duplicate_misses",
-                raw_command_count - unique_command_count,
-            )
-
-        return tuple(ordered_records)
-
-    @torch.inference_mode()
-    def _prepare_resident_prefetch_record(
-        self,
-        staged: _StagedResidentPrefetchRecord,
-        ordered_cluster_ids: torch.Tensor,
-    ) -> _PreparedResidentPrefetchRecord | None:
-        if ordered_cluster_ids.numel() == 0:
-            return None
-
-        stats = self.performance_stats
-        stale_commands = 0
-        skipped_resident = 0
-        skipped_pending = 0
+    ) -> tuple[_PreparedResidentPrefetchRecord | None, ...]:
+        pools: list[_LayerClusterPagePool] = []
+        resident_caches: list[RetroSpecResidentClusterCache] = []
+        descriptor_arenas: list[_LayerPrefetchDescriptorArena] = []
+        page_capacities: list[int] = []
         with self._resident_state_lock:
-            pool, resident_cache = self._get_or_create_resident_cache(staged.layer_name)
-            descriptors = self._cluster_block_descriptors.get(staged.layer_name, {})
-            transfer_buffer = self._get_full_verification_buffer(pool)
-            page_capacity = transfer_buffer.cpu_slot_capacity(pool)
-
-            known_cluster_ids: list[int] = []
-            for cluster_id in ordered_cluster_ids.tolist():
-                if cluster_id not in descriptors:
-                    stale_commands += 1
-                    continue
-                known_cluster_ids.append(cluster_id)
-
-            with resident_cache.mutation_guard():
-                (
-                    admission_candidates,
-                    skipped_resident,
-                    skipped_pending,
-                ) = resident_cache.partition_admission_candidates(known_cluster_ids)
-
-            selected_cluster_ids: list[int] = []
-            selected_descriptors: list[_ClusterBlockDescriptor] = []
-            selected_pages: set[int] = set()
-            for cluster_id in admission_candidates:
-                descriptor = descriptors[cluster_id]
-                new_pages = tuple(
-                    page_id
-                    for page_id in descriptor.page_ids
-                    if page_id not in selected_pages
+            for record in records:
+                pool, resident_cache = self._get_or_create_resident_cache(
+                    record.layer_name
                 )
-                if len(selected_pages) + len(new_pages) > page_capacity:
-                    break
-
-                selected_cluster_ids.append(cluster_id)
-                selected_descriptors.append(descriptor)
-                selected_pages.update(new_pages)
-
-            if not selected_cluster_ids:
-                prepared = None
-            else:
-                max_pages = max(
-                    len(descriptor.page_ids) for descriptor in selected_descriptors
+                descriptor_arena = self._prefetch_descriptor_arenas.get(
+                    record.layer_name
                 )
-                cluster_ids_cpu = torch.tensor(selected_cluster_ids, dtype=torch.int64)
-                page_ids_cpu = torch.full(
-                    (len(selected_cluster_ids), max_pages),
-                    -1,
-                    dtype=torch.int64,
-                )
-                cluster_groups: dict[int, RetroSpecClusterGroup] = {}
-                for row_index, (cluster_id, descriptor) in enumerate(
-                    zip(selected_cluster_ids, selected_descriptors)
-                ):
-                    page_count = len(descriptor.page_ids)
-                    page_ids_cpu[row_index, :page_count] = torch.tensor(
-                        descriptor.page_ids, dtype=torch.int64
+                if descriptor_arena is None:
+                    raise RuntimeError(
+                        f"Missing prefetch descriptors for {record.layer_name!r}"
                     )
-                    cluster_groups[cluster_id] = descriptor.identity.group
+                resident_cache.reserve_prefetch_handle_states(descriptor_arena.capacity)
+                transfer_buffer = self._get_full_verification_buffer(pool)
+                pools.append(pool)
+                resident_caches.append(resident_cache)
+                descriptor_arenas.append(descriptor_arena)
+                page_capacities.append(transfer_buffer.cpu_slot_capacity(pool))
+            plan_started_at = (
+                perf_counter()
+                if self.performance_stats is not None and self.performance_stats.enabled
+                else None
+            )
+            (
+                cluster_ids,
+                page_ids,
+                source_page_ids,
+                unique_page_ids,
+                group_ids,
+                statistics,
+            ) = ops.retrospec_plan_prefetch_admissions(
+                tuple(record.miss_cluster_ids_cpu for record in records),
+                tuple(record.miss_positions_cpu for record in records),
+                tuple(record.miss_count_cpu for record in records),
+                tuple(record.num_groups for record in records),
+                tuple(record.num_ranks for record in records),
+                tuple(arena.page_ids for arena in descriptor_arenas),
+                tuple(arena.page_counts for arena in descriptor_arenas),
+                tuple(arena.group_ids for arena in descriptor_arenas),
+                tuple(
+                    cache.prefetch_handle_states(arena.capacity)
+                    for cache, arena in zip(
+                        resident_caches, descriptor_arenas, strict=True
+                    )
+                ),
+                tuple(page_capacities),
+            )
 
-                prepared = _PreparedResidentPrefetchRecord(
-                    layer_name=staged.layer_name,
+        if plan_started_at is not None:
+            assert self.performance_stats is not None
+            self.performance_stats.record_cpu_time(
+                "prefetch_native_plan_wall", perf_counter() - plan_started_at
+            )
+        if self.performance_stats is not None:
+            totals = statistics.sum(dim=0).tolist()
+            counter_names = (
+                "prefetch_raw_commands",
+                "prefetch_miss_commands",
+                "prefetch_stale_commands",
+                "prefetch_skipped_pending_clusters",
+                "prefetch_skipped_resident_clusters",
+                "prefetch_planned_clusters",
+                "prefetch_planned_pages",
+                "prefetch_budget_stops",
+            )
+            for name, value in zip(counter_names, totals, strict=True):
+                if value:
+                    self.performance_stats.add_counter(name, value)
+            duplicate_count = totals[0] - totals[1]
+            if duplicate_count:
+                self.performance_stats.add_counter(
+                    "prefetch_duplicate_misses", duplicate_count
+                )
+
+        prepared: list[_PreparedResidentPrefetchRecord | None] = []
+        for (
+            record,
+            pool,
+            resident_cache,
+            descriptor_arena,
+            record_cluster_ids,
+            record_page_ids,
+            record_source_page_ids,
+            record_unique_page_ids,
+            record_group_ids,
+        ) in zip(
+            records,
+            pools,
+            resident_caches,
+            descriptor_arenas,
+            cluster_ids,
+            page_ids,
+            source_page_ids,
+            unique_page_ids,
+            group_ids,
+            strict=True,
+        ):
+            if record_cluster_ids.numel() == 0:
+                prepared.append(None)
+                continue
+            prepared.append(
+                _PreparedResidentPrefetchRecord(
+                    layer_name=record.layer_name,
                     pool=pool,
                     resident_cache=resident_cache,
-                    cluster_ids_cpu=cluster_ids_cpu,
-                    page_ids_cpu=page_ids_cpu,
-                    cluster_groups=cluster_groups,
+                    cluster_ids_cpu=record_cluster_ids,
+                    page_ids_cpu=record_page_ids,
+                    source_page_ids_cpu=record_source_page_ids,
+                    unique_page_ids_cpu=record_unique_page_ids,
+                    cluster_groups=descriptor_arena.resolve_groups(
+                        record_cluster_ids, record_group_ids
+                    ),
                 )
-
-        if stats is not None:
-            if stale_commands:
-                stats.add_counter("prefetch_stale_commands", stale_commands)
-            if skipped_resident:
-                stats.add_counter(
-                    "prefetch_skipped_resident_clusters", skipped_resident
-                )
-            if skipped_pending:
-                stats.add_counter("prefetch_skipped_pending_clusters", skipped_pending)
-        return prepared
+            )
+        return tuple(prepared)
 
     @torch.inference_mode()
     def _process_prepared_resident_prefetch(
@@ -4104,7 +4378,11 @@ class RetroSpecClusterPageStore:
             source_value_pages,
             transfer_buffer,
             transfer_slot,
-        ) = self._stage_resident_pages(prepared.pool, prepared.page_ids_cpu)
+        ) = self._stage_resident_pages(
+            prepared.pool,
+            prepared.source_page_ids_cpu,
+            prepared.unique_page_ids_cpu,
+        )
 
         with (
             self._resident_state_lock,
@@ -4147,6 +4425,7 @@ class RetroSpecClusterPageStore:
         )
         slot_released = False
         completed = False
+        active_records: list[_StagedResidentPrefetchRecord] = []
         try:
             metadata_wait_started_at = (
                 perf_counter() if stats is not None and stats.enabled else None
@@ -4158,27 +4437,38 @@ class RetroSpecClusterPageStore:
                     perf_counter() - metadata_wait_started_at,
                 )
 
-            ordered_records = self._order_resident_prefetch_wave(staged.records)
+            for record in staged.records:
+                if self._resident_prefetch_record_is_current(record):
+                    active_records.append(record)
+                else:
+                    staged.progress.complete_layer(record.layer_name)
+                    if stats is not None:
+                        stats.add_counter("prefetch_superseded_records")
             self._release_resident_prefetch_slot(staged.slot)
             slot_released = True
             self._auto_submit_deferred_resident_prefetch(staged.device)
 
-            for staged_record, ordered_cluster_ids in zip(
-                staged.records, ordered_records
+            prepared_records = (
+                self._prepare_resident_prefetch_wave(tuple(active_records))
+                if active_records
+                else ()
+            )
+            for staged_record, prepared in zip(
+                active_records, prepared_records, strict=True
             ):
-                prepared = self._prepare_resident_prefetch_record(
-                    staged_record, ordered_cluster_ids
-                )
                 if prepared is not None:
                     self._process_prepared_resident_prefetch(
                         prepared, staged.execution_stream
                     )
+                self._complete_resident_prefetch_record(staged_record)
                 staged.progress.complete_layer(staged_record.layer_name)
             completed = True
         except BaseException as error:
             staged.progress.fail(error)
             raise
         finally:
+            for record in active_records:
+                self._complete_resident_prefetch_record(record)
             if stats is not None:
                 stats.add_counter(
                     "prefetch_worker_completed"
@@ -4265,6 +4555,7 @@ class RetroSpecClusterPageStore:
         layer_name: str,
         cluster_ids: torch.Tensor,
         access_kinds: torch.Tensor,
+        source: RetroSpecResidentPrefetchSource = "draft",
     ) -> bool:
         """Compatibility wrapper for a one-layer resident-prefetch wave."""
         if self._closed:
@@ -4307,6 +4598,7 @@ class RetroSpecClusterPageStore:
                         compact_cluster_ids.shape[0] * compact_cluster_ids.shape[1]
                     ),
                     num_ranks=compact_cluster_ids.shape[2],
+                    source=source,
                 ),
             )
         )
@@ -4325,18 +4617,24 @@ class RetroSpecClusterPageStore:
             return False
         if not self.pin_memory:
             return False
-
         device = self._validate_resident_prefetch_wave(records)
-        layer_names = tuple(record.layer_name for record in records)
-        self._reap_resident_prefetches(layer_names, wait=False)
-        self._try_submit_deferred_resident_prefetch(device, wait_for_slot=False)
-        slot = self._acquire_resident_prefetch_slot(device)
-        if slot is None:
-            self._defer_resident_prefetch_wave(device, records)
-            return True
+        records = self._stamp_resident_prefetch_records(records)
+        if not records:
+            return False
+        try:
+            layer_names = tuple(record.layer_name for record in records)
+            self._reap_resident_prefetches(layer_names, wait=False)
+            self._try_submit_deferred_resident_prefetch(device, wait_for_slot=False)
+            slot = self._acquire_resident_prefetch_slot(device)
+            if slot is None:
+                self._defer_resident_prefetch_wave(device, records)
+                return True
 
-        self._submit_resident_prefetch_wave(records, slot, source_ready_events=None)
-        return True
+            self._submit_resident_prefetch_wave(records, slot, source_ready_events=None)
+            return True
+        except BaseException:
+            self._discard_resident_prefetch_records(records)
+            raise
 
     def wait_for_resident_prefetches(
         self,

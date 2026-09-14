@@ -231,3 +231,103 @@ void retrospec_gather_compact_kv(const std::vector<torch::Tensor>& key_slabs,
 
   parallel_copy_spans(spans, num_workers);
 }
+
+void retrospec_gather_cluster_pages(
+    const std::vector<torch::Tensor>& key_slabs,
+    const std::vector<torch::Tensor>& value_slabs,
+    const torch::Tensor& page_ids, int64_t page_size, torch::Tensor& key_output,
+    torch::Tensor& value_output, int64_t num_workers) {
+  TORCH_CHECK(key_slabs.size() == value_slabs.size(),
+              "Key/value slab counts differ");
+  TORCH_CHECK(page_ids.device().is_cpu(),
+              "Cluster page IDs must reside on CPU");
+  TORCH_CHECK(page_ids.scalar_type() == at::kLong,
+              "Cluster page IDs must use int64");
+  TORCH_CHECK(page_ids.dim() == 1 && page_ids.is_contiguous(),
+              "Cluster page IDs must be contiguous and one-dimensional");
+  TORCH_CHECK(key_output.device().is_cpu() && value_output.device().is_cpu(),
+              "Cluster page outputs must reside on CPU");
+  TORCH_CHECK(key_output.sizes() == value_output.sizes(),
+              "Cluster page output shapes differ");
+  TORCH_CHECK(key_output.dim() == 3,
+              "Cluster page outputs must have shape [pages, page_size, head]");
+  TORCH_CHECK(key_output.size(0) == page_ids.numel(),
+              "Cluster page output count differs from page IDs");
+  TORCH_CHECK(key_output.size(1) == page_size,
+              "Cluster page output page size differs");
+  TORCH_CHECK(key_output.scalar_type() == value_output.scalar_type(),
+              "Cluster page output dtypes differ");
+  TORCH_CHECK(key_output.is_contiguous() && value_output.is_contiguous(),
+              "Cluster page outputs must be contiguous");
+  TORCH_CHECK(num_workers > 0,
+              "Cluster page gather worker count must be positive");
+
+  constexpr uint64_t kPageOffsetMask = (uint64_t{1} << 32) - 1;
+  const int64_t head_size = key_output.size(2);
+  const size_t page_bytes =
+      static_cast<size_t>(page_size) * head_size * key_output.element_size();
+
+  for (size_t slab_index = 0; slab_index < key_slabs.size(); ++slab_index) {
+    validate_slab_pair(key_slabs[slab_index], value_slabs[slab_index],
+                       key_output);
+    TORCH_CHECK(key_slabs[slab_index].dim() == 3,
+                "Cluster page slab must be three-dimensional");
+    TORCH_CHECK(key_slabs[slab_index].size(1) == page_size &&
+                    key_slabs[slab_index].size(2) == head_size,
+                "Cluster page slab layout differs from output");
+  }
+
+  const auto* page_id_data = page_ids.data_ptr<int64_t>();
+  char* key_destination = reinterpret_cast<char*>(key_output.data_ptr());
+  char* value_destination = reinterpret_cast<char*>(value_output.data_ptr());
+  std::vector<CopySpan> spans;
+  spans.reserve(page_ids.numel());
+
+  for (int64_t destination_page = 0; destination_page < page_ids.numel();
+       ++destination_page) {
+    const int64_t encoded_page_id = page_id_data[destination_page];
+    TORCH_CHECK(encoded_page_id >= 0,
+                "Cluster page gather received an invalid page ID");
+    const uint64_t page_id = static_cast<uint64_t>(encoded_page_id);
+    const int64_t slab_id = page_id >> 32;
+    const int64_t page_offset = page_id & kPageOffsetMask;
+    TORCH_CHECK(
+        slab_id >= 0 && slab_id < static_cast<int64_t>(key_slabs.size()),
+        "Cluster page references an unknown slab");
+
+    const torch::Tensor& key_slab = key_slabs[slab_id];
+    const torch::Tensor& value_slab = value_slabs[slab_id];
+    TORCH_CHECK(page_offset < key_slab.size(0),
+                "Cluster page offset exceeds slab capacity");
+    const size_t source_byte_offset =
+        static_cast<size_t>(page_offset) * page_bytes;
+    const size_t destination_byte_offset =
+        static_cast<size_t>(destination_page) * page_bytes;
+    CopySpan next{
+        reinterpret_cast<const char*>(key_slab.data_ptr()) + source_byte_offset,
+        reinterpret_cast<const char*>(value_slab.data_ptr()) +
+            source_byte_offset,
+        key_destination + destination_byte_offset,
+        value_destination + destination_byte_offset,
+        page_bytes,
+    };
+
+    if (!spans.empty()) {
+      CopySpan& previous = spans.back();
+      const bool contiguous =
+          previous.key_source + previous.num_bytes == next.key_source &&
+          previous.value_source + previous.num_bytes == next.value_source &&
+          previous.key_destination + previous.num_bytes ==
+              next.key_destination &&
+          previous.value_destination + previous.num_bytes ==
+              next.value_destination;
+      if (contiguous) {
+        previous.num_bytes += next.num_bytes;
+        continue;
+      }
+    }
+    spans.push_back(next);
+  }
+
+  parallel_copy_spans(spans, num_workers);
+}

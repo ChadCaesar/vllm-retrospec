@@ -53,12 +53,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &retrospec_gather_compact_kv);
 
   ops.def(
-      "retrospec_order_prefetch_misses("
+      "retrospec_plan_prefetch_admissions("
       "Tensor[] cluster_id_records, Tensor[] position_records, "
-      "Tensor[] count_records, int[] num_groups, int[] num_ranks) "
-      "-> (Tensor[], Tensor)");
-  ops.impl("retrospec_order_prefetch_misses", torch::kCPU,
-           &retrospec_order_prefetch_misses);
+      "Tensor[] count_records, int[] num_groups, int[] num_ranks, "
+      "Tensor[] descriptor_page_ids, Tensor[] descriptor_page_counts, "
+      "Tensor[] descriptor_group_ids, Tensor[] resident_states, "
+      "int[] page_capacities) "
+      "-> (Tensor[], Tensor[], Tensor[], Tensor[], Tensor[], Tensor)");
+  ops.impl("retrospec_plan_prefetch_admissions", torch::kCPU,
+           &retrospec_plan_prefetch_admissions);
+
+  ops.def(
+      "retrospec_gather_cluster_pages("
+      "Tensor[] key_slabs, Tensor[] value_slabs, Tensor page_ids, "
+      "int page_size, Tensor! key_output, Tensor! value_output, "
+      "int num_workers) -> ()");
+  ops.impl("retrospec_gather_cluster_pages", torch::kCPU,
+           &retrospec_gather_cluster_pages);
 
   // Attention ops
   // Compute the attention between an input query and the cached

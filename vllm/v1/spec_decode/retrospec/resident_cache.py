@@ -21,6 +21,10 @@ from .resident_kernels import (
 _ClusterId = int
 _LogicalPages = tuple[int, ...]
 
+_PREFETCH_ABSENT = 0
+_PREFETCH_PENDING = 1
+_PREFETCH_RESIDENT = 2
+
 
 @dataclass(frozen=True)
 class _PendingCopyBatch:
@@ -218,6 +222,7 @@ class RetroSpecResidentClusterCache:
         self._handle_to_bucket: dict[_ClusterId, int] = {}
         self._bucket_handles: list[int] = []
         self._handle_table_needs_rebuild = False
+        self._prefetch_handle_states = torch.zeros(0, dtype=torch.uint8, device="cpu")
 
     @property
     def capacity(self) -> int:
@@ -278,6 +283,47 @@ class RetroSpecResidentClusterCache:
                 resident_count += 1
 
         return tuple(admission_candidates), resident_count, pending_count
+
+    def reserve_prefetch_handle_states(self, required_capacity: int) -> None:
+        if required_capacity < 0:
+            raise ValueError("Prefetch handle-state capacity must be non-negative")
+        if required_capacity <= self._prefetch_handle_states.numel():
+            return
+
+        capacity = self._next_power_of_two(max(required_capacity, 1))
+        # This shadow is updated by the background worker after CUDA events
+        # complete, which can happen outside the model runner's inference-mode
+        # scope. Keep its storage as a normal tensor even when the cache is
+        # first initialized from an inference-mode prefill call.
+        with torch.inference_mode(False):
+            states = torch.zeros(capacity, dtype=torch.uint8, device="cpu")
+            states[: self._prefetch_handle_states.numel()].copy_(
+                self._prefetch_handle_states
+            )
+        self._prefetch_handle_states = states
+
+    def _set_prefetch_handle_state(
+        self, cluster_ids: Collection[_ClusterId], state: int
+    ) -> None:
+        cluster_ids = tuple(dict.fromkeys(cluster_ids))
+        if not cluster_ids:
+            return
+        if state not in (
+            _PREFETCH_ABSENT,
+            _PREFETCH_PENDING,
+            _PREFETCH_RESIDENT,
+        ):
+            raise ValueError("Invalid resident prefetch state")
+
+        self.reserve_prefetch_handle_states(max(cluster_ids) + 1)
+        indices = torch.tensor(cluster_ids, dtype=torch.int64, device="cpu")
+        self._prefetch_handle_states.index_fill_(0, indices, state)
+
+    def prefetch_handle_states(self, required_capacity: int) -> torch.Tensor:
+        """Return the CPU planner shadow after reaping completed H2D copies."""
+        self._reap_completed_copy_batches()
+        self.reserve_prefetch_handle_states(required_capacity)
+        return self._prefetch_handle_states[:required_capacity]
 
     def _find_handle_bucket(self, cluster_id: _ClusterId) -> int | None:
         if self._handle_table_capacity == 0:
@@ -508,6 +554,7 @@ class RetroSpecResidentClusterCache:
                 pending_event = self._pending_cluster_events.get(cluster_id)
                 if pending_event is batch.ready_event:
                     del self._pending_cluster_events[cluster_id]
+            self._set_prefetch_handle_state(batch.cluster_ids, _PREFETCH_RESIDENT)
 
     def _record_copy_batch(
         self,
@@ -586,9 +633,11 @@ class RetroSpecResidentClusterCache:
 
         # Every batch uses one copy stream, so completion of the final event also
         # implies completion of all earlier batches.
+        pending_cluster_ids = tuple(self._pending_cluster_events)
         self._pending_copy_batches[-1].ready_event.synchronize()
         self._pending_copy_batches.clear()
         self._pending_cluster_events.clear()
+        self._set_prefetch_handle_state(pending_cluster_ids, _PREFETCH_RESIDENT)
 
     def _grow_storage(self, required_capacity: int) -> None:
         if required_capacity <= self._physical_capacity:
@@ -653,6 +702,7 @@ class RetroSpecResidentClusterCache:
 
         for logical_page_id in logical_pages:
             self._page_to_cluster[logical_page_id] = cluster_id
+        self._set_prefetch_handle_state((cluster_id,), _PREFETCH_PENDING)
 
     def _touch_cluster(self, cluster_id: _ClusterId) -> None:
         """Mark a resident cluster as recent within its owning group."""
@@ -685,6 +735,7 @@ class RetroSpecResidentClusterCache:
         slots = self._cluster_to_slots.pop(cluster_id, None)
         if slots is None:
             return
+        self._set_prefetch_handle_state((cluster_id,), _PREFETCH_ABSENT)
 
         if update_stream is None:
             update_stream = torch.cuda.current_stream(self.device)

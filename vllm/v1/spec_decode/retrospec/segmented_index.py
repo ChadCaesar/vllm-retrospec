@@ -2606,6 +2606,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             layer_name=layer_name,
             cluster_ids=cluster_handles,
             access_kinds=access_kinds,
+            source="prefill_hint",
         )
 
     def prefetch_final_prefill_queries(
@@ -4085,6 +4086,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             miss_count=count,
             num_groups=selection.prefetch_num_groups,
             num_ranks=selection.prefetch_num_ranks,
+            source="draft",
         )
 
     def submit_sparse_verification_prefetch_wave(

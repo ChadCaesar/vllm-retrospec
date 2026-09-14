@@ -1412,11 +1412,11 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
     store.close()
 
 
-def test_resident_prefetch_native_batch_preserves_rank_priority_and_miss():
-    ordered_ids, raw_counts = ops.retrospec_order_prefetch_misses(
+def test_resident_prefetch_native_batch_plans_rank_priority_and_pages():
+    outputs = ops.retrospec_plan_prefetch_admissions(
         (
-            torch.tensor([10, 11, 10, -1], dtype=torch.int64),
-            torch.tensor([20, 21, -1], dtype=torch.int64),
+            torch.tensor([0, 1, 0, -1], dtype=torch.int64),
+            torch.tensor([0, 1, -1], dtype=torch.int64),
         ),
         (
             torch.tensor([4, 1, 4, -1], dtype=torch.int64),
@@ -1428,32 +1428,76 @@ def test_resident_prefetch_native_batch_preserves_rank_priority_and_miss():
         ),
         (2, 2),
         (3, 2),
+        (
+            torch.tensor([[10, -1], [11, 12]], dtype=torch.int64),
+            torch.tensor([[20, -1], [21, 22]], dtype=torch.int64),
+        ),
+        (
+            torch.tensor([1, 2], dtype=torch.int32),
+            torch.tensor([1, 2], dtype=torch.int32),
+        ),
+        (
+            torch.tensor([0, 1], dtype=torch.int64),
+            torch.tensor([0, 1], dtype=torch.int64),
+        ),
+        (
+            torch.zeros(2, dtype=torch.uint8),
+            torch.zeros(2, dtype=torch.uint8),
+        ),
+        (3, 3),
     )
 
-    assert tuple(record.tolist() for record in ordered_ids) == ([11, 10], [21, 20])
-    assert raw_counts.tolist() == [3, 2]
+    cluster_ids, page_ids, source_page_ids, unique_page_ids, group_ids, stats = outputs
+    assert tuple(record.tolist() for record in cluster_ids) == ([1, 0], [1, 0])
+    assert tuple(record.tolist() for record in page_ids) == (
+        [[11, 12], [10, -1]],
+        [[21, 22], [20, -1]],
+    )
+    assert tuple(record.tolist() for record in source_page_ids) == (
+        [[0, 1], [2, -1]],
+        [[0, 1], [2, -1]],
+    )
+    assert tuple(record.tolist() for record in unique_page_ids) == (
+        [11, 12, 10],
+        [21, 22, 20],
+    )
+    assert tuple(record.tolist() for record in group_ids) == ([1, 0], [1, 0])
+    assert stats.tolist() == [
+        [3, 2, 0, 0, 0, 2, 3, 0],
+        [2, 2, 0, 0, 0, 2, 3, 0],
+    ]
 
 
 def test_resident_prefetch_native_batch_ignores_unused_suffix():
-    ordered_ids, raw_counts = ops.retrospec_order_prefetch_misses(
+    outputs = ops.retrospec_plan_prefetch_admissions(
         (torch.tensor([-1, -1], dtype=torch.int64),),
         (torch.tensor([-1, -1], dtype=torch.int64),),
         (torch.tensor([0], dtype=torch.int32),),
         (1,),
         (2,),
+        (torch.tensor([[-1]], dtype=torch.int64),),
+        (torch.zeros(1, dtype=torch.int32),),
+        (torch.full((1,), -1, dtype=torch.int64),),
+        (torch.zeros(1, dtype=torch.uint8),),
+        (1,),
     )
 
-    assert ordered_ids[0].numel() == 0
-    assert raw_counts.tolist() == [0]
+    assert all(records[0].numel() == 0 for records in outputs[:5])
+    assert outputs[5].tolist() == [[0, 0, 0, 0, 0, 0, 0, 0]]
 
 
 def test_resident_prefetch_native_batch_rejects_invalid_prefix():
     with pytest.raises(RuntimeError, match="count exceeds"):
-        ops.retrospec_order_prefetch_misses(
+        ops.retrospec_plan_prefetch_admissions(
             (torch.tensor([10], dtype=torch.int64),),
             (torch.tensor([0], dtype=torch.int64),),
             (torch.tensor([2], dtype=torch.int32),),
             (1,),
+            (1,),
+            (torch.tensor([[0]], dtype=torch.int64),),
+            (torch.ones(1, dtype=torch.int32),),
+            (torch.zeros(1, dtype=torch.int64),),
+            (torch.zeros(1, dtype=torch.uint8),),
             (1,),
         )
 
@@ -1461,22 +1505,171 @@ def test_resident_prefetch_native_batch_rejects_invalid_prefix():
 @pytest.mark.parametrize(
     ("cluster_id", "position", "error"),
     (
-        (-1, 0, "invalid cluster handle"),
-        (10, -1, "outside its layout"),
-        (10, 1, "outside its layout"),
+        (-1, 0, "invalid handle"),
+        (0, -1, "out of range"),
+        (0, 1, "out of range"),
     ),
 )
 def test_resident_prefetch_native_batch_rejects_invalid_commands(
     cluster_id: int, position: int, error: str
 ):
     with pytest.raises(RuntimeError, match=error):
-        ops.retrospec_order_prefetch_misses(
+        ops.retrospec_plan_prefetch_admissions(
             (torch.tensor([cluster_id], dtype=torch.int64),),
             (torch.tensor([position], dtype=torch.int64),),
             (torch.tensor([1], dtype=torch.int32),),
             (1,),
             (1,),
+            (torch.tensor([[0]], dtype=torch.int64),),
+            (torch.ones(1, dtype=torch.int32),),
+            (torch.zeros(1, dtype=torch.int64),),
+            (torch.zeros(1, dtype=torch.uint8),),
+            (1,),
         )
+
+
+def test_resident_prefetch_native_batch_filters_state_and_honors_budget():
+    outputs = ops.retrospec_plan_prefetch_admissions(
+        (torch.tensor([0, 1, 2, 3], dtype=torch.int64),),
+        (torch.arange(4, dtype=torch.int64),),
+        (torch.tensor([4], dtype=torch.int32),),
+        (1,),
+        (4,),
+        (torch.tensor([[10, -1], [11, -1], [12, -1], [13, 14]], dtype=torch.int64),),
+        (torch.tensor([1, 1, 1, 2], dtype=torch.int32),),
+        (torch.arange(4, dtype=torch.int64),),
+        (torch.tensor([1, 2, 0, 0], dtype=torch.uint8),),
+        (1,),
+    )
+
+    assert outputs[0][0].tolist() == [2]
+    assert outputs[3][0].tolist() == [12]
+    assert outputs[5].tolist() == [[4, 4, 0, 1, 1, 1, 1, 1]]
+
+
+def test_native_cluster_page_gather_reads_encoded_slab_ranges():
+    key_slabs = (
+        torch.arange(4, dtype=torch.float32).view(2, 2, 1),
+        torch.arange(6, dtype=torch.float32).view(3, 2, 1) + 10,
+    )
+    value_slabs = tuple(slab + 100 for slab in key_slabs)
+    page_ids = torch.tensor(
+        [
+            cluster_store_module._LayerClusterPagePool.encode_page_id(0, 1),
+            cluster_store_module._LayerClusterPagePool.encode_page_id(1, 0),
+            cluster_store_module._LayerClusterPagePool.encode_page_id(1, 2),
+        ],
+        dtype=torch.int64,
+    )
+    key_output = torch.empty((3, 2, 1), dtype=torch.float32)
+    value_output = torch.empty_like(key_output)
+
+    ops.retrospec_gather_cluster_pages(
+        key_slabs, value_slabs, page_ids, 2, key_output, value_output, 2
+    )
+
+    torch.testing.assert_close(
+        key_output,
+        torch.stack((key_slabs[0][1], key_slabs[1][0], key_slabs[1][2])),
+    )
+    torch.testing.assert_close(value_output, key_output + 100)
+
+
+def test_prefetch_descriptor_arena_preserves_and_invalidates_stable_handles():
+    arena = cluster_store_module._LayerPrefetchDescriptorArena()
+    first_group = RetroSpecClusterGroup("first", 0)
+    second_group = RetroSpecClusterGroup("second", 1)
+    arena.publish(
+        {
+            1: cluster_store_module._ClusterBlockDescriptor(
+                RetroSpecClusterIdentity(first_group, 3), (10, 11), (2, 1)
+            )
+        }
+    )
+    arena.publish(
+        {
+            4: cluster_store_module._ClusterBlockDescriptor(
+                RetroSpecClusterIdentity(second_group, 7), (20,), (2,)
+            )
+        }
+    )
+
+    assert arena.capacity >= 5
+    assert arena.page_ids[1, :2].tolist() == [10, 11]
+    assert arena.page_counts.tolist()[1] == 2
+    assert arena.resolve_groups(
+        torch.tensor([1, 4]), arena.group_ids.index_select(0, torch.tensor([1, 4]))
+    ) == {1: first_group, 4: second_group}
+
+    arena.invalidate({1})
+    assert arena.page_counts[1].item() == 0
+    assert arena.group_ids[1].item() == -1
+    assert torch.all(arena.page_ids[1] == -1)
+
+    outputs = ops.retrospec_plan_prefetch_admissions(
+        (torch.tensor([1], dtype=torch.int64),),
+        (torch.tensor([0], dtype=torch.int64),),
+        (torch.tensor([1], dtype=torch.int32),),
+        (1,),
+        (1,),
+        (arena.page_ids,),
+        (arena.page_counts,),
+        (arena.group_ids,),
+        (torch.zeros(arena.capacity, dtype=torch.uint8),),
+        (2,),
+    )
+    assert outputs[0][0].numel() == 0
+    assert outputs[5].tolist() == [[1, 1, 1, 0, 0, 0, 0, 0]]
+
+
+def test_resident_prefetch_source_priority_supersedes_hint_and_latest_draft():
+    store = RetroSpecClusterPageStore(page_size=2)
+
+    def make_record(source):
+        return RetroSpecResidentPrefetchInput(
+            layer_name="layer",
+            miss_cluster_ids=torch.empty(0),
+            miss_positions=torch.empty(0),
+            miss_count=torch.zeros(1),
+            num_groups=1,
+            num_ranks=1,
+            source=source,
+        )
+
+    hint = store._stamp_resident_prefetch_records((make_record("prefill_hint"),))[0]
+    first_draft = store._stamp_resident_prefetch_records((make_record("draft"),))[0]
+    assert first_draft.sequence > hint.sequence
+    assert not store._stamp_resident_prefetch_records((make_record("prefill_hint"),))
+
+    latest_draft = store._stamp_resident_prefetch_records((make_record("draft"),))[0]
+    assert latest_draft.sequence > first_draft.sequence
+    store._discard_resident_prefetch_records((latest_draft,))
+    assert store._stamp_resident_prefetch_records((make_record("prefill_hint"),))
+    store.close()
+
+
+def test_resident_prefetch_priority_executor_runs_queued_draft_before_hint():
+    executor = cluster_store_module._ResidentPrefetchPriorityExecutor()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    order = []
+
+    def first():
+        first_started.set()
+        assert release_first.wait(timeout=1.0)
+        order.append("running_hint")
+
+    running = executor.submit(0, first)
+    assert first_started.wait(timeout=1.0)
+    queued_hint = executor.submit(0, order.append, "queued_hint")
+    queued_draft = executor.submit(1, order.append, "queued_draft")
+    release_first.set()
+    running.result(timeout=1.0)
+    queued_draft.result(timeout=1.0)
+    queued_hint.result(timeout=1.0)
+    executor.shutdown()
+
+    assert order == ["running_hint", "queued_draft", "queued_hint"]
 
 
 def test_resident_prefetch_wave_progress_waits_only_for_requested_layer():
@@ -1690,14 +1883,14 @@ def test_resident_prefetch_releases_metadata_slot_before_descriptor_preparation(
     cluster_ids = table.cluster_ids.to(device).reshape(-1)
     prepare_started = threading.Event()
     release_prepare = threading.Event()
-    original_prepare = store._prepare_resident_prefetch_record
+    original_prepare = store._prepare_resident_prefetch_wave
 
-    def blocking_prepare(staged, ordered_cluster_ids):
+    def blocking_prepare(staged_records):
         prepare_started.set()
         assert release_prepare.wait(timeout=10.0)
-        return original_prepare(staged, ordered_cluster_ids)
+        return original_prepare(staged_records)
 
-    store._prepare_resident_prefetch_record = blocking_prepare
+    store._prepare_resident_prefetch_wave = blocking_prepare
     store.configure_resident_prefetch_wave(1)
     record = RetroSpecResidentPrefetchInput(
         layer_name="layer",

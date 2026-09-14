@@ -206,9 +206,11 @@ def test_resident_cache_records_copy_batch_and_retains_sources():
     pending = cache._pending_copy_batches[0]
     assert pending.source_key_pages is backing_keys
     assert pending.source_value_pages is backing_values
+    assert cache._prefetch_handle_states[0].item() == 1
 
     cache.synchronize_pending_copies()
     assert cache.num_pending_copy_batches == 0
+    assert cache.prefetch_handle_states(1).tolist() == [2]
     assert_cached_pages_match_backing(
         cache,
         page_ids,
@@ -963,6 +965,7 @@ def test_resident_cache_resize_evicts_whole_clusters_and_preserves_storage():
     backing_keys, backing_values = make_backing_pages()
     page_ids = torch.tensor([[0, 1], [2, -1]], dtype=torch.int64)
     cache.admit(page_ids, set(range(3)), backing_keys, backing_values)
+    cache.synchronize_pending_copies()
 
     cache.resize(2)
     access = cache.lookup(page_ids, set(range(3)), touch=False)
@@ -972,6 +975,7 @@ def test_resident_cache_resize_evicts_whole_clusters_and_preserves_storage():
     assert cache.capacity == 2
     assert cache.physical_capacity == 3
     assert cache.num_resident_pages == 2
+    assert cache.prefetch_handle_states(3).tolist() == [2, 0, 0]
 
     cache.resize(5)
     assert cache.capacity == 5

@@ -147,6 +147,7 @@ def test_sparse_verification_prefetch_forwards_compact_gpu_misses():
     assert records[0].miss_count is count
     assert records[0].num_groups == 2
     assert records[0].num_ranks == 2
+    assert records[0].source == "draft"
 
 
 def test_sparse_verification_prefetch_flushes_cluster_store_commands():
@@ -299,6 +300,8 @@ def test_final_prefill_query_prefetches_ranked_clusters():
     query = torch.ones(1, 1, 1, dtype=torch.bfloat16, device=device)
     score_resident_view = Mock(wraps=index._score_resident_view)
     index._score_resident_view = score_resident_view
+    prefetch_wave = Mock(wraps=index.cluster_store.prefetch_resident_cluster_wave)
+    index.cluster_store.prefetch_resident_cluster_wave = prefetch_wave
 
     submitted = index.prefetch_final_prefill_queries(
         ["request"],
@@ -311,6 +314,9 @@ def test_final_prefill_query_prefetches_ranked_clusters():
     assert index.cluster_store.num_resident_pages("layer") > 0
     score_resident_view.assert_called_once()
     assert score_resident_view.call_args.kwargs["prefill_hint"] is True
+    records = prefetch_wave.call_args.args[0]
+    assert len(records) == 1
+    assert records[0].source == "prefill_hint"
 
 
 def build_index(

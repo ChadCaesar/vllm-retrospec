@@ -67,21 +67,65 @@ def retrospec_gather_compact_kv(
     )
 
 
-def retrospec_order_prefetch_misses(
+def retrospec_plan_prefetch_admissions(
     cluster_id_records: tuple[torch.Tensor, ...],
     position_records: tuple[torch.Tensor, ...],
     count_records: tuple[torch.Tensor, ...],
     num_groups: tuple[int, ...],
     num_ranks: tuple[int, ...],
-) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-    ordered_ids, raw_counts = torch.ops._C.retrospec_order_prefetch_misses(
+    descriptor_page_ids: tuple[torch.Tensor, ...],
+    descriptor_page_counts: tuple[torch.Tensor, ...],
+    descriptor_group_ids: tuple[torch.Tensor, ...],
+    resident_states: tuple[torch.Tensor, ...],
+    page_capacities: tuple[int, ...],
+) -> tuple[
+    tuple[torch.Tensor, ...],
+    tuple[torch.Tensor, ...],
+    tuple[torch.Tensor, ...],
+    tuple[torch.Tensor, ...],
+    tuple[torch.Tensor, ...],
+    torch.Tensor,
+]:
+    outputs = torch.ops._C.retrospec_plan_prefetch_admissions(
         cluster_id_records,
         position_records,
         count_records,
         num_groups,
         num_ranks,
+        descriptor_page_ids,
+        descriptor_page_counts,
+        descriptor_group_ids,
+        resident_states,
+        page_capacities,
     )
-    return tuple(ordered_ids), raw_counts
+    return (
+        tuple(outputs[0]),
+        tuple(outputs[1]),
+        tuple(outputs[2]),
+        tuple(outputs[3]),
+        tuple(outputs[4]),
+        outputs[5],
+    )
+
+
+def retrospec_gather_cluster_pages(
+    key_slabs: tuple[torch.Tensor, ...],
+    value_slabs: tuple[torch.Tensor, ...],
+    page_ids: torch.Tensor,
+    page_size: int,
+    key_output: torch.Tensor,
+    value_output: torch.Tensor,
+    num_workers: int,
+) -> None:
+    torch.ops._C.retrospec_gather_cluster_pages(
+        key_slabs,
+        value_slabs,
+        page_ids,
+        page_size,
+        key_output,
+        value_output,
+        num_workers,
+    )
 
 
 if TYPE_CHECKING:
