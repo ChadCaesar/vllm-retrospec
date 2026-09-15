@@ -412,12 +412,11 @@ def _resolve_ranked_draft_buckets_kernel(
     ranked_index_stride_1,
     ranked_index_stride_2,
     table_page_stride,
+    max_pages_per_cluster,
     ARENA_CLUSTER_CAPACITY: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     SPARSE_WIDTH: tl.constexpr,
-    MAX_PAGES: tl.constexpr,
     TABLE_CAPACITY: tl.constexpr,
-    BLOCK_PAGES: tl.constexpr,
     BLOCK_SPARSE: tl.constexpr,
     CAPTURE_REQUEST_DESCRIPTORS: tl.constexpr,
     EMIT_MISSES: tl.constexpr,
@@ -528,29 +527,25 @@ def _resolve_ranked_draft_buckets_kernel(
         table_hit_gate_ready + safe_buckets, mask=found, other=0
     )
 
-    page_offsets = tl.arange(0, BLOCK_PAGES)
-    valid_logical_pages = (
-        selected[:, None]
-        & (page_offsets[None, :] < MAX_PAGES)
-        & (page_offsets[None, :] < logical_page_counts[:, None])
+    page_range_valid = (
+        selected
+        & found
+        & (logical_page_counts > 0)
+        & (logical_page_counts <= max_pages_per_cluster)
     )
-
-    resident_slots = tl.load(
-        table_page_slots
-        + safe_buckets[:, None] * table_page_stride
-        + page_offsets[None, :],
-        mask=(
-            found[:, None]
-            & valid_logical_pages
-            & (page_offsets[None, :] < resident_page_counts[:, None])
-        ),
+    first_page_slots = tl.load(
+        table_page_slots + safe_buckets * table_page_stride,
+        mask=page_range_valid,
+        other=-1,
+    )
+    last_page_offsets = tl.maximum(logical_page_counts - 1, 0)
+    last_page_slots = tl.load(
+        table_page_slots + safe_buckets * table_page_stride + last_page_offsets,
+        mask=page_range_valid,
         other=-1,
     )
     versions_after = tl.atomic_add(
         table_versions + safe_buckets, 0, mask=found, sem="acquire"
-    )
-    resolved_page_counts = tl.sum(
-        (valid_logical_pages & (resident_slots >= 0)).to(tl.int32), axis=1
     )
     stable_hits = (
         selected
@@ -558,10 +553,10 @@ def _resolve_ranked_draft_buckets_kernel(
         & (stored_handles == cluster_handles)
         & (versions_before == versions_after)
         & ((versions_before & 1) == 0)
-        & (logical_page_counts > 0)
-        & (logical_page_counts <= MAX_PAGES)
-        & (resident_page_counts >= logical_page_counts)
-        & (resolved_page_counts == logical_page_counts)
+        & page_range_valid
+        & (resident_page_counts == logical_page_counts)
+        & (first_page_slots >= 0)
+        & (last_page_slots >= 0)
     )
     misses = selected & ~stable_hits
 
@@ -2096,12 +2091,11 @@ def resolve_ranked_draft_buckets(
         ranked_indices.stride(1),
         ranked_indices.stride(2),
         table_page_slots.stride(0),
+        max_pages_per_cluster,
         ARENA_CLUSTER_CAPACITY=arena_cluster_ids.shape[1],
         NUM_KV_HEADS=num_kv_heads,
         SPARSE_WIDTH=sparse_width,
-        MAX_PAGES=max_pages_per_cluster,
         TABLE_CAPACITY=table_handles.numel(),
-        BLOCK_PAGES=triton.next_power_of_2(max_pages_per_cluster),
         BLOCK_SPARSE=triton.next_power_of_2(max(sparse_width, 1)),
         CAPTURE_REQUEST_DESCRIPTORS=capture_request_descriptors,
         EMIT_MISSES=emit_misses,

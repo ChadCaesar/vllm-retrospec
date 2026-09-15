@@ -382,20 +382,30 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
         (False, [-99, -99], [-99, -99]),
     ],
 )
+@pytest.mark.parametrize(
+    ("max_pages_per_cluster", "resident_page_count"),
+    [(2, 2), (27, 2), (27, 27)],
+)
 def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
     capture_request_descriptors: bool,
     expected_slots: list[int],
     expected_generations: list[int],
+    max_pages_per_cluster: int,
+    resident_page_count: int,
 ):
     device = torch.device("cuda")
-    table = _make_table(capacity=8, max_pages=2)
+    table = _make_table(capacity=8, max_pages=max_pages_per_cluster)
     update_resident_handles(
         bucket_ids=torch.tensor(
             [_resident_bucket(10)], dtype=torch.int32, device=device
         ),
         cluster_handles=torch.tensor([10], dtype=torch.int64, device=device),
-        page_counts=torch.tensor([2], dtype=torch.int32, device=device),
-        page_slots=torch.tensor([[5, 6]], dtype=torch.int32, device=device),
+        page_counts=torch.tensor(
+            [resident_page_count], dtype=torch.int32, device=device
+        ),
+        page_slots=torch.arange(
+            5, 5 + resident_page_count, dtype=torch.int32, device=device
+        ).unsqueeze(0),
         hit_gate_ready=torch.tensor([True], device=device),
         table_handles=table[0],
         table_versions=table[1],
@@ -438,10 +448,10 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
             (1, 4), -1, dtype=torch.int32, device=device
         ),
         arena_cluster_token_counts=torch.tensor(
-            [[3, 2, 2, 0]], dtype=torch.int32, device=device
+            [[resident_page_count, 2, 2, 0]], dtype=torch.int32, device=device
         ),
         arena_cluster_page_counts=torch.tensor(
-            [[2, 1, 1, 0]], dtype=torch.int32, device=device
+            [[resident_page_count, 1, 1, 0]], dtype=torch.int32, device=device
         ),
         arena_cluster_offsets=torch.tensor([0], dtype=torch.int64, device=device),
         arena_generations=torch.tensor([7], dtype=torch.int64, device=device),
@@ -457,7 +467,7 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
         retrieval_ratio=0.5,
         estimation_ratio=0.34,
         expanded_retrieval_width=3,
-        max_pages_per_cluster=2,
+        max_pages_per_cluster=max_pages_per_cluster,
         output_valid_rows=valid_rows,
         output_request_slot_ids=captured_slots,
         output_request_slot_generations=captured_generations,
@@ -487,7 +497,7 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
         [[_resident_bucket(10), -1]],
         [[-1, -1]],
     ]
-    assert clustered_counts.cpu().tolist() == [[3], [0]]
+    assert clustered_counts.cpu().tolist() == [[resident_page_count], [0]]
     assert selected_counts.cpu().tolist() == [[2], [0]]
     assert hit_counts.cpu().tolist() == [[1], [0]]
     assert miss_counts.cpu().tolist() == [[1], [0]]
