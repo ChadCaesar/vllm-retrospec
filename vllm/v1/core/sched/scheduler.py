@@ -62,6 +62,11 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.spec_decode.retrospec.capacity import (
+    RetroSpecGPUIndexFootprint,
+    estimate_retrospec_gpu_index_arena_bytes,
+    estimate_retrospec_gpu_index_footprint,
+)
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -283,6 +288,13 @@ class Scheduler(SchedulerInterface):
         self._retrospec_in_flight_req_ids: set[str] = set()
         self._retrospec_deferred_finish_status: dict[str, RequestStatus] = {}
         self._retrospec_layer_major_prefill_in_flight_req_id: str | None = None
+        self._retrospec_gpu_index_budget_bytes = 0
+        self._retrospec_gpu_index_footprints: dict[str, RetroSpecGPUIndexFootprint] = {}
+        if self.is_retrospec:
+            assert speculative_config is not None
+            self._retrospec_gpu_index_budget_bytes = int(
+                speculative_config.retrospec_max_gpu_index_memory * (1 << 30)
+            )
 
         def has_mamba_layers(kv_cache_config: KVCacheConfig) -> bool:
             return any(
@@ -365,6 +377,74 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _get_retrospec_gpu_index_footprint(
+        self, request: Request
+    ) -> RetroSpecGPUIndexFootprint:
+        max_context_tokens = min(
+            request.num_prompt_tokens + request.max_tokens, self.max_model_len
+        )
+        footprint = estimate_retrospec_gpu_index_footprint(
+            self.vllm_config, self.kv_cache_config, max_context_tokens
+        )
+
+        current = self._retrospec_gpu_index_footprints.get(request.request_id)
+        if current is None:
+            return footprint
+
+        # Resumable input may increase the request bound. Never shrink an
+        # existing ticket because worker arenas retain their high-water mark.
+        return RetroSpecGPUIndexFootprint(
+            cluster_capacity=max(current.cluster_capacity, footprint.cluster_capacity),
+            page_capacity=max(current.page_capacity, footprint.page_capacity),
+        )
+
+    def _requires_retrospec_gpu_index_ticket(self, request: Request) -> bool:
+        if not self.is_retrospec or request.pooling_params is not None:
+            return False
+
+        footprint = self._get_retrospec_gpu_index_footprint(request)
+        return footprint.cluster_capacity > 0
+
+    def _estimate_retrospec_gpu_index_bytes_with(self, request: Request) -> int:
+        footprints = dict(self._retrospec_gpu_index_footprints)
+        footprints[request.request_id] = self._get_retrospec_gpu_index_footprint(
+            request
+        )
+        return estimate_retrospec_gpu_index_arena_bytes(
+            self.vllm_config, self.kv_cache_config, footprints.values()
+        )
+
+    def _validate_retrospec_gpu_index_ticket(self, request: Request) -> None:
+        footprint = self._get_retrospec_gpu_index_footprint(request)
+        required_bytes = estimate_retrospec_gpu_index_arena_bytes(
+            self.vllm_config, self.kv_cache_config, (footprint,)
+        )
+        if required_bytes > self._retrospec_gpu_index_budget_bytes:
+            raise ValueError(
+                "RetroSpec request cannot fit the configured GPU index memory "
+                f"budget: request={request.request_id!r}, required={required_bytes}, "
+                f"budget={self._retrospec_gpu_index_budget_bytes} bytes"
+            )
+
+    def _can_admit_retrospec_gpu_index(self, request: Request) -> bool:
+        return (
+            self._estimate_retrospec_gpu_index_bytes_with(request)
+            <= self._retrospec_gpu_index_budget_bytes
+        )
+
+    def _reserve_retrospec_gpu_index_ticket(self, request: Request) -> None:
+        if not self._can_admit_retrospec_gpu_index(request):
+            raise RuntimeError(
+                "RetroSpec GPU index admission changed during scheduling"
+            )
+
+        self._retrospec_gpu_index_footprints[request.request_id] = (
+            self._get_retrospec_gpu_index_footprint(request)
+        )
+
+    def _release_retrospec_gpu_index_ticket(self, request_id: str) -> None:
+        self._retrospec_gpu_index_footprints.pop(request_id, None)
+
     def _is_retrospec_layer_major_prefill_candidate(self, request: Request) -> bool:
         if not self.enable_retrospec_layer_major_prefill:
             return False
@@ -395,6 +475,8 @@ class Scheduler(SchedulerInterface):
             request.status != RequestStatus.RUNNING
             and len(self.running) >= self.max_num_running_reqs
         ):
+            return False
+        if not self._can_admit_retrospec_gpu_index(request):
             return False
 
         num_recent_blocks = cdiv(self.num_spec_tokens, self.block_size) + 1
@@ -915,6 +997,19 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 is_layer_major_prefill = request_id == layer_major_prefill_req_id
+                requires_retrospec_gpu_index_ticket = (
+                    self._requires_retrospec_gpu_index_ticket(request)
+                )
+                if (
+                    requires_retrospec_gpu_index_ticket
+                    and not self._can_admit_retrospec_gpu_index(request)
+                ):
+                    if is_layer_major_prefill:
+                        break
+
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
 
                 # Get already-cached tokens.
                 if is_layer_major_prefill:
@@ -1076,6 +1171,9 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                if requires_retrospec_gpu_index_ticket:
+                    self._reserve_retrospec_gpu_index_ticket(request)
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -2129,6 +2227,8 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if self._requires_retrospec_gpu_index_ticket(request):
+                self._validate_retrospec_gpu_index_ticket(request)
             if request.resumable:
                 request.streaming_queue = deque()
             self.waiting.add_request(request)
@@ -2219,6 +2319,8 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+        if self.is_retrospec:
+            self._release_retrospec_gpu_index_ticket(request_id)
 
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:

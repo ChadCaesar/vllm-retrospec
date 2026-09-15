@@ -18,10 +18,14 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 from vllm.v1.spec_decode.retrospec.capacity import (
+    RetroSpecGPUIndexFootprint,
     RetroSpecLongContextCapacity,
     build_retrospec_long_context_capacity,
+    estimate_retrospec_gpu_index_arena_bytes,
+    estimate_retrospec_gpu_index_footprint,
     get_retrospec_exact_attention_partition_capacity,
     get_retrospec_exact_attention_source_token_capacity,
+    get_retrospec_gpu_index_descriptor_bytes,
     get_retrospec_native_working_set_tokens,
     is_retrospec_long_context_enabled,
 )
@@ -82,6 +86,20 @@ def make_kv_cache_specs(num_layers: int = 2) -> dict[str, FullAttentionSpec]:
         )
         for layer_index in range(num_layers)
     }
+
+
+def make_scheduler_kv_cache_config(num_layers: int = 2) -> KVCacheConfig:
+    spec = next(iter(make_kv_cache_specs(num_layers=1).values()))
+    return KVCacheConfig(
+        num_blocks=1024,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=[f"layer.{index}" for index in range(num_layers)],
+                kv_cache_spec=spec,
+            )
+        ],
+    )
 
 
 def make_engine_config(
@@ -166,6 +184,78 @@ def test_native_working_set_does_not_preallocate_for_max_num_seqs():
 def test_native_working_set_is_capped_by_max_model_len():
     config = make_capacity_config(max_model_len=4096)
     assert get_retrospec_native_working_set_tokens(config, 16) == 4096
+
+
+def test_gpu_index_footprint_matches_stable_cluster_and_page_layout():
+    config = make_capacity_config(max_model_len=2048)
+    kv_cache_config = make_scheduler_kv_cache_config()
+
+    footprint = estimate_retrospec_gpu_index_footprint(
+        config, kv_cache_config, max_context_tokens=1024
+    )
+
+    # Stable indexed range is 928 tokens: 58 clusters and at most 116 pages.
+    assert footprint == RetroSpecGPUIndexFootprint(
+        cluster_capacity=64,
+        page_capacity=128,
+    )
+
+
+def test_gpu_index_footprint_is_empty_before_stable_prefix_exists():
+    config = make_capacity_config(max_model_len=2048)
+
+    footprint = estimate_retrospec_gpu_index_footprint(
+        config, make_scheduler_kv_cache_config(), max_context_tokens=80
+    )
+
+    assert footprint == RetroSpecGPUIndexFootprint(0, 0)
+
+
+def test_gpu_index_descriptor_bytes_match_worker_tensor_layout():
+    config = make_capacity_config(max_num_seqs=4)
+    kv_cache_config = make_scheduler_kv_cache_config(num_layers=2)
+
+    descriptor_bytes = get_retrospec_gpu_index_descriptor_bytes(config, kv_cache_config)
+
+    # Per request/layer: 44 scalar bytes plus one int32 per KV head.
+    assert descriptor_bytes == 2 * 4 * (44 + 4 * 2)
+
+
+def test_gpu_index_arena_projects_packed_power_of_two_growth():
+    config = make_capacity_config(max_num_seqs=4)
+    kv_cache_config = make_scheduler_kv_cache_config(num_layers=2)
+    footprint = RetroSpecGPUIndexFootprint(64, 128)
+
+    one_request = estimate_retrospec_gpu_index_arena_bytes(
+        config, kv_cache_config, (footprint,)
+    )
+    two_requests = estimate_retrospec_gpu_index_arena_bytes(
+        config, kv_cache_config, (footprint, footprint)
+    )
+    three_requests = estimate_retrospec_gpu_index_arena_bytes(
+        config, kv_cache_config, (footprint, footprint, footprint)
+    )
+
+    assert one_request < two_requests < three_requests
+    assert three_requests > 2 * one_request
+
+
+def test_gpu_index_arena_ignores_empty_request_footprints():
+    config = make_capacity_config()
+    kv_cache_config = make_scheduler_kv_cache_config()
+    footprint = RetroSpecGPUIndexFootprint(64, 128)
+
+    expected = estimate_retrospec_gpu_index_arena_bytes(
+        config, kv_cache_config, (footprint,)
+    )
+    actual = estimate_retrospec_gpu_index_arena_bytes(
+        config,
+        kv_cache_config,
+        (RetroSpecGPUIndexFootprint(0, 0), footprint),
+    )
+
+    assert actual == expected
+    assert estimate_retrospec_gpu_index_arena_bytes(config, kv_cache_config, ()) == 0
 
 
 def test_exact_attention_capacity_includes_cluster_page_fragmentation():

@@ -56,6 +56,27 @@ def make_retrospec_pp_scheduler(
     return scheduler, requests
 
 
+def make_gpu_index_admission_scheduler(
+    *,
+    max_gpu_index_memory: float = 1.0,
+    max_num_seqs: int = 2,
+) -> Scheduler:
+    speculative_config = SpeculativeConfig(
+        method="retrospec",
+        num_speculative_tokens=4,
+        retrospec_max_draft_tokens=4,
+        retrospec_index_segment_size=32,
+        retrospec_max_gpu_index_memory=max_gpu_index_memory,
+    )
+    return create_scheduler(
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=1024,
+        max_model_len=2048,
+        speculative_config=speculative_config,
+        device_config=DeviceConfig(device="cpu"),
+    )
+
+
 def make_model_runner_output(
     scheduler_output: SchedulerOutput,
     *,
@@ -452,6 +473,111 @@ def test_retrospec_layer_major_prefill_defers_when_native_pool_is_full():
     assert len(scheduler.running) == 1
     assert len(scheduler.waiting) == 1
     assert scheduler.waiting.peek_request().request_id == "waiting-prefill"
+
+
+def test_retrospec_layer_major_prefill_defers_when_gpu_index_is_full():
+    scheduler = make_gpu_index_admission_scheduler()
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=1024,
+        max_tokens=1024,
+        req_ids=["decode", "waiting-prefill"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {"decode": 1024}
+    assert set(scheduler._retrospec_gpu_index_footprints) == {"decode"}
+
+    one_request_bytes = scheduler._estimate_retrospec_gpu_index_bytes_with(requests[0])
+    two_request_bytes = scheduler._estimate_retrospec_gpu_index_bytes_with(requests[1])
+    assert two_request_bytes > one_request_bytes
+    scheduler._retrospec_gpu_index_budget_bytes = (
+        one_request_bytes + two_request_bytes
+    ) // 2
+
+    requests[0].num_computed_tokens = requests[0].num_prompt_tokens
+    requests[0].append_output_token_ids(1)
+    second = scheduler.schedule()
+
+    assert second.num_scheduled_tokens == {"decode": 1}
+    assert second.retrospec_layer_major_prefill is None
+    assert set(scheduler._retrospec_gpu_index_footprints) == {"decode"}
+    assert scheduler.waiting.peek_request().request_id == "waiting-prefill"
+
+    scheduler.finish_requests("decode", RequestStatus.FINISHED_ABORTED)
+    third = scheduler.schedule()
+
+    assert third.num_scheduled_tokens == {"waiting-prefill": 1024}
+    assert set(scheduler._retrospec_gpu_index_footprints) == {"waiting-prefill"}
+
+
+def test_retrospec_gpu_index_ticket_survives_preemption_until_finish():
+    scheduler = make_gpu_index_admission_scheduler(max_num_seqs=1)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=1024,
+        max_tokens=1024,
+        req_ids=["request"],
+    )[0]
+    scheduler.add_request(request)
+    scheduler.schedule()
+
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, timestamp=0.0)
+
+    assert "request" in scheduler._retrospec_gpu_index_footprints
+
+    scheduler.finish_requests("request", RequestStatus.FINISHED_ABORTED)
+
+    assert "request" not in scheduler._retrospec_gpu_index_footprints
+
+
+def test_retrospec_gpu_index_rejects_request_larger_than_budget():
+    scheduler = make_gpu_index_admission_scheduler(max_gpu_index_memory=1e-9)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=1024,
+        max_tokens=1024,
+        req_ids=["oversized"],
+    )[0]
+
+    with pytest.raises(ValueError, match="cannot fit.*GPU index memory"):
+        scheduler.add_request(request)
+
+    assert "oversized" not in scheduler.requests
+
+
+def test_retrospec_short_prompt_long_generation_reserves_index_ticket():
+    scheduler = make_gpu_index_admission_scheduler(max_num_seqs=1)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=2040,
+        req_ids=["short-prompt"],
+    )[0]
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+
+    assert scheduler_output.retrospec_layer_major_prefill is None
+    assert set(scheduler._retrospec_gpu_index_footprints) == {"short-prompt"}
+
+
+def test_retrospec_empty_index_request_does_not_reserve_ticket():
+    scheduler = make_gpu_index_admission_scheduler(max_num_seqs=1)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=8,
+        req_ids=["empty-index"],
+    )[0]
+    scheduler.add_request(request)
+
+    scheduler.schedule()
+
+    assert scheduler._retrospec_gpu_index_footprints == {}
 
 
 def test_retrospec_pp_layer_major_prefill_blocks_pipeline_fill():

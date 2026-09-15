@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from math import ceil
 
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
 
 from .cluster_scoring import RESIDENT_CLUSTER_SCORE_TILE_SIZE
 from .workspace import (
@@ -20,6 +20,16 @@ from .workspace import (
 )
 
 _GIB_BYTES = 1 << 30
+_GPU_INDEX_CLUSTER_METADATA_BYTES = 28
+_GPU_INDEX_PAGE_METADATA_BYTES = 12
+_GPU_INDEX_REQUEST_SCALAR_BYTES = 44
+_GPU_INDEX_ADMISSION_SAFETY_FACTOR = 1.10
+
+
+@dataclass(frozen=True)
+class RetroSpecGPUIndexFootprint:
+    cluster_capacity: int
+    page_capacity: int
 
 
 @dataclass(frozen=True)
@@ -116,16 +126,133 @@ def _get_indexed_token_capacity(
     vllm_config: VllmConfig,
     block_size: int,
 ) -> int:
+    return _get_indexed_token_capacity_for_length(
+        vllm_config,
+        vllm_config.model_config.max_model_len,
+        block_size,
+    )
+
+
+def _get_indexed_token_capacity_for_length(
+    vllm_config: VllmConfig, context_len: int, block_size: int
+) -> int:
+    if context_len <= 0:
+        raise ValueError("context_len must be positive")
+
     config = vllm_config.speculative_config
     assert config is not None
     assert config.num_speculative_tokens is not None
 
-    max_model_len = vllm_config.model_config.max_model_len
+    context_len = min(context_len, vllm_config.model_config.max_model_len)
     num_recent_blocks = cdiv(config.num_speculative_tokens, block_size) + 1
 
-    full_block_count = max_model_len // block_size
+    full_block_count = context_len // block_size
     stable_end_block = max(full_block_count - num_recent_blocks, 1)
     return (stable_end_block - 1) * block_size
+
+
+def _get_scheduler_attention_specs(
+    kv_cache_config: KVCacheConfig,
+) -> tuple[tuple[int, AttentionSpec], ...]:
+    specs: list[tuple[int, AttentionSpec]] = []
+    for group in kv_cache_config.kv_cache_groups:
+        num_layers = len(group.layer_names)
+        if num_layers == 0:
+            continue
+
+        spec = group.kv_cache_spec
+        if not isinstance(spec, AttentionSpec):
+            raise NotImplementedError(
+                "RetroSpec GPU index admission supports attention KV caches only"
+            )
+        specs.append((num_layers, spec))
+
+    if not specs:
+        raise ValueError("RetroSpec GPU index admission requires attention layers")
+    return tuple(specs)
+
+
+def get_retrospec_gpu_index_descriptor_bytes(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> int:
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    return sum(
+        num_layers
+        * max_num_seqs
+        * (_GPU_INDEX_REQUEST_SCALAR_BYTES + 4 * spec.num_kv_heads)
+        for num_layers, spec in _get_scheduler_attention_specs(kv_cache_config)
+    )
+
+
+def estimate_retrospec_gpu_index_footprint(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+    max_context_tokens: int,
+) -> RetroSpecGPUIndexFootprint:
+    specs = _get_scheduler_attention_specs(kv_cache_config)
+    block_sizes = {spec.block_size for _, spec in specs}
+    if len(block_sizes) != 1:
+        raise NotImplementedError(
+            "RetroSpec GPU index admission requires one KV block size"
+        )
+
+    block_size = next(iter(block_sizes))
+    config = vllm_config.speculative_config
+    assert config is not None
+
+    tokens_per_cluster = config.retrospec_blocks_per_cluster * block_size
+    indexed_tokens = _get_indexed_token_capacity_for_length(
+        vllm_config, max_context_tokens, block_size
+    )
+    indexed_tokens = indexed_tokens // tokens_per_cluster * tokens_per_cluster
+    if indexed_tokens == 0:
+        return RetroSpecGPUIndexFootprint(0, 0)
+
+    num_clusters = indexed_tokens // tokens_per_cluster
+    return RetroSpecGPUIndexFootprint(
+        cluster_capacity=_next_power_of_two(num_clusters),
+        page_capacity=_next_power_of_two(
+            cdiv(indexed_tokens, block_size) + num_clusters
+        ),
+    )
+
+
+def estimate_retrospec_gpu_index_arena_bytes(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+    footprints: Iterable[RetroSpecGPUIndexFootprint],
+) -> int:
+    nonempty = tuple(
+        footprint
+        for footprint in footprints
+        if footprint.cluster_capacity and footprint.page_capacity
+    )
+    if not nonempty:
+        return 0
+
+    cluster_capacity = _next_power_of_two(
+        max(64, sum(item.cluster_capacity for item in nonempty))
+    )
+    page_capacity = _next_power_of_two(
+        max(64, sum(item.page_capacity for item in nonempty))
+    )
+
+    arena_bytes = get_retrospec_gpu_index_descriptor_bytes(vllm_config, kv_cache_config)
+    for num_layers, spec in _get_scheduler_attention_specs(kv_cache_config):
+        arena_bytes += (
+            num_layers
+            * spec.num_kv_heads
+            * (
+                cluster_capacity
+                * (
+                    _GPU_INDEX_CLUSTER_METADATA_BYTES
+                    + 2 * spec.head_size * get_dtype_size(spec.dtype)
+                )
+                + page_capacity * _GPU_INDEX_PAGE_METADATA_BYTES
+            )
+        )
+
+    return ceil(arena_bytes * _GPU_INDEX_ADMISSION_SAFETY_FACTOR)
 
 
 def get_retrospec_exact_attention_source_token_capacity(

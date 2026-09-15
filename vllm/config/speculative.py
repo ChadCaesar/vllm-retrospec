@@ -208,8 +208,9 @@ class SpeculativeConfig:
     D2H/H2D staging rings. Long-lived CPU data is stored in pageable memory."""
     retrospec_max_gpu_index_memory: float = Field(default=4.0, gt=0)
     """Maximum GPU-memory budget in GiB for persistent RetroSpec cluster
-    summaries and page descriptors. The budget is shared by all attention
-    layers in one worker."""
+    summaries and page descriptors in each worker. The scheduler uses a
+    conservative packed-arena projection for request admission, while the
+    worker keeps the final authoritative allocation check."""
     retrospec_prefill_warmup_multiplier: int = Field(default=4, ge=1)
     """Maximum number of clusters admitted from the final prefill query,
     relative to the normal sparse retrieval-cluster count. Admission is also
