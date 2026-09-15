@@ -390,24 +390,51 @@ class Scheduler(SchedulerInterface):
             and (sampling_params is None or sampling_params.prompt_logprobs is None)
         )
 
+    def _can_admit_retrospec_layer_major_prefill(self, request: Request) -> bool:
+        if (
+            request.status != RequestStatus.RUNNING
+            and len(self.running) >= self.max_num_running_reqs
+        ):
+            return False
+
+        num_recent_blocks = cdiv(self.num_spec_tokens, self.block_size) + 1
+        return self.kv_cache_manager.can_allocate_retrospec_prefill_slots(
+            request,
+            prompt_num_tokens=request.num_prompt_tokens,
+            num_recent_blocks=num_recent_blocks,
+            blocks_per_cluster=self.retrospec_blocks_per_cluster,
+            num_lookahead_tokens=self.num_lookahead_tokens,
+        )
+
     def _select_retrospec_layer_major_prefill_request(self) -> str | None:
+        # Layer-major prefill reuses one global workspace. Wait until every
+        # earlier prefill and PP batch has released its dependencies.
+        if self._retrospec_layer_major_prefill_in_flight_req_id is not None:
+            return None
+        if self._retrospec_in_flight_batches:
+            return None
+
         request_id = self._retrospec_layer_major_prefill_req_id
         if request_id is not None:
             request = self.requests.get(request_id)
             if request is not None and self._is_retrospec_layer_major_prefill_candidate(
                 request
             ):
-                return request_id
+                if self._can_admit_retrospec_layer_major_prefill(request):
+                    return request_id
+
+                # Keep the request selected, but let running decode requests
+                # release native blocks before retrying the exclusive prefill.
+                return None
             self._retrospec_layer_major_prefill_req_id = None
 
-        # Commit 66 does not reserve or offload the complete prompt working
-        # set. Start an exclusive prefill only after older requests finish, so
-        # an allocation failure cannot permanently block decode progress.
-        if self.running or not self.waiting:
+        if not self.waiting:
             return None
 
         request = self.waiting.peek_request()
         if not self._is_retrospec_layer_major_prefill_candidate(request):
+            return None
+        if not self._can_admit_retrospec_layer_major_prefill(request):
             return None
 
         request_id = request.request_id

@@ -401,21 +401,24 @@ class KVCacheManager:
             end_block,
         )
 
-    def allocate_retrospec_prefill_slots(
+    def _get_retrospec_prefill_layout(
         self,
-        request: Request,
         prompt_num_tokens: int,
         num_recent_blocks: int,
         blocks_per_cluster: int,
         num_lookahead_tokens: int,
-    ) -> tuple[KVCacheBlocks, int, int] | None:
-        """Allocate native blocks outside the cluster-backed prompt prefix."""
-        if request.num_computed_tokens != 0:
-            raise ValueError("Layer-major prefill requires an uncomputed prompt")
+    ) -> tuple[int, int, tuple[int, ...]]:
+        """Build the sparse logical layout used by layer-major prefill."""
+        if prompt_num_tokens <= 0:
+            raise ValueError("prompt_num_tokens must be positive")
+        if prompt_num_tokens > self.max_model_len:
+            raise ValueError("prompt_num_tokens exceeds max_model_len")
         if num_recent_blocks < 1:
             raise ValueError("num_recent_blocks must be positive")
         if blocks_per_cluster < 1:
             raise ValueError("blocks_per_cluster must be positive")
+        if num_lookahead_tokens < 0:
+            raise ValueError("num_lookahead_tokens must be non-negative")
         if len(self.coordinator.single_type_managers) != 1:
             raise NotImplementedError(
                 "RetroSpec layer-major prefill requires one KV-cache group"
@@ -436,6 +439,56 @@ class KVCacheManager:
         resident_block_indices = (
             0,
             *range(resident_start_block, num_logical_blocks),
+        )
+        return (
+            num_logical_blocks,
+            resident_start_block,
+            resident_block_indices,
+        )
+
+    def can_allocate_retrospec_prefill_slots(
+        self,
+        request: Request,
+        prompt_num_tokens: int,
+        num_recent_blocks: int,
+        blocks_per_cluster: int,
+        num_lookahead_tokens: int,
+    ) -> bool:
+        """Return whether layer-major prefill can allocate without mutation."""
+        if request.num_computed_tokens != 0:
+            return False
+        if any(self.coordinator.get_blocks(request.request_id)):
+            return False
+
+        _, _, resident_block_indices = self._get_retrospec_prefill_layout(
+            prompt_num_tokens,
+            num_recent_blocks,
+            blocks_per_cluster,
+            num_lookahead_tokens,
+        )
+        return len(resident_block_indices) <= self.block_pool.get_num_free_blocks()
+
+    def allocate_retrospec_prefill_slots(
+        self,
+        request: Request,
+        prompt_num_tokens: int,
+        num_recent_blocks: int,
+        blocks_per_cluster: int,
+        num_lookahead_tokens: int,
+    ) -> tuple[KVCacheBlocks, int, int] | None:
+        """Allocate native blocks outside the cluster-backed prompt prefix."""
+        if request.num_computed_tokens != 0:
+            raise ValueError("Layer-major prefill requires an uncomputed prompt")
+
+        (
+            num_logical_blocks,
+            resident_start_block,
+            resident_block_indices,
+        ) = self._get_retrospec_prefill_layout(
+            prompt_num_tokens,
+            num_recent_blocks,
+            blocks_per_cluster,
+            num_lookahead_tokens,
         )
 
         blocks = self.coordinator.allocate_retrospec_prefill_blocks(

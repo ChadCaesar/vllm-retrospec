@@ -392,19 +392,66 @@ def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
         )
     )
 
-    # Once the first request enters decode, the second prefill must remain
-    # waiting instead of silently joining a regular mixed batch.
+    # Once the first request enters decode, a capacity-safe second prefill
+    # owns the next batch exclusively instead of mixing with the decode row.
     requests[0].num_computed_tokens = requests[0].num_prompt_tokens
     requests[0].append_output_token_ids(1)
     scheduler_output = scheduler.schedule()
 
-    assert scheduler_output.num_scheduled_tokens == {"prefill-0": 1}
+    assert scheduler_output.num_scheduled_tokens == {"prefill-1": 8}
     assert scheduler_output.retrospec_generation_token_budgets == {
-        "prefill-0": requests[0].max_tokens - 1
+        "prefill-1": requests[1].max_tokens
     }
-    assert scheduler_output.retrospec_layer_major_prefill is None
+    assert scheduler_output.retrospec_layer_major_prefill == (
+        RetroSpecLayerMajorPrefillDescriptor(
+            request_id="prefill-1",
+            prompt_num_tokens=8,
+            scheduled_start=0,
+            scheduled_end=8,
+            resident_start_block=1,
+            num_logical_blocks=1,
+        )
+    )
+    assert len(scheduler.running) == 2
+    assert len(scheduler.waiting) == 0
+
+
+def test_retrospec_layer_major_prefill_defers_when_native_pool_is_full():
+    speculative_config = SpeculativeConfig(
+        method="retrospec",
+        num_speculative_tokens=4,
+        retrospec_max_draft_tokens=4,
+        retrospec_index_segment_size=4,
+    )
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        max_model_len=32,
+        num_blocks=2,
+        speculative_config=speculative_config,
+        device_config=DeviceConfig(device="cpu"),
+    )
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=8,
+        req_ids=["decode", "waiting-prefill"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {"decode": 8}
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 0
+
+    requests[0].num_computed_tokens = requests[0].num_prompt_tokens
+    requests[0].append_output_token_ids(1)
+    second = scheduler.schedule()
+
+    assert second.num_scheduled_tokens == {"decode": 1}
+    assert second.retrospec_layer_major_prefill is None
     assert len(scheduler.running) == 1
     assert len(scheduler.waiting) == 1
+    assert scheduler.waiting.peek_request().request_id == "waiting-prefill"
 
 
 def test_retrospec_pp_layer_major_prefill_blocks_pipeline_fill():
@@ -501,6 +548,65 @@ def test_layer_major_prefill_allocates_only_sink_and_resident_suffix():
 
     scheduler.kv_cache_manager.free(request)
 
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
+
+
+def test_layer_major_prefill_capacity_probe_is_side_effect_free():
+    speculative_config = SpeculativeConfig(
+        method="retrospec",
+        num_speculative_tokens=4,
+        retrospec_max_draft_tokens=4,
+        retrospec_index_segment_size=4,
+    )
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=8,
+        max_model_len=128,
+        speculative_config=speculative_config,
+        device_config=DeviceConfig(device="cpu"),
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["capacity-probe"],
+    )[0]
+    scheduler.add_request(request)
+    manager = scheduler.kv_cache_manager
+    initial_free_blocks = manager.block_pool.get_num_free_blocks()
+
+    can_allocate = manager.can_allocate_retrospec_prefill_slots(
+        request,
+        prompt_num_tokens=64,
+        num_recent_blocks=2,
+        blocks_per_cluster=1,
+        num_lookahead_tokens=4,
+    )
+
+    assert can_allocate
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
+    assert all(
+        not blocks for blocks in manager.coordinator.get_blocks(request.request_id)
+    )
+
+    allocation = manager.allocate_retrospec_prefill_slots(
+        request,
+        prompt_num_tokens=64,
+        num_recent_blocks=2,
+        blocks_per_cluster=1,
+        num_lookahead_tokens=4,
+    )
+
+    assert allocation is not None
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks - 4
+    assert not manager.can_allocate_retrospec_prefill_slots(
+        request,
+        prompt_num_tokens=64,
+        num_recent_blocks=2,
+        blocks_per_cluster=1,
+        num_lookahead_tokens=4,
+    )
+
+    manager.free(request)
     assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
 
 

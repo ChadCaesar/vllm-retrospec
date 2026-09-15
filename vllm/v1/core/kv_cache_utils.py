@@ -1340,10 +1340,11 @@ def _report_kv_cache_config(
             min_block_size,
         )
         logger.info_once(
-            "Maximum concurrent RetroSpec native working sets (%d tokens "
-            "each): %.2fx; scheduler request limit is %d",
-            working_set_tokens,
+            "RetroSpec shared native KV pool holds %.2fx worst-case working "
+            "sets of %d tokens; actual request admission is block-capacity "
+            "gated and the scheduler request limit is %d",
             max_concurrency,
+            working_set_tokens,
             vllm_config.scheduler_config.max_num_seqs,
             scope="local",
         )
@@ -1593,9 +1594,9 @@ def get_kv_cache_configs(
             ]
 
             logger.info_once(
-                "RetroSpec long-context one-request baseline: native KV "
-                "working set %d tokens, native KV %s GiB, auxiliary reserve "
-                "%s GiB; runtime index storage grows with resident requests",
+                "RetroSpec long-context shared native KV pool: %d-token "
+                "worst-case working set, native KV %s GiB, auxiliary reserve "
+                "%s GiB; requests consume physical blocks on demand",
                 retrospec_capacities[0].native_working_set_tokens,
                 format_gib(retrospec_capacities[0].native_memory_bytes),
                 format_gib(retrospec_capacities[0].auxiliary_memory_bytes),
