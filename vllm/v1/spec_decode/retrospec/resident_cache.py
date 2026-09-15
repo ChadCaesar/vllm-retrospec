@@ -29,6 +29,14 @@ _PREFETCH_PENDING = 1
 _PREFETCH_RESIDENT = 2
 
 
+def _resident_handle_hash(cluster_id: _ClusterId) -> int:
+    """Mix every handle bit before masking into the GPU hash table."""
+    value = ((cluster_id & 0xFFFFFFFF) ^ (cluster_id >> 32)) & 0xFFFFFFFF
+    value = ((value ^ (value >> 16)) * 0x7FEB352D) & 0xFFFFFFFF
+    value = ((value ^ (value >> 15)) * 0x846CA68B) & 0xFFFFFFFF
+    return (value ^ (value >> 16)) & 0xFFFFFFFF
+
+
 @dataclass(frozen=True)
 class _PendingCopyBatch:
     """Keep asynchronous cache-copy sources alive until completion."""
@@ -344,8 +352,9 @@ class RetroSpecResidentClusterCache:
 
         mask = self._handle_table_capacity - 1
         first_tombstone: int | None = None
+        first_bucket = _resident_handle_hash(cluster_id) & mask
         for probe in range(64):
-            bucket = (cluster_id + probe) & mask
+            bucket = (first_bucket + probe) & mask
             stored_handle = self._bucket_handles[bucket]
             if stored_handle == cluster_id:
                 return bucket
@@ -387,7 +396,11 @@ class RetroSpecResidentClusterCache:
         self._bucket_handles = [-1] * capacity
         self._handle_table_needs_rebuild = False
 
-    def _ensure_handle_table(self, max_pages_per_cluster: int) -> None:
+    def _ensure_handle_table(
+        self,
+        max_pages_per_cluster: int,
+        stream: torch.cuda.Stream | None = None,
+    ) -> bool:
         required_capacity = self._next_power_of_two(max(2, self._logical_capacity * 2))
         requires_rebuild = (
             self._handle_table_needs_rebuild
@@ -395,18 +408,22 @@ class RetroSpecResidentClusterCache:
             or max_pages_per_cluster > self._handle_table_max_pages
         )
         if not requires_rebuild:
-            return
+            return False
 
+        previous_max_pages = self._handle_table_max_pages
         # A pending publication targets the current table allocation. Complete
         # it before replacing that allocation, then republish every live entry.
         self.synchronize_pending_copies()
-        current_stream = torch.cuda.current_stream(self.device)
-        if self._handle_table_capacity and self._group_states:
-            self._refresh_group_lru_from_gpu(self._group_states.keys(), current_stream)
-        self._allocate_handle_table(
-            max(required_capacity, self._handle_table_capacity),
-            max(max_pages_per_cluster, self._handle_table_max_pages),
+        update_stream = (
+            torch.cuda.current_stream(self.device) if stream is None else stream
         )
+        if self._handle_table_capacity and self._group_states:
+            self._refresh_group_lru_from_gpu(self._group_states.keys(), update_stream)
+        with torch.cuda.stream(update_stream):
+            self._allocate_handle_table(
+                max(required_capacity, self._handle_table_capacity),
+                max(max_pages_per_cluster, self._handle_table_max_pages),
+            )
         entries = tuple(
             (
                 cluster_id,
@@ -415,12 +432,45 @@ class RetroSpecResidentClusterCache:
             )
             for cluster_id in self._cluster_to_slots
         )
-        self._publish_handle_entries(
-            entries,
-            current_stream,
-        )
+        published = self._write_handle_entries(entries, update_stream)
+
+        # Readers immediately switch to the new tensor references after this
+        # method returns. Complete this rare rebuild before releasing the
+        # mutation guard so they cannot observe an uninitialized table.
+        update_stream.synchronize()
+        if published != len(entries):
+            raise RuntimeError(
+                "Resident handle table rebuild did not publish every live cluster"
+            )
+
+        stats = self.performance_stats
+        if stats is not None and stats.enabled:
+            stats.add_counter("resident_handle_table_rebuilds")
+            if self._handle_table_max_pages > previous_max_pages:
+                stats.add_counter("resident_handle_table_width_growths")
+            stats.observe_peak(
+                "resident_handle_table_max_pages",
+                self._handle_table_max_pages,
+            )
+        return True
 
     def _publish_handle_entries(
+        self,
+        entries: Collection[tuple[_ClusterId, tuple[int, ...], RetroSpecClusterGroup]],
+        stream: torch.cuda.Stream,
+    ) -> int:
+        entries = tuple(entries)
+        if not entries:
+            return 0
+
+        max_pages_per_cluster = max(len(slots) for _, slots, _ in entries)
+        if self._ensure_handle_table(max_pages_per_cluster, stream):
+            # A rebuild republishes every live cluster, including this delta.
+            return len(entries)
+
+        return self._write_handle_entries(entries, stream)
+
+    def _write_handle_entries(
         self,
         entries: Collection[tuple[_ClusterId, tuple[int, ...], RetroSpecClusterGroup]],
         stream: torch.cuda.Stream,
@@ -437,6 +487,13 @@ class RetroSpecResidentClusterCache:
         new_entry_indices: list[int] = []
 
         for cluster_id, slots, group in entries:
+            if len(slots) > self._handle_table_max_pages:
+                raise RuntimeError(
+                    f"Resident cluster {cluster_id} has {len(slots)} pages, "
+                    f"but the handle table width is "
+                    f"{self._handle_table_max_pages}"
+                )
+
             bucket = self._handle_to_bucket.get(cluster_id)
             if bucket is None:
                 bucket = self._find_handle_bucket(cluster_id)

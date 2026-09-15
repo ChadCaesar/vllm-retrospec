@@ -1578,6 +1578,143 @@ def test_handle_table_rebuild_preserves_pending_cluster_publication():
     assert access.cache_page_ids.item() == 0
 
 
+def test_handle_table_grows_for_mixed_page_width_pending_admission():
+    group = RetroSpecClusterGroup("request", 0)
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cuda"),
+        log_interval_seconds=60.0,
+    )
+    cache = make_cache(
+        capacity=18,
+        group_targets={group: 18},
+        performance_stats=stats,
+    )
+    backing_keys, backing_values = make_backing_pages(num_pages=18)
+    cluster_groups = {10: group, 11: group}
+
+    with cache.mutation_guard():
+        RetroSpecResidentClusterCache.admit(
+            cache,
+            cluster_ids=torch.tensor([10]),
+            page_ids=torch.arange(8).reshape(1, 8),
+            cluster_groups=cluster_groups,
+            allocated_cluster_ids=set(cluster_groups),
+            allocated_page_ids=set(range(18)),
+            backing_key_pages=backing_keys,
+            backing_value_pages=backing_values,
+        )
+
+    assert cache._pending_cluster_events
+    assert cache._handle_table_max_pages == 8
+
+    with cache.mutation_guard():
+        RetroSpecResidentClusterCache.admit(
+            cache,
+            cluster_ids=torch.tensor([11]),
+            page_ids=torch.arange(8, 18).reshape(1, 10),
+            cluster_groups=cluster_groups,
+            allocated_cluster_ids=set(cluster_groups),
+            allocated_page_ids=set(range(18)),
+            backing_key_pages=backing_keys,
+            backing_value_pages=backing_values,
+        )
+    cache.synchronize_pending_copies()
+
+    assert cache._handle_table_max_pages == 10
+    assert cache._handle_table_page_slots.shape[-1] == 10
+    assert stats._cpu_counters["resident_handle_table_rebuilds"] == 2
+    assert stats._cpu_counters["resident_handle_table_width_growths"] == 2
+    assert stats._peaks["resident_handle_table_max_pages"] == 10
+    assert list(cache._group_states[group].lru) == [10, 11]
+
+    cluster_ids = torch.tensor([[[10, 11]]], device="cuda")
+    logical_page_ids = torch.full((1, 1, 2, 10), -1, dtype=torch.int64, device="cuda")
+    logical_page_ids[0, 0, 0, :8] = torch.arange(8, device="cuda")
+    logical_page_ids[0, 0, 1] = torch.arange(8, 18, device="cuda")
+    access = cache.lookup_gpu(
+        cluster_ids=cluster_ids,
+        page_ids=logical_page_ids,
+        active_mask=torch.tensor([True], device="cuda"),
+        cache_page_ids=torch.empty_like(logical_page_ids),
+        hit_cluster_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+        miss_cluster_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+        hit_gate_ready_mask=torch.empty_like(cluster_ids, dtype=torch.bool),
+        access_kinds=torch.empty_like(cluster_ids, dtype=torch.uint8),
+    )
+    assert access.read_lease is not None
+    access.read_lease.release()
+    torch.cuda.synchronize(cache.device)
+
+    expected_page_slots = torch.full_like(logical_page_ids, -1)
+    expected_page_slots[0, 0, 0, :8] = torch.tensor(
+        cache._cluster_to_slots[10], device="cuda"
+    )
+    expected_page_slots[0, 0, 1] = torch.tensor(
+        cache._cluster_to_slots[11], device="cuda"
+    )
+    assert torch.equal(access.cache_page_ids, expected_page_slots)
+    assert access.hit_cluster_mask.all()
+    assert not access.miss_cluster_mask.any()
+    assert access.hit_gate_ready_mask.all()
+    for cluster_id in cluster_groups:
+        version, gate_ready = resident_handle_state(cache, cluster_id)
+        assert version > 0
+        assert version % 2 == 0
+        assert gate_ready
+
+
+def test_handle_table_write_rejects_entry_wider_than_table():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=2, group_targets={group: 2})
+    cache._ensure_handle_table(1)
+
+    with pytest.raises(RuntimeError, match="has 2 pages.*table width is 1"):
+        cache._write_handle_entries(
+            ((7, (0, 1), group),), torch.cuda.current_stream(cache.device)
+        )
+
+
+def test_handle_table_rebuild_hashes_sparse_monotonic_handles():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=65, group_targets={group: 65})
+    backing_keys, backing_values = make_backing_pages(num_pages=65)
+    cluster_ids = tuple(index * 128 for index in range(65))
+    cluster_groups = {cluster_id: group for cluster_id in cluster_ids}
+
+    with cache.mutation_guard():
+        RetroSpecResidentClusterCache.admit(
+            cache,
+            cluster_ids=torch.tensor(cluster_ids),
+            page_ids=torch.arange(65).reshape(65, 1),
+            cluster_groups=cluster_groups,
+            allocated_cluster_ids=set(cluster_ids),
+            allocated_page_ids=set(range(65)),
+            backing_key_pages=backing_keys,
+            backing_value_pages=backing_values,
+        )
+    cache.synchronize_pending_copies()
+
+    lookup_cluster_ids = torch.tensor(cluster_ids, device="cuda").reshape(1, 1, -1)
+    logical_page_ids = torch.arange(65, device="cuda").reshape(1, 1, 65, 1)
+    access = cache.lookup_gpu(
+        cluster_ids=lookup_cluster_ids,
+        page_ids=logical_page_ids,
+        active_mask=torch.tensor([True], device="cuda"),
+        cache_page_ids=torch.empty_like(logical_page_ids),
+        hit_cluster_mask=torch.empty_like(lookup_cluster_ids, dtype=torch.bool),
+        miss_cluster_mask=torch.empty_like(lookup_cluster_ids, dtype=torch.bool),
+        hit_gate_ready_mask=torch.empty_like(lookup_cluster_ids, dtype=torch.bool),
+        access_kinds=torch.empty_like(lookup_cluster_ids, dtype=torch.uint8),
+    )
+    assert access.read_lease is not None
+    access.read_lease.release()
+    torch.cuda.synchronize(cache.device)
+
+    assert access.hit_cluster_mask.all()
+    assert not access.miss_cluster_mask.any()
+    assert access.hit_gate_ready_mask.all()
+
+
 def test_gpu_hit_epochs_refresh_group_lru_before_eviction():
     group = RetroSpecClusterGroup("request", 0)
     cache = make_cache(capacity=2, group_targets={group: 2})

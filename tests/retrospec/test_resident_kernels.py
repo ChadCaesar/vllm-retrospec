@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from vllm.v1.spec_decode.retrospec.resident_cache import _resident_handle_hash
 from vllm.v1.spec_decode.retrospec.resident_kernels import (
     compact_resident_misses,
     lookup_resident_handles,
@@ -19,6 +20,10 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA is required for resident handle kernels",
 )
+
+
+def _resident_bucket(cluster_handle: int, capacity: int = 8) -> int:
+    return _resident_handle_hash(cluster_handle) & (capacity - 1)
 
 
 def _make_table(
@@ -93,7 +98,11 @@ def test_resident_handle_lookup_returns_slots_and_gpu_access_records():
     device = torch.device("cuda")
     table = _make_table()
     update_resident_handles(
-        bucket_ids=torch.tensor([3, 4], dtype=torch.int32, device=device),
+        bucket_ids=torch.tensor(
+            [_resident_bucket(3), _resident_bucket(11)],
+            dtype=torch.int32,
+            device=device,
+        ),
         cluster_handles=torch.tensor([3, 11], dtype=torch.int64, device=device),
         page_counts=torch.tensor([2, 1], dtype=torch.int32, device=device),
         page_slots=torch.tensor([[5, 6], [7, -1]], dtype=torch.int32, device=device),
@@ -123,14 +132,17 @@ def test_resident_handle_lookup_returns_slots_and_gpu_access_records():
     assert outputs[2].cpu().tolist() == [[[False, False]], [[False, False]]]
     assert outputs[3].cpu().tolist() == [[[True, False]], [[False, False]]]
     assert outputs[4].cpu().tolist() == [[[1, 1]], [[0, 0]]]
-    assert table[5].cpu().tolist()[3:5] == [7, 7]
+    assert table[5][_resident_bucket(3)].item() == 7
+    assert table[5][_resident_bucket(11)].item() == 7
 
 
 def test_resident_handle_lookup_reports_tombstone_and_unknown_handle_as_miss():
     device = torch.device("cuda")
     table = _make_table()
     update_resident_handles(
-        bucket_ids=torch.tensor([3], dtype=torch.int32, device=device),
+        bucket_ids=torch.tensor(
+            [_resident_bucket(3)], dtype=torch.int32, device=device
+        ),
         cluster_handles=torch.tensor([-2], dtype=torch.int64, device=device),
         page_counts=torch.tensor([0], dtype=torch.int32, device=device),
         page_slots=torch.tensor([[-1, -1]], dtype=torch.int32, device=device),
@@ -163,7 +175,9 @@ def test_resident_handle_lookup_can_activate_all_valid_verification_rows():
     device = torch.device("cuda")
     table = _make_table()
     update_resident_handles(
-        bucket_ids=torch.tensor([3], dtype=torch.int32, device=device),
+        bucket_ids=torch.tensor(
+            [_resident_bucket(3)], dtype=torch.int32, device=device
+        ),
         cluster_handles=torch.tensor([3], dtype=torch.int64, device=device),
         page_counts=torch.tensor([1], dtype=torch.int32, device=device),
         page_slots=torch.tensor([[5, -1]], dtype=torch.int32, device=device),
@@ -192,7 +206,11 @@ def test_resident_handle_lookup_indexes_persistent_plan_rows():
     device = torch.device("cuda")
     table = _make_table()
     update_resident_handles(
-        bucket_ids=torch.tensor([3, 4], dtype=torch.int32, device=device),
+        bucket_ids=torch.tensor(
+            [_resident_bucket(3), _resident_bucket(4)],
+            dtype=torch.int32,
+            device=device,
+        ),
         cluster_handles=torch.tensor([3, 4], dtype=torch.int64, device=device),
         page_counts=torch.tensor([1, 2], dtype=torch.int32, device=device),
         page_slots=torch.tensor([[5, -1], [6, 7]], dtype=torch.int32, device=device),
@@ -227,7 +245,9 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
     device = torch.device("cuda")
     table = _make_table(capacity=8, max_pages=2)
     update_resident_handles(
-        bucket_ids=torch.tensor([2], dtype=torch.int32, device=device),
+        bucket_ids=torch.tensor(
+            [_resident_bucket(10)], dtype=torch.int32, device=device
+        ),
         cluster_handles=torch.tensor([10], dtype=torch.int64, device=device),
         page_counts=torch.tensor([2], dtype=torch.int32, device=device),
         page_slots=torch.tensor([[5, 6]], dtype=torch.int32, device=device),
@@ -332,7 +352,9 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
     )
 
     assert sparse_indices.cpu().tolist() == [[[0, 1]], [[-1, -1]]]
-    assert arena_resident_table_buckets.cpu().tolist() == [[2, -1, -1, -1]]
+    assert arena_resident_table_buckets.cpu().tolist() == [
+        [_resident_bucket(10), -1, -1, -1]
+    ]
     assert cluster_handles.cpu().tolist() == [[[10, 11]], [[-1, -1]]]
     assert resident_page_ids.cpu().tolist() == [[[5, 6, -1, -1]], [[-1] * 4]]
     assert page_token_counts.cpu().tolist() == [[[2, 1, 0, 0]], [[0] * 4]]
@@ -350,7 +372,7 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
     torch.testing.assert_close(sparse_attention.cpu(), torch.tensor([0.9, 1.0]))
     torch.testing.assert_close(expanded_attention.cpu(), torch.tensor([1.0, 1.0]))
     assert statistics.cpu().tolist() == [10, 21, 32, 40, 51, 62]
-    assert table[5][2].item() == 9
+    assert table[5][_resident_bucket(10)].item() == 9
 
 
 @pytest.mark.parametrize(
@@ -368,7 +390,9 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
     device = torch.device("cuda")
     table = _make_table(capacity=8, max_pages=2)
     update_resident_handles(
-        bucket_ids=torch.tensor([2], dtype=torch.int32, device=device),
+        bucket_ids=torch.tensor(
+            [_resident_bucket(10)], dtype=torch.int32, device=device
+        ),
         cluster_handles=torch.tensor([10], dtype=torch.int64, device=device),
         page_counts=torch.tensor([2], dtype=torch.int32, device=device),
         page_slots=torch.tensor([[5, 6]], dtype=torch.int32, device=device),
@@ -471,7 +495,10 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
     assert captured_slots.cpu().tolist() == expected_slots
     assert captured_generations.cpu().tolist() == expected_generations
     assert handles.cpu().tolist() == [[[10, 11]], [[-1, -1]]]
-    assert buckets.cpu().tolist() == [[[2, -1]], [[-1, -1]]]
+    assert buckets.cpu().tolist() == [
+        [[_resident_bucket(10), -1]],
+        [[-1, -1]],
+    ]
     assert clustered_counts.cpu().tolist() == [[3], [0]]
     assert selected_counts.cpu().tolist() == [[2], [0]]
     assert hit_counts.cpu().tolist() == [[1], [0]]
@@ -483,7 +510,7 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
     torch.testing.assert_close(attention.cpu(), torch.tensor([0.6, 1.0]))
     torch.testing.assert_close(sparse_attention.cpu(), torch.tensor([0.9, 1.0]))
     torch.testing.assert_close(expanded_attention.cpu(), torch.tensor([1.0, 1.0]))
-    assert table[5][2].item() == 9
+    assert table[5][_resident_bucket(10)].item() == 9
 
 
 def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
@@ -591,7 +618,7 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
     assert miss_positions.item() == 7
 
     # An invalid binding must not bypass normal hash-table semantics. Bucket 2
-    # is empty, so probing stops and the stale binding is cleared.
+    # and the authoritative home bucket are empty, so the stale binding clears.
     binding.fill_(2)
     fallback_counts.fill_(4)
     resolve()
@@ -603,7 +630,9 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
     # A table rebuild can move the same stable handle. The invalid direct
     # binding falls back to the authoritative table and learns its new bucket.
     update_resident_handles(
-        bucket_ids=torch.tensor([2], dtype=torch.int32, device=device),
+        bucket_ids=torch.tensor(
+            [_resident_bucket(10)], dtype=torch.int32, device=device
+        ),
         cluster_handles=torch.tensor([10], dtype=torch.int64, device=device),
         page_counts=torch.tensor([1], dtype=torch.int32, device=device),
         page_slots=torch.tensor([[7]], dtype=torch.int32, device=device),
@@ -619,13 +648,17 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
     assert page_slots.item() == 7
     assert hit_counts.item() == 1
     assert miss_count.item() == 0
-    assert binding.item() == 2
+    assert binding.item() == _resident_bucket(10)
 
     # Request-slot reuse publishes a new, globally unique handle. Even if a
     # stale binding survives, handle validation prevents it from reading the
     # old resident slot and normal probing learns the replacement bucket.
     update_resident_handles(
-        bucket_ids=torch.tensor([2, 3], dtype=torch.int32, device=device),
+        bucket_ids=torch.tensor(
+            [_resident_bucket(10), _resident_bucket(11)],
+            dtype=torch.int32,
+            device=device,
+        ),
         cluster_handles=torch.tensor([-1, 11], dtype=torch.int64, device=device),
         page_counts=torch.tensor([0, 1], dtype=torch.int32, device=device),
         page_slots=torch.tensor([[-1], [5]], dtype=torch.int32, device=device),
@@ -642,7 +675,7 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
     assert page_slots.item() == 5
     assert hit_counts.item() == 1
     assert miss_count.item() == 0
-    assert binding.item() == 3
+    assert binding.item() == _resident_bucket(11)
 
 
 def test_compact_resident_misses_preserves_handles_and_flat_positions():
@@ -838,7 +871,11 @@ def test_compact_verification_resolver_preserves_ranked_pages_and_emits_misses()
     device = torch.device("cuda")
     table = _make_table(max_pages=2)
     update_resident_handles(
-        bucket_ids=torch.tensor([5, 3], dtype=torch.int32, device=device),
+        bucket_ids=torch.tensor(
+            [_resident_bucket(21), _resident_bucket(11)],
+            dtype=torch.int32,
+            device=device,
+        ),
         cluster_handles=torch.tensor([21, 11], dtype=torch.int64, device=device),
         page_counts=torch.tensor([2, 1], dtype=torch.int32, device=device),
         page_slots=torch.tensor([[7, 8], [9, -1]], dtype=torch.int32, device=device),
@@ -900,7 +937,8 @@ def test_compact_verification_resolver_preserves_ranked_pages_and_emits_misses()
     assert miss_records[0][0] == 2
     assert miss_records[1][0] == 8
     assert miss_records[0][1] == miss_records[1][1] == 0
-    assert table[5].cpu().tolist()[3:6] == [19, 0, 19]
+    assert table[5][_resident_bucket(11)].item() == 19
+    assert table[5][_resident_bucket(21)].item() == 19
 
 
 def test_compact_verification_resolver_honors_miss_page_row_stride():

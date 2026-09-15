@@ -7,6 +7,16 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
+def _resident_handle_hash(cluster_handle):
+    """Match the uint32 avalanche hash used by the CPU table publisher."""
+    value = cluster_handle.to(tl.int64)
+    value = (value ^ (value >> 32)) & 0xFFFFFFFF
+    value = ((value ^ (value >> 16)) * 0x7FEB352D) & 0xFFFFFFFF
+    value = ((value ^ (value >> 15)) * 0x846CA68B) & 0xFFFFFFFF
+    return (value ^ (value >> 16)) & 0xFFFFFFFF
+
+
+@triton.jit
 def _find_resident_buckets(
     cluster_handles,
     selected,
@@ -37,7 +47,7 @@ def _find_resident_buckets(
         bound_buckets,
         tl.full((BLOCK_WIDTH,), -1, tl.int64),
     )
-    first_buckets = cluster_handles & (TABLE_CAPACITY - 1)
+    first_buckets = _resident_handle_hash(cluster_handles) & (TABLE_CAPACITY - 1)
     searching = selected & ~direct_hits
     searching_count = tl.sum(searching.to(tl.int32), axis=0)
     probe = 0
@@ -986,7 +996,7 @@ def _resolve_compact_verification_pages_vector_kernel(
     ).to(tl.int32)
     selected &= (handles >= 0) & (logical_page_counts > 0)
 
-    first_buckets = handles & (TABLE_CAPACITY - 1)
+    first_buckets = _resident_handle_hash(handles) & (TABLE_CAPACITY - 1)
     matched_buckets = tl.full((BLOCK_CLUSTERS,), -1, tl.int64)
     searching = selected
     for probe in tl.range(0, 64, num_stages=1, loop_unroll_factor=1):
@@ -1294,7 +1304,7 @@ def _lookup_resident_handles_kernel(
         active = True
     valid_cluster &= (handle >= 0) & active
 
-    first_bucket = handle & (TABLE_CAPACITY - 1)
+    first_bucket = _resident_handle_hash(handle) & (TABLE_CAPACITY - 1)
     matched_bucket = -1
     searching = valid_cluster
 
