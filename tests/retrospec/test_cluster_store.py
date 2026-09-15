@@ -449,6 +449,11 @@ def test_cluster_store_packs_per_head_clusters_across_pages():
     assert metadata.page_ids.shape == (2, 2, 2)
     assert table.cluster_ids.shape == (2, 2)
     assert table.cluster_ids.tolist() == [[0, 1], [2, 3]]
+    torch.testing.assert_close(table.page_metadata.page_ids, metadata.page_ids)
+    torch.testing.assert_close(
+        table.page_metadata.page_token_counts,
+        metadata.page_token_counts,
+    )
     assert metadata.page_token_counts.tolist() == [
         [[2, 1], [2, 0]],
         [[2, 0], [2, 1]],
@@ -506,6 +511,29 @@ def test_cluster_store_packs_per_head_clusters_across_pages():
     )
     assert not gathered_keys[~token_mask.unsqueeze(-1)].any()
     assert not gathered_values[~token_mask.unsqueeze(-1)].any()
+
+
+def test_cluster_store_reuses_block_metadata_when_freeing(monkeypatch):
+    store = RetroSpecClusterPageStore(page_size=2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    table = store_cluster_data(
+        store,
+        "layer",
+        keys,
+        values,
+        assignments,
+        cluster_token_counts,
+    )
+    metadata_lookup = Mock(
+        side_effect=AssertionError("free rebuilt persistent block metadata")
+    )
+    monkeypatch.setattr(store, "get_cluster_block_metadata", metadata_lookup)
+
+    store.free("layer", table)
+
+    metadata_lookup.assert_not_called()
+    assert store.num_allocated_pages("layer") == 0
+    assert store.num_allocated_clusters("layer") == 0
 
 
 def test_cluster_store_uses_gpu_generated_offsets_without_sorting_tokens():

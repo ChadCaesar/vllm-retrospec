@@ -7,9 +7,29 @@ from unittest.mock import Mock
 
 from benchmarks.retrospec.benchmark_long_context import (
     build_speculative_config,
+    parse_args,
     shutdown_llm,
 )
 from benchmarks.retrospec.summarize_long_context import summarize
+
+
+def test_benchmark_uses_default_draft_limit(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "benchmark_long_context.py",
+            "--model",
+            "model",
+            "--dataset-dir",
+            str(tmp_path),
+            "--context-len",
+            "32768",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.max_draft_tokens == 8
 
 
 def test_benchmark_profile_controls_observation_interval():

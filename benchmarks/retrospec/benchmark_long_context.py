@@ -77,7 +77,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--num-speculative-tokens", type=int, default=64)
     parser.add_argument("--min-draft-tokens", type=int, default=1)
-    parser.add_argument("--max-draft-tokens", type=int, default=16)
+    parser.add_argument(
+        "--max-draft-tokens",
+        type=int,
+        default=8,
+        help=(
+            "Hard upper bound for one RetroSpec draft block; dynamic signals "
+            "may stop the block earlier."
+        ),
+    )
     parser.add_argument("--retrieval-ratio", type=float, default=0.018)
     parser.add_argument("--estimation-ratio", type=float, default=0.232)
     parser.add_argument("--cache-ratio", type=float, default=0.0)

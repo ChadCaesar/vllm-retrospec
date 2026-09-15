@@ -1481,11 +1481,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     "Built RetroSpec segment cluster offset is no longer current"
                 )
 
-            block_metadata = self.cluster_store.get_cluster_block_metadata(
-                layer_name=staged_segment.layer_name,
-                cluster_ids=cluster_blocks.cluster_ids,
-                device=torch.device("cpu"),
-            )
+            block_metadata = cluster_blocks.page_metadata
             resident_segments.append(
                 self._gpu_index_residency.build_resident_segment(
                     layer_name=staged_segment.layer_name,

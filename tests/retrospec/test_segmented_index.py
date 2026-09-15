@@ -377,7 +377,14 @@ def test_segmented_index_builds_and_reuses_sparse_selection_plan():
     assert segment.cluster_token_counts.tolist() == [[2, 2]]
     assert segment.cluster_blocks.cluster_ids.tolist() == [[0, 1]]
     assert segment.cluster_blocks.cluster_ids.device.type == "cpu"
-    assert not hasattr(segment.cluster_blocks, "page_ids")
+    torch.testing.assert_close(
+        segment.cluster_blocks.page_metadata.page_ids,
+        metadata.page_ids,
+    )
+    torch.testing.assert_close(
+        segment.cluster_blocks.page_metadata.page_token_counts,
+        metadata.page_token_counts,
+    )
     assert metadata.page_ids.shape == (1, 2, 1)
     assert metadata.page_token_counts.tolist() == [[[2], [2]]]
     assert index.cluster_store.num_allocated_pages("layer") == 2
@@ -1904,7 +1911,17 @@ def test_cpu_offload_builds_cluster_pages_on_background_worker(monkeypatch):
         assert worker_names[0].startswith("retrospec-cluster-page")
 
         allow_build.set()
+        index._staged_segments[0].build_future.result()
+        metadata_lookup = Mock(
+            side_effect=AssertionError("publish rebuilt persistent block metadata")
+        )
+        monkeypatch.setattr(
+            index.cluster_store,
+            "get_cluster_block_metadata",
+            metadata_lookup,
+        )
         index.flush_staged_updates()
+        metadata_lookup.assert_not_called()
     finally:
         allow_build.set()
         if index.has_staged_updates:

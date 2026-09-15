@@ -41,7 +41,7 @@ def test_retrospec_defaults():
     assert config.retrospec_prefill_warmup_multiplier == 4
     assert config.retrospec_index_update_interval == 1024
     assert config.retrospec_min_draft_tokens == 1
-    assert config.retrospec_max_draft_tokens == 16
+    assert config.retrospec_max_draft_tokens == 8
     assert config.retrospec_draft_margin_threshold is None
     assert config.retrospec_sparse_margin_threshold is None
     assert config.retrospec_expanded_margin_threshold is None

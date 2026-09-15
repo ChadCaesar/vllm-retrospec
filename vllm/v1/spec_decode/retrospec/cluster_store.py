@@ -622,12 +622,17 @@ class RetroSpecClusterBlockTable:
 
         [num_kv_heads, num_clusters]
 
-    The handle deliberately does not expose backing page IDs. Page placement
-    belongs to RetroSpecClusterPageStore and is materialized only when an active
-    batch is packed for retrieval.
+    page_metadata is the immutable CPU page layout produced while the cluster
+    pages are built. Retaining it avoids rebuilding the same descriptor during
+    request publication and release. Arbitrary active selections continue to
+    resolve through RetroSpecClusterPageStore.
     """
 
     cluster_ids: torch.Tensor
+    page_metadata: "RetroSpecClusterBlockMetadata" = field(
+        repr=False,
+        compare=False,
+    )
     full_verification_descriptor: "RetroSpecFullVerificationDescriptor"
 
 
@@ -3407,6 +3412,10 @@ class RetroSpecClusterPageStore:
         assert cluster_ids is not None
         return RetroSpecClusterBlockTable(
             cluster_ids=cluster_ids,
+            page_metadata=RetroSpecClusterBlockMetadata(
+                page_ids=page_ids,
+                page_token_counts=page_token_counts,
+            ),
             full_verification_descriptor=full_descriptor,
         )
 
@@ -3424,18 +3433,12 @@ class RetroSpecClusterPageStore:
                     f"No RetroSpec page pool exists for layer {layer_name!r}"
                 )
 
-            block_metadata = self.get_cluster_block_metadata(
-                layer_name=layer_name,
-                cluster_ids=block_table.cluster_ids,
-                device=torch.device("cpu"),
-            )
-
             resident_cache = self._resident_caches.get(layer_name)
             if resident_cache is not None:
                 with resident_cache.mutation_guard():
                     resident_cache.invalidate(block_table.cluster_ids)
 
-            pool.free(block_metadata.page_ids)
+            pool.free(block_table.page_metadata.page_ids)
             self._free_cluster_ids(layer_name, block_table.cluster_ids)
             self._resize_resident_cache(layer_name, pool)
 
