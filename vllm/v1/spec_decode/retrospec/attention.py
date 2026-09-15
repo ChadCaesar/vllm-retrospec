@@ -1469,11 +1469,13 @@ class RetroSpecSparseAttention:
                     token_mask=selection.plan.primary_exact_token_mask,
                 ),
                 request_slot_ids=selection.plan.request_slot_ids,
-                exact_cluster_indices=selection.plan.sparse_exact_cluster_indices,
-                estimation_cluster_indices=(
-                    selection.plan.sparse_estimation_cluster_indices
-                ),
+                ranked_cluster_indices=selection.plan.ranked_cluster_indices,
+                candidate_counts=selection.plan.candidate_counts,
                 resident_bucket_ids=resolved.resident_bucket_ids,
+                sparse_retrieval_width=selection.plan.sparse_retrieval_width,
+                sparse_estimation_width=selection.plan.sparse_estimation_width,
+                retrieval_ratio=self.index.retrieval_ratio,
+                estimation_ratio=self.index.estimation_ratio,
                 cluster_keys=selection.arena.cluster_keys,
                 cluster_values=selection.arena.cluster_values,
                 cluster_token_counts=selection.arena.cluster_token_counts,
@@ -1650,21 +1652,23 @@ class RetroSpecSparseAttention:
             if has_parallel_plan:
                 with self.performance_stats.cuda_timer("verification_plan_index"):
                     selection = self._get_indexed_selection(layer_name, level)
-                if query.device.type != "cuda" or query.dtype not in (
-                    torch.float16,
-                    torch.bfloat16,
-                ):
-                    selection = self.index.materialize_indexed_reference(selection)
             else:
-                plan = self.index.get_selection_plan(layer_name, self.step_index)
-                with self.performance_stats.cuda_timer("verification_plan_materialize"):
-                    selection = self.index.materialize(
-                        plan,
+                request_indices = torch.arange(
+                    query.shape[0], dtype=torch.int64, device=query.device
+                )
+                token_indices = torch.full_like(request_indices, self.step_index)
+                with self.performance_stats.cuda_timer("verification_plan_index"):
+                    selection = self.index.get_indexed_selection(
+                        layer_name,
                         level,
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table,
+                        request_indices,
+                        token_indices,
                     )
+            if query.device.type != "cuda" or query.dtype not in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                selection = self.index.materialize_indexed_reference(selection)
 
         stage_name = {
             RetroSpecAttentionMode.DRAFT: "draft",

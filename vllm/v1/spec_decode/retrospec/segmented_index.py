@@ -45,7 +45,7 @@ from .selection_kernels import (
     emit_primary_exact_token_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
-    pack_indexed_verification_plan,
+    pack_ranked_verification_plan,
 )
 from .selection_provenance import (
     RetroSpecReplayMode,
@@ -72,6 +72,27 @@ class RetroSpecTokenSelectionPlan:
 
     sparse_attn: torch.Tensor
     expanded_attn: torch.Tensor
+
+
+@dataclass(frozen=True)
+class RetroSpecRankedSelectionPlan:
+    layer_name: str
+
+    request_slot_ids: torch.Tensor
+    request_slot_generations: torch.Tensor
+
+    primary_exact_token_indices: torch.Tensor
+    primary_exact_token_mask: torch.Tensor
+
+    ranked_cluster_indices: torch.Tensor
+    candidate_counts: torch.Tensor
+
+    sparse_attn: torch.Tensor
+    expanded_attn: torch.Tensor
+
+    sparse_retrieval_width: int
+    sparse_estimation_width: int
+    expanded_retrieval_width: int
 
 
 @dataclass(frozen=True)
@@ -105,7 +126,7 @@ class RetroSpecTokenAttentionSelection:
 class RetroSpecRankedDraftAttentionSelection:
     """DRAFT selection consumed directly from the resident GPU index."""
 
-    plan: RetroSpecTokenSelectionPlan
+    plan: RetroSpecRankedSelectionPlan
     arena: RetroSpecResidentLayerArena
     resolved_clusters: RetroSpecRankedDraftResolvedClusters
     exact_token_counts: torch.Tensor
@@ -345,10 +366,8 @@ class _SelectionPlanTable:
     primary_exact_token_indices: torch.Tensor
     primary_exact_token_mask: torch.Tensor
 
-    sparse_exact_cluster_indices: torch.Tensor
-    sparse_estimation_cluster_indices: torch.Tensor
-    expanded_exact_cluster_indices: torch.Tensor
-    expanded_estimation_cluster_indices: torch.Tensor
+    ranked_cluster_indices: torch.Tensor
+    candidate_counts: torch.Tensor
 
     draft_prefetch_miss_cluster_ids: torch.Tensor
     draft_prefetch_miss_positions: torch.Tensor
@@ -357,6 +376,7 @@ class _SelectionPlanTable:
     sparse_attn: torch.Tensor
     expanded_attn: torch.Tensor
 
+    ranking_width: int
     sparse_estimation_width: int
     sparse_retrieval_width: int
     expanded_retrieval_width: int
@@ -383,15 +403,8 @@ class _SelectionPlanTable:
         device: torch.device,
     ) -> "_SelectionPlanTable":
         prefix = (num_steps, batch_capacity, num_kv_heads)
-        sparse_cluster_shape = (
-            *prefix,
-            sparse_retrieval_width,
-        )
-        expanded_cluster_shape = (
-            *prefix,
-            expanded_retrieval_width,
-        )
-        estimation_cluster_shape = (*prefix, sparse_estimation_width)
+        ranking_width = sparse_retrieval_width + sparse_estimation_width
+        ranked_cluster_shape = (*prefix, ranking_width)
         primary_shape = (*prefix, primary_exact_width)
         prefetch_capacity = batch_capacity * num_kv_heads * prefetch_width
 
@@ -412,18 +425,10 @@ class _SelectionPlanTable:
             primary_exact_token_mask=torch.empty(
                 primary_shape, dtype=torch.bool, device=device
             ),
-            sparse_exact_cluster_indices=torch.empty(
-                sparse_cluster_shape, dtype=torch.int32, device=device
+            ranked_cluster_indices=torch.empty(
+                ranked_cluster_shape, dtype=torch.int64, device=device
             ),
-            sparse_estimation_cluster_indices=torch.empty(
-                estimation_cluster_shape, dtype=torch.int32, device=device
-            ),
-            expanded_exact_cluster_indices=torch.empty(
-                expanded_cluster_shape, dtype=torch.int32, device=device
-            ),
-            expanded_estimation_cluster_indices=torch.empty(
-                estimation_cluster_shape, dtype=torch.int32, device=device
-            ),
+            candidate_counts=torch.empty(prefix, dtype=torch.int32, device=device),
             draft_prefetch_miss_cluster_ids=torch.empty(
                 (num_steps, prefetch_capacity), dtype=torch.int64, device=device
             ),
@@ -439,6 +444,7 @@ class _SelectionPlanTable:
             expanded_attn=torch.empty(
                 (num_steps, batch_capacity), dtype=torch.float32, device=device
             ),
+            ranking_width=ranking_width,
             sparse_estimation_width=sparse_estimation_width,
             sparse_retrieval_width=sparse_retrieval_width,
             expanded_retrieval_width=expanded_retrieval_width,
@@ -472,28 +478,29 @@ class _SelectionPlanTable:
             and self.batch_capacity >= batch_size
             and self.primary_exact_token_indices.shape[2:]
             == (num_kv_heads, primary_exact_width)
-            and self.sparse_exact_cluster_indices.shape[2:]
-            == (num_kv_heads, sparse_retrieval_width)
-            and self.sparse_estimation_cluster_indices.shape[2:]
-            == (num_kv_heads, sparse_estimation_width)
+            and self.ranked_cluster_indices.shape[2:]
+            == (
+                num_kv_heads,
+                sparse_retrieval_width + sparse_estimation_width,
+            )
+            and self.candidate_counts.shape[2:] == (num_kv_heads,)
             and self.prefetch_width == prefetch_width
-            and self.expanded_exact_cluster_indices.shape[2:]
-            == (num_kv_heads, expanded_retrieval_width)
-            and self.expanded_estimation_cluster_indices.shape[2:]
-            == (num_kv_heads, sparse_estimation_width)
+            and self.expanded_retrieval_width == expanded_retrieval_width
             and self.max_pages_per_cluster == max_pages_per_cluster
             and self.head_size == head_size
             and self.dtype == dtype
             and self.valid_rows.device == device
         )
 
-    def plan(self, step_index: int, batch_size: int) -> RetroSpecTokenSelectionPlan:
+    def ranked_plan(
+        self, step_index: int, batch_size: int
+    ) -> RetroSpecRankedSelectionPlan:
         if not 0 <= step_index < self.valid_rows.shape[0]:
             raise IndexError("Selection-plan step is out of range")
         if not 0 < batch_size <= self.batch_capacity:
             raise ValueError("Selection-plan batch exceeds table capacity")
 
-        return RetroSpecTokenSelectionPlan(
+        return RetroSpecRankedSelectionPlan(
             layer_name=self.layer_name,
             request_slot_ids=self.request_slot_ids[:batch_size],
             request_slot_generations=self.request_slot_generations[:batch_size],
@@ -503,20 +510,15 @@ class _SelectionPlanTable:
             primary_exact_token_mask=(
                 self.primary_exact_token_mask[step_index, :batch_size]
             ),
-            sparse_exact_cluster_indices=(
-                self.sparse_exact_cluster_indices[step_index, :batch_size]
+            ranked_cluster_indices=(
+                self.ranked_cluster_indices[step_index, :batch_size]
             ),
-            sparse_estimation_cluster_indices=(
-                self.sparse_estimation_cluster_indices[step_index, :batch_size]
-            ),
-            expanded_exact_cluster_indices=(
-                self.expanded_exact_cluster_indices[step_index, :batch_size]
-            ),
-            expanded_estimation_cluster_indices=(
-                self.expanded_estimation_cluster_indices[step_index, :batch_size]
-            ),
+            candidate_counts=self.candidate_counts[step_index, :batch_size],
             sparse_attn=self.sparse_attn[step_index, :batch_size],
             expanded_attn=self.expanded_attn[step_index, :batch_size],
+            sparse_retrieval_width=self.sparse_retrieval_width,
+            sparse_estimation_width=self.sparse_estimation_width,
+            expanded_retrieval_width=self.expanded_retrieval_width,
         )
 
     def step_workspace(
@@ -530,7 +532,7 @@ class _SelectionPlanTable:
         if not 0 < batch_size <= self.batch_capacity:
             raise ValueError("Selection-plan batch exceeds table capacity")
 
-        num_kv_heads = self.sparse_exact_cluster_indices.shape[2]
+        num_kv_heads = self.ranked_cluster_indices.shape[2]
         retrieval_width = self.sparse_retrieval_width
         group_shape = (batch_size, num_kv_heads)
         cluster_shape = (*group_shape, retrieval_width)
@@ -2312,8 +2314,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         cluster_scores: torch.Tensor,
         workspace: _ClusterSelectionWorkspace,
         ranking_width: int | None = None,
+        output_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rank into the fixed CUDA workspace without allocating zone tensors."""
+        """Rank clusters and optionally publish into a persistent journal."""
         if cluster_scores is not workspace.scores:
             raise ValueError("Workspace scores do not match cluster scores")
 
@@ -2323,11 +2326,20 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             ranking_width = max_retrieval + max_estimation
         if ranking_width <= 0 or ranking_width > num_clusters:
             raise ValueError("Cluster ranking width is outside the valid range")
-        if workspace.topk_indices.shape[2] < ranking_width:
-            raise ValueError("Workspace top-k capacity is too small")
-
         ranked_values = workspace.topk_values[:, :, :ranking_width]
-        ranked_indices = workspace.topk_indices[:, :, :ranking_width]
+        if output_indices is None:
+            if workspace.topk_indices.shape[2] < ranking_width:
+                raise ValueError("Workspace top-k capacity is too small")
+            ranked_indices = workspace.topk_indices[:, :, :ranking_width]
+        else:
+            expected_shape = (*cluster_scores.shape[:2], ranking_width)
+            if output_indices.shape != expected_shape:
+                raise ValueError("Persistent ranked journal has the wrong shape")
+            if output_indices.dtype != torch.int64:
+                raise ValueError("Persistent ranked journal must use int64")
+            if output_indices.device != cluster_scores.device:
+                raise ValueError("Persistent ranked journal uses the wrong device")
+            ranked_indices = output_indices
         torch.topk(
             workspace.scores,
             k=ranking_width,
@@ -2973,7 +2985,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         dtype: torch.dtype,
         device: torch.device,
     ) -> tuple[
-        RetroSpecTokenSelectionPlan,
+        RetroSpecRankedSelectionPlan,
         _SelectionStepWorkspace,
         _SelectionPlanTable,
     ]:
@@ -3058,7 +3070,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             sparse_retrieval_width=sparse_retrieval_width,
             device=device,
         )
-        plan = table.plan(plan_slot, batch_size)
+        plan = table.ranked_plan(plan_slot, batch_size)
         workspace = table.step_workspace(plan_slot, batch_size, scratch)
         return plan, workspace, table
 
@@ -3248,7 +3260,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         head_size: int,
         dtype: torch.dtype,
     ) -> tuple[
-        RetroSpecTokenSelectionPlan,
+        RetroSpecRankedSelectionPlan,
         _SelectionStepWorkspace,
         _SelectionPlanTable,
     ]:
@@ -3294,6 +3306,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         active_mask: torch.Tensor,
         forced_exact_mask: torch.Tensor,
         cluster_zones: _PackedClusterZones,
+        ranked_indices: torch.Tensor,
+        candidate_counts: torch.Tensor,
         sparse_attn: torch.Tensor,
         expanded_attn: torch.Tensor,
         view: RetroSpecResidentBatchView,
@@ -3301,7 +3315,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         head_size: int,
         dtype: torch.dtype,
     ) -> tuple[RetroSpecTokenSelectionPlan, _SelectionStepWorkspace]:
-        plan, output_workspace, table = self._get_selection_plan_step(
+        ranked_plan, output_workspace, table = self._get_selection_plan_step(
             layer_name=layer_name,
             plan_slot=plan_slot,
             view=view,
@@ -3311,66 +3325,66 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             dtype=dtype,
             device=forced_exact_mask.device,
         )
+        if ranked_indices.shape != ranked_plan.ranked_cluster_indices.shape:
+            raise ValueError("Reference ranking does not match the plan journal")
+        ranked_plan.ranked_cluster_indices.copy_(ranked_indices)
+        ranked_plan.candidate_counts.copy_(candidate_counts)
 
         per_head_forced_exact = forced_exact_mask.unsqueeze(1).expand(
             -1, num_kv_heads, -1
         )
         packed_indices, packed_mask = self._pack_bounded_mask_indices(
             per_head_forced_exact,
-            plan.primary_exact_token_indices.shape[-1],
+            ranked_plan.primary_exact_token_indices.shape[-1],
         )
-        plan.primary_exact_token_indices.zero_()
-        plan.primary_exact_token_mask.zero_()
+        ranked_plan.primary_exact_token_indices.zero_()
+        ranked_plan.primary_exact_token_mask.zero_()
         packed_width = packed_indices.shape[-1]
-        plan.primary_exact_token_indices[..., :packed_width].copy_(packed_indices)
-        plan.primary_exact_token_mask[..., :packed_width].copy_(packed_mask)
+        ranked_plan.primary_exact_token_indices[..., :packed_width].copy_(
+            packed_indices
+        )
+        ranked_plan.primary_exact_token_mask[..., :packed_width].copy_(packed_mask)
 
-        plan.request_slot_ids.copy_(view.request_slot_ids)
+        ranked_plan.request_slot_ids.copy_(view.request_slot_ids)
         if view.arena is None:
-            plan.request_slot_generations.fill_(-1)
+            ranked_plan.request_slot_generations.fill_(-1)
         else:
             valid_slots = view.request_slot_ids >= 0
             safe_slots = view.request_slot_ids.clamp_min(0)
-            plan.request_slot_generations.copy_(
+            ranked_plan.request_slot_generations.copy_(
                 view.arena.generations.index_select(0, safe_slots)
             )
-            plan.request_slot_generations.masked_fill_(~valid_slots, -1)
+            ranked_plan.request_slot_generations.masked_fill_(~valid_slots, -1)
 
-        plan.sparse_exact_cluster_indices.copy_(cluster_zones.sparse_retrieval_indices)
-        plan.sparse_exact_cluster_indices.masked_fill_(
+        sparse_exact = cluster_zones.sparse_retrieval_indices.masked_fill(
             ~cluster_zones.sparse_retrieval_mask, -1
         )
-        plan.sparse_estimation_cluster_indices.copy_(
-            cluster_zones.sparse_estimation_indices
-        )
-        plan.sparse_estimation_cluster_indices.masked_fill_(
+        sparse_estimation = cluster_zones.sparse_estimation_indices.masked_fill(
             ~cluster_zones.sparse_estimation_mask, -1
         )
-        plan.expanded_exact_cluster_indices.copy_(
-            cluster_zones.expanded_retrieval_indices
-        )
-        plan.expanded_exact_cluster_indices.masked_fill_(
+        expanded_exact = cluster_zones.expanded_retrieval_indices.masked_fill(
             ~cluster_zones.expanded_retrieval_mask, -1
         )
-        plan.expanded_estimation_cluster_indices.copy_(
-            cluster_zones.expanded_estimation_indices
-        )
-        plan.expanded_estimation_cluster_indices.masked_fill_(
+        expanded_estimation = cluster_zones.expanded_estimation_indices.masked_fill(
             ~cluster_zones.expanded_estimation_mask, -1
         )
-
-        plan.sparse_attn.copy_(sparse_attn)
-        plan.expanded_attn.copy_(expanded_attn)
+        ranked_plan.sparse_attn.copy_(sparse_attn)
+        ranked_plan.expanded_attn.copy_(expanded_attn)
         self._publish_plan_step(layer_name, plan_slot, active_mask, table)
+        plan = RetroSpecTokenSelectionPlan(
+            layer_name=layer_name,
+            request_slot_ids=ranked_plan.request_slot_ids,
+            request_slot_generations=ranked_plan.request_slot_generations,
+            primary_exact_token_indices=ranked_plan.primary_exact_token_indices,
+            primary_exact_token_mask=ranked_plan.primary_exact_token_mask,
+            sparse_exact_cluster_indices=sparse_exact,
+            sparse_estimation_cluster_indices=sparse_estimation,
+            expanded_exact_cluster_indices=expanded_exact,
+            expanded_estimation_cluster_indices=expanded_estimation,
+            sparse_attn=ranked_plan.sparse_attn,
+            expanded_attn=ranked_plan.expanded_attn,
+        )
         return plan, output_workspace
-
-    def get_selection_plan(
-        self, layer_name: str, step_index: int
-    ) -> RetroSpecTokenSelectionPlan:
-        table = self._selection_plan_tables.get(layer_name)
-        if table is None:
-            raise RuntimeError(f"No draft selection plan for layer {layer_name!r}")
-        return table.plan(step_index, len(self._proposal_request_ids))
 
     @staticmethod
     def _flatten_plan_rows(tensor: torch.Tensor) -> torch.Tensor:
@@ -3502,20 +3516,19 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             raise ValueError("Indexed token indices use the wrong device")
 
         if level == RetroSpecAttentionLevel.SPARSE:
-            exact_cluster_indices = table.sparse_exact_cluster_indices
-            estimation_cluster_indices = table.sparse_estimation_cluster_indices
+            exact_width = table.sparse_retrieval_width
+            expanded = False
             attention_mass = table.sparse_attn
         elif level == RetroSpecAttentionLevel.EXPANDED:
-            exact_cluster_indices = table.expanded_exact_cluster_indices
-            estimation_cluster_indices = table.expanded_estimation_cluster_indices
+            exact_width = table.expanded_retrieval_width
+            expanded = True
             attention_mass = table.expanded_attn
         else:
             raise ValueError(f"Unsupported RetroSpec attention level: {level}")
 
         num_pairs = request_indices.numel()
-        num_kv_heads = exact_cluster_indices.shape[2]
-        exact_width = exact_cluster_indices.shape[3]
-        estimation_width = estimation_cluster_indices.shape[3]
+        num_kv_heads = table.ranked_cluster_indices.shape[2]
+        estimation_width = table.sparse_estimation_width
         workspace = self._get_indexed_verification_workspace(
             pair_capacity=num_pairs,
             num_kv_heads=num_kv_heads,
@@ -3546,14 +3559,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         packed_attention = workspace.attention_mass[:num_pairs]
 
         flatten = self._flatten_plan_rows
-        pack_indexed_verification_plan(
+        pack_ranked_verification_plan(
             request_indices=request_indices,
             token_indices=token_indices,
             valid_rows=table.valid_rows,
             request_slot_ids=table.request_slot_ids,
             request_slot_generations=table.request_slot_generations,
-            exact_cluster_indices=flatten(exact_cluster_indices),
-            estimation_cluster_indices=flatten(estimation_cluster_indices),
+            ranked_cluster_indices=flatten(table.ranked_cluster_indices),
+            candidate_counts=flatten(table.candidate_counts),
             attention_mass=attention_mass.view(-1),
             output_plan_row_indices=plan_rows,
             output_plan_valid_rows=plan_valid_rows,
@@ -3563,6 +3576,9 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             output_estimation_cluster_indices=packed_estimation,
             output_estimation_cluster_mask=packed_estimation_mask,
             output_attention_mass=packed_attention,
+            retrieval_ratio=self.retrieval_ratio,
+            estimation_ratio=self.estimation_ratio,
+            expanded=expanded,
         )
 
         view = self._gpu_index_residency.get_active_view(
@@ -3725,7 +3741,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
     def _resolve_ranked_draft_clusters(
         self,
-        plan: RetroSpecTokenSelectionPlan,
+        plan: RetroSpecRankedSelectionPlan,
         output_workspace: _SelectionStepWorkspace,
         view: RetroSpecResidentBatchView,
         active_mask: torch.Tensor,
@@ -3749,14 +3765,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             active_mask=active_mask,
             retrieval_ratio=self.retrieval_ratio,
             estimation_ratio=self.estimation_ratio,
-            expanded_retrieval_width=plan.expanded_exact_cluster_indices.shape[2],
+            expanded_retrieval_width=plan.expanded_retrieval_width,
             max_pages_per_cluster=view.max_pages_per_cluster,
-            sparse_exact_cluster_indices=plan.sparse_exact_cluster_indices,
-            expanded_exact_cluster_indices=plan.expanded_exact_cluster_indices,
-            sparse_estimation_cluster_indices=(plan.sparse_estimation_cluster_indices),
-            expanded_estimation_cluster_indices=(
-                plan.expanded_estimation_cluster_indices
-            ),
             plan_valid_rows=plan_valid_rows,
             output_request_slot_ids=plan.request_slot_ids,
             output_request_slot_generations=plan.request_slot_generations,
@@ -3788,10 +3798,34 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         snapshot: str,
         physical_source: str,
         index_revisions: Sequence[int],
-        plan: RetroSpecTokenSelectionPlan,
+        plan: RetroSpecRankedSelectionPlan,
         output_workspace: _SelectionStepWorkspace,
         candidate_counts: torch.Tensor,
     ) -> None:
+        candidate_counts_i64 = plan.candidate_counts.to(torch.int64)
+        retrieval_counts = torch.ceil(
+            candidate_counts_i64.float() * self.retrieval_ratio
+        ).to(torch.int64)
+        retrieval_counts = torch.minimum(retrieval_counts, candidate_counts_i64)
+        estimation_counts = torch.ceil(
+            candidate_counts_i64.float() * self.estimation_ratio
+        ).to(torch.int64)
+        estimation_counts = torch.minimum(
+            estimation_counts, candidate_counts_i64 - retrieval_counts
+        )
+        zero_counts = torch.zeros_like(retrieval_counts)
+        sparse_exact, sparse_exact_mask = self._slice_rank_range(
+            plan.ranked_cluster_indices,
+            zero_counts,
+            retrieval_counts,
+            plan.sparse_retrieval_width,
+        )
+        sparse_estimation, sparse_estimation_mask = self._slice_rank_range(
+            plan.ranked_cluster_indices,
+            retrieval_counts,
+            retrieval_counts + estimation_counts,
+            plan.sparse_estimation_width,
+        )
         self.selection_provenance.record_draft_selection(
             request_ids=request_ids,
             layer_name=plan.layer_name,
@@ -3804,8 +3838,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             query=query,
             request_slot_ids=plan.request_slot_ids,
             request_slot_generations=plan.request_slot_generations,
-            sparse_exact_cluster_indices=plan.sparse_exact_cluster_indices,
-            sparse_estimation_cluster_indices=(plan.sparse_estimation_cluster_indices),
+            sparse_exact_cluster_indices=sparse_exact.masked_fill(
+                ~sparse_exact_mask, -1
+            ),
+            sparse_estimation_cluster_indices=sparse_estimation.masked_fill(
+                ~sparse_estimation_mask, -1
+            ),
             exact_cluster_handles=output_workspace.draft_exact_cluster_handles,
             candidate_counts=candidate_counts,
             selected_cluster_counts=(output_workspace.draft_selected_cluster_counts),
@@ -3816,7 +3854,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
     def _materialize_draft_selection(
         self,
-        plan: RetroSpecTokenSelectionPlan,
+        plan: RetroSpecTokenSelectionPlan | RetroSpecRankedSelectionPlan,
         output_workspace: _SelectionStepWorkspace | None,
         view: RetroSpecResidentBatchView,
         active_mask: torch.Tensor,
@@ -3838,6 +3876,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             or output_workspace.draft_exact_cluster_handles.device.type != "cuda"
         )
         if native_only:
+            if not isinstance(plan, RetroSpecTokenSelectionPlan):
+                raise RuntimeError("Ranked DRAFT selection requires a resident arena")
             if self.selection_provenance.enabled:
                 if query is None:
                     raise RuntimeError("Selection provenance requires the draft query")
@@ -3882,6 +3922,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 plan,
                 RetroSpecAttentionLevel.SPARSE,
             )
+        if not isinstance(plan, RetroSpecRankedSelectionPlan):
+            raise RuntimeError("Resident DRAFT selection requires a ranked plan")
         if ranked_values is None:
             raise RuntimeError("CUDA draft selection requires ranked scores")
         if ranked_indices is None:
@@ -4910,7 +4952,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                 ranked_values, ranked_indices = self._rank_cluster_scores(
                     cluster_scores,
                     workspace,
+                    ranking_width=plan.ranked_cluster_indices.shape[2],
+                    output_indices=plan.ranked_cluster_indices,
                 )
+                plan.candidate_counts.copy_(candidate_counts)
             plan_valid_rows = plan_table.valid_rows[plan_slot, : active_mask.shape[0]]
             capture_request_descriptors = (
                 layer_name not in self._selection_plan_written_layers
@@ -4932,6 +4977,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     candidate_counts,
                     view=view,
                     workspace=workspace,
+                )
+                max_retrieval, max_estimation, _ = self._maximum_zone_widths(
+                    cluster_scores.shape[2]
+                )
+                _, ranked_indices = torch.topk(
+                    cluster_scores,
+                    k=max_retrieval + max_estimation,
+                    dim=2,
+                    largest=True,
+                    sorted=True,
                 )
 
             sparse_attn_by_head = self._sum_selected_scores(
@@ -4973,6 +5028,8 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
                     active_mask=active_mask,
                     forced_exact_mask=forced_exact_mask,
                     cluster_zones=cluster_zones,
+                    ranked_indices=ranked_indices,
+                    candidate_counts=candidate_counts,
                     sparse_attn=sparse_attn,
                     expanded_attn=expanded_attn,
                     view=view,

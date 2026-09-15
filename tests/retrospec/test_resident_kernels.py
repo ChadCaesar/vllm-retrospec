@@ -405,10 +405,6 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
     )
 
     row_shape = (2, 1)
-    sparse_indices = torch.empty((2, 1, 2), dtype=torch.int32, device=device)
-    expanded_indices = torch.empty((2, 1, 3), dtype=torch.int32, device=device)
-    sparse_estimation = torch.empty((2, 1, 1), dtype=torch.int32, device=device)
-    expanded_estimation = torch.empty_like(sparse_estimation)
     valid_rows = torch.empty(2, dtype=torch.bool, device=device)
     captured_slots = torch.full((2,), -99, dtype=torch.int64, device=device)
     captured_generations = torch.full_like(captured_slots, -99)
@@ -462,10 +458,6 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
         estimation_ratio=0.34,
         expanded_retrieval_width=3,
         max_pages_per_cluster=2,
-        sparse_exact_cluster_indices=sparse_indices,
-        expanded_exact_cluster_indices=expanded_indices,
-        sparse_estimation_cluster_indices=sparse_estimation,
-        expanded_estimation_cluster_indices=expanded_estimation,
         output_valid_rows=valid_rows,
         output_request_slot_ids=captured_slots,
         output_request_slot_generations=captured_generations,
@@ -487,10 +479,6 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
     )
 
     torch.cuda.synchronize()
-    assert sparse_indices.cpu().tolist() == [[[0, 1]], [[-1, -1]]]
-    assert expanded_indices.cpu().tolist() == [[[0, 1, 2]], [[-1, -1, -1]]]
-    assert sparse_estimation.cpu().tolist() == [[[2]], [[-1]]]
-    assert expanded_estimation.cpu().tolist() == [[[-1]], [[-1]]]
     assert valid_rows.cpu().tolist() == [True, True]
     assert captured_slots.cpu().tolist() == expected_slots
     assert captured_generations.cpu().tolist() == expected_generations

@@ -76,9 +76,13 @@ class RetroSpecRankedDraftKVSource:
 
     primary: RetroSpecExactPrimaryKVSource
     request_slot_ids: torch.Tensor
-    exact_cluster_indices: torch.Tensor
-    estimation_cluster_indices: torch.Tensor
+    ranked_cluster_indices: torch.Tensor
+    candidate_counts: torch.Tensor
     resident_bucket_ids: torch.Tensor
+    sparse_retrieval_width: int
+    sparse_estimation_width: int
+    retrieval_ratio: float
+    estimation_ratio: float
     cluster_keys: torch.Tensor
     cluster_values: torch.Tensor
     cluster_token_counts: torch.Tensor
@@ -383,8 +387,8 @@ def _ranked_draft_attention_partition_kernel(
     primary_token_indices,
     primary_token_mask,
     request_slot_ids,
-    exact_cluster_indices,
-    estimation_cluster_indices,
+    ranked_cluster_indices,
+    candidate_counts,
     resident_bucket_ids,
     cluster_keys,
     cluster_values,
@@ -442,6 +446,9 @@ def _ranked_draft_attention_partition_kernel(
     BLOCK_D: tl.constexpr,
     PARTITION_SIZE: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
+    RANKING_WIDTH: tl.constexpr,
+    RETRIEVAL_RATIO: tl.constexpr,
+    ESTIMATION_RATIO: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -467,6 +474,20 @@ def _ranked_draft_attention_partition_kernel(
     request_page_offset = tl.load(
         page_offsets + safe_request_slot, mask=request_valid, other=0
     ).to(tl.int64)
+    candidate_count = tl.load(
+        candidate_counts + query_idx * NUM_KV_HEADS + kv_head_idx,
+        mask=request_valid,
+        other=0,
+    ).to(tl.int32)
+    retrieval_count = tl.ceil(candidate_count.to(tl.float32) * RETRIEVAL_RATIO).to(
+        tl.int32
+    )
+    retrieval_count = tl.minimum(retrieval_count, candidate_count)
+    estimation_count = tl.ceil(candidate_count.to(tl.float32) * ESTIMATION_RATIO).to(
+        tl.int32
+    )
+    estimation_count = tl.minimum(estimation_count, candidate_count - retrieval_count)
+    ranked_row_offset = (query_idx * NUM_KV_HEADS + kv_head_idx) * RANKING_WIDTH
 
     resident_region_start = MAX_PRIMARY_TOKENS
     resident_cluster_stride = MAX_PAGES * PAGE_SIZE
@@ -544,8 +565,9 @@ def _ranked_draft_attention_partition_kernel(
         )
         safe_resident_ranks = tl.maximum(resident_ranks, 0)
         exact_row_offset = (query_idx * NUM_KV_HEADS + kv_head_idx) * RETRIEVAL_WIDTH
+        resident_valid &= resident_ranks < retrieval_count
         local_cluster_indices = tl.load(
-            exact_cluster_indices + exact_row_offset + safe_resident_ranks,
+            ranked_cluster_indices + ranked_row_offset + safe_resident_ranks,
             mask=resident_valid,
             other=-1,
         ).to(tl.int64)
@@ -623,16 +645,16 @@ def _ranked_draft_attention_partition_kernel(
         fallback_valid = source_valid & (token_offsets >= estimation_region_end)
         safe_estimation_ranks = tl.maximum(estimation_ranks, 0)
         safe_fallback_ranks = tl.maximum(fallback_ranks, 0)
-        estimation_row_offset = (
-            query_idx * NUM_KV_HEADS + kv_head_idx
-        ) * ESTIMATION_WIDTH
+        estimation_valid &= estimation_ranks < estimation_count
+        fallback_valid &= fallback_ranks < retrieval_count
+        ranked_estimation_ranks = retrieval_count + safe_estimation_ranks
         estimation_local_indices = tl.load(
-            estimation_cluster_indices + estimation_row_offset + safe_estimation_ranks,
+            ranked_cluster_indices + ranked_row_offset + ranked_estimation_ranks,
             mask=estimation_valid,
             other=-1,
         ).to(tl.int64)
         fallback_local_indices = tl.load(
-            exact_cluster_indices + exact_row_offset + safe_fallback_ranks,
+            ranked_cluster_indices + ranked_row_offset + safe_fallback_ranks,
             mask=fallback_valid,
             other=-1,
         ).to(tl.int64)
@@ -2281,25 +2303,28 @@ class RetroSpecExactAttentionWorkspace:
         if primary.block_table.shape[0] != batch_size:
             raise ValueError("Block table batch does not match query")
 
-        retrieval_shape = source.exact_cluster_indices.shape
-        if source.resident_bucket_ids.shape != retrieval_shape:
-            raise ValueError("Resident buckets do not match exact clusters")
-        if retrieval_shape[:2] != (batch_size, num_kv_heads):
-            raise ValueError("Exact cluster rows do not match query")
-        if source.estimation_cluster_indices.shape[:2] != (
+        ranked_shape = source.ranked_cluster_indices.shape
+        retrieval_shape = (
             batch_size,
             num_kv_heads,
+            source.sparse_retrieval_width,
+        )
+        if source.resident_bucket_ids.shape != retrieval_shape:
+            raise ValueError("Resident buckets do not match retrieval clusters")
+        if ranked_shape[:2] != (batch_size, num_kv_heads):
+            raise ValueError("Ranked journal rows do not match query")
+        if source.candidate_counts.shape != (batch_size, num_kv_heads):
+            raise ValueError("Candidate counts do not match query")
+        if ranked_shape[2] < (
+            source.sparse_retrieval_width + source.sparse_estimation_width
         ):
-            raise ValueError("Estimation cluster rows do not match query")
+            raise ValueError("Ranked journal is narrower than DRAFT selection")
         if source.request_slot_ids.shape != (batch_size,):
             raise ValueError("Request slots do not match query")
-        if source.exact_cluster_indices.dtype not in (torch.int32, torch.int64):
-            raise ValueError("Exact cluster indices must be integral")
-        if source.estimation_cluster_indices.dtype not in (
-            torch.int32,
-            torch.int64,
-        ):
-            raise ValueError("Estimation cluster indices must be integral")
+        if source.ranked_cluster_indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Ranked cluster indices must be integral")
+        if source.candidate_counts.dtype != torch.int32:
+            raise ValueError("Candidate counts must use int32")
         if source.resident_bucket_ids.dtype not in (torch.int32, torch.int64):
             raise ValueError("Resident buckets must be integral")
 
@@ -2348,8 +2373,8 @@ class RetroSpecExactAttentionWorkspace:
             primary.token_indices,
             primary.token_mask,
             source.request_slot_ids,
-            source.exact_cluster_indices,
-            source.estimation_cluster_indices,
+            source.ranked_cluster_indices,
+            source.candidate_counts,
             source.resident_bucket_ids,
             source.cluster_keys,
             source.cluster_values,
@@ -2368,8 +2393,8 @@ class RetroSpecExactAttentionWorkspace:
         return (
             num_kv_heads,
             max_primary_tokens,
-            retrieval_shape[2],
-            source.estimation_cluster_indices.shape[2],
+            source.sparse_retrieval_width,
+            source.sparse_estimation_width,
         )
 
     def _launch_ranked_draft_partitions(
@@ -2417,8 +2442,8 @@ class RetroSpecExactAttentionWorkspace:
                 primary.token_indices,
                 primary.token_mask,
                 source.request_slot_ids,
-                source.exact_cluster_indices,
-                source.estimation_cluster_indices,
+                source.ranked_cluster_indices,
+                source.candidate_counts,
                 source.resident_bucket_ids,
                 source.cluster_keys,
                 source.cluster_values,
@@ -2476,6 +2501,9 @@ class RetroSpecExactAttentionWorkspace:
                 BLOCK_D=block_d,
                 PARTITION_SIZE=EXACT_ATTENTION_PARTITION_SIZE,
                 BLOCK_TOKENS=_EXACT_ATTENTION_BLOCK_TOKENS,
+                RANKING_WIDTH=source.ranked_cluster_indices.shape[2],
+                RETRIEVAL_RATIO=source.retrieval_ratio,
+                ESTIMATION_RATIO=source.estimation_ratio,
             )
             partition_start += wave_partitions
             if total_partitions <= self._partition_capacity:

@@ -17,6 +17,7 @@ from vllm.v1.spec_decode.retrospec.index_residency import (
 )
 from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecSegmentedTokenIndex,
+    RetroSpecTokenSelectionPlan,
 )
 
 
@@ -212,10 +213,13 @@ def test_prefill_hint_requires_pinned_cpu_backing():
 def test_draft_materialization_skips_resident_lookup_without_arena():
     device = torch.device("cuda")
     index = make_index(pin_memory=True)
-    plan = SimpleNamespace(
+    plan = RetroSpecTokenSelectionPlan(
         layer_name="layer",
         request_slot_ids=torch.full((1,), -1, dtype=torch.int64, device=device),
         request_slot_generations=torch.zeros(1, dtype=torch.int64, device=device),
+        primary_exact_token_indices=torch.tensor(
+            [[[0, 1]]], dtype=torch.int64, device=device
+        ),
         primary_exact_token_mask=torch.ones(1, 1, 2, dtype=torch.bool, device=device),
         sparse_exact_cluster_indices=torch.full(
             (1, 1, 1), -1, dtype=torch.int32, device=device
@@ -2229,7 +2233,9 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     index.begin_proposal(["request"])
     try:
         cold = index.select_segmented(**selection_kwargs)
-        cold_sparse_indices = cold.plan.sparse_exact_cluster_indices.clone()
+        cold_sparse_indices = cold.plan.ranked_cluster_indices[
+            ..., : cold.plan.sparse_retrieval_width
+        ].clone()
     finally:
         index.end_proposal()
 
@@ -2245,7 +2251,8 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     assert cold.resolved_clusters is not None
     assert index.cluster_store.num_resident_pages("layer") == 0
     assert cold.exact_token_counts.tolist() == [[6]]
-    assert cold.plan.sparse_estimation_cluster_indices.ge(0).all()
+    assert cold.plan.candidate_counts.gt(0).all()
+    assert cold.plan.ranked_cluster_indices.ge(0).all()
     assert cold.resolved_clusters.resident_bucket_ids.tolist() == [[[-1]]]
     assert cold.hit_attn.item() == pytest.approx(1.0)
     assert not cold.resolved_clusters.hit_gate_ready.any()
@@ -2280,20 +2287,21 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     index.begin_proposal(["request"])
     try:
         warm = index.select_segmented(**selection_kwargs)
-        verification = index.materialize(
-            warm.plan,
+        indexed = index.get_indexed_selection(
+            "layer",
             RetroSpecAttentionLevel.SPARSE,
-            keys,
-            values,
-            block_table,
+            torch.tensor([0], dtype=torch.int64, device=device),
+            torch.tensor([0], dtype=torch.int64, device=device),
         )
+        verification = index.materialize_indexed_reference(indexed)
     finally:
         index.end_proposal()
 
     assert warm.resolved_clusters is not None
     assert index.cluster_store.num_resident_pages("layer") == 1
     assert warm.exact_token_counts.tolist() == [[8]]
-    assert warm.plan.sparse_estimation_cluster_indices.ge(0).all()
+    assert warm.plan.candidate_counts.gt(0).all()
+    assert warm.plan.ranked_cluster_indices.ge(0).all()
     assert warm.resolved_clusters.resident_bucket_ids.ge(0).all()
     assert warm.resolved_clusters.hit_gate_ready.all()
     assert warm.hit_attn.item() == pytest.approx(warm.plan.sparse_attn.item())
@@ -2404,7 +2412,7 @@ def test_segmented_index_builds_and_selects_on_cuda():
     assert selection.resolved_clusters.cluster_handles.device.type == "cuda"
     assert selection.resolved_clusters.resident_bucket_ids.device.type == "cuda"
     assert selection.exact_token_counts.tolist() == [[6]]
-    assert selection.plan.sparse_estimation_cluster_indices[0, 0, 0].item() >= 0
+    assert selection.plan.ranked_cluster_indices[0, 0, 0].item() >= 0
 
 
 @pytest.mark.parametrize(

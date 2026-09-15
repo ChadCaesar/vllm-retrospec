@@ -14,7 +14,7 @@ from vllm.v1.spec_decode.retrospec.selection_kernels import (
     emit_primary_exact_token_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
-    pack_indexed_verification_plan,
+    pack_ranked_verification_plan,
 )
 
 
@@ -147,23 +147,19 @@ def test_emit_primary_exact_token_plan_clears_slots_past_logical_width():
 
 
 @pytest.mark.parametrize("device_type", ["cpu", "cuda"])
-def test_pack_indexed_verification_plan_matches_query_rows(device_type: str):
+@pytest.mark.parametrize("expanded", [False, True])
+def test_pack_ranked_verification_plan_matches_query_rows(
+    device_type: str, expanded: bool
+):
     if device_type == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device(device_type)
     valid_rows = torch.tensor([[True, True], [True, False]], device=device)
     request_slots = torch.tensor([3, 7], dtype=torch.int64, device=device)
     request_generations = torch.tensor([11, 13], dtype=torch.int64, device=device)
-    exact = torch.arange(4 * 2 * 3, dtype=torch.int32, device=device).view(4, 2, 3)
-    estimation = torch.tensor(
-        [
-            [[0, 1], [2, -1]],
-            [[3, 4], [-1, 5]],
-            [[6, 7], [8, 9]],
-            [[10, 11], [12, 13]],
-        ],
-        dtype=torch.int32,
-        device=device,
+    ranked = torch.arange(4 * 2 * 5, dtype=torch.int64, device=device).view(4, 2, 5)
+    candidate_counts = torch.tensor(
+        [[5, 2], [4, 1], [0, 5], [5, 5]], dtype=torch.int32, device=device
     )
     attention = torch.tensor([0.1, 0.2, 0.3, 0.4], device=device)
     requests = torch.tensor([1, 0, 1, 2], dtype=torch.int64, device=device)
@@ -174,19 +170,22 @@ def test_pack_indexed_verification_plan_matches_query_rows(device_type: str):
     plan_valid = torch.empty(num_pairs, dtype=torch.bool, device=device)
     packed_slots = torch.empty(num_pairs, dtype=torch.int64, device=device)
     packed_generations = torch.empty(num_pairs, dtype=torch.int64, device=device)
-    packed_exact = torch.empty(num_pairs, 2, 3, dtype=torch.int32, device=device)
+    exact_width = 5 if expanded else 3
+    packed_exact = torch.empty(
+        num_pairs, 2, exact_width, dtype=torch.int32, device=device
+    )
     packed_estimation = torch.empty(num_pairs, 2, 2, dtype=torch.int32, device=device)
     packed_mask = torch.empty_like(packed_estimation, dtype=torch.bool)
     packed_attention = torch.empty(num_pairs, device=device)
 
-    pack_indexed_verification_plan(
+    pack_ranked_verification_plan(
         request_indices=requests,
         token_indices=tokens,
         valid_rows=valid_rows,
         request_slot_ids=request_slots,
         request_slot_generations=request_generations,
-        exact_cluster_indices=exact,
-        estimation_cluster_indices=estimation,
+        ranked_cluster_indices=ranked,
+        candidate_counts=candidate_counts,
         attention_mass=attention,
         output_plan_row_indices=plan_rows,
         output_plan_valid_rows=plan_valid,
@@ -196,22 +195,42 @@ def test_pack_indexed_verification_plan_matches_query_rows(device_type: str):
         output_estimation_cluster_indices=packed_estimation,
         output_estimation_cluster_mask=packed_mask,
         output_attention_mass=packed_attention,
+        retrieval_ratio=0.5,
+        estimation_ratio=0.4,
+        expanded=expanded,
     )
 
     assert plan_rows.cpu().tolist() == [1, 2, 3, 0]
     assert plan_valid.cpu().tolist() == [True, True, False, False]
     assert packed_slots.cpu().tolist() == [7, 3, -1, -1]
     assert packed_generations.cpu().tolist() == [13, 11, -1, -1]
-    expected_exact = exact.index_select(0, torch.tensor([1, 2], device=device))
-    torch.testing.assert_close(packed_exact[:2], expected_exact)
-    assert (packed_exact[2:] == -1).all()
-    expected_estimation = estimation.index_select(
-        0, torch.tensor([1, 2], device=device)
-    )
-    torch.testing.assert_close(packed_estimation[:2], expected_estimation)
-    assert (packed_estimation[2:] == -1).all()
-    torch.testing.assert_close(packed_mask[:2], expected_estimation >= 0)
-    assert not packed_mask[2:].any()
+    expected_exact = torch.full_like(packed_exact, -1)
+    expected_estimation = torch.full_like(packed_estimation, -1)
+    expected_estimation_mask = torch.zeros_like(packed_mask)
+    selected_rows = (1, 2)
+    for pair_idx, row in enumerate(selected_rows):
+        for head_idx in range(2):
+            candidates = int(candidate_counts[row, head_idx].item())
+            retrieval = min((candidates + 1) // 2, candidates)
+            estimation_count = min(
+                int(torch.ceil(torch.tensor(candidates * 0.4)).item()),
+                candidates - retrieval,
+            )
+            total = retrieval + estimation_count
+            exact_count = min(retrieval * 2, total) if expanded else retrieval
+            output_estimation_count = total - exact_count
+            expected_exact[pair_idx, head_idx, :exact_count] = ranked[
+                row, head_idx, :exact_count
+            ]
+            expected_estimation[pair_idx, head_idx, :output_estimation_count] = ranked[
+                row, head_idx, exact_count:total
+            ]
+            expected_estimation_mask[pair_idx, head_idx, :output_estimation_count] = (
+                True
+            )
+    torch.testing.assert_close(packed_exact, expected_exact)
+    torch.testing.assert_close(packed_estimation, expected_estimation)
+    torch.testing.assert_close(packed_mask, expected_estimation_mask)
     torch.testing.assert_close(
         packed_attention.cpu(), torch.tensor([0.2, 0.3, 1.0, 1.0])
     )
@@ -524,8 +543,10 @@ def test_selection_plan_table_uses_one_shared_draft_scratch():
     assert not hasattr(table, "draft_estimation_keys")
     assert not hasattr(table, "expanded_estimation_keys")
     assert not hasattr(index._draft_selection_scratch, "primary_topk_order")
-    assert table.sparse_estimation_cluster_indices.shape == (2, 1, 1, 1)
-    assert table.expanded_estimation_cluster_indices.shape == (2, 1, 1, 1)
+    assert table.ranked_cluster_indices.shape == (2, 1, 1, 3)
+    assert table.candidate_counts.shape == (2, 1, 1)
+    assert not hasattr(table, "sparse_exact_cluster_indices")
+    assert not hasattr(table, "expanded_exact_cluster_indices")
     assert first.draft_exact_cluster_handles.data_ptr() == (
         second.draft_exact_cluster_handles.data_ptr()
     )

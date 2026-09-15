@@ -204,14 +204,14 @@ def emit_primary_exact_token_plan(
 
 
 @triton.jit
-def _pack_indexed_verification_plan_kernel(
+def _pack_ranked_verification_plan_kernel(
     request_indices,
     token_indices,
     valid_rows,
     request_slot_ids,
     request_slot_generations,
-    exact_cluster_indices,
-    estimation_cluster_indices,
+    ranked_cluster_indices,
+    candidate_counts,
     attention_mass,
     output_plan_row_indices,
     output_plan_valid_rows,
@@ -223,12 +223,11 @@ def _pack_indexed_verification_plan_kernel(
     output_attention_mass,
     valid_row_stride_0,
     valid_row_stride_1,
-    exact_stride_0,
-    exact_stride_1,
-    exact_stride_2,
-    estimation_stride_0,
-    estimation_stride_1,
-    estimation_stride_2,
+    ranked_stride_0,
+    ranked_stride_1,
+    ranked_stride_2,
+    candidate_stride_0,
+    candidate_stride_1,
     output_exact_stride_0,
     output_exact_stride_1,
     output_exact_stride_2,
@@ -240,6 +239,9 @@ def _pack_indexed_verification_plan_kernel(
     EXACT_WIDTH: tl.constexpr,
     ESTIMATION_WIDTH: tl.constexpr,
     BLOCK_RANK: tl.constexpr,
+    EXPANDED: tl.constexpr,
+    RETRIEVAL_RATIO: tl.constexpr,
+    ESTIMATION_RATIO: tl.constexpr,
 ):
     pair_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -285,15 +287,32 @@ def _pack_indexed_verification_plan_kernel(
     )
     tl.store(output_attention_mass + pair_idx, packed_attention, mask=scalar_writer)
 
-    exact_rank_valid = ranks < EXACT_WIDTH
-    exact_source_offsets = (
-        plan_row * exact_stride_0
-        + kv_head_idx * exact_stride_1
-        + ranks * exact_stride_2
+    candidate_count = tl.load(
+        candidate_counts
+        + plan_row * candidate_stride_0
+        + kv_head_idx * candidate_stride_1,
+        mask=plan_valid,
+        other=0,
+    ).to(tl.int32)
+    retrieval_count = tl.ceil(candidate_count.to(tl.float32) * RETRIEVAL_RATIO).to(
+        tl.int32
     )
+    retrieval_count = tl.minimum(retrieval_count, candidate_count)
+    estimation_count = tl.ceil(candidate_count.to(tl.float32) * ESTIMATION_RATIO).to(
+        tl.int32
+    )
+    estimation_count = tl.minimum(estimation_count, candidate_count - retrieval_count)
+    total_compute_count = retrieval_count + estimation_count
+    exact_count = retrieval_count
+    if EXPANDED:
+        exact_count = tl.minimum(retrieval_count * 2, total_compute_count)
+    selected_estimation_count = total_compute_count - exact_count
+
+    ranked_row_offset = plan_row * ranked_stride_0 + kv_head_idx * ranked_stride_1
+    exact_rank_valid = plan_valid & (ranks < EXACT_WIDTH) & (ranks < exact_count)
     exact_indices = tl.load(
-        exact_cluster_indices + exact_source_offsets,
-        mask=plan_valid & exact_rank_valid,
+        ranked_cluster_indices + ranked_row_offset + ranks * ranked_stride_2,
+        mask=exact_rank_valid,
         other=-1,
     )
     exact_output_offsets = (
@@ -303,19 +322,17 @@ def _pack_indexed_verification_plan_kernel(
     )
     tl.store(
         output_exact_cluster_indices + exact_output_offsets,
-        exact_indices,
-        mask=exact_rank_valid,
+        tl.where(exact_rank_valid, exact_indices, -1),
+        mask=ranks < EXACT_WIDTH,
     )
 
-    estimation_rank_valid = ranks < ESTIMATION_WIDTH
-    estimation_source_offsets = (
-        plan_row * estimation_stride_0
-        + kv_head_idx * estimation_stride_1
-        + ranks * estimation_stride_2
+    estimation_rank_valid = (
+        plan_valid & (ranks < ESTIMATION_WIDTH) & (ranks < selected_estimation_count)
     )
+    estimation_ranks = exact_count + ranks
     estimation_indices = tl.load(
-        estimation_cluster_indices + estimation_source_offsets,
-        mask=plan_valid & estimation_rank_valid,
+        ranked_cluster_indices + ranked_row_offset + estimation_ranks * ranked_stride_2,
+        mask=estimation_rank_valid,
         other=-1,
     )
     estimation_output_offsets = (
@@ -325,25 +342,25 @@ def _pack_indexed_verification_plan_kernel(
     )
     tl.store(
         output_estimation_cluster_indices + estimation_output_offsets,
-        estimation_indices,
-        mask=estimation_rank_valid,
+        tl.where(estimation_rank_valid, estimation_indices, -1),
+        mask=ranks < ESTIMATION_WIDTH,
     )
     tl.store(
         output_estimation_cluster_mask + estimation_output_offsets,
-        plan_valid & (estimation_indices >= 0),
-        mask=estimation_rank_valid,
+        estimation_rank_valid & (estimation_indices >= 0),
+        mask=ranks < ESTIMATION_WIDTH,
     )
 
 
-def pack_indexed_verification_plan(
+def pack_ranked_verification_plan(
     *,
     request_indices: torch.Tensor,
     token_indices: torch.Tensor,
     valid_rows: torch.Tensor,
     request_slot_ids: torch.Tensor,
     request_slot_generations: torch.Tensor,
-    exact_cluster_indices: torch.Tensor,
-    estimation_cluster_indices: torch.Tensor,
+    ranked_cluster_indices: torch.Tensor,
+    candidate_counts: torch.Tensor,
     attention_mass: torch.Tensor,
     output_plan_row_indices: torch.Tensor,
     output_plan_valid_rows: torch.Tensor,
@@ -353,8 +370,11 @@ def pack_indexed_verification_plan(
     output_estimation_cluster_indices: torch.Tensor,
     output_estimation_cluster_mask: torch.Tensor,
     output_attention_mass: torch.Tensor,
+    retrieval_ratio: float,
+    estimation_ratio: float,
+    expanded: bool,
 ) -> None:
-    """Pack persistent verification-plan rows into query-row descriptors."""
+    """Expand ranked journal rows into packed verification descriptors."""
     if request_indices.ndim != 1 or token_indices.ndim != 1:
         raise ValueError("Indexed verification inputs must be one-dimensional")
     if request_indices.shape != token_indices.shape:
@@ -365,16 +385,23 @@ def pack_indexed_verification_plan(
         raise ValueError("Request slot descriptors must have equal shapes")
     if request_slot_ids.shape != (valid_rows.shape[1],):
         raise ValueError("Request slot descriptors do not match plan capacity")
-    if exact_cluster_indices.ndim != 3 or estimation_cluster_indices.ndim != 3:
-        raise ValueError("Cluster plans must have shape [rows, heads, width]")
+    if ranked_cluster_indices.ndim != 3:
+        raise ValueError("Ranked journal must have shape [rows, heads, ranks]")
+    if candidate_counts.shape != ranked_cluster_indices.shape[:2]:
+        raise ValueError("Candidate counts do not match ranked journal rows")
+    if not 0.0 < retrieval_ratio <= 1.0:
+        raise ValueError("Retrieval ratio must be in (0, 1]")
+    if not 0.0 <= estimation_ratio <= 1.0:
+        raise ValueError("Estimation ratio must be in [0, 1]")
 
     num_pairs = request_indices.numel()
     num_plan_rows = valid_rows.numel()
-    num_kv_heads = exact_cluster_indices.shape[1]
-    if exact_cluster_indices.shape[0] != num_plan_rows:
-        raise ValueError("Exact cluster plan has the wrong row capacity")
-    if estimation_cluster_indices.shape[:2] != (num_plan_rows, num_kv_heads):
-        raise ValueError("Estimation cluster plan has the wrong row shape")
+    num_kv_heads = ranked_cluster_indices.shape[1]
+    ranking_width = ranked_cluster_indices.shape[2]
+    if ranked_cluster_indices.shape[0] != num_plan_rows:
+        raise ValueError("Ranked journal has the wrong row capacity")
+    if ranking_width <= 0:
+        raise ValueError("Ranked journal width must be positive")
     if attention_mass.shape != (num_plan_rows,):
         raise ValueError("Attention plan has the wrong row capacity")
     if output_plan_row_indices.shape != (num_pairs,):
@@ -385,21 +412,25 @@ def pack_indexed_verification_plan(
         raise ValueError("Packed request slots have the wrong shape")
     if output_request_slot_generations.shape != (num_pairs,):
         raise ValueError("Packed request generations have the wrong shape")
-    if output_exact_cluster_indices.shape != (
-        num_pairs,
-        num_kv_heads,
-        exact_cluster_indices.shape[2],
-    ):
+    if output_exact_cluster_indices.ndim != 3 or output_exact_cluster_indices.shape[
+        :2
+    ] != (num_pairs, num_kv_heads):
         raise ValueError("Packed exact clusters have the wrong shape")
+    if output_exact_cluster_indices.shape[2] > ranking_width:
+        raise ValueError("Packed exact clusters exceed the ranked journal")
+    if output_estimation_cluster_indices.ndim != 3:
+        raise ValueError("Packed estimation clusters have the wrong shape")
     expected_estimation_shape = (
         num_pairs,
         num_kv_heads,
-        estimation_cluster_indices.shape[2],
+        output_estimation_cluster_indices.shape[2],
     )
     if output_estimation_cluster_indices.shape != expected_estimation_shape:
         raise ValueError("Packed estimation clusters have the wrong shape")
     if output_estimation_cluster_mask.shape != expected_estimation_shape:
         raise ValueError("Packed estimation mask has the wrong shape")
+    if output_estimation_cluster_indices.shape[2] > ranking_width:
+        raise ValueError("Packed estimation clusters exceed the ranked journal")
     if output_attention_mass.shape != (num_pairs,):
         raise ValueError("Packed attention mass has the wrong shape")
 
@@ -408,8 +439,8 @@ def pack_indexed_verification_plan(
         token_indices,
         request_slot_ids,
         request_slot_generations,
-        exact_cluster_indices,
-        estimation_cluster_indices,
+        ranked_cluster_indices,
+        candidate_counts,
     )
     if any(tensor.dtype not in (torch.int32, torch.int64) for tensor in integer_inputs):
         raise ValueError("Indexed verification descriptors must be integral")
@@ -456,33 +487,65 @@ def pack_indexed_verification_plan(
                 ~plan_valid, -1
             )
         )
-        exact = exact_cluster_indices.index_select(0, plan_rows)
-        estimation = estimation_cluster_indices.index_select(0, plan_rows)
+        ranked = ranked_cluster_indices.index_select(0, plan_rows)
+        candidates = candidate_counts.index_select(0, plan_rows)
+        retrieval_counts = torch.ceil(candidates * retrieval_ratio).to(torch.int64)
+        retrieval_counts = torch.minimum(retrieval_counts, candidates.to(torch.int64))
+        estimation_counts = torch.ceil(candidates * estimation_ratio).to(torch.int64)
+        estimation_counts = torch.minimum(
+            estimation_counts, candidates.to(torch.int64) - retrieval_counts
+        )
+        total_counts = retrieval_counts + estimation_counts
+        exact_counts = retrieval_counts
+        if expanded:
+            exact_counts = torch.minimum(retrieval_counts * 2, total_counts)
+        selected_estimation_counts = total_counts - exact_counts
+
+        exact_ranks = torch.arange(
+            output_exact_cluster_indices.shape[2], device=request_indices.device
+        )
+        exact_mask = plan_valid[:, None, None] & (
+            exact_ranks < exact_counts.unsqueeze(-1)
+        )
+        safe_exact_ranks = exact_ranks.expand_as(output_exact_cluster_indices)
         output_exact_cluster_indices.copy_(
-            exact.masked_fill(~plan_valid[:, None, None], -1)
+            ranked.gather(2, safe_exact_ranks).masked_fill(~exact_mask, -1)
         )
+
+        estimation_ranks = torch.arange(
+            output_estimation_cluster_indices.shape[2],
+            device=request_indices.device,
+        )
+        estimation_mask = plan_valid[:, None, None] & (
+            estimation_ranks < selected_estimation_counts.unsqueeze(-1)
+        )
+        ranked_estimation_ranks = exact_counts.unsqueeze(-1) + estimation_ranks
+        safe_estimation_ranks = ranked_estimation_ranks.clamp_max(ranked.shape[2] - 1)
+        estimation = ranked.gather(2, safe_estimation_ranks)
         output_estimation_cluster_indices.copy_(
-            estimation.masked_fill(~plan_valid[:, None, None], -1)
+            estimation.masked_fill(~estimation_mask, -1)
         )
-        output_estimation_cluster_mask.copy_(
-            plan_valid[:, None, None] & (estimation >= 0)
-        )
+        output_estimation_cluster_mask.copy_(estimation_mask & (estimation >= 0))
         output_attention_mass.copy_(
             attention_mass.index_select(0, plan_rows).masked_fill(~plan_valid, 1.0)
         )
         return
 
     block_rank = triton.next_power_of_2(
-        max(exact_cluster_indices.shape[2], estimation_cluster_indices.shape[2], 1)
+        max(
+            output_exact_cluster_indices.shape[2],
+            output_estimation_cluster_indices.shape[2],
+            1,
+        )
     )
-    _pack_indexed_verification_plan_kernel[(num_pairs, num_kv_heads)](
+    _pack_ranked_verification_plan_kernel[(num_pairs, num_kv_heads)](
         request_indices,
         token_indices,
         valid_rows,
         request_slot_ids,
         request_slot_generations,
-        exact_cluster_indices,
-        estimation_cluster_indices,
+        ranked_cluster_indices,
+        candidate_counts,
         attention_mass,
         output_plan_row_indices,
         output_plan_valid_rows,
@@ -494,12 +557,11 @@ def pack_indexed_verification_plan(
         output_attention_mass,
         valid_rows.stride(0),
         valid_rows.stride(1),
-        exact_cluster_indices.stride(0),
-        exact_cluster_indices.stride(1),
-        exact_cluster_indices.stride(2),
-        estimation_cluster_indices.stride(0),
-        estimation_cluster_indices.stride(1),
-        estimation_cluster_indices.stride(2),
+        ranked_cluster_indices.stride(0),
+        ranked_cluster_indices.stride(1),
+        ranked_cluster_indices.stride(2),
+        candidate_counts.stride(0),
+        candidate_counts.stride(1),
         output_exact_cluster_indices.stride(0),
         output_exact_cluster_indices.stride(1),
         output_exact_cluster_indices.stride(2),
@@ -508,9 +570,12 @@ def pack_indexed_verification_plan(
         output_estimation_cluster_indices.stride(2),
         NUM_STEPS=valid_rows.shape[0],
         BATCH_CAPACITY=valid_rows.shape[1],
-        EXACT_WIDTH=exact_cluster_indices.shape[2],
-        ESTIMATION_WIDTH=estimation_cluster_indices.shape[2],
+        EXACT_WIDTH=output_exact_cluster_indices.shape[2],
+        ESTIMATION_WIDTH=output_estimation_cluster_indices.shape[2],
         BLOCK_RANK=block_rank,
+        EXPANDED=expanded,
+        RETRIEVAL_RATIO=retrieval_ratio,
+        ESTIMATION_RATIO=estimation_ratio,
     )
 
 

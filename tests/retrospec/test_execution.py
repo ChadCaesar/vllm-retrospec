@@ -635,9 +635,17 @@ def test_ranked_draft_attention_reads_resident_buckets_and_summary_misses(dtype)
             token_mask=primary_mask,
         ),
         request_slot_ids=torch.tensor([0, 1], dtype=torch.int64, device=device),
-        exact_cluster_indices=exact_indices,
-        estimation_cluster_indices=estimation_indices,
+        ranked_cluster_indices=torch.cat(
+            (exact_indices.to(torch.int64), estimation_indices.to(torch.int64)), dim=2
+        ),
+        candidate_counts=torch.full(
+            (batch_size, num_kv_heads), 3, dtype=torch.int32, device=device
+        ),
         resident_bucket_ids=resident_buckets,
+        sparse_retrieval_width=2,
+        sparse_estimation_width=1,
+        retrieval_ratio=0.5,
+        estimation_ratio=0.34,
         cluster_keys=cluster_keys,
         cluster_values=cluster_values,
         cluster_token_counts=cluster_counts,

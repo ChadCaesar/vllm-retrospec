@@ -5111,10 +5111,6 @@ class RetroSpecClusterPageStore:
         estimation_ratio: float,
         expanded_retrieval_width: int,
         max_pages_per_cluster: int,
-        sparse_exact_cluster_indices: torch.Tensor,
-        expanded_exact_cluster_indices: torch.Tensor,
-        sparse_estimation_cluster_indices: torch.Tensor,
-        expanded_estimation_cluster_indices: torch.Tensor,
         plan_valid_rows: torch.Tensor,
         output_request_slot_ids: torch.Tensor,
         output_request_slot_generations: torch.Tensor,
@@ -5159,12 +5155,6 @@ class RetroSpecClusterPageStore:
                 estimation_ratio=estimation_ratio,
                 expanded_retrieval_width=expanded_retrieval_width,
                 max_pages_per_cluster=max_pages_per_cluster,
-                sparse_exact_cluster_indices=sparse_exact_cluster_indices,
-                expanded_exact_cluster_indices=expanded_exact_cluster_indices,
-                sparse_estimation_cluster_indices=sparse_estimation_cluster_indices,
-                expanded_estimation_cluster_indices=(
-                    expanded_estimation_cluster_indices
-                ),
                 plan_valid_rows=plan_valid_rows,
                 output_request_slot_ids=output_request_slot_ids,
                 output_request_slot_generations=(output_request_slot_generations),

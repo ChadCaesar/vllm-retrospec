@@ -39,6 +39,7 @@ from vllm.v1.spec_decode.retrospec.segmented_index import (
     RetroSpecFullVerificationPlan,
     RetroSpecIndexedTokenAttentionSelection,
     RetroSpecRankedDraftAttentionSelection,
+    RetroSpecRankedSelectionPlan,
     RetroSpecSegmentedTokenIndex,
     RetroSpecTokenAttentionSelection,
     RetroSpecTokenSelectionPlan,
@@ -321,15 +322,11 @@ def make_selection(batch_size: int = 2) -> RetroSpecTokenAttentionSelection:
     )
 
 
-_TOKEN_PLAN_TENSOR_FIELDS = (
+_TOKEN_PLAN_COMMON_FIELDS = (
     "request_slot_ids",
     "request_slot_generations",
     "primary_exact_token_indices",
     "primary_exact_token_mask",
-    "sparse_exact_cluster_indices",
-    "sparse_estimation_cluster_indices",
-    "expanded_exact_cluster_indices",
-    "expanded_estimation_cluster_indices",
     "sparse_attn",
     "expanded_attn",
 )
@@ -366,9 +363,15 @@ def store_token_plan(
         )
         index._selection_plan_tables[plan.layer_name] = table
 
-    stored = table.plan(step_index, batch_size)
-    for field_name in _TOKEN_PLAN_TENSOR_FIELDS:
+    stored = table.ranked_plan(step_index, batch_size)
+    for field_name in _TOKEN_PLAN_COMMON_FIELDS:
         getattr(stored, field_name).copy_(getattr(plan, field_name))
+    ranked = torch.cat(
+        (plan.sparse_exact_cluster_indices, plan.sparse_estimation_cluster_indices),
+        dim=2,
+    )
+    stored.ranked_cluster_indices.copy_(ranked)
+    stored.candidate_counts.copy_((ranked >= 0).sum(dim=2, dtype=torch.int32))
     if active_mask is None:
         active_mask = torch.ones(
             batch_size, dtype=torch.bool, device=table.valid_rows.device
@@ -1765,16 +1768,22 @@ def test_ranked_draft_attention_consumes_arena_views_and_releases_lease():
     controller = make_controller(cache_ratio=0.5)
     controller.mode = RetroSpecAttentionMode.DRAFT
     device = torch.device("cuda")
-    plan = make_token_plan(1, num_kv_heads=1, exact_width=1, estimation_width=1)
-    plan = replace(
-        plan,
-        request_slot_ids=plan.request_slot_ids.to(device),
-        primary_exact_token_indices=plan.primary_exact_token_indices.to(device),
-        primary_exact_token_mask=plan.primary_exact_token_mask.to(device),
-        sparse_exact_cluster_indices=plan.sparse_exact_cluster_indices.to(device),
-        sparse_estimation_cluster_indices=(
-            plan.sparse_estimation_cluster_indices.to(device)
+    token_plan = make_token_plan(1, num_kv_heads=1, exact_width=1, estimation_width=1)
+    plan = RetroSpecRankedSelectionPlan(
+        layer_name=token_plan.layer_name,
+        request_slot_ids=token_plan.request_slot_ids.to(device),
+        request_slot_generations=token_plan.request_slot_generations.to(device),
+        primary_exact_token_indices=token_plan.primary_exact_token_indices.to(device),
+        primary_exact_token_mask=token_plan.primary_exact_token_mask.to(device),
+        ranked_cluster_indices=torch.tensor(
+            [[[0, 1]]], dtype=torch.int64, device=device
         ),
+        candidate_counts=torch.tensor([[2]], dtype=torch.int32, device=device),
+        sparse_attn=torch.ones(1, device=device),
+        expanded_attn=torch.ones(1, device=device),
+        sparse_retrieval_width=1,
+        sparse_estimation_width=1,
+        expanded_retrieval_width=2,
     )
     lease = SimpleNamespace(release=Mock())
     resolved = RetroSpecRankedDraftResolvedClusters(
@@ -1838,7 +1847,11 @@ def test_ranked_draft_attention_consumes_arena_views_and_releases_lease():
     run_ranked.assert_called_once()
     source = run_ranked.call_args.kwargs["source"]
     assert source.cluster_keys is arena.cluster_keys
+    assert source.ranked_cluster_indices is plan.ranked_cluster_indices
+    assert source.candidate_counts is plan.candidate_counts
     assert source.resident_bucket_ids is resolved.resident_bucket_ids
+    assert source.sparse_retrieval_width == 1
+    assert source.sparse_estimation_width == 1
     assert source.resident_table_page_slots is resolved.resident_table_page_slots
     lease.release.assert_called_once_with()
 
@@ -1848,9 +1861,10 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
     mark_installed(controller)
     controller.index.has_cluster_pages = Mock(return_value=True)
     selection = make_selection(batch_size=1)
+    indexed_selection = Mock(spec=RetroSpecIndexedTokenAttentionSelection)
     controller.index.select_segmented = Mock(return_value=selection)
-    controller.index.get_selection_plan = Mock(return_value=selection.plan)
-    controller.index.materialize = Mock(return_value=selection)
+    controller.index.get_indexed_selection = Mock(return_value=indexed_selection)
+    controller.index.materialize_indexed_reference = Mock(return_value=selection)
     controller._run_exact_attention = Mock(
         return_value=(torch.zeros(1, 1, 1), torch.zeros(1, 1))
     )
@@ -1910,14 +1924,14 @@ def test_verification_reuses_draft_selection_plan_without_reranking():
         controller.end_step()
 
         controller.index.select_segmented.assert_called_once()
-        controller.index.get_selection_plan.assert_called_once_with("layer", 0)
-        controller.index.materialize.assert_called_once()
-        materialize_args = controller.index.materialize.call_args.args
-        assert materialize_args[0] is selection.plan
-        assert materialize_args[1] == RetroSpecAttentionLevel.EXPANDED
-        assert torch.equal(materialize_args[2], kv_cache[0])
-        assert torch.equal(materialize_args[3], kv_cache[1])
-        assert materialize_args[4] is metadata.block_table
+        controller.index.get_indexed_selection.assert_called_once()
+        indexed_args = controller.index.get_indexed_selection.call_args.args
+        assert indexed_args[:2] == ("layer", RetroSpecAttentionLevel.EXPANDED)
+        assert indexed_args[2].tolist() == [0]
+        assert indexed_args[3].tolist() == [0]
+        controller.index.materialize_indexed_reference.assert_called_once_with(
+            indexed_selection
+        )
 
 
 def test_empty_cluster_index_uses_native_attention_without_selection_plan():
@@ -2115,14 +2129,14 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
     controller = make_controller()
     mark_installed(controller)
     step_zero = replace(
-        make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),
+        make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=2),
         primary_exact_token_indices=torch.tensor([[[0, 1]], [[2, 3]]]),
         primary_exact_token_mask=torch.tensor([[[True, False]], [[True, True]]]),
         sparse_exact_cluster_indices=torch.tensor(
             [[[10, 11]], [[12, 13]]], dtype=torch.int32
         ),
         sparse_estimation_cluster_indices=torch.tensor(
-            [[[20]], [[21]]], dtype=torch.int32
+            [[[20, 21]], [[22, 23]]], dtype=torch.int32
         ),
         expanded_exact_cluster_indices=torch.tensor(
             [[[30, 31, 32]], [[33, 34, 35]]], dtype=torch.int32
@@ -2134,14 +2148,14 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         expanded_attn=torch.tensor([0.5, 0.6]),
     )
     step_one = replace(
-        make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=1),
+        make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=2),
         primary_exact_token_indices=torch.tensor([[[4, 5]], [[6, 7]]]),
         primary_exact_token_mask=torch.tensor([[[False, True]], [[True, False]]]),
         sparse_exact_cluster_indices=torch.tensor(
             [[[60, 61]], [[62, 63]]], dtype=torch.int32
         ),
         sparse_estimation_cluster_indices=torch.tensor(
-            [[[90]], [[91]]], dtype=torch.int32
+            [[[90, 91]], [[92, 93]]], dtype=torch.int32
         ),
         expanded_exact_cluster_indices=torch.tensor(
             [[[100, 101, 102]], [[103, 104, 105]]], dtype=torch.int32
@@ -2153,10 +2167,13 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         expanded_attn=torch.tensor([0.7, 0.8]),
     )
     other_layer = replace(
-        make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=2),
+        make_token_plan(2, num_kv_heads=1, exact_width=2, estimation_width=3),
         layer_name="other",
         sparse_exact_cluster_indices=torch.tensor(
             [[[140]], [[141]]], dtype=torch.int32
+        ),
+        sparse_estimation_cluster_indices=torch.tensor(
+            [[[150, 151, 152]], [[153, 154, 155]]], dtype=torch.int32
         ),
         expanded_exact_cluster_indices=torch.tensor(
             [[[160, 161]], [[162, 163]]], dtype=torch.int32
@@ -2182,14 +2199,15 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         assert selection.plan_valid_rows.tolist() == [True, True, True]
 
         table = controller.index._selection_plan_tables["layer"]
-        indexed_fields = {
-            "exact_cluster_indices": table.expanded_exact_cluster_indices,
-            "attention_mass": table.expanded_attn,
-        }
-        for field_name, source in indexed_fields.items():
-            actual = getattr(selection, field_name)
-            expected = source.flatten(0, 1).index_select(0, selection.plan_row_indices)
-            torch.testing.assert_close(actual, expected)
+        assert selection.exact_cluster_indices.tolist() == [
+            [[12, 13, -1]],
+            [[60, 61, -1]],
+            [[62, 63, -1]],
+        ]
+        expected_attention = table.expanded_attn.flatten().index_select(
+            0, selection.plan_row_indices
+        )
+        torch.testing.assert_close(selection.attention_mass, expected_attention)
         assert selection.request_slot_ids.tolist() == [1, 0, 1]
         assert selection.request_slot_generations.tolist() == [0, 0, 0]
         assert selection.primary_exact_token_indices.untyped_storage().data_ptr() == (
@@ -2198,16 +2216,14 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         assert selection.primary_exact_token_mask.untyped_storage().data_ptr() == (
             table.primary_exact_token_mask.untyped_storage().data_ptr()
         )
-        expected_estimation_indices = table.expanded_estimation_cluster_indices.flatten(
-            0, 1
-        ).index_select(0, selection.plan_row_indices)
-        torch.testing.assert_close(
-            selection.estimation_cluster_indices,
-            expected_estimation_indices,
-        )
-        assert selection.estimation_keys.shape == (3, 1, 1, 1)
-        assert selection.estimation_values.shape == (3, 1, 1, 1)
-        assert selection.estimation_token_counts.shape == (3, 1, 1)
+        assert selection.estimation_cluster_indices.tolist() == [
+            [[22, -1]],
+            [[90, -1]],
+            [[92, -1]],
+        ]
+        assert selection.estimation_keys.shape == (3, 1, 2, 1)
+        assert selection.estimation_values.shape == (3, 1, 2, 1)
+        assert selection.estimation_token_counts.shape == (3, 1, 2)
         assert selection.estimation_keys.count_nonzero().item() == 0
         assert selection.estimation_values.count_nonzero().item() == 0
         assert selection.estimation_token_counts.count_nonzero().item() == 0
@@ -2218,11 +2234,11 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         )
         assert other_selection.exact_cluster_indices.shape == (3, 1, 2)
         assert other_selection.exact_cluster_indices.tolist() == [
-            [[162, 163]],
-            [[160, 161]],
-            [[162, 163]],
+            [[141, 153]],
+            [[140, 150]],
+            [[141, 153]],
         ]
-        assert other_selection.estimation_keys.shape == (3, 1, 2, 1)
+        assert other_selection.estimation_keys.shape == (3, 1, 3, 1)
         grown_estimation_pointer = other_selection.estimation_keys.data_ptr()
         assert grown_estimation_pointer != first_estimation_pointer
         grown_row_pointer = other_selection.plan_row_indices.data_ptr()
@@ -2240,7 +2256,7 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
         )
         assert reused.plan_row_indices.data_ptr() == grown_row_pointer
         assert reused.plan_row_indices.tolist() == [2, 1]
-        assert reused.exact_cluster_indices.tolist() == [[[60, 61]], [[12, 13]]]
+        assert reused.exact_cluster_indices.tolist() == [[[60, -1]], [[12, -1]]]
         assert reused.primary_exact_token_indices.index_select(
             0, reused.plan_row_indices
         ).tolist() == [
@@ -2248,8 +2264,8 @@ def test_parallel_verification_indexes_persistent_token_plan_rows():
             [[2, 3]],
         ]
         assert reused.estimation_cluster_indices.tolist() == [
-            [[90]],
-            [[21]],
+            [[61, 90]],
+            [[13, 22]],
         ]
         assert reused.estimation_keys.data_ptr() == grown_estimation_pointer
         assert reused.estimation_keys.is_contiguous()
