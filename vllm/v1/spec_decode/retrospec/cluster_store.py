@@ -2864,6 +2864,21 @@ class RetroSpecClusterPageStore:
             resident_cache.reserve_prefetch_handle_states(descriptor_arena.capacity)
         return pool, resident_cache
 
+    def _get_resident_cache_for_lookup(
+        self,
+        layer_name: str,
+    ) -> RetroSpecResidentClusterCache:
+        """Return a stable per-layer resident cache for lookup."""
+        resident_cache = self._resident_caches.get(layer_name)
+        if resident_cache is not None:
+            return resident_cache
+
+        # Cache objects are published once and are not removed or replaced.
+        # Only the cold creation path requires the global lifecycle lock.
+        with self._resident_state_lock:
+            _, resident_cache = self._get_or_create_resident_cache(layer_name)
+        return resident_cache
+
     @staticmethod
     def _validate_token_kv_input(
         token_keys: torch.Tensor,
@@ -4465,15 +4480,18 @@ class RetroSpecClusterPageStore:
                     staged.progress.complete_layer(record.layer_name)
                     if stats is not None:
                         stats.add_counter("prefetch_superseded_records")
-            self._release_resident_prefetch_slot(staged.slot)
-            slot_released = True
-            self._auto_submit_deferred_resident_prefetch(staged.device)
-
             prepared_records = (
                 self._prepare_resident_prefetch_wave(tuple(active_records))
                 if active_records
                 else ()
             )
+            # The prepared records still reference the pinned command slot.
+            # Parse them before releasing the slot so a deferred wave cannot
+            # overwrite the metadata while the CPU planner is reading it.
+            self._release_resident_prefetch_slot(staged.slot)
+            slot_released = True
+            self._auto_submit_deferred_resident_prefetch(staged.device)
+
             for staged_record, prepared in zip(
                 active_records, prepared_records, strict=True
             ):
@@ -5040,8 +5058,7 @@ class RetroSpecClusterPageStore:
         if ranked_values.device.type != "cuda":
             raise ValueError("Ranked compact draft lookup requires CUDA")
 
-        with self._resident_state_lock:
-            _, resident_cache = self._get_or_create_resident_cache(layer_name)
+        resident_cache = self._get_resident_cache_for_lookup(layer_name)
 
         access = resident_cache.lookup_ranked_compact_draft_gpu(
             ranked_values=ranked_values,
@@ -5135,8 +5152,7 @@ class RetroSpecClusterPageStore:
         if ranked_values.device.type != "cuda":
             raise ValueError("Ranked DRAFT lookup requires CUDA")
 
-        with self._resident_state_lock:
-            _, resident_cache = self._get_or_create_resident_cache(layer_name)
+        resident_cache = self._get_resident_cache_for_lookup(layer_name)
 
         access: RetroSpecRankedDraftResidentAccess = (
             resident_cache.lookup_ranked_draft_gpu(

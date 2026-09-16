@@ -5,7 +5,7 @@ import threading
 from concurrent.futures import CancelledError, Future
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -77,6 +77,30 @@ def make_token_offsets(
             next_offsets[cluster_idx] += 1
 
     return offsets
+
+
+def test_resident_cache_lookup_avoids_global_lock_on_hot_path():
+    store = RetroSpecClusterPageStore(page_size=2)
+    resident_cache = Mock()
+    lifecycle_lock = MagicMock()
+    store._resident_caches["layer"] = resident_cache
+    store._resident_state_lock = lifecycle_lock
+
+    assert store._get_resident_cache_for_lookup("layer") is resident_cache
+    lifecycle_lock.__enter__.assert_not_called()
+
+
+def test_resident_cache_lookup_serializes_cold_creation():
+    store = RetroSpecClusterPageStore(page_size=2)
+    resident_cache = Mock()
+    lifecycle_lock = MagicMock()
+    store._resident_state_lock = lifecycle_lock
+    store._get_or_create_resident_cache = Mock(return_value=(Mock(), resident_cache))
+
+    assert store._get_resident_cache_for_lookup("layer") is resident_cache
+    lifecycle_lock.__enter__.assert_called_once_with()
+    lifecycle_lock.__exit__.assert_called_once()
+    store._get_or_create_resident_cache.assert_called_once_with("layer")
 
 
 def test_full_verification_ticket_reports_ready_and_signals_cancellation():
@@ -1898,7 +1922,7 @@ def test_resident_prefetch_wave_batches_layers_and_waits_per_layer():
     not torch.cuda.is_available() or not is_pin_memory_available(),
     reason="CUDA pinned memory is required for asynchronous resident prefetch",
 )
-def test_resident_prefetch_releases_metadata_slot_before_descriptor_preparation():
+def test_resident_prefetch_retains_metadata_slot_during_descriptor_preparation():
     device = torch.device("cuda", torch.cuda.current_device())
     store = RetroSpecClusterPageStore(
         page_size=2,
@@ -1942,8 +1966,8 @@ def test_resident_prefetch_releases_metadata_slot_before_descriptor_preparation(
     assert store.prefetch_resident_cluster_wave((record,))
     try:
         assert prepare_started.wait(timeout=10.0)
-        assert all(
-            not slot.in_use
+        assert any(
+            slot.in_use
             for slots in store._resident_prefetch_slots.values()
             for slot in slots
         )
@@ -1951,6 +1975,11 @@ def test_resident_prefetch_releases_metadata_slot_before_descriptor_preparation(
         release_prepare.set()
 
     store.wait_for_resident_prefetches()
+    assert all(
+        not slot.in_use
+        for slots in store._resident_prefetch_slots.values()
+        for slot in slots
+    )
     store.close()
 
 

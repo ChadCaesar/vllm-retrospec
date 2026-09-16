@@ -3,7 +3,7 @@
 
 import threading
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -90,6 +90,28 @@ def test_index_shares_one_pinned_memory_budget_across_components():
 
     index.close()
     assert index._pinned_memory.allocated_bytes == 0
+
+
+def test_segmented_index_cpu_timer_uses_performance_stats():
+    index = make_index()
+    timer = nullcontext()
+    index.performance_stats = Mock()
+    index.performance_stats.cpu_timer.return_value = timer
+
+    assert index._cpu_timer("draft_bucket_resolve_wall") is timer
+    index.performance_stats.cpu_timer.assert_called_once_with(
+        "draft_bucket_resolve_wall"
+    )
+    index.close()
+
+
+def test_segmented_index_cpu_timer_is_disabled_without_stats():
+    index = make_index()
+
+    with index._cpu_timer("draft_bucket_resolve_wall"):
+        pass
+
+    index.close()
 
 
 @contextmanager

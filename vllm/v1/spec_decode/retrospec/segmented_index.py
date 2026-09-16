@@ -857,6 +857,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             return nullcontext()
         return self.performance_stats.cuda_timer(name)
 
+    def _cpu_timer(self, name: str) -> AbstractContextManager[None]:
+        if self.performance_stats is None:
+            return nullcontext()
+        return self.performance_stats.cpu_timer(name)
+
     def _stable_indexed_end(self, seq_len: int) -> int:
         """Return the exclusive end of tokens that may leave native GPU KV."""
         full_block_count = seq_len // self.block_size
@@ -5043,7 +5048,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             if direct_cuda_plan
             else "draft_reference_materialize"
         )
-        with self._cuda_timer(resolve_timer):
+        with (
+            self._cpu_timer(f"{resolve_timer}_wall"),
+            self._cuda_timer(resolve_timer),
+        ):
             selection = self._materialize_draft_selection(
                 request_ids=request_ids,
                 query=query,
