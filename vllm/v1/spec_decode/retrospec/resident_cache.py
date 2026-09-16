@@ -6,6 +6,8 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from math import prod
 from threading import Lock
+from time import perf_counter
+from types import MappingProxyType
 
 import torch
 
@@ -68,6 +70,28 @@ class RetroSpecResidentPageAccess:
     ready_event: torch.cuda.Event | None
     access_kinds: torch.Tensor | None = None
     read_lease: "RetroSpecResidentReadLease | None" = None
+
+
+@dataclass(frozen=True)
+class RetroSpecPreparedResidentAdmission:
+    """Immutable CPU descriptors prepared before taking the mutation guard."""
+
+    cluster_ids: torch.Tensor
+    page_ids: torch.Tensor
+    cluster_groups: Mapping[_ClusterId, RetroSpecClusterGroup]
+    source_page_ids: torch.Tensor
+    source_key_pages: torch.Tensor
+    source_value_pages: torch.Tensor
+    cluster_ids_cpu: torch.Tensor
+    page_ids_cpu: torch.Tensor
+    parsed_cluster_ids: tuple[_ClusterId | None, ...]
+    parsed_cluster_pages: tuple[_LogicalPages, ...]
+    valid_positions: tuple[tuple[int, ...], ...]
+    requested_clusters: tuple[_ClusterId, ...]
+    cluster_page_map: Mapping[_ClusterId, _LogicalPages]
+    cluster_source_ids: Mapping[_ClusterId, tuple[int, ...]]
+    referenced_cluster_ids: frozenset[_ClusterId]
+    referenced_page_ids: frozenset[int]
 
 
 @dataclass(frozen=True)
@@ -1226,8 +1250,8 @@ class RetroSpecResidentClusterCache:
     def _parse_clusters(
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
-        allocated_cluster_ids: Collection[int],
-        allocated_page_ids: Collection[int],
+        allocated_cluster_ids: Collection[int] | None,
+        allocated_page_ids: Collection[int] | None,
         cluster_ids_cpu: torch.Tensor | None = None,
         page_ids_cpu: torch.Tensor | None = None,
     ) -> tuple[
@@ -1312,7 +1336,10 @@ class RetroSpecResidentClusterCache:
 
             cluster_id = int(raw_cluster_id)
 
-            if cluster_id not in allocated_cluster_ids:
+            if (
+                allocated_cluster_ids is not None
+                and cluster_id not in allocated_cluster_ids
+            ):
                 raise RuntimeError(
                     f"Cluster selection references unallocated cluster {cluster_id}"
                 )
@@ -1329,7 +1356,10 @@ class RetroSpecResidentClusterCache:
             requested_cluster_pages[cluster_id] = logical_pages
 
             for logical_page_id in logical_pages:
-                if logical_page_id not in allocated_page_ids:
+                if (
+                    allocated_page_ids is not None
+                    and logical_page_id not in allocated_page_ids
+                ):
                     raise RuntimeError(
                         "Cluster page table references an unallocated "
                         f"logical page {logical_page_id}"
@@ -1763,7 +1793,16 @@ class RetroSpecResidentClusterCache:
         if ranked_values.device != self.device:
             raise ValueError("Ranked DRAFT lookup must use the cache device")
 
+        stats = self.performance_stats
+        lock_started_at = (
+            perf_counter() if stats is not None and stats.enabled else None
+        )
         self._gpu_access_lock.acquire()
+        if lock_started_at is not None:
+            stats.record_cpu_time(
+                "draft_ranked_resident_lock_wait_wall",
+                perf_counter() - lock_started_at,
+            )
         try:
             self._ensure_handle_table(max_pages_per_cluster)
             access_epoch = self._next_access_epoch
@@ -2021,23 +2060,18 @@ class RetroSpecResidentClusterCache:
             stats.add_counter("resident_copy_pages", len(source_page_ids))
             stats.add_counter("resident_copy_spans", span_count)
 
-    def _admit_from_sources(
+    def _prepare_admission_from_sources(
         self,
         cluster_ids: torch.Tensor,
         page_ids: torch.Tensor,
         cluster_groups: Mapping[_ClusterId, RetroSpecClusterGroup],
-        allocated_cluster_ids: Collection[int],
-        allocated_page_ids: Collection[int],
         source_page_ids: torch.Tensor,
         source_key_pages: torch.Tensor,
         source_value_pages: torch.Tensor,
         cluster_ids_cpu: torch.Tensor | None = None,
         page_ids_cpu: torch.Tensor | None = None,
-        reuse_ready_event: torch.cuda.Event | None = None,
-        mutation_stream: torch.cuda.Stream | None = None,
-        lookup_after_admit: bool = True,
-    ) -> RetroSpecResidentPageAccess:
-        """Admit a priority cluster prefix from CPU or GPU source pages."""
+    ) -> RetroSpecPreparedResidentAdmission:
+        """Parse immutable metadata without reading live resident state."""
         self._validate_source_pages(source_key_pages, source_value_pages)
 
         if source_page_ids.shape != page_ids.shape:
@@ -2049,15 +2083,15 @@ class RetroSpecResidentClusterCache:
 
         (
             cluster_ids_cpu,
-            _,
+            page_ids_cpu,
             parsed_cluster_ids,
             parsed_cluster_pages,
             valid_positions,
         ) = self._parse_clusters(
             cluster_ids,
             page_ids,
-            allocated_cluster_ids,
-            allocated_page_ids,
+            None,
+            None,
             cluster_ids_cpu=cluster_ids_cpu,
             page_ids_cpu=page_ids_cpu,
         )
@@ -2074,7 +2108,6 @@ class RetroSpecResidentClusterCache:
             len(parsed_cluster_ids),
             source_page_ids_cpu.shape[-1],
         )
-
         cluster_page_map: dict[_ClusterId, _LogicalPages] = {}
         cluster_source_ids: dict[_ClusterId, tuple[int, ...]] = {}
 
@@ -2083,12 +2116,12 @@ class RetroSpecResidentClusterCache:
             parsed_cluster_pages,
             valid_positions,
             flat_source_page_ids,
+            strict=True,
         ):
             if cluster_id is None:
                 continue
 
             cluster_page_map[cluster_id] = logical_pages
-
             current_source_ids = tuple(
                 int(source_row[position]) for position in positions
             )
@@ -2101,10 +2134,136 @@ class RetroSpecResidentClusterCache:
             ):
                 cluster_source_ids[cluster_id] = current_source_ids
 
-        requested_clusters = self._priority_ordered_clusters(
-            parsed_cluster_ids,
-            cluster_ids_cpu.shape,
+        requested_clusters = tuple(
+            self._priority_ordered_clusters(
+                parsed_cluster_ids,
+                cluster_ids_cpu.shape,
+            )
         )
+        referenced_page_ids = frozenset(
+            page_id
+            for logical_pages in cluster_page_map.values()
+            for page_id in logical_pages
+        )
+
+        return RetroSpecPreparedResidentAdmission(
+            cluster_ids=cluster_ids,
+            page_ids=page_ids,
+            cluster_groups=MappingProxyType(dict(cluster_groups)),
+            source_page_ids=source_page_ids_cpu,
+            source_key_pages=source_key_pages,
+            source_value_pages=source_value_pages,
+            cluster_ids_cpu=cluster_ids_cpu,
+            page_ids_cpu=page_ids_cpu,
+            parsed_cluster_ids=tuple(parsed_cluster_ids),
+            parsed_cluster_pages=tuple(parsed_cluster_pages),
+            valid_positions=tuple(valid_positions),
+            requested_clusters=requested_clusters,
+            cluster_page_map=MappingProxyType(cluster_page_map),
+            cluster_source_ids=MappingProxyType(cluster_source_ids),
+            referenced_cluster_ids=frozenset(cluster_page_map),
+            referenced_page_ids=referenced_page_ids,
+        )
+
+    @staticmethod
+    def _validate_prepared_admission_allocations(
+        prepared: RetroSpecPreparedResidentAdmission,
+        allocated_cluster_ids: Collection[int],
+        allocated_page_ids: Collection[int],
+    ) -> None:
+        """Reject a descriptor whose request storage was released or reused."""
+        missing_cluster_ids = prepared.referenced_cluster_ids.difference(
+            allocated_cluster_ids
+        )
+        if missing_cluster_ids:
+            cluster_id = min(missing_cluster_ids)
+            raise RuntimeError(
+                f"Prepared admission references unallocated cluster {cluster_id}"
+            )
+
+        missing_page_ids = prepared.referenced_page_ids.difference(allocated_page_ids)
+        if missing_page_ids:
+            page_id = min(missing_page_ids)
+            raise RuntimeError(
+                f"Prepared admission references unallocated logical page {page_id}"
+            )
+
+    def prepare_staged_admission(
+        self,
+        cluster_ids: torch.Tensor,
+        page_ids: torch.Tensor,
+        cluster_groups: Mapping[_ClusterId, RetroSpecClusterGroup],
+        staging_page_ids: torch.Tensor,
+        staging_key_pages: torch.Tensor,
+        staging_value_pages: torch.Tensor,
+        cluster_ids_cpu: torch.Tensor | None = None,
+        page_ids_cpu: torch.Tensor | None = None,
+    ) -> RetroSpecPreparedResidentAdmission:
+        """Prepare staged admission metadata without taking mutation_guard()."""
+        self._validate_source_pages(staging_key_pages, staging_value_pages)
+        if (
+            staging_key_pages.device.type != "cpu"
+            and staging_key_pages.device != self.device
+        ):
+            raise ValueError("Staging pages must use CPU or the resident CUDA device")
+
+        return self._prepare_admission_from_sources(
+            cluster_ids=cluster_ids,
+            page_ids=page_ids,
+            cluster_groups=cluster_groups,
+            source_page_ids=staging_page_ids,
+            source_key_pages=staging_key_pages,
+            source_value_pages=staging_value_pages,
+            cluster_ids_cpu=cluster_ids_cpu,
+            page_ids_cpu=page_ids_cpu,
+        )
+
+    def _admit_from_sources(
+        self,
+        cluster_ids: torch.Tensor,
+        page_ids: torch.Tensor,
+        cluster_groups: Mapping[_ClusterId, RetroSpecClusterGroup],
+        allocated_cluster_ids: Collection[int],
+        allocated_page_ids: Collection[int],
+        source_page_ids: torch.Tensor,
+        source_key_pages: torch.Tensor,
+        source_value_pages: torch.Tensor,
+        cluster_ids_cpu: torch.Tensor | None = None,
+        page_ids_cpu: torch.Tensor | None = None,
+        reuse_ready_event: torch.cuda.Event | None = None,
+        mutation_stream: torch.cuda.Stream | None = None,
+        lookup_after_admit: bool = True,
+        prepared: RetroSpecPreparedResidentAdmission | None = None,
+    ) -> RetroSpecResidentPageAccess:
+        """Admit a priority cluster prefix from CPU or GPU source pages."""
+        if prepared is None:
+            prepared = self._prepare_admission_from_sources(
+                cluster_ids=cluster_ids,
+                page_ids=page_ids,
+                cluster_groups=cluster_groups,
+                source_page_ids=source_page_ids,
+                source_key_pages=source_key_pages,
+                source_value_pages=source_value_pages,
+                cluster_ids_cpu=cluster_ids_cpu,
+                page_ids_cpu=page_ids_cpu,
+            )
+
+        self._validate_prepared_admission_allocations(
+            prepared,
+            allocated_cluster_ids,
+            allocated_page_ids,
+        )
+
+        cluster_ids = prepared.cluster_ids
+        page_ids = prepared.page_ids
+        cluster_groups = prepared.cluster_groups
+        source_key_pages = prepared.source_key_pages
+        source_value_pages = prepared.source_value_pages
+        cluster_ids_cpu = prepared.cluster_ids_cpu
+        page_ids_cpu = prepared.page_ids_cpu
+        requested_clusters = prepared.requested_clusters
+        cluster_page_map = prepared.cluster_page_map
+        cluster_source_ids = prepared.cluster_source_ids
 
         for cluster_id in requested_clusters:
             logical_pages = cluster_page_map[cluster_id]
@@ -2415,6 +2574,33 @@ class RetroSpecResidentClusterCache:
             reuse_ready_event=reuse_ready_event,
             mutation_stream=mutation_stream,
             lookup_after_admit=lookup_after_admit,
+        )
+
+    def admit_prepared_staged(
+        self,
+        prepared: RetroSpecPreparedResidentAdmission,
+        allocated_cluster_ids: Collection[int],
+        allocated_page_ids: Collection[int],
+        reuse_ready_event: torch.cuda.Event | None = None,
+        mutation_stream: torch.cuda.Stream | None = None,
+        lookup_after_admit: bool = True,
+    ) -> RetroSpecResidentPageAccess:
+        """Commit a previously prepared admission under mutation_guard()."""
+        return self._admit_from_sources(
+            cluster_ids=prepared.cluster_ids,
+            page_ids=prepared.page_ids,
+            cluster_groups=prepared.cluster_groups,
+            allocated_cluster_ids=allocated_cluster_ids,
+            allocated_page_ids=allocated_page_ids,
+            source_page_ids=prepared.source_page_ids,
+            source_key_pages=prepared.source_key_pages,
+            source_value_pages=prepared.source_value_pages,
+            cluster_ids_cpu=prepared.cluster_ids_cpu,
+            page_ids_cpu=prepared.page_ids_cpu,
+            reuse_ready_event=reuse_ready_event,
+            mutation_stream=mutation_stream,
+            lookup_after_admit=lookup_after_admit,
+            prepared=prepared,
         )
 
     def invalidate(

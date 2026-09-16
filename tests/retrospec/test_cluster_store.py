@@ -1374,7 +1374,7 @@ def test_cpu_backing_store_admits_and_invalidates_resident_clusters():
     not torch.cuda.is_available() or not is_pin_memory_available(),
     reason="CUDA pinned memory is required for asynchronous resident prefetch",
 )
-def test_cpu_backing_store_prefetches_resident_clusters_in_background():
+def test_cpu_backing_store_prefetches_resident_clusters_in_background(monkeypatch):
     device = torch.device("cuda", torch.cuda.current_device())
     stats = RetroSpecPerformanceStats(
         device=device,
@@ -1405,7 +1405,32 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
         store.resolve_cluster_blocks(
             "layer", cluster_ids, metadata.page_ids, mode="resident_only"
         )
-    assert store._resident_caches["layer"].performance_stats is stats
+    resident_cache = store._resident_caches["layer"]
+    assert resident_cache.performance_stats is stats
+    calls = {"prepare": 0, "commit": 0}
+    original_prepare = resident_cache.prepare_staged_admission
+    original_commit = resident_cache.admit_prepared_staged
+
+    def prepare_outside_mutation_guard(*args, **kwargs):
+        assert not resident_cache.mutation_guard().locked()
+        calls["prepare"] += 1
+        return original_prepare(*args, **kwargs)
+
+    def commit_inside_mutation_guard(*args, **kwargs):
+        assert resident_cache.mutation_guard().locked()
+        calls["commit"] += 1
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(
+        resident_cache,
+        "prepare_staged_admission",
+        prepare_outside_mutation_guard,
+    )
+    monkeypatch.setattr(
+        resident_cache,
+        "admit_prepared_staged",
+        commit_inside_mutation_guard,
+    )
     stats._cpu_counters.clear()
 
     access_kinds = torch.full_like(cluster_ids, 2, dtype=torch.uint8)
@@ -1421,9 +1446,12 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background():
     assert stats._cpu_counters["prefetch_duplicate_misses"] == 0
     assert stats._cpu_times["prefetch_metadata_wait"][1] == 1
     assert stats._cpu_times["prefetch_page_gather_wall"][1] == 1
+    assert stats._cpu_times["prefetch_resident_prepare_wall"][1] == 1
+    assert stats._cpu_times["prefetch_resident_commit_wall"][1] == 1
     assert stats._cpu_times["prefetch_resident_admission_wall"][1] == 1
     assert stats._cpu_times["prefetch_worker_wall"][1] == 1
     assert stats._cpu_times["prefetch_wait_wall"][1] >= 1
+    assert calls == {"prepare": 1, "commit": 1}
 
     access = store.lookup_resident_clusters(
         "layer", cluster_ids, metadata.page_ids, touch=False

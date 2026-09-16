@@ -4414,33 +4414,56 @@ class RetroSpecClusterPageStore:
             perf_counter() if stats is not None and stats.enabled else None
         )
         try:
-            with (
-                self._resident_state_lock,
-                prepared.resident_cache.mutation_guard(),
-                torch.cuda.device(prepared.pool.metadata_device),
-            ):
-                try:
-                    access = prepared.resident_cache.admit_staged(
-                        cluster_ids=prepared.cluster_ids_cpu,
-                        page_ids=prepared.page_ids_cpu,
-                        cluster_groups=prepared.cluster_groups,
+            prepare_started_at = (
+                perf_counter() if stats is not None and stats.enabled else None
+            )
+            try:
+                admission = prepared.resident_cache.prepare_staged_admission(
+                    cluster_ids=prepared.cluster_ids_cpu,
+                    page_ids=prepared.page_ids_cpu,
+                    cluster_groups=prepared.cluster_groups,
+                    staging_page_ids=source_page_ids,
+                    staging_key_pages=source_key_pages,
+                    staging_value_pages=source_value_pages,
+                    cluster_ids_cpu=prepared.cluster_ids_cpu,
+                    page_ids_cpu=prepared.page_ids_cpu,
+                )
+            finally:
+                if prepare_started_at is not None:
+                    stats.record_cpu_time(
+                        "prefetch_resident_prepare_wall",
+                        perf_counter() - prepare_started_at,
+                    )
+
+            commit_started_at = (
+                perf_counter() if stats is not None and stats.enabled else None
+            )
+            try:
+                with (
+                    self._resident_state_lock,
+                    prepared.resident_cache.mutation_guard(),
+                    torch.cuda.device(prepared.pool.metadata_device),
+                ):
+                    access = prepared.resident_cache.admit_prepared_staged(
+                        prepared=admission,
                         allocated_cluster_ids=self._get_allocated_cluster_ids(
                             prepared.layer_name
                         ),
                         allocated_page_ids=prepared.pool.allocated_page_ids,
-                        staging_page_ids=source_page_ids,
-                        staging_key_pages=source_key_pages,
-                        staging_value_pages=source_value_pages,
-                        cluster_ids_cpu=prepared.cluster_ids_cpu,
-                        page_ids_cpu=prepared.page_ids_cpu,
                         mutation_stream=execution_stream,
                         lookup_after_admit=False,
                     )
-                except BaseException:
-                    prepared.resident_cache.synchronize_pending_copies()
-                    if transfer_slot is not None:
-                        transfer_buffer.release_cpu_slot(transfer_slot, None)
-                    raise
+            finally:
+                if commit_started_at is not None:
+                    stats.record_cpu_time(
+                        "prefetch_resident_commit_wall",
+                        perf_counter() - commit_started_at,
+                    )
+        except BaseException:
+            prepared.resident_cache.synchronize_pending_copies()
+            if transfer_slot is not None:
+                transfer_buffer.release_cpu_slot(transfer_slot, None)
+            raise
         finally:
             if admission_started_at is not None:
                 stats.record_cpu_time(

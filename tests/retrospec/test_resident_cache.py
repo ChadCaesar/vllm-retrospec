@@ -1309,6 +1309,86 @@ def test_resident_cache_admits_from_gpu_staging_pages():
     )
 
 
+def test_prepared_staged_admission_revalidates_current_allocations():
+    cache = make_cache(capacity=2)
+    source_keys, source_values = make_backing_pages(num_pages=2)
+    cluster_ids = torch.tensor([10], dtype=torch.int64)
+    logical_page_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    staging_page_ids = torch.tensor([[1, 0]], dtype=torch.int64)
+    group = RetroSpecClusterGroup("prepared", 0)
+
+    prepared = cache.prepare_staged_admission(
+        cluster_ids=cluster_ids,
+        page_ids=logical_page_ids,
+        cluster_groups={10: group},
+        staging_page_ids=staging_page_ids,
+        staging_key_pages=source_keys,
+        staging_value_pages=source_values,
+        cluster_ids_cpu=cluster_ids,
+        page_ids_cpu=logical_page_ids,
+    )
+
+    assert prepared.requested_clusters == (10,)
+    assert prepared.cluster_page_map[10] == (0, 1)
+    assert prepared.cluster_source_ids[10] == (1, 0)
+    with pytest.raises(TypeError):
+        prepared.cluster_page_map[10] = (1, 0)
+
+    with (
+        cache.mutation_guard(),
+        pytest.raises(RuntimeError, match="unallocated cluster 10"),
+    ):
+        cache.admit_prepared_staged(
+            prepared,
+            allocated_cluster_ids=set(),
+            allocated_page_ids={0, 1},
+            lookup_after_admit=False,
+        )
+    assert cache.num_resident_clusters == 0
+
+    with cache.mutation_guard():
+        access = cache.admit_prepared_staged(
+            prepared,
+            allocated_cluster_ids={10},
+            allocated_page_ids={0, 1},
+            lookup_after_admit=False,
+        )
+    assert access.ready_event is not None
+    cache.synchronize_pending_copies()
+    assert cache.num_resident_clusters == 1
+    assert cache._cluster_to_pages[10] == (0, 1)
+
+
+def test_prepared_staged_admission_rejects_released_logical_page():
+    cache = make_cache(capacity=2)
+    source_keys, source_values = make_backing_pages(num_pages=2)
+    cluster_ids = torch.tensor([10], dtype=torch.int64)
+    logical_page_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    group = RetroSpecClusterGroup("prepared", 0)
+    prepared = cache.prepare_staged_admission(
+        cluster_ids=cluster_ids,
+        page_ids=logical_page_ids,
+        cluster_groups={10: group},
+        staging_page_ids=logical_page_ids,
+        staging_key_pages=source_keys,
+        staging_value_pages=source_values,
+        cluster_ids_cpu=cluster_ids,
+        page_ids_cpu=logical_page_ids,
+    )
+
+    with (
+        cache.mutation_guard(),
+        pytest.raises(RuntimeError, match="unallocated logical page 1"),
+    ):
+        cache.admit_prepared_staged(
+            prepared,
+            allocated_cluster_ids={10},
+            allocated_page_ids={0},
+            lookup_after_admit=False,
+        )
+    assert cache.num_resident_pages == 0
+
+
 def test_resident_cache_validates_staging_sources_before_eviction():
     cache = make_cache(capacity=1)
     backing_keys, backing_values = make_backing_pages()
