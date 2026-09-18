@@ -1389,6 +1389,138 @@ def test_prepared_staged_admission_rejects_released_logical_page():
     assert cache.num_resident_pages == 0
 
 
+def test_prepared_admission_skips_lru_capture_without_eviction():
+    cache = make_cache(capacity=2)
+    source_keys, source_values = make_backing_pages(num_pages=1)
+    cluster_ids = torch.tensor([10], dtype=torch.int64)
+    page_ids = torch.tensor([[0]], dtype=torch.int64)
+    group = RetroSpecClusterGroup("prepared", 0)
+    prepared = cache.prepare_staged_admission(
+        cluster_ids=cluster_ids,
+        page_ids=page_ids,
+        cluster_groups={10: group},
+        staging_page_ids=page_ids,
+        staging_key_pages=source_keys,
+        staging_value_pages=source_values,
+    )
+
+    with cache.mutation_guard():
+        capture = cache.capture_prepared_admission_lru(
+            prepared,
+            allocated_cluster_ids={10},
+            allocated_page_ids={0},
+            stream=torch.cuda.current_stream(cache.device),
+        )
+
+    assert capture is None
+
+
+@pytest.mark.parametrize("invalidate_snapshot", [False, True])
+def test_prepared_admission_applies_or_retries_lru_capture(invalidate_snapshot: bool):
+    stats = RetroSpecPerformanceStats(
+        device=torch.device("cuda"),
+        log_interval_seconds=60.0,
+    )
+    group = RetroSpecClusterGroup("prepared", 0)
+    cache = make_cache(capacity=2, group_targets={group: 2}, performance_stats=stats)
+    backing_keys, backing_values = make_backing_pages(num_pages=3)
+    cluster_ids = torch.tensor([10, 11, 12], dtype=torch.int64)
+    page_ids = torch.tensor([[0], [1], [2]], dtype=torch.int64)
+    cluster_groups = {cluster_id: group for cluster_id in (10, 11, 12)}
+    allocated_cluster_ids = set(cluster_groups)
+    allocated_page_ids = {0, 1, 2}
+
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        cluster_ids=cluster_ids[:2],
+        page_ids=page_ids[:2],
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=allocated_cluster_ids,
+        allocated_page_ids=allocated_page_ids,
+        backing_key_pages=backing_keys,
+        backing_value_pages=backing_values,
+    )
+    cache.synchronize_pending_copies()
+
+    lookup_cluster_ids = cluster_ids[:2].view(1, 1, -1).cuda()
+    lookup_page_ids = page_ids[:2].view(1, 1, 2, 1).cuda()
+    access = cache.lookup_gpu(
+        cluster_ids=lookup_cluster_ids,
+        page_ids=lookup_page_ids,
+        active_mask=torch.ones(1, dtype=torch.bool, device="cuda"),
+        cache_page_ids=torch.empty_like(lookup_page_ids),
+        hit_cluster_mask=torch.empty_like(lookup_cluster_ids, dtype=torch.bool),
+        miss_cluster_mask=torch.empty_like(lookup_cluster_ids, dtype=torch.bool),
+        hit_gate_ready_mask=torch.empty_like(lookup_cluster_ids, dtype=torch.bool),
+        access_kinds=torch.empty_like(lookup_cluster_ids, dtype=torch.uint8),
+    )
+    access.read_lease.release()
+
+    newest_cluster_ids = cluster_ids[1:2].view(1, 1, 1).cuda()
+    newest_page_ids = page_ids[1:2].view(1, 1, 1, 1).cuda()
+    access = cache.lookup_gpu(
+        cluster_ids=newest_cluster_ids,
+        page_ids=newest_page_ids,
+        active_mask=torch.ones(1, dtype=torch.bool, device="cuda"),
+        cache_page_ids=torch.empty_like(newest_page_ids),
+        hit_cluster_mask=torch.empty_like(newest_cluster_ids, dtype=torch.bool),
+        miss_cluster_mask=torch.empty_like(newest_cluster_ids, dtype=torch.bool),
+        hit_gate_ready_mask=torch.empty_like(newest_cluster_ids, dtype=torch.bool),
+        access_kinds=torch.empty_like(newest_cluster_ids, dtype=torch.uint8),
+    )
+    access.read_lease.release()
+
+    prepared = cache.prepare_staged_admission(
+        cluster_ids=cluster_ids[2:],
+        page_ids=page_ids[2:],
+        cluster_groups=cluster_groups,
+        staging_page_ids=page_ids[2:],
+        staging_key_pages=backing_keys,
+        staging_value_pages=backing_values,
+    )
+    with cache.mutation_guard():
+        capture = cache.capture_prepared_admission_lru(
+            prepared,
+            allocated_cluster_ids=allocated_cluster_ids,
+            allocated_page_ids=allocated_page_ids,
+            stream=torch.cuda.current_stream(cache.device),
+        )
+    assert capture is not None
+    resolved = cache.resolve_lru_capture(capture)
+
+    if invalidate_snapshot:
+        with cache.mutation_guard():
+            cache._touch_cluster(11)
+
+    with cache.mutation_guard():
+        cache.admit_prepared_staged(
+            prepared,
+            allocated_cluster_ids=allocated_cluster_ids,
+            allocated_page_ids=allocated_page_ids,
+            lookup_after_admit=False,
+            resolved_lru=resolved,
+        )
+    cache.synchronize_pending_copies()
+
+    access = RetroSpecResidentClusterCache.lookup(
+        cache,
+        cluster_ids=cluster_ids,
+        page_ids=page_ids,
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=allocated_cluster_ids,
+        allocated_page_ids=allocated_page_ids,
+        touch=False,
+    )
+    assert access.hit_cluster_mask.tolist() == [False, True, True]
+    assert stats._cpu_counters["resident_lru_snapshot_requested"] == 1
+    expected_counter = (
+        "resident_lru_snapshot_retried"
+        if invalidate_snapshot
+        else "resident_lru_snapshot_applied"
+    )
+    assert stats._cpu_counters[expected_counter] == 1
+
+
 def test_resident_cache_validates_staging_sources_before_eviction():
     cache = make_cache(capacity=1)
     backing_keys, backing_values = make_backing_pages()

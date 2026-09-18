@@ -95,6 +95,25 @@ class RetroSpecPreparedResidentAdmission:
 
 
 @dataclass(frozen=True)
+class RetroSpecResidentLruCapture:
+    """Immutable resident descriptors captured while structure is stable."""
+
+    structure_revision: int
+    groups: tuple[RetroSpecClusterGroup, ...]
+    epoch_table: torch.Tensor = field(repr=False, compare=False)
+    stream: torch.cuda.Stream = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class RetroSpecResolvedResidentLru:
+    """CPU-resolved LRU epoch snapshot awaiting revision validation."""
+
+    structure_revision: int
+    groups: tuple[RetroSpecClusterGroup, ...]
+    epochs: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class RetroSpecCompactResidentPageAccess:
     """Row-local compact resident pages and fused DRAFT statistics."""
 
@@ -260,6 +279,7 @@ class RetroSpecResidentClusterCache:
         self._bucket_handles: list[int] = []
         self._handle_table_needs_rebuild = False
         self._prefetch_handle_states = torch.zeros(0, dtype=torch.uint8, device="cpu")
+        self._structure_revision = 0
 
     @property
     def capacity(self) -> int:
@@ -304,6 +324,9 @@ class RetroSpecResidentClusterCache:
     def mutation_guard(self) -> Lock:
         """Return the short guard shared by GPU readers and cache mutations."""
         return self._gpu_access_lock
+
+    def _bump_structure_revision(self) -> None:
+        self._structure_revision += 1
 
     def partition_admission_candidates(
         self,
@@ -419,6 +442,7 @@ class RetroSpecResidentClusterCache:
         self._handle_to_bucket.clear()
         self._bucket_handles = [-1] * capacity
         self._handle_table_needs_rebuild = False
+        self._bump_structure_revision()
 
     def _ensure_handle_table(
         self,
@@ -895,6 +919,7 @@ class RetroSpecResidentClusterCache:
                 self._page_to_cluster[logical_page_id] = cluster_id
 
         self._set_prefetch_handle_state(cluster_ids, _PREFETCH_PENDING)
+        self._bump_structure_revision()
 
     def _touch_cluster(self, cluster_id: _ClusterId) -> None:
         """Mark a resident cluster as recent within its owning group."""
@@ -908,7 +933,9 @@ class RetroSpecResidentClusterCache:
         if group_state is None or cluster_id not in group_state.lru:
             raise RuntimeError(f"Resident group state is missing cluster {cluster_id}")
 
-        group_state.lru.move_to_end(cluster_id, last=True)
+        if next(reversed(group_state.lru)) != cluster_id:
+            group_state.lru.move_to_end(cluster_id, last=True)
+            self._bump_structure_revision()
 
     def _is_group_hit_gate_ready(self, group: RetroSpecClusterGroup) -> bool:
         """Return whether one request/head LRU reached its soft target."""
@@ -994,6 +1021,7 @@ class RetroSpecResidentClusterCache:
                     raise RuntimeError("An empty resident group still owns GPU pages")
                 del self._group_states[group]
 
+        self._bump_structure_revision()
         return affected_groups
 
     @staticmethod
@@ -1007,60 +1035,92 @@ class RetroSpecResidentClusterCache:
 
         return None
 
+    def _capture_group_lru_from_gpu(
+        self,
+        groups: Collection[RetroSpecClusterGroup],
+        stream: torch.cuda.Stream,
+    ) -> RetroSpecResidentLruCapture:
+        """Capture the epoch allocation guarded by a structural revision."""
+        return RetroSpecResidentLruCapture(
+            structure_revision=self._structure_revision,
+            groups=tuple(groups),
+            epoch_table=self._handle_table_last_access_epochs,
+            stream=stream,
+        )
+
+    @staticmethod
+    def resolve_lru_capture(
+        capture: RetroSpecResidentLruCapture,
+    ) -> RetroSpecResolvedResidentLru:
+        """Gather and resolve epochs without holding resident locks."""
+        with (
+            torch.cuda.device(capture.epoch_table.device),
+            torch.cuda.stream(capture.stream),
+        ):
+            epochs_cpu = capture.epoch_table.to(device="cpu", dtype=torch.int64)
+
+        return RetroSpecResolvedResidentLru(
+            structure_revision=capture.structure_revision,
+            groups=capture.groups,
+            epochs=tuple(epochs_cpu.tolist()),
+        )
+
+    def _apply_resolved_group_lru(
+        self,
+        resolved: RetroSpecResolvedResidentLru,
+    ) -> bool:
+        """Apply a resolved snapshot if no structural mutation intervened."""
+        if resolved.structure_revision != self._structure_revision:
+            return False
+
+        def cluster_epoch(cluster_id: _ClusterId) -> int:
+            if cluster_id in self._pending_cluster_events:
+                return 0
+            bucket = self._handle_to_bucket.get(cluster_id)
+            if bucket is None or bucket >= len(resolved.epochs):
+                return 0
+            return resolved.epochs[bucket]
+
+        changed = False
+        for group in resolved.groups:
+            group_state = self._group_states.get(group)
+            if group_state is None:
+                continue
+            order = tuple(group_state.lru)
+            previous_positions = {
+                cluster_id: position for position, cluster_id in enumerate(order)
+            }
+            ranked = tuple(
+                sorted(
+                    order,
+                    key=lambda cluster_id: (
+                        cluster_epoch(cluster_id),
+                        previous_positions[cluster_id],
+                    ),
+                )
+            )
+            if ranked != order:
+                self._group_states[group].lru = OrderedDict.fromkeys(ranked)
+                changed = True
+
+        if changed:
+            self._bump_structure_revision()
+        return True
+
     def _refresh_group_lru_from_gpu(
         self,
         groups: Collection[RetroSpecClusterGroup],
         stream: torch.cuda.Stream,
     ) -> None:
-        """Refresh group-local LRU order from GPU-recorded hit epochs.
+        """Synchronously refresh group-local LRU from GPU-recorded epochs.
 
         This is intentionally called only when an admission or resize must
         evict pages. Draft hits therefore remain entirely on the GPU hot path.
         """
-        group_orders: dict[RetroSpecClusterGroup, list[_ClusterId]] = {}
-        epoch_cluster_ids: list[_ClusterId] = []
-        bucket_ids: list[int] = []
-
-        for group in tuple(groups):
-            group_state = self._group_states.get(group)
-            if group_state is None:
-                continue
-            order = list(group_state.lru)
-            group_orders[group] = order
-            for cluster_id in order:
-                if cluster_id in self._pending_cluster_events:
-                    continue
-                bucket = self._handle_to_bucket.get(cluster_id)
-                if bucket is not None:
-                    epoch_cluster_ids.append(cluster_id)
-                    bucket_ids.append(bucket)
-
-        if not bucket_ids:
-            return
-
-        with torch.cuda.stream(stream):
-            bucket_ids_gpu = torch.tensor(
-                bucket_ids, dtype=torch.int64, device=self.device
-            )
-            epochs_cpu = self._handle_table_last_access_epochs.index_select(
-                0, bucket_ids_gpu
-            ).cpu()
-
-        epochs_by_cluster = dict(
-            zip(epoch_cluster_ids, epochs_cpu.tolist(), strict=True)
-        )
-        for group, order in group_orders.items():
-            previous_positions = {
-                cluster_id: position for position, cluster_id in enumerate(order)
-            }
-            ranked = sorted(
-                order,
-                key=lambda cluster_id: (
-                    epochs_by_cluster.get(cluster_id, 0),
-                    previous_positions[cluster_id],
-                ),
-            )
-            self._group_states[group].lru = OrderedDict.fromkeys(ranked)
+        capture = self._capture_group_lru_from_gpu(groups, stream)
+        resolved = self.resolve_lru_capture(capture)
+        if not self._apply_resolved_group_lru(resolved):
+            raise RuntimeError("Resident LRU changed during synchronous refresh")
 
     def _select_victim_cluster(
         self,
@@ -1230,6 +1290,7 @@ class RetroSpecResidentClusterCache:
         self._grow_storage(capacity)
         self._logical_capacity = capacity
         self._group_targets = new_group_targets
+        self._bump_structure_revision()
 
         if self.num_resident_pages > capacity:
             self._refresh_group_lru_from_gpu(
@@ -2218,6 +2279,77 @@ class RetroSpecResidentClusterCache:
             page_ids_cpu=page_ids_cpu,
         )
 
+    def _plan_prepared_admission_targets(
+        self,
+        prepared: RetroSpecPreparedResidentAdmission,
+    ) -> tuple[
+        tuple[_ClusterId, ...],
+        set[_ClusterId],
+        tuple[_ClusterId, ...],
+        int,
+        dict[RetroSpecClusterGroup, int],
+    ]:
+        """Plan the priority prefix against the current resident state."""
+        target_clusters: list[_ClusterId] = []
+        target_page_count = 0
+        for cluster_id in prepared.requested_clusters:
+            cluster_page_count = len(prepared.cluster_page_map[cluster_id])
+            if cluster_page_count > self._logical_capacity:
+                continue
+            if target_page_count + cluster_page_count > self._logical_capacity:
+                break
+            target_clusters.append(cluster_id)
+            target_page_count += cluster_page_count
+
+        missing_targets = tuple(
+            cluster_id
+            for cluster_id in target_clusters
+            if cluster_id not in self._cluster_to_slots
+        )
+        required_page_count = sum(
+            len(prepared.cluster_page_map[cluster_id]) for cluster_id in missing_targets
+        )
+        incoming_group_pages: dict[RetroSpecClusterGroup, int] = {}
+        for cluster_id in missing_targets:
+            group = prepared.cluster_groups[cluster_id]
+            incoming_group_pages[group] = incoming_group_pages.get(group, 0) + len(
+                prepared.cluster_page_map[cluster_id]
+            )
+
+        target_cluster_tuple = tuple(target_clusters)
+        return (
+            target_cluster_tuple,
+            set(target_cluster_tuple),
+            missing_targets,
+            required_page_count,
+            incoming_group_pages,
+        )
+
+    def capture_prepared_admission_lru(
+        self,
+        prepared: RetroSpecPreparedResidentAdmission,
+        allocated_cluster_ids: Collection[int],
+        allocated_page_ids: Collection[int],
+        stream: torch.cuda.Stream,
+    ) -> RetroSpecResidentLruCapture | None:
+        """Capture stable eviction descriptors without waiting on the GPU."""
+        self._validate_prepared_admission_allocations(
+            prepared,
+            allocated_cluster_ids,
+            allocated_page_ids,
+        )
+        _, _, _, required_page_count, _ = self._plan_prepared_admission_targets(
+            prepared
+        )
+        if self.num_resident_pages + required_page_count <= self._logical_capacity:
+            return None
+
+        self._reap_completed_copy_batches()
+        stats = self.performance_stats
+        if stats is not None and stats.enabled:
+            stats.add_counter("resident_lru_snapshot_requested")
+        return self._capture_group_lru_from_gpu(self._group_states.keys(), stream)
+
     def _admit_from_sources(
         self,
         cluster_ids: torch.Tensor,
@@ -2234,6 +2366,7 @@ class RetroSpecResidentClusterCache:
         mutation_stream: torch.cuda.Stream | None = None,
         lookup_after_admit: bool = True,
         prepared: RetroSpecPreparedResidentAdmission | None = None,
+        resolved_lru: RetroSpecResolvedResidentLru | None = None,
     ) -> RetroSpecResidentPageAccess:
         """Admit a priority cluster prefix from CPU or GPU source pages."""
         if prepared is None:
@@ -2287,26 +2420,13 @@ class RetroSpecResidentClusterCache:
                         "resident cluster"
                     )
 
-        target_clusters: list[_ClusterId] = []
-        target_page_count = 0
-
-        for cluster_id in requested_clusters:
-            cluster_page_count = len(cluster_page_map[cluster_id])
-
-            if cluster_page_count > self._logical_capacity:
-                continue
-            if target_page_count + cluster_page_count > self._logical_capacity:
-                break
-
-            target_clusters.append(cluster_id)
-            target_page_count += cluster_page_count
-
-        target_cluster_set = set(target_clusters)
-        missing_targets = [
-            cluster_id
-            for cluster_id in target_clusters
-            if cluster_id not in self._cluster_to_slots
-        ]
+        (
+            _,
+            target_cluster_set,
+            missing_targets,
+            required_page_count,
+            incoming_group_pages,
+        ) = self._plan_prepared_admission_targets(prepared)
 
         # Validate every source before changing resident ownership.
         for cluster_id in missing_targets:
@@ -2325,17 +2445,6 @@ class RetroSpecResidentClusterCache:
             ):
                 raise RuntimeError("Source page ID exceeds source storage capacity")
 
-        required_page_count = sum(
-            len(cluster_page_map[cluster_id]) for cluster_id in missing_targets
-        )
-
-        incoming_group_pages: dict[RetroSpecClusterGroup, int] = {}
-        for cluster_id in missing_targets:
-            group = cluster_groups[cluster_id]
-            incoming_group_pages[group] = incoming_group_pages.get(group, 0) + len(
-                cluster_page_map[cluster_id]
-            )
-
         if mutation_stream is None:
             mutation_stream = torch.cuda.current_stream(self.device)
         if reuse_ready_event is not None:
@@ -2345,7 +2454,20 @@ class RetroSpecResidentClusterCache:
         victims: tuple[_ClusterId, ...] = ()
         if self.num_resident_pages + required_page_count > self._logical_capacity:
             self._reap_completed_copy_batches()
-            self._refresh_group_lru_from_gpu(self._group_states.keys(), mutation_stream)
+            snapshot_applied = False
+            if resolved_lru is not None:
+                snapshot_applied = self._apply_resolved_group_lru(resolved_lru)
+                stats = self.performance_stats
+                if stats is not None and stats.enabled:
+                    stats.add_counter(
+                        "resident_lru_snapshot_applied"
+                        if snapshot_applied
+                        else "resident_lru_snapshot_retried"
+                    )
+            if not snapshot_applied:
+                self._refresh_group_lru_from_gpu(
+                    self._group_states.keys(), mutation_stream
+                )
             protected_clusters = target_cluster_set | set(self._pending_cluster_events)
             victims = self._select_victim_clusters(
                 protected_clusters,
@@ -2584,6 +2706,7 @@ class RetroSpecResidentClusterCache:
         reuse_ready_event: torch.cuda.Event | None = None,
         mutation_stream: torch.cuda.Stream | None = None,
         lookup_after_admit: bool = True,
+        resolved_lru: RetroSpecResolvedResidentLru | None = None,
     ) -> RetroSpecResidentPageAccess:
         """Commit a previously prepared admission under mutation_guard()."""
         return self._admit_from_sources(
@@ -2601,6 +2724,7 @@ class RetroSpecResidentClusterCache:
             mutation_stream=mutation_stream,
             lookup_after_admit=lookup_after_admit,
             prepared=prepared,
+            resolved_lru=resolved_lru,
         )
 
     def invalidate(

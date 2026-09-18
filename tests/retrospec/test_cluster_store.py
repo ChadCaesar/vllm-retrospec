@@ -1407,14 +1407,20 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background(monkeypatc
         )
     resident_cache = store._resident_caches["layer"]
     assert resident_cache.performance_stats is stats
-    calls = {"prepare": 0, "commit": 0}
+    calls = {"prepare": 0, "capture": 0, "commit": 0}
     original_prepare = resident_cache.prepare_staged_admission
+    original_capture = resident_cache.capture_prepared_admission_lru
     original_commit = resident_cache.admit_prepared_staged
 
     def prepare_outside_mutation_guard(*args, **kwargs):
         assert not resident_cache.mutation_guard().locked()
         calls["prepare"] += 1
         return original_prepare(*args, **kwargs)
+
+    def capture_inside_mutation_guard(*args, **kwargs):
+        assert resident_cache.mutation_guard().locked()
+        calls["capture"] += 1
+        return original_capture(*args, **kwargs)
 
     def commit_inside_mutation_guard(*args, **kwargs):
         assert resident_cache.mutation_guard().locked()
@@ -1425,6 +1431,11 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background(monkeypatc
         resident_cache,
         "prepare_staged_admission",
         prepare_outside_mutation_guard,
+    )
+    monkeypatch.setattr(
+        resident_cache,
+        "capture_prepared_admission_lru",
+        capture_inside_mutation_guard,
     )
     monkeypatch.setattr(
         resident_cache,
@@ -1447,11 +1458,13 @@ def test_cpu_backing_store_prefetches_resident_clusters_in_background(monkeypatc
     assert stats._cpu_times["prefetch_metadata_wait"][1] == 1
     assert stats._cpu_times["prefetch_page_gather_wall"][1] == 1
     assert stats._cpu_times["prefetch_resident_prepare_wall"][1] == 1
+    assert stats._cpu_times["prefetch_resident_lru_capture_wall"][1] == 1
+    assert stats._cpu_times["prefetch_resident_lru_resolve_wall"][1] == 1
     assert stats._cpu_times["prefetch_resident_commit_wall"][1] == 1
     assert stats._cpu_times["prefetch_resident_admission_wall"][1] == 1
     assert stats._cpu_times["prefetch_worker_wall"][1] == 1
     assert stats._cpu_times["prefetch_wait_wall"][1] >= 1
-    assert calls == {"prepare": 1, "commit": 1}
+    assert calls == {"prepare": 1, "capture": 1, "commit": 1}
 
     access = store.lookup_resident_clusters(
         "layer", cluster_ids, metadata.page_ids, touch=False

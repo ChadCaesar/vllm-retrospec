@@ -4435,6 +4435,48 @@ class RetroSpecClusterPageStore:
                         perf_counter() - prepare_started_at,
                     )
 
+            capture_started_at = (
+                perf_counter() if stats is not None and stats.enabled else None
+            )
+            try:
+                with (
+                    self._resident_state_lock,
+                    prepared.resident_cache.mutation_guard(),
+                    torch.cuda.device(prepared.pool.metadata_device),
+                ):
+                    lru_capture = (
+                        prepared.resident_cache.capture_prepared_admission_lru(
+                            prepared=admission,
+                            allocated_cluster_ids=self._get_allocated_cluster_ids(
+                                prepared.layer_name
+                            ),
+                            allocated_page_ids=prepared.pool.allocated_page_ids,
+                            stream=execution_stream,
+                        )
+                    )
+            finally:
+                if capture_started_at is not None:
+                    stats.record_cpu_time(
+                        "prefetch_resident_lru_capture_wall",
+                        perf_counter() - capture_started_at,
+                    )
+
+            resolve_started_at = (
+                perf_counter() if stats is not None and stats.enabled else None
+            )
+            try:
+                resolved_lru = (
+                    None
+                    if lru_capture is None
+                    else prepared.resident_cache.resolve_lru_capture(lru_capture)
+                )
+            finally:
+                if resolve_started_at is not None:
+                    stats.record_cpu_time(
+                        "prefetch_resident_lru_resolve_wall",
+                        perf_counter() - resolve_started_at,
+                    )
+
             commit_started_at = (
                 perf_counter() if stats is not None and stats.enabled else None
             )
@@ -4452,6 +4494,7 @@ class RetroSpecClusterPageStore:
                         allocated_page_ids=prepared.pool.allocated_page_ids,
                         mutation_stream=execution_stream,
                         lookup_after_admit=False,
+                        resolved_lru=resolved_lru,
                     )
             finally:
                 if commit_started_at is not None:
