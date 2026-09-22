@@ -160,6 +160,10 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.retrospec import RetroSpecProposer
+from vllm.v1.spec_decode.retrospec.capacity import (
+    estimate_retrospec_gpu_index_arena_bytes,
+    estimate_retrospec_gpu_index_footprint,
+)
 from vllm.v1.spec_decode.retrospec.prefill import (
     RetroSpecLayerMajorPrefillProtocol,
     RetroSpecLayerPrefillTile,
@@ -3238,6 +3242,21 @@ class GPUModelRunner(
         )
         return 2 * get_dtype_size(self.model_config.dtype) * activation_elements
 
+    def _estimate_retrospec_prefill_future_memory_bytes(
+        self,
+        prompt_num_tokens: int,
+    ) -> int:
+        footprint = estimate_retrospec_gpu_index_footprint(
+            self.vllm_config,
+            self.kv_cache_config,
+            prompt_num_tokens,
+        )
+        return estimate_retrospec_gpu_index_arena_bytes(
+            self.vllm_config,
+            self.kv_cache_config,
+            (footprint,),
+        )
+
     def _build_retrospec_prefill_tile_plan(
         self,
         workspace: RetroSpecLayerPrefillWorkspace,
@@ -3365,7 +3384,13 @@ class GPUModelRunner(
         if tile_planner is None:
             raise RuntimeError("Layer-major prefill tile planner is unavailable")
 
-        tile_selection = tile_planner.select(prompt_num_tokens)
+        future_memory_reserve_bytes = (
+            self._estimate_retrospec_prefill_future_memory_bytes(prompt_num_tokens)
+        )
+        tile_selection = tile_planner.select(
+            prompt_num_tokens,
+            future_memory_reserve_bytes=future_memory_reserve_bytes,
+        )
         tile_size_tensor = torch.tensor(
             tile_selection.tile_size,
             dtype=torch.int64,
@@ -3385,13 +3410,27 @@ class GPUModelRunner(
             "layer_prefill_activation_estimate_bytes",
             tile_size * tile_planner.activation_bytes_per_token,
         )
+        stats.observe_peak(
+            "layer_prefill_available_memory_bytes",
+            tile_selection.available_memory_bytes,
+        )
+        stats.observe_peak(
+            "layer_prefill_reserve_memory_bytes",
+            tile_selection.reserve_memory_bytes,
+        )
+        stats.observe_peak(
+            "layer_prefill_future_reserve_bytes",
+            tile_selection.future_memory_reserve_bytes,
+        )
         logger.debug(
             "RetroSpec layer-prefill selected %d-token tiles for %d tokens "
-            "(available=%d, reserve=%d, activation_estimate=%d)",
+            "(available=%d, reserve=%d, future_reserve=%d, "
+            "activation_estimate=%d)",
             tile_size,
             prompt_num_tokens,
             tile_selection.available_memory_bytes,
             tile_selection.reserve_memory_bytes,
+            tile_selection.future_memory_reserve_bytes,
             tile_size * tile_planner.activation_bytes_per_token,
         )
 

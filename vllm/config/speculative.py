@@ -175,11 +175,11 @@ class SpeculativeConfig:
     This controls only initial prompt-index construction and does not control
     generation-time incremental updates. The final prefill tail uses a shorter
     cluster-aligned segment when it cannot fill this target size."""
-    retrospec_prefill_tile_size: int = Field(default=8192, gt=0)
-    """Target token count for one layer-major prefill forward. The runtime
-    planner may select a smaller block-aligned bucket when temporary GPU
-    activation headroom is insufficient. This is independent of
-    max_num_batched_tokens."""
+    retrospec_prefill_tile_size: int = Field(default=32768, gt=0)
+    """Maximum token count for one layer-major prefill forward. The runtime
+    planner selects the largest block-aligned tile that fits the temporary
+    activation budget on every participating rank. This is independent of the
+    cluster segment size and max_num_batched_tokens."""
     retrospec_blocks_per_cluster: int = Field(default=1, gt=0)
     """Average number of vLLM KV blocks represented by one cluster. With the
     default CUDA block size of 16, this targets approximately 16 tokens per

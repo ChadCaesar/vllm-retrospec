@@ -416,6 +416,37 @@ def test_estimate_layer_prefill_activation_bytes_uses_tp_local_widths():
     assert estimated_bytes == 2 * 2 * activation_elements
 
 
+def test_estimate_layer_prefill_future_memory_uses_actual_prompt_length():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = Mock()
+    runner.kv_cache_config = Mock()
+    footprint = Mock()
+
+    with (
+        patch(
+            "vllm.v1.worker.gpu_model_runner.estimate_retrospec_gpu_index_footprint",
+            return_value=footprint,
+        ) as estimate_footprint,
+        patch(
+            "vllm.v1.worker.gpu_model_runner.estimate_retrospec_gpu_index_arena_bytes",
+            return_value=1234,
+        ) as estimate_arena,
+    ):
+        estimate = runner._estimate_retrospec_prefill_future_memory_bytes(120000)
+
+    assert estimate == 1234
+    estimate_footprint.assert_called_once_with(
+        runner.vllm_config,
+        runner.kv_cache_config,
+        120000,
+    )
+    estimate_arena.assert_called_once_with(
+        runner.vllm_config,
+        runner.kv_cache_config,
+        (footprint,),
+    )
+
+
 def test_build_layer_prefill_tile_plan_builds_metadata_once_per_tile():
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner._build_retrospec_prefill_tile_metadata = Mock(

@@ -30,6 +30,7 @@ def test_benchmark_uses_default_draft_limit(monkeypatch, tmp_path):
     args = parse_args()
 
     assert args.max_draft_tokens == 8
+    assert args.prefill_tile_size == 32768
 
 
 def test_benchmark_profile_controls_observation_interval():

@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-ratio", type=float, default=0.0)
     parser.add_argument("--index-segment-size", type=int, default=8192)
     parser.add_argument("--index-update-interval", type=int, default=1024)
-    parser.add_argument("--prefill-tile-size", type=int, default=8192)
+    parser.add_argument("--prefill-tile-size", type=int, default=32768)
     parser.add_argument("--blocks-per-cluster", type=int, default=1)
     parser.add_argument("--kmeans-iterations", type=int, default=10)
     parser.add_argument("--cpu-page-build-workers", type=int, default=4)

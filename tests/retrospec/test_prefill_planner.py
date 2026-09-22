@@ -73,7 +73,25 @@ def test_prefill_tile_planner_selects_largest_bucket_with_headroom(monkeypatch):
     assert selection.tile_size == 4096
     assert selection.available_memory_bytes == (1 << 30) + (6 << 20)
     assert selection.reserve_memory_bytes == 1 << 30
+    assert selection.future_memory_reserve_bytes == 0
     assert selection.estimated_activation_bytes == 4 << 20
+
+
+def test_prefill_tile_planner_reserves_future_gpu_index_memory(monkeypatch):
+    set_cuda_memory(
+        monkeypatch,
+        free_memory=(1 << 30) + (12 << 20),
+    )
+    planner = make_planner()
+
+    selection = planner.select(
+        120000,
+        future_memory_reserve_bytes=8 << 20,
+    )
+
+    assert selection.tile_size == 4096
+    assert selection.reserve_memory_bytes == (1 << 30) + (8 << 20)
+    assert selection.future_memory_reserve_bytes == 8 << 20
 
 
 def test_prefill_tile_planner_counts_reusable_allocator_slack(monkeypatch):
@@ -112,3 +130,11 @@ def test_prefill_tile_planner_rejects_invalid_prompt_length(
 
     with pytest.raises(ValueError, match="prompt length must be positive"):
         planner.select(prompt_num_tokens)
+
+
+def test_prefill_tile_planner_rejects_negative_future_memory_reserve(monkeypatch):
+    set_cuda_memory(monkeypatch, free_memory=2 << 30)
+    planner = make_planner()
+
+    with pytest.raises(ValueError, match="Future memory reserve"):
+        planner.select(120000, future_memory_reserve_bytes=-1)

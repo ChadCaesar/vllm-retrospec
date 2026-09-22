@@ -79,6 +79,7 @@ class RetroSpecLayerPrefillTileSelection:
     tile_size: int
     available_memory_bytes: int
     reserve_memory_bytes: int
+    future_memory_reserve_bytes: int
     estimated_activation_bytes: int
 
 
@@ -130,9 +131,16 @@ class RetroSpecLayerPrefillTilePlanner:
             candidates.append(next_size)
         return tuple(candidates)
 
-    def select(self, prompt_num_tokens: int) -> RetroSpecLayerPrefillTileSelection:
+    def select(
+        self,
+        prompt_num_tokens: int,
+        *,
+        future_memory_reserve_bytes: int = 0,
+    ) -> RetroSpecLayerPrefillTileSelection:
         if prompt_num_tokens <= 0:
             raise ValueError("Layer-prefill prompt length must be positive")
+        if future_memory_reserve_bytes < 0:
+            raise ValueError("Future memory reserve must be non-negative")
 
         free_memory, total_memory = torch.cuda.mem_get_info(self.device)
         allocator_slack = max(
@@ -141,10 +149,11 @@ class RetroSpecLayerPrefillTilePlanner:
             0,
         )
         available_memory = free_memory + allocator_slack
-        reserve_memory = max(
+        base_reserve_memory = max(
             self._MIN_MEMORY_RESERVE_BYTES,
             int(total_memory * self._MEMORY_RESERVE_FRACTION),
         )
+        reserve_memory = base_reserve_memory + future_memory_reserve_bytes
         usable_memory = max(available_memory - reserve_memory, 0)
 
         candidates = self._candidate_sizes(prompt_num_tokens)
@@ -158,7 +167,8 @@ class RetroSpecLayerPrefillTilePlanner:
             tile_size=tile_size,
             available_memory_bytes=available_memory,
             reserve_memory_bytes=reserve_memory,
-            estimated_activation_bytes=(tile_size * self.activation_bytes_per_token),
+            future_memory_reserve_bytes=future_memory_reserve_bytes,
+            estimated_activation_bytes=tile_size * self.activation_bytes_per_token,
         )
 
 
