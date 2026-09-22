@@ -8,6 +8,7 @@ from vllm.v1.spec_decode.retrospec.resident_cache import _resident_handle_hash
 from vllm.v1.spec_decode.retrospec.resident_kernels import (
     compact_resident_misses,
     lookup_resident_handles,
+    publish_resident_table_bindings,
     resolve_compact_draft_pages,
     resolve_compact_verification_pages,
     resolve_ranked_draft_buckets,
@@ -39,6 +40,51 @@ def _make_table(
         torch.zeros(capacity, dtype=torch.bool, device=device),
         torch.zeros(capacity, dtype=torch.int64, device=device),
     )
+
+
+def test_resident_binding_publication_validates_generation_and_handle():
+    device = torch.device("cuda")
+    cluster_ids = torch.tensor(
+        [[10, 11, 12], [20, 21, 22]], dtype=torch.int64, device=device
+    )
+    bindings = torch.full((2, 3), -1, dtype=torch.int32, device=device)
+    cluster_offsets = torch.tensor([0, 2], dtype=torch.int64, device=device)
+    num_clusters = torch.tensor([2, 1], dtype=torch.int32, device=device)
+    generations = torch.tensor([5, 7], dtype=torch.int64, device=device)
+
+    publish_resident_table_bindings(
+        binding_commands=torch.tensor(
+            [
+                [0, 5, 0, 1, 11, 3],
+                [0, 4, 0, 0, 10, 4],
+                [1, 7, 1, 0, 22, 5],
+                [0, 5, 0, 0, 99, 6],
+            ],
+            dtype=torch.int64,
+            device=device,
+        ),
+        arena_cluster_ids=cluster_ids,
+        arena_resident_table_buckets=bindings,
+        arena_cluster_offsets=cluster_offsets,
+        arena_num_clusters=num_clusters,
+        arena_generations=generations,
+    )
+    torch.cuda.synchronize(device)
+
+    assert bindings.cpu().tolist() == [[-1, 3, -1], [-1, -1, 5]]
+
+    publish_resident_table_bindings(
+        binding_commands=torch.tensor(
+            [[0, 5, 0, 1, 11, -1]], dtype=torch.int64, device=device
+        ),
+        arena_cluster_ids=cluster_ids,
+        arena_resident_table_buckets=bindings,
+        arena_cluster_offsets=cluster_offsets,
+        arena_num_clusters=num_clusters,
+        arena_generations=generations,
+    )
+    torch.cuda.synchronize(device)
+    assert bindings[0, 1].item() == -1
 
 
 def _lookup(

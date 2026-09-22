@@ -776,6 +776,13 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             enabled=pin_memory,
             max_bytes=max_pinned_memory_bytes,
         )
+        self._gpu_index_residency = RetroSpecGPUIndexResidencyManager(
+            max_resident_requests=max_resident_requests,
+            max_gpu_index_memory_bytes=max_gpu_index_memory_bytes,
+            pinned_memory=self._pinned_memory,
+            max_summary_slots=max_pending_cluster_builds,
+            performance_stats=performance_stats,
+        )
         self.cluster_store = RetroSpecClusterPageStore(
             page_size=block_size,
             cache_ratio=effective_cache_ratio,
@@ -786,14 +793,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             full_verify_gather_workers=full_verify_gather_workers,
             performance_stats=performance_stats,
             pinned_memory=self._pinned_memory,
-        )
-
-        self._gpu_index_residency = RetroSpecGPUIndexResidencyManager(
-            max_resident_requests=max_resident_requests,
-            max_gpu_index_memory_bytes=max_gpu_index_memory_bytes,
-            pinned_memory=self._pinned_memory,
-            max_summary_slots=max_pending_cluster_builds,
-            performance_stats=performance_stats,
+            gpu_index_residency=self._gpu_index_residency,
         )
 
         # layer_name -> request_id -> token-level index
@@ -1539,6 +1539,14 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             new_indices[layer_name] = layer_indices
 
         self._gpu_index_residency.publish_resident_segments(resident_segments)
+        for segment in resident_segments:
+            if segment.cluster_keys.device.type != "cuda":
+                continue
+            self.cluster_store.republish_resident_table_bindings(
+                layer_name=segment.layer_name,
+                cluster_ids=segment.cluster_ids_cpu,
+                stream=torch.cuda.current_stream(segment.cluster_keys.device),
+            )
         self._indices = new_indices
 
     def flush_staged_updates(self) -> None:

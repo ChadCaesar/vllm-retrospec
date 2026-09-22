@@ -24,7 +24,10 @@ from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecFullVerificationTicket,
     RetroSpecResidentPrefetchInput,
 )
-from vllm.v1.spec_decode.retrospec.index_residency import RetroSpecResidentLayerArena
+from vllm.v1.spec_decode.retrospec.index_residency import (
+    RetroSpecResidentLayerArena,
+    RetroSpecResidentTableBinding,
+)
 from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
 
 
@@ -88,6 +91,44 @@ def test_resident_cache_lookup_avoids_global_lock_on_hot_path():
 
     assert store._get_resident_cache_for_lookup("layer") is resident_cache
     lifecycle_lock.__enter__.assert_not_called()
+
+
+def test_resident_binding_publication_reuses_cluster_identity_descriptors():
+    residency = Mock()
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        gpu_index_residency=residency,
+    )
+    group = RetroSpecClusterGroup("request", 3)
+    store._cluster_block_descriptors["layer"] = {
+        7: cluster_store_module._ClusterBlockDescriptor(
+            identity=RetroSpecClusterIdentity(group=group, local_cluster_id=11),
+            page_ids=(2,),
+            page_token_counts=(2,),
+        )
+    }
+    stream = Mock()
+
+    store._publish_resident_table_bindings(
+        "layer",
+        (7, 8),
+        (5, 6),
+        stream,
+    )
+
+    residency.publish_resident_table_bindings.assert_called_once_with(
+        layer_name="layer",
+        bindings=[
+            RetroSpecResidentTableBinding(
+                request_id="request",
+                kv_head_index=3,
+                local_cluster_index=11,
+                cluster_handle=7,
+                table_bucket=5,
+            )
+        ],
+        stream=stream,
+    )
 
 
 def test_resident_cache_lookup_serializes_cold_creation():

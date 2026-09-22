@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import OrderedDict, deque
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from math import prod
 from threading import Lock
@@ -25,6 +25,9 @@ from .resident_kernels import (
 
 _ClusterId = int
 _LogicalPages = tuple[int, ...]
+RetroSpecResidentBindingPublisher = Callable[
+    [tuple[int, ...], tuple[int, ...], torch.cuda.Stream], None
+]
 
 _PREFETCH_ABSENT = 0
 _PREFETCH_PENDING = 1
@@ -204,6 +207,7 @@ class RetroSpecResidentClusterCache:
         dtype: torch.dtype,
         device: torch.device,
         performance_stats: RetroSpecPerformanceStats | None = None,
+        binding_publisher: RetroSpecResidentBindingPublisher | None = None,
     ) -> None:
         if page_size <= 0:
             raise ValueError("page_size must be positive")
@@ -219,6 +223,7 @@ class RetroSpecResidentClusterCache:
         self.dtype = dtype
         self.device = device
         self.performance_stats = performance_stats
+        self._binding_publisher = binding_publisher
 
         self.key_pages = torch.empty(
             0,
@@ -601,6 +606,12 @@ class RetroSpecResidentClusterCache:
                 self._handle_table_last_access_epochs.index_fill_(
                     0, new_bucket_ids.to(torch.int64), self._next_access_epoch
                 )
+            if self._binding_publisher is not None:
+                self._binding_publisher(
+                    tuple(cluster_ids),
+                    tuple(bucket_ids),
+                    stream,
+                )
 
         return len(cluster_ids)
 
@@ -613,11 +624,13 @@ class RetroSpecResidentClusterCache:
             return
 
         bucket_ids: list[int] = []
+        erased_cluster_ids: list[int] = []
         for cluster_id in cluster_ids:
             bucket = self._handle_to_bucket.pop(cluster_id, None)
             if bucket is None:
                 continue
             self._bucket_handles[bucket] = -2
+            erased_cluster_ids.append(cluster_id)
             bucket_ids.append(bucket)
 
         if not bucket_ids:
@@ -653,6 +666,41 @@ class RetroSpecResidentClusterCache:
             )
             self._handle_table_last_access_epochs.index_fill_(
                 0, bucket_ids_gpu.to(torch.int64), 0
+            )
+            if self._binding_publisher is not None:
+                self._binding_publisher(
+                    tuple(erased_cluster_ids),
+                    (-1,) * len(erased_cluster_ids),
+                    stream,
+                )
+
+    def republish_handle_bindings(
+        self,
+        cluster_ids: Collection[_ClusterId],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Replay live buckets after a matching index segment is published."""
+        if self._binding_publisher is None:
+            return
+
+        published_cluster_ids: list[int] = []
+        published_buckets: list[int] = []
+        seen: set[int] = set()
+        for cluster_id in cluster_ids:
+            if cluster_id < 0 or cluster_id in seen:
+                continue
+            seen.add(cluster_id)
+            bucket = self._handle_to_bucket.get(cluster_id)
+            if bucket is None:
+                continue
+            published_cluster_ids.append(cluster_id)
+            published_buckets.append(bucket)
+
+        if published_cluster_ids:
+            self._binding_publisher(
+                tuple(published_cluster_ids),
+                tuple(published_buckets),
+                stream,
             )
 
     def _snapshot_group_hit_gate_ready(

@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from functools import partial
 from math import ceil
 from queue import PriorityQueue
 from threading import Condition, Lock, RLock, Thread
@@ -21,7 +22,11 @@ from .cluster_identity import (
     RetroSpecClusterGroup,
     RetroSpecClusterIdentity,
 )
-from .index_residency import RetroSpecResidentLayerArena
+from .index_residency import (
+    RetroSpecGPUIndexResidencyManager,
+    RetroSpecResidentLayerArena,
+    RetroSpecResidentTableBinding,
+)
 from .performance import RetroSpecPerformanceStats
 from .pinned_memory import RetroSpecPinnedMemoryManager
 from .resident_cache import (
@@ -2102,6 +2107,7 @@ class RetroSpecClusterPageStore:
         full_verify_gather_workers: int = 4,
         performance_stats: RetroSpecPerformanceStats | None = None,
         pinned_memory: RetroSpecPinnedMemoryManager | None = None,
+        gpu_index_residency: RetroSpecGPUIndexResidencyManager | None = None,
     ) -> None:
         if page_size <= 0:
             raise ValueError("page_size must be positive")
@@ -2145,6 +2151,7 @@ class RetroSpecClusterPageStore:
         self.cpu_page_build_workers = cpu_page_build_workers
         self.full_verify_gather_workers = full_verify_gather_workers
         self.performance_stats = performance_stats
+        self._gpu_index_residency = gpu_index_residency
         self._draft_resolve_counter_buffer: torch.Tensor | None = None
         self._draft_resolve_counter_indices: tuple[int, ...] | None = None
         if performance_stats is not None and performance_stats.enabled:
@@ -2230,6 +2237,44 @@ class RetroSpecClusterPageStore:
         self._resident_state_lock = RLock()
         self._resident_admission_frozen = False
         self._closed = False
+
+    def _publish_resident_table_bindings(
+        self,
+        layer_name: str,
+        cluster_ids: tuple[int, ...],
+        table_buckets: tuple[int, ...],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        if self._gpu_index_residency is None:
+            return
+        if len(cluster_ids) != len(table_buckets):
+            raise ValueError("Resident handle and bucket counts must match")
+
+        with self._resident_state_lock:
+            descriptors = self._cluster_block_descriptors.get(layer_name, {})
+            bindings: list[RetroSpecResidentTableBinding] = []
+            for cluster_id, table_bucket in zip(
+                cluster_ids, table_buckets, strict=True
+            ):
+                descriptor = descriptors.get(cluster_id)
+                if descriptor is None:
+                    continue
+                identity = descriptor.identity
+                bindings.append(
+                    RetroSpecResidentTableBinding(
+                        request_id=identity.group.request_id,
+                        kv_head_index=identity.group.kv_head_index,
+                        local_cluster_index=identity.local_cluster_id,
+                        cluster_handle=cluster_id,
+                        table_bucket=table_bucket,
+                    )
+                )
+
+        self._gpu_index_residency.publish_resident_table_bindings(
+            layer_name=layer_name,
+            bindings=bindings,
+            stream=stream,
+        )
 
     def _allocate_cluster_ids(
         self,
@@ -2858,6 +2903,10 @@ class RetroSpecClusterPageStore:
                 dtype=pool.dtype,
                 device=pool.metadata_device,
                 performance_stats=self.performance_stats,
+                binding_publisher=partial(
+                    self._publish_resident_table_bindings,
+                    layer_name,
+                ),
             )
             self._resident_caches[layer_name] = resident_cache
 
@@ -2870,6 +2919,28 @@ class RetroSpecClusterPageStore:
         if descriptor_arena is not None:
             resident_cache.reserve_prefetch_handle_states(descriptor_arena.capacity)
         return pool, resident_cache
+
+    def republish_resident_table_bindings(
+        self,
+        layer_name: str,
+        cluster_ids: torch.Tensor,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        cluster_ids_cpu = cluster_ids.detach().to(device="cpu", dtype=torch.int64)
+        valid_cluster_ids = tuple(
+            int(cluster_id)
+            for cluster_id in cluster_ids_cpu.reshape(-1).tolist()
+            if cluster_id >= 0
+        )
+        if not valid_cluster_ids:
+            return
+
+        with self._resident_state_lock:
+            resident_cache = self._resident_caches.get(layer_name)
+            if resident_cache is None:
+                return
+            with resident_cache.mutation_guard():
+                resident_cache.republish_handle_bindings(valid_cluster_ids, stream)
 
     def _get_resident_cache_for_lookup(
         self,

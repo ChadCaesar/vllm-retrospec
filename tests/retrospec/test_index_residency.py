@@ -7,6 +7,7 @@ import torch
 from vllm.v1.spec_decode.retrospec.index_residency import (
     RetroSpecGPUIndexResidencyManager,
     RetroSpecResidentSegment,
+    RetroSpecResidentTableBinding,
 )
 from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
 
@@ -29,11 +30,13 @@ def make_resident_segment(
     indexed_start: int = 2,
     cluster_start: int = 0,
     num_clusters: int = 1,
+    device: torch.device | str = "cpu",
 ) -> RetroSpecResidentSegment:
     keys = torch.arange(
         cluster_start + 1,
         cluster_start + num_clusters + 1,
         dtype=torch.float32,
+        device=device,
     ).view(1, num_clusters, 1)
     values = keys + 10
     counts = torch.full((1, num_clusters), 2, dtype=torch.int32)
@@ -112,6 +115,62 @@ def test_resident_segments_survive_batch_deactivation():
 
     assert manager.get_num_clusters("layer", "request") == 1
     assert manager.get_indexed_end("layer", "request") == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_resident_binding_publication_survives_request_slot_reuse():
+    manager = make_manager(max_resident_requests=1)
+    first = make_resident_segment(manager, request_id="first", device="cuda")
+    manager.publish_resident_segments([first])
+    stream = torch.cuda.current_stream()
+    manager.publish_resident_table_bindings(
+        "layer",
+        [
+            RetroSpecResidentTableBinding(
+                request_id="first",
+                kv_head_index=0,
+                local_cluster_index=0,
+                cluster_handle=0,
+                table_bucket=3,
+            )
+        ],
+        stream,
+    )
+    torch.cuda.synchronize()
+
+    manager.activate(["first"])
+    first_view = manager.get_active_view("layer", ["first"], torch.device("cuda"))
+    assert first_view.arena is not None
+    assert first_view.arena.resident_table_buckets[0, 0].item() == 3
+    manager.deactivate()
+
+    manager.invalidate_requests(["first"])
+    replacement = make_resident_segment(
+        manager, request_id="replacement", device="cuda"
+    )
+    manager.publish_resident_segments([replacement])
+    manager.publish_resident_table_bindings(
+        "layer",
+        [
+            RetroSpecResidentTableBinding(
+                request_id="first",
+                kv_head_index=0,
+                local_cluster_index=0,
+                cluster_handle=0,
+                table_bucket=7,
+            )
+        ],
+        stream,
+    )
+    torch.cuda.synchronize()
+
+    manager.activate(["replacement"])
+    replacement_view = manager.get_active_view(
+        "layer", ["replacement"], torch.device("cuda")
+    )
+    assert replacement_view.arena is not None
+    assert replacement_view.arena.resident_table_buckets[0, 0].item() == -1
+    manager.deactivate()
 
 
 def test_active_view_omits_arena_when_layer_has_no_requested_resident_index():

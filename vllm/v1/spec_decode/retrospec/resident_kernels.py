@@ -1531,6 +1531,69 @@ def _update_resident_handles_kernel(
     tl.atomic_add(version_ptr, 1, mask=valid, sem="release")
 
 
+@triton.jit
+def _publish_resident_table_bindings_kernel(
+    binding_commands,
+    arena_cluster_ids,
+    arena_resident_table_buckets,
+    arena_cluster_offsets,
+    arena_num_clusters,
+    arena_generations,
+    num_bindings,
+    command_stride_0,
+    command_stride_1,
+    cluster_stride_0,
+    cluster_stride_1,
+):
+    binding_index = tl.program_id(0)
+    valid = binding_index < num_bindings
+    command_offset = binding_index * command_stride_0
+    request_slot = tl.load(binding_commands + command_offset, mask=valid, other=0)
+    expected_generation = tl.load(
+        binding_commands + command_offset + command_stride_1,
+        mask=valid,
+        other=-1,
+    )
+    kv_head_index = tl.load(
+        binding_commands + command_offset + 2 * command_stride_1,
+        mask=valid,
+        other=0,
+    )
+    local_cluster_index = tl.load(
+        binding_commands + command_offset + 3 * command_stride_1,
+        mask=valid,
+        other=0,
+    )
+    expected_handle = tl.load(
+        binding_commands + command_offset + 4 * command_stride_1,
+        mask=valid,
+        other=-1,
+    )
+    table_bucket = tl.load(
+        binding_commands + command_offset + 5 * command_stride_1,
+        mask=valid,
+        other=-1,
+    )
+
+    current_generation = tl.load(arena_generations + request_slot, mask=valid, other=-1)
+    num_clusters = tl.load(arena_num_clusters + request_slot, mask=valid, other=0)
+    cluster_offset = tl.load(arena_cluster_offsets + request_slot, mask=valid, other=0)
+    valid &= current_generation == expected_generation
+    valid &= local_cluster_index >= 0
+    valid &= local_cluster_index < num_clusters
+
+    storage_index = cluster_offset + local_cluster_index
+    flat_offset = kv_head_index * cluster_stride_0 + storage_index * cluster_stride_1
+    current_handle = tl.load(arena_cluster_ids + flat_offset, mask=valid, other=-1)
+    valid &= current_handle == expected_handle
+
+    tl.store(
+        arena_resident_table_buckets + flat_offset,
+        table_bucket,
+        mask=valid,
+    )
+
+
 def lookup_resident_handles(
     cluster_handles: torch.Tensor,
     logical_page_ids: torch.Tensor,
@@ -2647,4 +2710,41 @@ def update_resident_handles(
         table_page_slots.stride(0),
         table_page_slots.stride(1),
         MAX_PAGES=table_page_slots.shape[1],
+    )
+
+
+def publish_resident_table_bindings(
+    binding_commands: torch.Tensor,
+    arena_cluster_ids: torch.Tensor,
+    arena_resident_table_buckets: torch.Tensor,
+    arena_cluster_offsets: torch.Tensor,
+    arena_num_clusters: torch.Tensor,
+    arena_generations: torch.Tensor,
+) -> None:
+    if binding_commands.ndim != 2 or binding_commands.shape[1] != 6:
+        raise ValueError("Resident binding commands must have shape [count, 6]")
+    if binding_commands.dtype != torch.int64:
+        raise ValueError("Resident binding commands must use int64")
+    num_bindings = binding_commands.shape[0]
+    if arena_cluster_ids.shape != arena_resident_table_buckets.shape:
+        raise ValueError("Resident bucket bindings must match cluster IDs")
+    if arena_cluster_ids.device.type != "cuda":
+        raise ValueError("Resident binding publication requires CUDA tensors")
+    if binding_commands.device != arena_cluster_ids.device:
+        raise ValueError("Resident binding commands must use the arena device")
+    if num_bindings == 0:
+        return
+
+    _publish_resident_table_bindings_kernel[(num_bindings,)](
+        binding_commands,
+        arena_cluster_ids,
+        arena_resident_table_buckets,
+        arena_cluster_offsets,
+        arena_num_clusters,
+        arena_generations,
+        num_bindings,
+        binding_commands.stride(0),
+        binding_commands.stride(1),
+        arena_cluster_ids.stride(0),
+        arena_cluster_ids.stride(1),
     )

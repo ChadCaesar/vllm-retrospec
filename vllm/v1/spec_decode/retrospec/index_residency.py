@@ -3,12 +3,13 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from threading import Lock
+from threading import Lock, RLock
 
 import torch
 
 from .performance import RetroSpecPerformanceStats
 from .pinned_memory import RetroSpecPinnedMemoryManager
+from .resident_kernels import publish_resident_table_bindings
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,17 @@ class RetroSpecResidentSegment:
     cluster_page_ids_cpu: torch.Tensor
     cluster_page_token_counts_cpu: torch.Tensor
     cluster_page_counts_cpu: torch.Tensor
+
+
+@dataclass(frozen=True)
+class RetroSpecResidentTableBinding:
+    """Validated route from one stable cluster handle to an arena binding."""
+
+    request_id: str
+    kv_head_index: int
+    local_cluster_index: int
+    cluster_handle: int
+    table_bucket: int
 
 
 @dataclass
@@ -283,6 +295,9 @@ class RetroSpecGPUIndexResidencyManager:
         self._offload_streams: dict[torch.device, torch.cuda.Stream] = {}
         self._summary_slots: dict[torch.device, list[_PinnedSummarySlot]] = {}
         self._summary_slot_lock = Lock()
+        self._arena_lock = RLock()
+        self._arena_ready_events: dict[str, torch.cuda.Event] = {}
+        self._binding_update_events: dict[str, torch.cuda.Event] = {}
 
     @property
     def active_request_ids(self) -> tuple[str, ...]:
@@ -1033,7 +1048,98 @@ class RetroSpecGPUIndexResidencyManager:
                 *transaction.old_cluster_span
             )
 
+    def _wait_for_binding_updates(
+        self,
+        layer_name: str,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        event = self._binding_update_events.get(layer_name)
+        if event is not None:
+            stream.wait_event(event)
+
+    def _record_arena_ready(
+        self,
+        layer_name: str,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        event = torch.cuda.Event()
+        event.record(stream)
+        self._arena_ready_events[layer_name] = event
+
+    def publish_resident_table_bindings(
+        self,
+        layer_name: str,
+        bindings: Sequence[RetroSpecResidentTableBinding],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        bindings = tuple(bindings)
+        if not bindings:
+            return
+
+        with self._arena_lock:
+            layer_state = self._layer_arenas.get(layer_name)
+            resident_states = self._resident_states.get(layer_name)
+            if layer_state is None or resident_states is None:
+                return
+
+            arena = layer_state.arena
+            binding_commands: list[tuple[int, int, int, int, int, int]] = []
+            num_kv_heads = arena.cluster_ids.shape[0]
+
+            for binding in bindings:
+                state = resident_states.get(binding.request_id)
+                if state is None:
+                    continue
+                if not 0 <= binding.kv_head_index < num_kv_heads:
+                    continue
+                if not 0 <= binding.local_cluster_index < state.num_clusters:
+                    continue
+
+                binding_commands.append(
+                    (
+                        state.slot,
+                        state.generation,
+                        binding.kv_head_index,
+                        binding.local_cluster_index,
+                        binding.cluster_handle,
+                        binding.table_bucket,
+                    )
+                )
+
+            if not binding_commands:
+                return
+
+            ready_event = self._arena_ready_events.get(layer_name)
+            if ready_event is not None:
+                stream.wait_event(ready_event)
+            previous_update = self._binding_update_events.get(layer_name)
+            if previous_update is not None:
+                stream.wait_event(previous_update)
+
+            device = arena.cluster_ids.device
+            with torch.cuda.device(device), torch.cuda.stream(stream):
+                publish_resident_table_bindings(
+                    binding_commands=torch.tensor(
+                        binding_commands, dtype=torch.int64, device=device
+                    ),
+                    arena_cluster_ids=arena.cluster_ids,
+                    arena_resident_table_buckets=arena.resident_table_buckets,
+                    arena_cluster_offsets=arena.cluster_offsets,
+                    arena_num_clusters=arena.num_clusters,
+                    arena_generations=arena.generations,
+                )
+                update_event = torch.cuda.Event()
+                update_event.record(stream)
+                self._binding_update_events[layer_name] = update_event
+
     def publish_resident_segments(
+        self,
+        segments: Sequence[RetroSpecResidentSegment],
+    ) -> None:
+        with self._arena_lock:
+            self._publish_resident_segments_locked(segments)
+
+    def _publish_resident_segments_locked(
         self,
         segments: Sequence[RetroSpecResidentSegment],
     ) -> None:
@@ -1057,8 +1163,16 @@ class RetroSpecGPUIndexResidencyManager:
         allocated_request_ids: list[str] = []
         transactions: list[_ResidentSpanTransaction] = []
 
+        waited_layers: set[str] = set()
         try:
             for segment in self._coalesce_resident_segments(segments):
+                if (
+                    segment.cluster_keys.device.type == "cuda"
+                    and segment.layer_name not in waited_layers
+                ):
+                    stream = torch.cuda.current_stream(segment.cluster_keys.device)
+                    self._wait_for_binding_updates(segment.layer_name, stream)
+                    waited_layers.add(segment.layer_name)
                 if segment.request_id not in self._request_slots:
                     allocated_request_ids.append(segment.request_id)
                 slot = self._get_or_allocate_request_slot(segment.request_id)
@@ -1103,6 +1217,11 @@ class RetroSpecGPUIndexResidencyManager:
                 arena.indexed_starts[state.slot] = state.indexed_start
                 arena.indexed_ends[state.slot] = state.indexed_end
             self._active_views.pop(layer_name, None)
+            if arena.cluster_ids.device.type == "cuda":
+                self._record_arena_ready(
+                    layer_name,
+                    torch.cuda.current_stream(arena.cluster_ids.device),
+                )
 
     def get_active_view(
         self,
@@ -1196,35 +1315,65 @@ class RetroSpecGPUIndexResidencyManager:
         arena.indexed_ends[state.slot] = 0
 
     def discard_request_layer(self, layer_name: str, request_id: str) -> None:
-        layer_states = self._resident_states.get(layer_name)
-        if layer_states is None:
-            return
+        with self._arena_lock:
+            layer_states = self._resident_states.get(layer_name)
+            layer_state = self._layer_arenas.get(layer_name)
+            if layer_states is None or layer_state is None:
+                return
 
-        state = layer_states.pop(request_id, None)
-        if state is None:
-            return
+            state = layer_states.pop(request_id, None)
+            if state is None:
+                return
 
-        self._release_request_state(layer_name, state)
-        self._active_views.pop(layer_name, None)
+            arena = layer_state.arena
+            stream = (
+                torch.cuda.current_stream(arena.cluster_ids.device)
+                if arena.cluster_ids.device.type == "cuda"
+                else None
+            )
+            if stream is not None:
+                self._wait_for_binding_updates(layer_name, stream)
+            self._release_request_state(layer_name, state)
+            self._active_views.pop(layer_name, None)
+            if stream is not None:
+                self._record_arena_ready(layer_name, stream)
 
     def invalidate_requests(self, request_ids: Sequence[str]) -> None:
         removed = set(request_ids)
         if not removed:
             return
 
-        for layer_name, layer_states in self._resident_states.items():
-            for request_id in removed:
-                state = layer_states.pop(request_id, None)
-                if state is None:
+        with self._arena_lock:
+            for layer_name, layer_states in self._resident_states.items():
+                layer_state = self._layer_arenas.get(layer_name)
+                if layer_state is None:
                     continue
-                self._release_request_state(layer_name, state)
+                arena = layer_state.arena
+                stream = (
+                    torch.cuda.current_stream(arena.cluster_ids.device)
+                    if arena.cluster_ids.device.type == "cuda"
+                    else None
+                )
+                waited = False
+                changed = False
+                for request_id in removed:
+                    state = layer_states.pop(request_id, None)
+                    if state is None:
+                        continue
+                    if not waited and stream is not None:
+                        self._wait_for_binding_updates(layer_name, stream)
+                        waited = True
+                    self._release_request_state(layer_name, state)
+                    changed = True
+                if changed and stream is not None:
+                    self._record_arena_ready(layer_name, stream)
 
-        self._active_views.clear()
+            self._active_views.clear()
 
-        for request_id in removed:
-            slot = self._request_slots.pop(request_id, None)
-            if slot is not None:
-                self._free_request_slots.append(slot)
+            for request_id in removed:
+                slot = self._request_slots.pop(request_id, None)
+                if slot is not None:
+                    self._free_request_slots.append(slot)
 
     def _get_offload_stream(self, device: torch.device) -> torch.cuda.Stream:
         if device.index is None:

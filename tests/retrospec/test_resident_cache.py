@@ -154,6 +154,7 @@ def make_cache(
     *,
     group_targets: dict[RetroSpecClusterGroup, int] | None = None,
     performance_stats: RetroSpecPerformanceStats | None = None,
+    binding_publisher=None,
 ) -> RetroSpecResidentClusterCache:
     cache = _ResidentCacheTestAdapter(
         page_size=2,
@@ -161,6 +162,7 @@ def make_cache(
         dtype=torch.float32,
         device=torch.device("cuda"),
         performance_stats=performance_stats,
+        binding_publisher=binding_publisher,
     )
     cache.resize(capacity, group_targets=group_targets)
     return cache
@@ -1749,6 +1751,51 @@ def test_gpu_handle_table_tracks_resident_admission_and_invalidation():
     invalidated = lookup_gpu()
     assert invalidated.miss_cluster_mask.item()
     assert invalidated.cache_page_ids.cpu().tolist() == [[[[-1, -1]]]]
+
+
+def test_handle_publication_updates_rebuilds_replays_and_clears_bindings():
+    group = RetroSpecClusterGroup("request", 0)
+    binding_publisher = Mock()
+    cache = make_cache(
+        capacity=1,
+        group_targets={group: 1},
+        binding_publisher=binding_publisher,
+    )
+    backing_keys, backing_values = make_backing_pages(num_pages=1)
+
+    with cache.mutation_guard():
+        RetroSpecResidentClusterCache.admit(
+            cache,
+            cluster_ids=torch.tensor([7]),
+            page_ids=torch.tensor([[0]]),
+            cluster_groups={7: group},
+            allocated_cluster_ids={7},
+            allocated_page_ids={0},
+            backing_key_pages=backing_keys,
+            backing_value_pages=backing_values,
+        )
+    cache.synchronize_pending_copies()
+
+    bucket = cache._handle_to_bucket[7]
+    assert binding_publisher.call_args.args[:2] == ((7,), (bucket,))
+
+    binding_publisher.reset_mock()
+    stream = torch.cuda.current_stream(cache.device)
+    with cache.mutation_guard():
+        cache.republish_handle_bindings((7, 8, 7, -1), stream)
+    binding_publisher.assert_called_once_with((7,), (bucket,), stream)
+
+    binding_publisher.reset_mock()
+    cache._handle_table_needs_rebuild = True
+    with cache.mutation_guard():
+        cache._ensure_handle_table(1, stream)
+    rebuilt_bucket = cache._handle_to_bucket[7]
+    binding_publisher.assert_called_once_with((7,), (rebuilt_bucket,), stream)
+
+    binding_publisher.reset_mock()
+    with cache.mutation_guard():
+        cache.invalidate(torch.tensor([7]))
+    binding_publisher.assert_any_call((7,), (-1,), stream)
 
 
 def test_handle_table_rebuild_preserves_pending_cluster_publication():
