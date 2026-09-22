@@ -23,6 +23,7 @@ from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecFullVerificationDescriptor,
     RetroSpecFullVerificationTicket,
     RetroSpecResidentPrefetchInput,
+    RetroSpecVerificationResolveRequest,
 )
 from vllm.v1.spec_decode.retrospec.index_residency import (
     RetroSpecResidentLayerArena,
@@ -2518,6 +2519,71 @@ def test_gpu_verification_resolution_deduplicates_miss_pages_before_h2d():
         == expected_metadata_bytes
     )
     reference_store.close()
+    store.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for batched verification resolution",
+)
+@torch.inference_mode()
+def test_gpu_verification_resolution_batches_cross_layer_metadata_waits():
+    device = torch.device("cuda", torch.cuda.current_device())
+    stats = RetroSpecPerformanceStats(device=device, log_interval_seconds=60.0)
+    store = RetroSpecClusterPageStore(
+        page_size=2,
+        pin_memory=True,
+        cache_ratio=0.5,
+        performance_stats=stats,
+    )
+    store.configure_resident_prefetch_wave(2)
+    keys, values, assignments, cluster_token_counts = make_cluster_data()
+    requests = []
+    for layer_name in ("layer.0", "layer.1"):
+        table = store_cluster_data(
+            store,
+            layer_name,
+            keys.to(device),
+            values.to(device),
+            assignments.to(device),
+            cluster_token_counts.to(device),
+        )
+        cluster_ids = table.cluster_ids.to(device=device)
+        metadata = store.get_cluster_block_metadata(
+            layer_name=layer_name,
+            cluster_ids=cluster_ids,
+            device=device,
+        )
+        arena = make_resident_arena(table, metadata, cluster_token_counts, device)
+        requests.append(
+            RetroSpecVerificationResolveRequest(
+                layer_name=layer_name,
+                selected_cluster_indices=torch.arange(
+                    cluster_ids.shape[-1], dtype=torch.int32, device=device
+                )[None, None, :].expand(1, cluster_ids.shape[0], -1),
+                plan_valid_rows=torch.ones(1, dtype=torch.bool, device=device),
+                request_slot_ids=torch.zeros(1, dtype=torch.int64, device=device),
+                request_slot_generations=torch.ones(
+                    1, dtype=torch.int64, device=device
+                ),
+                arena=arena,
+                max_pages_per_cluster=metadata.page_ids.shape[-1],
+            )
+        )
+
+    resolved = store.resolve_verification_cluster_batch(requests)
+    assert tuple(resolved) == ("layer.0", "layer.1")
+    assert stats._cpu_times["verification_batch_count_wait"][1] == 1
+    assert stats._cpu_times["verification_batch_metadata_wait"][1] == 1
+    assert stats._cpu_counters["verification_prepared_layers"] == 2
+    assert stats._cpu_counters["verification_miss_layers"] == 2
+    for pages in resolved.values():
+        assert pages.miss_admission is not None
+        assert pages.read_lease is not None
+        pages.read_lease.release()
+        store.submit_verification_miss_admission(pages.miss_admission)
+    store.wait_for_verification_admissions()
+    assert stats._cpu_counters["verification_async_admissions"] == 2
     store.close()
 
 

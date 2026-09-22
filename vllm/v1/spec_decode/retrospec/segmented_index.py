@@ -27,6 +27,7 @@ from .cluster_store import (
     RetroSpecResidentPrefetchInput,
     RetroSpecResolvedClusterPages,
     RetroSpecStagedClusterInput,
+    RetroSpecVerificationResolveRequest,
 )
 from .clustering import segmented_kmeans
 from .index import RetroSpecAttentionLevel, RetroSpecIndexBase
@@ -45,6 +46,7 @@ from .selection_kernels import (
     emit_primary_exact_token_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
+    pack_ranked_verification_exact_plan,
     pack_ranked_verification_plan,
 )
 from .selection_provenance import (
@@ -162,6 +164,26 @@ class RetroSpecIndexedTokenAttentionSelection:
     estimation_token_counts: torch.Tensor
 
     attention_mass: torch.Tensor
+
+
+@dataclass
+class _PreparedIndexedVerificationLayer:
+    layer_name: str
+    plan_row_indices: torch.Tensor
+    plan_valid_rows: torch.Tensor
+    request_slot_ids: torch.Tensor
+    request_slot_generations: torch.Tensor
+    exact_cluster_indices: torch.Tensor
+    attention_mass: torch.Tensor
+    resolved_pages: RetroSpecCompactVerificationResolvedPages | None = None
+
+
+@dataclass
+class _IndexedVerificationTransaction:
+    level: RetroSpecAttentionLevel
+    layers: tuple[str, ...]
+    prepared: dict[str, _PreparedIndexedVerificationLayer]
+    next_layer_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -821,6 +843,12 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         self._indexed_verification_workspace: _IndexedVerificationWorkspace | None = (
             None
         )
+        self._indexed_verification_exact_workspaces: dict[
+            tuple[str, RetroSpecAttentionLevel], _IndexedVerificationWorkspace
+        ] = {}
+        self._indexed_verification_transaction: (
+            _IndexedVerificationTransaction | None
+        ) = None
 
         # CPU-offload construction is staged during layer execution and
         # committed after the complete prefill attention context.
@@ -989,6 +1017,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
     def remove_requests(self, request_ids: Sequence[str]) -> None:
         request_ids = tuple(request_ids)
+        self.end_indexed_verification_transaction()
         self._discard_primed_full_verification_for_requests(request_ids, wait=True)
         self.cluster_store.wait_for_resident_prefetches()
         self._gpu_index_residency.invalidate_requests(request_ids)
@@ -1008,6 +1037,10 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         layer_names: Sequence[str],
     ) -> None:
         """Roll back clustered state that extends past committed context."""
+        # Sparse miss admission may overlap boundary handling and proposal
+        # teardown, but it must not compete with the full-verification H2D
+        # pipeline for PCIe bandwidth or mutate resident state underneath it.
+        self.cluster_store.wait_for_verification_admissions()
         request_ids = tuple(request_ids)
         context_lens = tuple(int(context_len) for context_len in context_lens)
 
@@ -1140,6 +1173,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         if not self._proposal_active:
             raise RuntimeError("Segmented token index proposal is not active")
 
+        self.end_indexed_verification_transaction()
         try:
             self._gpu_index_residency.deactivate()
         finally:
@@ -1206,6 +1240,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
 
     def close(self) -> None:
         try:
+            self.end_indexed_verification_transaction()
             if self.has_staged_updates:
                 self.discard_staged_updates()
         finally:
@@ -3515,6 +3550,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         level: RetroSpecAttentionLevel,
         request_indices: torch.Tensor,
         token_indices: torch.Tensor,
+        prepared_exact: _PreparedIndexedVerificationLayer | None = None,
     ) -> RetroSpecIndexedTokenAttentionSelection:
         table = self._selection_plan_tables.get(layer_name)
         if table is None:
@@ -3545,7 +3581,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         workspace = self._get_indexed_verification_workspace(
             pair_capacity=num_pairs,
             num_kv_heads=num_kv_heads,
-            exact_width=exact_width,
+            exact_width=0 if prepared_exact is not None else exact_width,
             estimation_width=estimation_width,
             head_size=table.head_size,
             dtype=table.dtype,
@@ -3556,7 +3592,11 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         plan_valid_rows = workspace.plan_valid_rows[:num_pairs]
         packed_slots = workspace.request_slot_ids[:num_pairs]
         packed_generations = workspace.request_slot_generations[:num_pairs]
-        exact_shape = (num_pairs, num_kv_heads, exact_width)
+        exact_shape = (
+            (num_pairs, num_kv_heads, 0)
+            if prepared_exact is not None
+            else (num_pairs, num_kv_heads, exact_width)
+        )
         estimation_shape = (num_pairs, num_kv_heads, estimation_width)
         num_exact = prod(exact_shape)
         num_estimation = prod(estimation_shape)
@@ -3593,6 +3633,16 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             estimation_ratio=self.estimation_ratio,
             expanded=expanded,
         )
+
+        if prepared_exact is not None:
+            if prepared_exact.layer_name != layer_name:
+                raise RuntimeError("Prepared verification layer does not match")
+            plan_rows = prepared_exact.plan_row_indices
+            plan_valid_rows = prepared_exact.plan_valid_rows
+            packed_slots = prepared_exact.request_slot_ids
+            packed_generations = prepared_exact.request_slot_generations
+            packed_exact = prepared_exact.exact_cluster_indices
+            packed_attention = prepared_exact.attention_mass
 
         view = self._gpu_index_residency.get_active_view(
             layer_name, self._proposal_request_ids, request_indices.device
@@ -3634,6 +3684,225 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
             estimation_token_counts=counts,
             attention_mass=packed_attention,
         )
+
+    def _get_indexed_verification_exact_workspace(
+        self,
+        layer_name: str,
+        level: RetroSpecAttentionLevel,
+        pair_capacity: int,
+        num_kv_heads: int,
+        exact_width: int,
+        head_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> _IndexedVerificationWorkspace:
+        key = (layer_name, level)
+        workspace = self._indexed_verification_exact_workspaces.get(key)
+        if workspace is not None and workspace.matches(
+            pair_capacity=pair_capacity,
+            num_kv_heads=num_kv_heads,
+            exact_width=exact_width,
+            estimation_width=0,
+            head_size=head_size,
+            dtype=dtype,
+            device=device,
+        ):
+            return workspace
+        if workspace is not None:
+            pair_capacity = max(pair_capacity, workspace.keys.shape[0])
+            exact_width = max(exact_width, workspace.exact_cluster_indices.shape[2])
+        workspace = _IndexedVerificationWorkspace.allocate(
+            pair_capacity=pair_capacity,
+            num_kv_heads=num_kv_heads,
+            exact_width=exact_width,
+            estimation_width=0,
+            head_size=head_size,
+            dtype=dtype,
+            device=device,
+        )
+        self._indexed_verification_exact_workspaces[key] = workspace
+        return workspace
+
+    def _prepare_indexed_verification_exact(
+        self,
+        layer_name: str,
+        level: RetroSpecAttentionLevel,
+        request_indices: torch.Tensor,
+        token_indices: torch.Tensor,
+    ) -> _PreparedIndexedVerificationLayer:
+        table = self._selection_plan_tables.get(layer_name)
+        if table is None:
+            raise RuntimeError(
+                f"No draft selection plan exists for layer {layer_name!r}"
+            )
+        if level == RetroSpecAttentionLevel.SPARSE:
+            exact_width = table.sparse_retrieval_width
+            expanded = False
+            attention_mass = table.sparse_attn
+        elif level == RetroSpecAttentionLevel.EXPANDED:
+            exact_width = table.expanded_retrieval_width
+            expanded = True
+            attention_mass = table.expanded_attn
+        else:
+            raise ValueError(f"Unsupported RetroSpec attention level: {level}")
+
+        num_pairs = request_indices.numel()
+        num_kv_heads = table.ranked_cluster_indices.shape[2]
+        workspace = self._get_indexed_verification_exact_workspace(
+            layer_name=layer_name,
+            level=level,
+            pair_capacity=num_pairs,
+            num_kv_heads=num_kv_heads,
+            exact_width=exact_width,
+            head_size=table.head_size,
+            dtype=table.dtype,
+            device=request_indices.device,
+        )
+        plan_rows = workspace.plan_row_indices[:num_pairs]
+        plan_valid_rows = workspace.plan_valid_rows[:num_pairs]
+        packed_slots = workspace.request_slot_ids[:num_pairs]
+        packed_generations = workspace.request_slot_generations[:num_pairs]
+        packed_attention = workspace.attention_mass[:num_pairs]
+        exact_items = num_pairs * num_kv_heads * exact_width
+        packed_exact = workspace.exact_cluster_indices.view(-1)[:exact_items].view(
+            num_pairs, num_kv_heads, exact_width
+        )
+        empty_items = workspace.estimation_cluster_indices.view(-1)[:0].view(
+            num_pairs, num_kv_heads, 0
+        )
+        empty_mask = workspace.estimation_cluster_mask.view(-1)[:0].view(
+            num_pairs, num_kv_heads, 0
+        )
+        pack_ranked_verification_exact_plan(
+            request_indices=request_indices,
+            token_indices=token_indices,
+            valid_rows=table.valid_rows,
+            request_slot_ids=table.request_slot_ids,
+            request_slot_generations=table.request_slot_generations,
+            ranked_cluster_indices=self._flatten_plan_rows(
+                table.ranked_cluster_indices
+            ),
+            candidate_counts=self._flatten_plan_rows(table.candidate_counts),
+            attention_mass=attention_mass.view(-1),
+            output_plan_row_indices=plan_rows,
+            output_plan_valid_rows=plan_valid_rows,
+            output_request_slot_ids=packed_slots,
+            output_request_slot_generations=packed_generations,
+            output_exact_cluster_indices=packed_exact,
+            output_attention_mass=packed_attention,
+            empty_estimation_cluster_indices=empty_items,
+            empty_estimation_cluster_mask=empty_mask,
+            retrieval_ratio=self.retrieval_ratio,
+            estimation_ratio=self.estimation_ratio,
+            expanded=expanded,
+        )
+        return _PreparedIndexedVerificationLayer(
+            layer_name=layer_name,
+            plan_row_indices=plan_rows,
+            plan_valid_rows=plan_valid_rows,
+            request_slot_ids=packed_slots,
+            request_slot_generations=packed_generations,
+            exact_cluster_indices=packed_exact,
+            attention_mass=packed_attention,
+        )
+
+    def begin_indexed_verification_transaction(
+        self,
+        level: RetroSpecAttentionLevel,
+        layer_names: Sequence[str],
+        request_indices: torch.Tensor,
+        token_indices: torch.Tensor,
+    ) -> None:
+        if self._indexed_verification_transaction is not None:
+            raise RuntimeError("Indexed verification transaction is already active")
+        layers = tuple(layer_names)
+        prepared = {
+            layer_name: self._prepare_indexed_verification_exact(
+                layer_name, level, request_indices, token_indices
+            )
+            for layer_name in layers
+        }
+        requests: list[RetroSpecVerificationResolveRequest] = []
+        for layer_name in layers:
+            packed = prepared[layer_name]
+            view = self._gpu_index_residency.get_active_view(
+                layer_name,
+                self._proposal_request_ids,
+                request_indices.device,
+            )
+            if view.arena is None or packed.exact_cluster_indices.shape[2] == 0:
+                continue
+            requests.append(
+                RetroSpecVerificationResolveRequest(
+                    layer_name=layer_name,
+                    selected_cluster_indices=packed.exact_cluster_indices,
+                    plan_valid_rows=packed.plan_valid_rows,
+                    request_slot_ids=packed.request_slot_ids,
+                    request_slot_generations=packed.request_slot_generations,
+                    arena=view.arena,
+                    max_pages_per_cluster=view.max_pages_per_cluster,
+                )
+            )
+        resolved = self.cluster_store.resolve_verification_cluster_batch(requests)
+        for layer_name, pages in resolved.items():
+            prepared[layer_name].resolved_pages = pages
+        self._indexed_verification_transaction = _IndexedVerificationTransaction(
+            level=level,
+            layers=layers,
+            prepared=prepared,
+        )
+
+    def consume_indexed_verification_layer(
+        self,
+        layer_name: str,
+        request_indices: torch.Tensor,
+        token_indices: torch.Tensor,
+    ) -> tuple[
+        RetroSpecIndexedTokenAttentionSelection,
+        RetroSpecCompactVerificationResolvedPages | None,
+    ]:
+        transaction = self._indexed_verification_transaction
+        if transaction is None:
+            raise RuntimeError("No indexed verification transaction is active")
+        if transaction.next_layer_index >= len(transaction.layers):
+            raise RuntimeError("Indexed verification transaction is exhausted")
+        expected_layer = transaction.layers[transaction.next_layer_index]
+        if expected_layer != layer_name:
+            raise RuntimeError(
+                "Verification layer order differs from the installed model"
+            )
+        packed = transaction.prepared[layer_name]
+        selection = self.get_indexed_selection(
+            layer_name=layer_name,
+            level=transaction.level,
+            request_indices=request_indices,
+            token_indices=token_indices,
+            prepared_exact=packed,
+        )
+        transaction.next_layer_index += 1
+        return selection, packed.resolved_pages
+
+    def end_indexed_verification_transaction(self) -> None:
+        transaction = self._indexed_verification_transaction
+        if transaction is None:
+            return
+        self._indexed_verification_transaction = None
+        error: BaseException | None = None
+        for packed in transaction.prepared.values():
+            pages = packed.resolved_pages
+            if pages is None:
+                continue
+            try:
+                self.cluster_store.submit_verification_miss_admission(
+                    pages.miss_admission
+                )
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            finally:
+                pages.read_lease.release()
+        if error is not None:
+            raise error
 
     def materialize_indexed_reference(
         self, selection: RetroSpecIndexedTokenAttentionSelection

@@ -848,6 +848,31 @@ class RetroSpecSparseAttention:
 
         self.attention_mass_sum[: self.batch_size].zero_()
         self.attention_mass_layer_count = 0
+        if self.device.type == "cuda":
+            level = (
+                RetroSpecAttentionLevel.SPARSE
+                if mode == RetroSpecAttentionMode.SPARSE_VERIFY
+                else RetroSpecAttentionLevel.EXPANDED
+            )
+            layer_names = tuple(
+                layer_name
+                for layer_name in self.original_forwards
+                if self.index.has_cluster_pages(layer_name, self.proposal_request_ids)
+            )
+            try:
+                self.index.begin_indexed_verification_transaction(
+                    level,
+                    layer_names,
+                    request_indices,
+                    token_indices,
+                )
+            except BaseException:
+                self.mode = RetroSpecAttentionMode.PASSTHROUGH
+                self.batch_size = 0
+                self.active_mask = None
+                self.parallel_request_indices = None
+                self.parallel_token_indices = None
+                raise
         self.step_active = True
 
     def _should_reduce_attention_mass(self) -> bool:
@@ -888,6 +913,8 @@ class RetroSpecSparseAttention:
             if prefetch_wave:
                 with self.performance_stats.cpu_timer("draft_prefetch_wave_submit"):
                     self.index.submit_sparse_verification_prefetch_wave(prefetch_wave)
+        elif self.parallel_request_indices is not None:
+            self.index.end_indexed_verification_transaction()
 
         self.mode = RetroSpecAttentionMode.PASSTHROUGH
         self.step_active = False
@@ -902,6 +929,21 @@ class RetroSpecSparseAttention:
             value_sum=attention_mass_sum,
             layer_count=layer_count,
         )
+
+    def abort_step(self) -> None:
+        """Release verification state after a failed model forward."""
+        try:
+            self.index.end_indexed_verification_transaction()
+        finally:
+            self._resident_prefetch_wave.clear()
+            self.mode = RetroSpecAttentionMode.PASSTHROUGH
+            self.step_active = False
+            self.step_index = -1
+            self.active_mask = None
+            self.batch_size = 0
+            self.parallel_request_indices = None
+            self.parallel_token_indices = None
+            self.attention_mass_layer_count = 0
 
     def end_step(self) -> torch.Tensor:
         return self.end_step_statistics().mean()
@@ -1251,6 +1293,8 @@ class RetroSpecSparseAttention:
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
+        prepared_pages: RetroSpecCompactVerificationResolvedPages | None = None,
+        pages_prepared: bool = False,
     ) -> tuple[
         RetroSpecExactKVSource,
         RetroSpecResolvedClusterPages
@@ -1273,7 +1317,11 @@ class RetroSpecSparseAttention:
                 RetroSpecAttentionMode.EXPANDED_VERIFY,
             ):
                 raise RuntimeError("Indexed plans are only valid during verification")
-            resolved_pages = self.index.resolve_indexed_verification_pages(selection)
+            resolved_pages = (
+                prepared_pages
+                if pages_prepared
+                else self.index.resolve_indexed_verification_pages(selection)
+            )
             if resolved_pages is None:
                 exact_page_token_counts = torch.empty(
                     plan_row_indices.shape[0],
@@ -1453,6 +1501,8 @@ class RetroSpecSparseAttention:
         attn_metadata: FlashAttentionMetadata,
         selection: RetroSpecSelection,
         output: torch.Tensor,
+        prepared_pages: RetroSpecCompactVerificationResolvedPages | None = None,
+        pages_prepared: bool = False,
     ) -> torch.Tensor:
         if isinstance(selection, RetroSpecRankedDraftAttentionSelection):
             if self.mode != RetroSpecAttentionMode.DRAFT:
@@ -1509,12 +1559,22 @@ class RetroSpecSparseAttention:
             self.performance_stats.cpu_timer(f"{stage_name}_page_resolve_wall"),
             self.performance_stats.cuda_timer(f"{stage_name}_page_resolve"),
         ):
-            source, resolved_pages = self._resolve_exact_kv_source(
-                selection=selection,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                block_table=attn_metadata.block_table,
-            )
+            if pages_prepared:
+                source, resolved_pages = self._resolve_exact_kv_source(
+                    selection=selection,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_table=attn_metadata.block_table,
+                    prepared_pages=prepared_pages,
+                    pages_prepared=True,
+                )
+            else:
+                source, resolved_pages = self._resolve_exact_kv_source(
+                    selection=selection,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_table=attn_metadata.block_table,
+                )
 
         estimation_keys, estimation_values, estimation_token_counts = (
             self._get_grouped_estimation(selection)
@@ -1536,11 +1596,15 @@ class RetroSpecSparseAttention:
                     output=output,
                 )
         finally:
-            if resolved_pages is not None and resolved_pages.read_lease is not None:
+            if (
+                not pages_prepared
+                and resolved_pages is not None
+                and resolved_pages.read_lease is not None
+            ):
                 resolved_pages.read_lease.release()
 
         miss_admission = getattr(resolved_pages, "miss_admission", None)
-        if miss_admission is not None:
+        if not pages_prepared and miss_admission is not None:
             with self.performance_stats.cpu_timer(
                 f"{stage_name}_resident_admit_submit"
             ):
@@ -1649,7 +1713,19 @@ class RetroSpecSparseAttention:
             else:
                 raise RuntimeError(f"Unexpected RetroSpec attention mode: {self.mode}")
 
-            if has_parallel_plan:
+            prepared_pages = None
+            pages_prepared = False
+            if has_parallel_plan and query.device.type == "cuda":
+                with self.performance_stats.cuda_timer("verification_plan_index"):
+                    selection, prepared_pages = (
+                        self.index.consume_indexed_verification_layer(
+                            layer_name,
+                            self.parallel_request_indices,
+                            self.parallel_token_indices,
+                        )
+                    )
+                pages_prepared = True
+            elif has_parallel_plan:
                 with self.performance_stats.cuda_timer("verification_plan_index"):
                     selection = self._get_indexed_selection(layer_name, level)
             else:
@@ -1688,6 +1764,16 @@ class RetroSpecSparseAttention:
                 attn_metadata=attn_metadata,
                 selection=selection,
                 output=output[:num_actual_tokens],
+                prepared_pages=(
+                    prepared_pages
+                    if self.mode != RetroSpecAttentionMode.DRAFT
+                    else None
+                ),
+                pages_prepared=(
+                    pages_prepared
+                    if self.mode != RetroSpecAttentionMode.DRAFT
+                    else False
+                ),
             )
         else:
             exact_output, exact_lse = self._run_exact_attention(

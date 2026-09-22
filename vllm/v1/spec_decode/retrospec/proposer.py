@@ -1614,32 +1614,38 @@ class RetroSpecProposer:
                 attention_mode, request_indices, token_indices
             )
 
-        with (
-            self.performance_stats.cuda_timer(f"{stage_name}_forward"),
-            set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                num_tokens=batch_descriptor.num_tokens,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=(
-                    batch_descriptor if cudagraph_mode != CUDAGraphMode.NONE else None
+        try:
+            with (
+                self.performance_stats.cuda_timer(f"{stage_name}_forward"),
+                set_forward_context(
+                    per_layer_attn_metadata,
+                    self.vllm_config,
+                    num_tokens=batch_descriptor.num_tokens,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=(
+                        batch_descriptor
+                        if cudagraph_mode != CUDAGraphMode.NONE
+                        else None
+                    ),
+                    slot_mapping=per_layer_slot_mapping,
                 ),
-                slot_mapping=per_layer_slot_mapping,
-            ),
-        ):
-            hidden_states = self._run_pipeline_stage_model(
-                model_input_ids,
-                model_positions,
-                batch_descriptor.num_tokens,
-                cudagraph_mode,
-                stage_name,
-            )
+            ):
+                hidden_states = self._run_pipeline_stage_model(
+                    model_input_ids,
+                    model_positions,
+                    batch_descriptor.num_tokens,
+                    cudagraph_mode,
+                    stage_name,
+                )
 
-        with self.performance_stats.cuda_timer(f"{stage_name}_end_step"):
-            local_attention_stats = self.sparse_attention.end_step_statistics()
-            attention_mass = self.pipeline_protocol.reduce_attention_mass(
-                local_attention_stats
-            )
+            with self.performance_stats.cuda_timer(f"{stage_name}_end_step"):
+                local_attention_stats = self.sparse_attention.end_step_statistics()
+                attention_mass = self.pipeline_protocol.reduce_attention_mass(
+                    local_attention_stats
+                )
+        except BaseException:
+            self.sparse_attention.abort_step()
+            raise
 
         if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY:
             compute_margin = self.policy.sparse_margin_threshold is not None

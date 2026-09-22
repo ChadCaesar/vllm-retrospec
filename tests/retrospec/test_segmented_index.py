@@ -2337,6 +2337,54 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_indexed_verification_transaction_prepares_and_releases_layer_pages():
+    device = torch.device("cuda")
+    index = make_index(cache_ratio=0.5, pin_memory=True)
+    index.configure_sparse_prefetch_wave(1)
+    keys, values = make_cache()
+    keys = keys.to(device=device, dtype=torch.bfloat16)
+    values = values.to(device=device, dtype=torch.bfloat16)
+    block_table = torch.arange(7, dtype=torch.int32, device=device).view(1, -1)
+    build_index(index, 10, keys, values, block_table)
+    request_indices = torch.tensor([0], dtype=torch.int64, device=device)
+    token_indices = torch.tensor([0], dtype=torch.int64, device=device)
+
+    index.begin_proposal(["request"])
+    try:
+        draft_selection = index.select_segmented(
+            request_ids=["request"],
+            layer_name="layer",
+            query=torch.ones(1, 1, 1, device=device, dtype=torch.bfloat16),
+            key_cache=keys,
+            value_cache=values,
+            block_table=block_table,
+            seq_lens=torch.tensor([10], dtype=torch.int32, device=device),
+            active_mask=torch.tensor([True], device=device),
+            scale=1.0,
+        )
+        draft_selection.resolved_clusters.read_lease.release()
+        index.begin_indexed_verification_transaction(
+            RetroSpecAttentionLevel.SPARSE,
+            ("layer",),
+            request_indices,
+            token_indices,
+        )
+        selection, pages = index.consume_indexed_verification_layer(
+            "layer", request_indices, token_indices
+        )
+        assert selection.plan_valid_rows.tolist() == [True]
+        assert pages is not None
+        assert pages.miss_admission is not None
+        index.end_indexed_verification_transaction()
+        assert index._indexed_verification_transaction is None
+        index.cluster_store._reap_verification_admissions(wait=True)
+        assert index.cluster_store.num_resident_pages("layer") > 0
+    finally:
+        index.end_proposal()
+        index.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_ready_selected_replay_admits_current_topk_before_draft_attention():
     device = torch.device("cuda")
     index = make_index(

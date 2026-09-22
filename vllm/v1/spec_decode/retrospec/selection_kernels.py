@@ -579,6 +579,61 @@ def pack_ranked_verification_plan(
     )
 
 
+def pack_ranked_verification_exact_plan(
+    *,
+    request_indices: torch.Tensor,
+    token_indices: torch.Tensor,
+    valid_rows: torch.Tensor,
+    request_slot_ids: torch.Tensor,
+    request_slot_generations: torch.Tensor,
+    ranked_cluster_indices: torch.Tensor,
+    candidate_counts: torch.Tensor,
+    attention_mass: torch.Tensor,
+    output_plan_row_indices: torch.Tensor,
+    output_plan_valid_rows: torch.Tensor,
+    output_request_slot_ids: torch.Tensor,
+    output_request_slot_generations: torch.Tensor,
+    output_exact_cluster_indices: torch.Tensor,
+    output_attention_mass: torch.Tensor,
+    empty_estimation_cluster_indices: torch.Tensor,
+    empty_estimation_cluster_mask: torch.Tensor,
+    retrieval_ratio: float,
+    estimation_ratio: float,
+    expanded: bool,
+) -> None:
+    """Pack only the exact portion needed by cross-layer page resolution."""
+    expected_empty_shape = (
+        request_indices.numel(),
+        ranked_cluster_indices.shape[1],
+        0,
+    )
+    if empty_estimation_cluster_indices.shape != expected_empty_shape:
+        raise ValueError("Empty estimation indices have the wrong shape")
+    if empty_estimation_cluster_mask.shape != expected_empty_shape:
+        raise ValueError("Empty estimation mask has the wrong shape")
+    pack_ranked_verification_plan(
+        request_indices=request_indices,
+        token_indices=token_indices,
+        valid_rows=valid_rows,
+        request_slot_ids=request_slot_ids,
+        request_slot_generations=request_slot_generations,
+        ranked_cluster_indices=ranked_cluster_indices,
+        candidate_counts=candidate_counts,
+        attention_mass=attention_mass,
+        output_plan_row_indices=output_plan_row_indices,
+        output_plan_valid_rows=output_plan_valid_rows,
+        output_request_slot_ids=output_request_slot_ids,
+        output_request_slot_generations=output_request_slot_generations,
+        output_exact_cluster_indices=output_exact_cluster_indices,
+        output_estimation_cluster_indices=empty_estimation_cluster_indices,
+        output_estimation_cluster_mask=empty_estimation_cluster_mask,
+        output_attention_mass=output_attention_mass,
+        retrieval_ratio=retrieval_ratio,
+        estimation_ratio=estimation_ratio,
+        expanded=expanded,
+    )
+
+
 @triton.jit
 def _gather_resident_estimation_kernel(
     cluster_keys,

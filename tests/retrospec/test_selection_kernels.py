@@ -14,6 +14,7 @@ from vllm.v1.spec_decode.retrospec.selection_kernels import (
     emit_primary_exact_token_plan,
     gather_resident_estimation,
     gather_resident_exact_pages,
+    pack_ranked_verification_exact_plan,
     pack_ranked_verification_plan,
 )
 
@@ -234,6 +235,94 @@ def test_pack_ranked_verification_plan_matches_query_rows(
     torch.testing.assert_close(
         packed_attention.cpu(), torch.tensor([0.2, 0.3, 1.0, 1.0])
     )
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+@pytest.mark.parametrize("expanded", [False, True])
+def test_pack_ranked_verification_exact_plan_matches_full_pack(
+    device_type: str, expanded: bool
+):
+    if device_type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    device = torch.device(device_type)
+    valid_rows = torch.tensor([[True, True], [True, False]], device=device)
+    request_slots = torch.tensor([3, 7], dtype=torch.int64, device=device)
+    request_generations = torch.tensor([11, 13], dtype=torch.int64, device=device)
+    ranked = torch.arange(4 * 2 * 5, dtype=torch.int32, device=device).view(4, 2, 5)
+    candidate_counts = torch.tensor(
+        [[5, 2], [4, 1], [0, 5], [5, 5]], dtype=torch.int32, device=device
+    )
+    attention = torch.tensor([0.1, 0.2, 0.3, 0.4], device=device)
+    requests = torch.tensor([1, 0, 1, 2], dtype=torch.int64, device=device)
+    tokens = torch.tensor([0, 1, 1, 0], dtype=torch.int64, device=device)
+    num_pairs = requests.numel()
+    exact_width = 5 if expanded else 3
+
+    def outputs():
+        return (
+            torch.empty(num_pairs, dtype=torch.int64, device=device),
+            torch.empty(num_pairs, dtype=torch.bool, device=device),
+            torch.empty(num_pairs, dtype=torch.int64, device=device),
+            torch.empty(num_pairs, dtype=torch.int64, device=device),
+            torch.empty(num_pairs, 2, exact_width, dtype=torch.int32, device=device),
+            torch.empty(num_pairs, device=device),
+        )
+
+    exact_outputs = outputs()
+    pack_ranked_verification_exact_plan(
+        request_indices=requests,
+        token_indices=tokens,
+        valid_rows=valid_rows,
+        request_slot_ids=request_slots,
+        request_slot_generations=request_generations,
+        ranked_cluster_indices=ranked,
+        candidate_counts=candidate_counts,
+        attention_mass=attention,
+        output_plan_row_indices=exact_outputs[0],
+        output_plan_valid_rows=exact_outputs[1],
+        output_request_slot_ids=exact_outputs[2],
+        output_request_slot_generations=exact_outputs[3],
+        output_exact_cluster_indices=exact_outputs[4],
+        output_attention_mass=exact_outputs[5],
+        empty_estimation_cluster_indices=torch.empty(
+            num_pairs, 2, 0, dtype=torch.int32, device=device
+        ),
+        empty_estimation_cluster_mask=torch.empty(
+            num_pairs, 2, 0, dtype=torch.bool, device=device
+        ),
+        retrieval_ratio=0.5,
+        estimation_ratio=0.4,
+        expanded=expanded,
+    )
+
+    full_outputs = outputs()
+    pack_ranked_verification_plan(
+        request_indices=requests,
+        token_indices=tokens,
+        valid_rows=valid_rows,
+        request_slot_ids=request_slots,
+        request_slot_generations=request_generations,
+        ranked_cluster_indices=ranked,
+        candidate_counts=candidate_counts,
+        attention_mass=attention,
+        output_plan_row_indices=full_outputs[0],
+        output_plan_valid_rows=full_outputs[1],
+        output_request_slot_ids=full_outputs[2],
+        output_request_slot_generations=full_outputs[3],
+        output_exact_cluster_indices=full_outputs[4],
+        output_estimation_cluster_indices=torch.empty(
+            num_pairs, 2, 2, dtype=torch.int32, device=device
+        ),
+        output_estimation_cluster_mask=torch.empty(
+            num_pairs, 2, 2, dtype=torch.bool, device=device
+        ),
+        output_attention_mass=full_outputs[5],
+        retrieval_ratio=0.5,
+        estimation_ratio=0.4,
+        expanded=expanded,
+    )
+    for exact_output, full_output in zip(exact_outputs, full_outputs):
+        torch.testing.assert_close(exact_output, full_output)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
