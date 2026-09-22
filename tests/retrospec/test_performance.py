@@ -241,6 +241,14 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     stats.add_counter("full_verify_requests", 1)
     stats.add_gpu_counter("resident_cluster_hits", torch.tensor([9]))
     stats.add_gpu_counter("resident_cluster_misses", torch.tensor([1]))
+    stats.add_gpu_counter("draft_compact_selected_clusters", torch.tensor([10]))
+    stats.add_gpu_counter("resident_bound_direct_hits", torch.tensor([6]))
+    stats.add_gpu_counter("resident_hash_fallback_lookups", torch.tensor([4]))
+    stats.add_gpu_counter("resident_hash_fallback_hits", torch.tensor([3]))
+    stats.add_gpu_counter("resident_hash_fallback_misses", torch.tensor([1]))
+    stats.add_gpu_counter("resident_hash_probe_steps", torch.tensor([7]))
+    stats.add_gpu_counter("resident_hash_max_probe", torch.tensor([3]))
+    stats.add_gpu_counter("resident_binding_invalidations", torch.tensor([2]))
     stats.add_counter("prefetch_submitted", 3)
     stats.add_counter("prefetch_waves_submitted", 3)
     stats.add_counter("prefetch_waves_coalesced", 1)
@@ -272,6 +280,11 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     assert "expanded/sparse=0.250" in message
     assert "full/request=0.500" in message
     assert "resident_hit_rate=0.900" in message
+    assert "resident_bound_hit_rate=0.750" in message
+    assert "resident_hash_fallback_rate=0.400" in message
+    assert "resident_hash_fallback_hit_rate=0.750" in message
+    assert "resident_hash_avg_probe=1.75" in message
+    assert "resident_binding_invalidation_rate=0.250" in message
     assert "verification_hit_rate=0.900" in message
     assert "prefetch_coalesce_rate=0.250" in message
     assert "prefetch_backpressure_rate=0.333" in message

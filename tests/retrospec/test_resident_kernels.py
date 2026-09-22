@@ -302,9 +302,7 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
     draft_attention = torch.empty(2, device=device)
     sparse_attention = torch.empty(2, device=device)
     expanded_attention = torch.empty(2, device=device)
-    statistics = torch.tensor(
-        [10, 20, 30, 40, 50, 60], dtype=torch.int64, device=device
-    )
+    statistics = torch.zeros(11, dtype=torch.int64, device=device)
 
     resolve_compact_draft_pages(
         ranked_values=ranked_values,
@@ -348,7 +346,7 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
         sparse_attention=sparse_attention,
         expanded_attention=expanded_attention,
         statistics_buffer=statistics,
-        statistics_indices=(4, 1, 5, 2),
+        statistics_indices=tuple(range(11)),
     )
 
     assert sparse_indices.cpu().tolist() == [[[0, 1]], [[-1, -1]]]
@@ -371,7 +369,8 @@ def test_ranked_compact_draft_resolution_emits_journal_pages_and_misses():
     torch.testing.assert_close(draft_attention.cpu(), torch.tensor([0.6, 1.0]))
     torch.testing.assert_close(sparse_attention.cpu(), torch.tensor([0.9, 1.0]))
     torch.testing.assert_close(expanded_attention.cpu(), torch.tensor([1.0, 1.0]))
-    assert statistics.cpu().tolist() == [10, 21, 32, 40, 51, 62]
+    assert statistics.cpu().tolist() == [1, 1, 2, 2, 0, 2, 1, 1, 2, 1, 0]
+    assert statistics[0].item() == statistics[4].item() + statistics[6].item()
     assert table[5][_resident_bucket(10)].item() == 9
 
 
@@ -432,6 +431,7 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
     miss_count = torch.empty(1, dtype=torch.int32, device=device)
     sparse_attention = torch.empty(2, device=device)
     expanded_attention = torch.empty(2, device=device)
+    statistics = torch.zeros(11, dtype=torch.int64, device=device)
 
     resolve_ranked_draft_buckets(
         ranked_values=torch.tensor(
@@ -486,6 +486,8 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
         sparse_attention=sparse_attention,
         expanded_attention=expanded_attention,
         capture_request_descriptors=capture_request_descriptors,
+        statistics_buffer=statistics,
+        statistics_indices=tuple(range(11)),
     )
 
     torch.cuda.synchronize()
@@ -508,6 +510,20 @@ def test_ranked_draft_bucket_resolution_emits_plan_and_avoids_page_outputs(
     torch.testing.assert_close(attention.cpu(), torch.tensor([0.6, 1.0]))
     torch.testing.assert_close(sparse_attention.cpu(), torch.tensor([0.9, 1.0]))
     torch.testing.assert_close(expanded_attention.cpu(), torch.tensor([1.0, 1.0]))
+    assert statistics.cpu().tolist() == [
+        1,
+        1,
+        resident_page_count,
+        2,
+        0,
+        2,
+        1,
+        1,
+        2,
+        1,
+        0,
+    ]
+    assert statistics[0].item() == statistics[4].item() + statistics[6].item()
     assert table[5][_resident_bucket(10)].item() == 9
 
 
@@ -549,6 +565,7 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
     miss_count = torch.empty(1, dtype=torch.int32, device=device)
     sparse_attention = torch.empty(1, device=device)
     expanded_attention = torch.empty(1, device=device)
+    statistics = torch.zeros(11, dtype=torch.int64, device=device)
 
     def resolve(emit_misses: bool = True) -> None:
         resolve_compact_draft_pages(
@@ -599,6 +616,8 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
             sparse_attention=sparse_attention,
             expanded_attention=expanded_attention,
             emit_misses=emit_misses,
+            statistics_buffer=statistics,
+            statistics_indices=tuple(range(11)),
         )
 
     resolve()
@@ -674,6 +693,8 @@ def test_ranked_compact_draft_resolution_validates_direct_bucket_binding():
     assert hit_counts.item() == 1
     assert miss_count.item() == 0
     assert binding.item() == _resident_bucket(11)
+    assert statistics.cpu().tolist() == [4, 1, 4, 5, 2, 3, 2, 1, 3, 1, 2]
+    assert statistics[0].item() == statistics[4].item() + statistics[6].item()
 
 
 def test_compact_resident_misses_preserves_handles_and_flat_positions():

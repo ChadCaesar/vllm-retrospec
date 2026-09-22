@@ -2157,6 +2157,13 @@ class RetroSpecClusterPageStore:
                     "resident_cluster_misses",
                     "draft_compact_resident_pages",
                     "draft_compact_selected_clusters",
+                    "resident_bound_direct_hits",
+                    "resident_hash_fallback_lookups",
+                    "resident_hash_fallback_hits",
+                    "resident_hash_fallback_misses",
+                    "resident_hash_probe_steps",
+                    "resident_hash_max_probe",
+                    "resident_binding_invalidations",
                 )
             )
 

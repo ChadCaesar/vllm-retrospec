@@ -5,6 +5,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+_DRAFT_RESOLVE_STATISTIC_COUNT = 11
+
 
 @triton.jit
 def _resident_handle_hash(cluster_handle):
@@ -25,6 +27,7 @@ def _find_resident_buckets(
     table_versions,
     TABLE_CAPACITY: tl.constexpr,
     BLOCK_WIDTH: tl.constexpr,
+    TRACK_STATISTICS: tl.constexpr,
 ):
     bound_valid = selected & (bound_buckets >= 0) & (bound_buckets < TABLE_CAPACITY)
     safe_bound_buckets = tl.maximum(bound_buckets, 0)
@@ -40,18 +43,23 @@ def _find_resident_buckets(
     bound_stable = (bound_versions_before == bound_versions_after) & (
         (bound_versions_before & 1) == 0
     )
-    direct_hits = bound_valid & bound_stable & (bound_handles == cluster_handles)
+    direct_matches = bound_valid & bound_stable & (bound_handles == cluster_handles)
 
     matched_buckets = tl.where(
-        direct_hits,
+        direct_matches,
         bound_buckets,
         tl.full((BLOCK_WIDTH,), -1, tl.int64),
     )
     first_buckets = _resident_handle_hash(cluster_handles) & (TABLE_CAPACITY - 1)
-    searching = selected & ~direct_hits
+    fallback_lookups = selected & ~direct_matches
+    searching = fallback_lookups
     searching_count = tl.sum(searching.to(tl.int32), axis=0)
+    probe_counts = tl.zeros((BLOCK_WIDTH,), tl.int32)
     probe = 0
     while tl.condition((probe < 64) & (searching_count > 0), disable_licm=True):
+        if TRACK_STATISTICS:
+            probe_counts += searching.to(tl.int32)
+
         buckets = (first_buckets + probe) & (TABLE_CAPACITY - 1)
         versions_before = tl.atomic_add(
             table_versions + buckets, 0, mask=searching, sem="acquire"
@@ -62,13 +70,72 @@ def _find_resident_buckets(
         )
         stable = (versions_before == versions_after) & ((versions_before & 1) == 0)
         matched = searching & stable & (stored_handles == cluster_handles)
-        empty = stable & (stored_handles == -1)
+        empty = searching & stable & (stored_handles == -1)
         matched_buckets = tl.where(matched, buckets, matched_buckets)
         searching &= ~matched & ~empty
         searching_count = tl.sum(searching.to(tl.int32), axis=0)
         probe += 1
 
-    return matched_buckets
+    return matched_buckets, direct_matches, fallback_lookups, probe_counts
+
+
+@triton.jit
+def _record_resident_lookup_statistics(
+    statistics_buffer,
+    selected,
+    bound_buckets,
+    direct_matches,
+    fallback_lookups,
+    probe_counts,
+    stable_hits,
+    BOUND_DIRECT_HIT_COUNTER_INDEX: tl.constexpr,
+    HASH_FALLBACK_LOOKUP_COUNTER_INDEX: tl.constexpr,
+    HASH_FALLBACK_HIT_COUNTER_INDEX: tl.constexpr,
+    HASH_FALLBACK_MISS_COUNTER_INDEX: tl.constexpr,
+    HASH_PROBE_STEP_COUNTER_INDEX: tl.constexpr,
+    HASH_MAX_PROBE_COUNTER_INDEX: tl.constexpr,
+    BINDING_INVALIDATION_COUNTER_INDEX: tl.constexpr,
+):
+    direct_hits = direct_matches & stable_hits
+    fallback_hits = fallback_lookups & stable_hits
+    fallback_misses = fallback_lookups & ~stable_hits
+    binding_invalidations = selected & (bound_buckets >= 0) & ~direct_hits
+
+    tl.atomic_add(
+        statistics_buffer + BOUND_DIRECT_HIT_COUNTER_INDEX,
+        tl.sum(direct_hits.to(tl.int32), axis=0).to(tl.int64),
+        sem="relaxed",
+    )
+    tl.atomic_add(
+        statistics_buffer + HASH_FALLBACK_LOOKUP_COUNTER_INDEX,
+        tl.sum(fallback_lookups.to(tl.int32), axis=0).to(tl.int64),
+        sem="relaxed",
+    )
+    tl.atomic_add(
+        statistics_buffer + HASH_FALLBACK_HIT_COUNTER_INDEX,
+        tl.sum(fallback_hits.to(tl.int32), axis=0).to(tl.int64),
+        sem="relaxed",
+    )
+    tl.atomic_add(
+        statistics_buffer + HASH_FALLBACK_MISS_COUNTER_INDEX,
+        tl.sum(fallback_misses.to(tl.int32), axis=0).to(tl.int64),
+        sem="relaxed",
+    )
+    tl.atomic_add(
+        statistics_buffer + HASH_PROBE_STEP_COUNTER_INDEX,
+        tl.sum(probe_counts, axis=0).to(tl.int64),
+        sem="relaxed",
+    )
+    tl.atomic_max(
+        statistics_buffer + HASH_MAX_PROBE_COUNTER_INDEX,
+        tl.max(probe_counts, axis=0).to(tl.int64),
+        sem="relaxed",
+    )
+    tl.atomic_add(
+        statistics_buffer + BINDING_INVALIDATION_COUNTER_INDEX,
+        tl.sum(binding_invalidations.to(tl.int32), axis=0).to(tl.int64),
+        sem="relaxed",
+    )
 
 
 @triton.jit
@@ -127,6 +194,13 @@ def _resolve_compact_draft_pages_kernel(
     RESIDENT_MISS_COUNTER_INDEX: tl.constexpr,
     RESIDENT_PAGE_COUNTER_INDEX: tl.constexpr,
     SELECTED_CLUSTER_COUNTER_INDEX: tl.constexpr,
+    BOUND_DIRECT_HIT_COUNTER_INDEX: tl.constexpr,
+    HASH_FALLBACK_LOOKUP_COUNTER_INDEX: tl.constexpr,
+    HASH_FALLBACK_HIT_COUNTER_INDEX: tl.constexpr,
+    HASH_FALLBACK_MISS_COUNTER_INDEX: tl.constexpr,
+    HASH_PROBE_STEP_COUNTER_INDEX: tl.constexpr,
+    HASH_MAX_PROBE_COUNTER_INDEX: tl.constexpr,
+    BINDING_INVALIDATION_COUNTER_INDEX: tl.constexpr,
 ):
     row = tl.program_id(0)
     batch_idx = row // NUM_KV_HEADS
@@ -197,7 +271,12 @@ def _resolve_compact_draft_pages_kernel(
         mask=selected,
         other=-1,
     ).to(tl.int64)
-    matched_buckets = _find_resident_buckets(
+    (
+        matched_buckets,
+        direct_matches,
+        fallback_lookups,
+        probe_counts,
+    ) = _find_resident_buckets(
         selected_cluster_handles,
         selected,
         bound_buckets,
@@ -205,6 +284,7 @@ def _resolve_compact_draft_pages_kernel(
         table_versions,
         TABLE_CAPACITY=TABLE_CAPACITY,
         BLOCK_WIDTH=BLOCK_SPARSE,
+        TRACK_STATISTICS=UPDATE_STATISTICS,
     )
 
     found = matched_buckets >= 0
@@ -368,6 +448,22 @@ def _resolve_compact_draft_pages_kernel(
             num_selected.to(tl.int64),
             sem="relaxed",
         )
+        _record_resident_lookup_statistics(
+            statistics_buffer,
+            selected,
+            bound_buckets,
+            direct_matches,
+            fallback_lookups,
+            probe_counts,
+            stable_hits,
+            BOUND_DIRECT_HIT_COUNTER_INDEX=BOUND_DIRECT_HIT_COUNTER_INDEX,
+            HASH_FALLBACK_LOOKUP_COUNTER_INDEX=(HASH_FALLBACK_LOOKUP_COUNTER_INDEX),
+            HASH_FALLBACK_HIT_COUNTER_INDEX=HASH_FALLBACK_HIT_COUNTER_INDEX,
+            HASH_FALLBACK_MISS_COUNTER_INDEX=HASH_FALLBACK_MISS_COUNTER_INDEX,
+            HASH_PROBE_STEP_COUNTER_INDEX=HASH_PROBE_STEP_COUNTER_INDEX,
+            HASH_MAX_PROBE_COUNTER_INDEX=HASH_MAX_PROBE_COUNTER_INDEX,
+            BINDING_INVALIDATION_COUNTER_INDEX=(BINDING_INVALIDATION_COUNTER_INDEX),
+        )
 
 
 @triton.jit
@@ -426,6 +522,13 @@ def _resolve_ranked_draft_buckets_kernel(
     RESIDENT_MISS_COUNTER_INDEX: tl.constexpr,
     RESIDENT_PAGE_COUNTER_INDEX: tl.constexpr,
     SELECTED_CLUSTER_COUNTER_INDEX: tl.constexpr,
+    BOUND_DIRECT_HIT_COUNTER_INDEX: tl.constexpr,
+    HASH_FALLBACK_LOOKUP_COUNTER_INDEX: tl.constexpr,
+    HASH_FALLBACK_HIT_COUNTER_INDEX: tl.constexpr,
+    HASH_FALLBACK_MISS_COUNTER_INDEX: tl.constexpr,
+    HASH_PROBE_STEP_COUNTER_INDEX: tl.constexpr,
+    HASH_MAX_PROBE_COUNTER_INDEX: tl.constexpr,
+    BINDING_INVALIDATION_COUNTER_INDEX: tl.constexpr,
 ):
     row = tl.program_id(0)
     batch_idx = row // NUM_KV_HEADS
@@ -504,7 +607,12 @@ def _resolve_ranked_draft_buckets_kernel(
         mask=selected,
         other=-1,
     ).to(tl.int64)
-    matched_buckets = _find_resident_buckets(
+    (
+        matched_buckets,
+        direct_matches,
+        fallback_lookups,
+        probe_counts,
+    ) = _find_resident_buckets(
         cluster_handles,
         selected,
         bound_buckets,
@@ -512,6 +620,7 @@ def _resolve_ranked_draft_buckets_kernel(
         table_versions,
         TABLE_CAPACITY=TABLE_CAPACITY,
         BLOCK_WIDTH=BLOCK_SPARSE,
+        TRACK_STATISTICS=UPDATE_STATISTICS,
     )
 
     found = matched_buckets >= 0
@@ -637,6 +746,22 @@ def _resolve_ranked_draft_buckets_kernel(
             statistics_buffer + SELECTED_CLUSTER_COUNTER_INDEX,
             num_selected.to(tl.int64),
             sem="relaxed",
+        )
+        _record_resident_lookup_statistics(
+            statistics_buffer,
+            selected,
+            bound_buckets,
+            direct_matches,
+            fallback_lookups,
+            probe_counts,
+            stable_hits,
+            BOUND_DIRECT_HIT_COUNTER_INDEX=BOUND_DIRECT_HIT_COUNTER_INDEX,
+            HASH_FALLBACK_LOOKUP_COUNTER_INDEX=(HASH_FALLBACK_LOOKUP_COUNTER_INDEX),
+            HASH_FALLBACK_HIT_COUNTER_INDEX=HASH_FALLBACK_HIT_COUNTER_INDEX,
+            HASH_FALLBACK_MISS_COUNTER_INDEX=HASH_FALLBACK_MISS_COUNTER_INDEX,
+            HASH_PROBE_STEP_COUNTER_INDEX=HASH_PROBE_STEP_COUNTER_INDEX,
+            HASH_MAX_PROBE_COUNTER_INDEX=HASH_MAX_PROBE_COUNTER_INDEX,
+            BINDING_INVALIDATION_COUNTER_INDEX=(BINDING_INVALIDATION_COUNTER_INDEX),
         )
 
 
@@ -1708,7 +1833,7 @@ def resolve_compact_draft_pages(
 
     if statistics_buffer is None:
         statistics_buffer = output_miss_count
-        statistics_indices = (0, 0, 0, 0)
+        statistics_indices = (0,) * _DRAFT_RESOLVE_STATISTIC_COUNT
     else:
         if statistics_buffer.ndim != 1:
             raise ValueError("Statistics buffer must be one-dimensional")
@@ -1716,8 +1841,14 @@ def resolve_compact_draft_pages(
             raise ValueError("Statistics buffer must use int64")
         if statistics_buffer.device != ranked_values.device:
             raise ValueError("Statistics buffer must use the resolve device")
-        if statistics_indices is None or len(statistics_indices) != 4:
-            raise ValueError("DRAFT resolve requires four counter indices")
+        if (
+            statistics_indices is None
+            or len(statistics_indices) != _DRAFT_RESOLVE_STATISTIC_COUNT
+        ):
+            raise ValueError(
+                f"DRAFT resolve requires {_DRAFT_RESOLVE_STATISTIC_COUNT} "
+                "counter indices"
+            )
         if any(
             index < 0 or index >= statistics_buffer.numel()
             for index in statistics_indices
@@ -1730,6 +1861,13 @@ def resolve_compact_draft_pages(
         resident_miss_counter_index,
         resident_page_counter_index,
         selected_cluster_counter_index,
+        bound_direct_hit_counter_index,
+        hash_fallback_lookup_counter_index,
+        hash_fallback_hit_counter_index,
+        hash_fallback_miss_counter_index,
+        hash_probe_step_counter_index,
+        hash_max_probe_counter_index,
+        binding_invalidation_counter_index,
     ) = statistics_indices
 
     tensors = (
@@ -1845,6 +1983,13 @@ def resolve_compact_draft_pages(
         RESIDENT_MISS_COUNTER_INDEX=resident_miss_counter_index,
         RESIDENT_PAGE_COUNTER_INDEX=resident_page_counter_index,
         SELECTED_CLUSTER_COUNTER_INDEX=selected_cluster_counter_index,
+        BOUND_DIRECT_HIT_COUNTER_INDEX=bound_direct_hit_counter_index,
+        HASH_FALLBACK_LOOKUP_COUNTER_INDEX=hash_fallback_lookup_counter_index,
+        HASH_FALLBACK_HIT_COUNTER_INDEX=hash_fallback_hit_counter_index,
+        HASH_FALLBACK_MISS_COUNTER_INDEX=hash_fallback_miss_counter_index,
+        HASH_PROBE_STEP_COUNTER_INDEX=hash_probe_step_counter_index,
+        HASH_MAX_PROBE_COUNTER_INDEX=hash_max_probe_counter_index,
+        BINDING_INVALIDATION_COUNTER_INDEX=binding_invalidation_counter_index,
     )
     _finalize_ranked_compact_draft_attention_kernel[(batch_size,)](
         ranked_values,
@@ -2000,14 +2145,20 @@ def resolve_ranked_draft_buckets(
         )
     if statistics_buffer is None:
         statistics_buffer = output_miss_count
-        statistics_indices = (0, 0, 0, 0)
+        statistics_indices = (0,) * _DRAFT_RESOLVE_STATISTIC_COUNT
     else:
         if statistics_buffer.ndim != 1 or statistics_buffer.dtype != torch.int64:
             raise ValueError("Statistics buffer must be one-dimensional int64")
         if statistics_buffer.device != ranked_values.device:
             raise ValueError("Statistics buffer must use the resolve device")
-        if statistics_indices is None or len(statistics_indices) != 4:
-            raise ValueError("DRAFT resolve requires four counter indices")
+        if (
+            statistics_indices is None
+            or len(statistics_indices) != _DRAFT_RESOLVE_STATISTIC_COUNT
+        ):
+            raise ValueError(
+                f"DRAFT resolve requires {_DRAFT_RESOLVE_STATISTIC_COUNT} "
+                "counter indices"
+            )
         if any(
             index < 0 or index >= statistics_buffer.numel()
             for index in statistics_indices
@@ -2105,6 +2256,13 @@ def resolve_ranked_draft_buckets(
         RESIDENT_MISS_COUNTER_INDEX=statistics_indices[1],
         RESIDENT_PAGE_COUNTER_INDEX=statistics_indices[2],
         SELECTED_CLUSTER_COUNTER_INDEX=statistics_indices[3],
+        BOUND_DIRECT_HIT_COUNTER_INDEX=statistics_indices[4],
+        HASH_FALLBACK_LOOKUP_COUNTER_INDEX=statistics_indices[5],
+        HASH_FALLBACK_HIT_COUNTER_INDEX=statistics_indices[6],
+        HASH_FALLBACK_MISS_COUNTER_INDEX=statistics_indices[7],
+        HASH_PROBE_STEP_COUNTER_INDEX=statistics_indices[8],
+        HASH_MAX_PROBE_COUNTER_INDEX=statistics_indices[9],
+        BINDING_INVALIDATION_COUNTER_INDEX=statistics_indices[10],
     )
     _finalize_ranked_compact_draft_attention_kernel[(batch_size,)](
         ranked_values,

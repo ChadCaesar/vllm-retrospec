@@ -5050,7 +5050,7 @@ class RetroSpecSegmentedTokenIndex(RetroSpecIndexBase):
         )
         with (
             self._cpu_timer(f"{resolve_timer}_wall"),
-            self._cuda_timer(resolve_timer),
+            self._cuda_timer(f"{resolve_timer}/{layer_name}"),
         ):
             selection = self._materialize_draft_selection(
                 request_ids=request_ids,
