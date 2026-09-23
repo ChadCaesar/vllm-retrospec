@@ -2254,7 +2254,13 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
 
     index.begin_proposal(["request"])
     try:
-        cold = index.select_segmented(**selection_kwargs)
+        with patch.object(
+            index,
+            "_resolve_ranked_draft_clusters",
+            wraps=index._resolve_ranked_draft_clusters,
+        ) as resolve:
+            cold = index.select_segmented(**selection_kwargs)
+        assert resolve.call_args.kwargs["emit_misses"] is False
         cold_sparse_indices = cold.plan.ranked_cluster_indices[
             ..., : cold.plan.sparse_retrieval_width
         ].clone()
@@ -2271,6 +2277,11 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
     finally:
         index.end_proposal()
     assert cold.resolved_clusters is not None
+    assert cold.prefetch_miss_cluster_ids is None
+    assert cold.prefetch_miss_positions is None
+    assert cold.prefetch_miss_count is None
+    assert cold.prefetch_num_groups == 0
+    assert cold.prefetch_num_ranks == 0
     assert index.cluster_store.num_resident_pages("layer") == 0
     assert cold.exact_token_counts.tolist() == [[6]]
     assert cold.plan.candidate_counts.gt(0).all()
@@ -2320,6 +2331,9 @@ def test_cpu_offload_draft_estimates_misses_and_uses_resident_hits():
         index.end_proposal()
 
     assert warm.resolved_clusters is not None
+    assert warm.prefetch_miss_cluster_ids is None
+    assert warm.prefetch_miss_positions is None
+    assert warm.prefetch_miss_count is None
     assert index.cluster_store.num_resident_pages("layer") == 1
     assert warm.exact_token_counts.tolist() == [[8]]
     assert warm.plan.candidate_counts.gt(0).all()
@@ -2402,21 +2416,30 @@ def test_ready_selected_replay_admits_current_topk_before_draft_attention():
 
     index.begin_proposal(["request"])
     try:
-        selection = index.select_segmented(
-            request_ids=["request"],
-            layer_name="layer",
-            query=torch.ones(1, 1, 1, device=device, dtype=torch.bfloat16),
-            key_cache=keys,
-            value_cache=values,
-            block_table=block_table,
-            seq_lens=torch.tensor([10], dtype=torch.int32, device=device),
-            active_mask=torch.tensor([True], device=device),
-            scale=1.0,
-            proposal_round=2,
-        )
+        with patch.object(
+            index,
+            "_resolve_ranked_draft_clusters",
+            wraps=index._resolve_ranked_draft_clusters,
+        ) as resolve:
+            selection = index.select_segmented(
+                request_ids=["request"],
+                layer_name="layer",
+                query=torch.ones(1, 1, 1, device=device, dtype=torch.bfloat16),
+                key_cache=keys,
+                value_cache=values,
+                block_table=block_table,
+                seq_lens=torch.tensor([10], dtype=torch.int32, device=device),
+                active_mask=torch.tensor([True], device=device),
+                scale=1.0,
+                proposal_round=2,
+            )
     finally:
         index.end_proposal()
 
+    assert [call.kwargs["emit_misses"] for call in resolve.call_args_list] == [
+        True,
+        False,
+    ]
     assert index.cluster_store.num_resident_pages("layer") == 1
     assert selection.resolved_clusters is not None
     assert selection.resolved_clusters.hit_gate_ready.all()

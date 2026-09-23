@@ -25,7 +25,6 @@ from vllm.v1.spec_decode.retrospec.cluster_store import (
     RetroSpecFullVerificationDescriptor,
     RetroSpecFullVerificationStaging,
     RetroSpecRankedDraftResolvedClusters,
-    RetroSpecResidentPrefetchInput,
     RetroSpecResolvedClusterPages,
     RetroSpecVerificationMissAdmission,
 )
@@ -2005,7 +2004,7 @@ def test_empty_cluster_index_uses_native_attention_without_selection_plan():
     controller.index.materialize.assert_not_called()
 
 
-def test_segmented_draft_prefetches_sparse_plan_after_attention():
+def test_segmented_draft_does_not_prefetch_sparse_plan_after_attention():
     controller = make_controller(
         cache_ratio=0.5,
     )
@@ -2036,19 +2035,11 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
         side_effect=lambda *args: call_order.append("estimation")
         or (torch.zeros(2, 1, 1), torch.zeros(2, 1))
     )
-    prefetch_record = RetroSpecResidentPrefetchInput(
-        layer_name="layer",
-        miss_cluster_ids=torch.zeros(2, dtype=torch.int64),
-        miss_positions=torch.arange(2, dtype=torch.int64),
-        miss_count=torch.tensor([2], dtype=torch.int32),
-        num_groups=2,
-        num_ranks=1,
-    )
     controller.index.build_sparse_verification_prefetch = Mock(
-        side_effect=lambda **kwargs: call_order.append("build") or prefetch_record
+        side_effect=lambda **kwargs: call_order.append("build")
     )
     controller.index.submit_sparse_verification_prefetch_wave = Mock(
-        side_effect=lambda records: call_order.append("submit") or True
+        side_effect=lambda records: call_order.append("submit")
     )
     impl = cast(FlashAttentionImpl, SimpleNamespace(scale=1.0))
     layer = cast(torch.nn.Module, SimpleNamespace())
@@ -2083,46 +2074,32 @@ def test_segmented_draft_prefetches_sparse_plan_after_attention():
         )
         controller.end_step()
 
-    assert call_order == ["exact", "estimation", "build", "submit"]
-    controller.index.build_sparse_verification_prefetch.assert_called_once_with(
-        selection=selection,
-        active_mask=active_mask,
-    )
-    controller.index.submit_sparse_verification_prefetch_wave.assert_called_once_with(
-        (prefetch_record,)
-    )
+    assert call_order == ["exact", "estimation"]
+    controller.index.build_sparse_verification_prefetch.assert_not_called()
+    controller.index.submit_sparse_verification_prefetch_wave.assert_not_called()
     assert "warm_first_draft" not in controller.index.select_segmented.call_args.kwargs
 
 
-def test_draft_end_step_submits_one_cross_layer_prefetch_wave():
+def test_draft_end_step_keeps_attention_mass_without_prefetch_wave():
     controller = make_controller()
     mark_installed(controller)
-    records = tuple(
-        RetroSpecResidentPrefetchInput(
-            layer_name=layer_name,
-            miss_cluster_ids=torch.tensor([index], dtype=torch.int64),
-            miss_positions=torch.zeros(1, dtype=torch.int64),
-            miss_count=torch.ones(1, dtype=torch.int32),
-            num_groups=1,
-            num_ranks=1,
-        )
-        for index, layer_name in enumerate(("first", "second"))
-    )
     controller.index.submit_sparse_verification_prefetch_wave = Mock(return_value=True)
     controller.index.flush_sparse_verification_prefetch = Mock()
 
     with controller.proposal_context(["request"]):
         controller.begin_step(RetroSpecAttentionMode.DRAFT, 0, torch.tensor([True]))
-        controller._resident_prefetch_wave.extend(records)
-        controller.attention_mass_sum[0] = 1.0
+        controller.attention_mass_sum[0] = 1.5
         controller.attention_mass_layer_count = 2
-        controller.end_step()
+        first_mass = controller.end_step()
+        controller.begin_step(RetroSpecAttentionMode.DRAFT, 1, torch.tensor([True]))
+        controller.attention_mass_sum[0] = 0.5
+        controller.attention_mass_layer_count = 2
+        second_mass = controller.end_step()
 
-    controller.index.submit_sparse_verification_prefetch_wave.assert_called_once_with(
-        records
-    )
+    assert first_mass.tolist() == [0.75]
+    assert second_mass.tolist() == [0.25]
+    controller.index.submit_sparse_verification_prefetch_wave.assert_not_called()
     controller.index.flush_sparse_verification_prefetch.assert_called_once_with()
-    assert not controller._resident_prefetch_wave
 
 
 def test_parallel_verification_indexes_persistent_token_plan_rows():
