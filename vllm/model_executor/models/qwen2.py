@@ -26,7 +26,6 @@
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 
 from collections.abc import Iterable
-from itertools import islice
 from typing import Any
 
 import torch
@@ -415,6 +414,40 @@ class Qwen2Model(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def forward_layer(
+        self,
+        layer_index: int,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        **extra_layer_kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Execute one decoder layer owned by the current pipeline rank."""
+        if not self.start_layer <= layer_index < self.end_layer:
+            raise ValueError(
+                f"Layer {layer_index} is not owned by this pipeline rank; "
+                f"local range is [{self.start_layer}, {self.end_layer})"
+            )
+
+        return self.layers[layer_index](
+            positions, hidden_states, residual, **extra_layer_kwargs
+        )
+
+    def finalize_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply the final decoder norm after explicit layer execution."""
+        if not get_pp_group().is_last_rank:
+            raise RuntimeError(
+                "Layer-major prefill does not support pipeline parallelism"
+            )
+        output = self.norm(hidden_states, residual)
+        if isinstance(output, tuple):
+            return output[0]
+        return output
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -434,19 +467,21 @@ class Qwen2Model(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
+        for local_index, layer_index in enumerate(
+            range(self.start_layer, self.end_layer)
         ):
-            if idx in self.aux_hidden_state_layers:
+            if local_index in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = self.forward_layer(
+                layer_index, positions, hidden_states, residual
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.finalize_hidden_states(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
