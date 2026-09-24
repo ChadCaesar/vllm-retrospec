@@ -372,7 +372,7 @@ def test_layer_major_prefill_protocol_rejects_speculative_tokens():
         RetroSpecLayerMajorPrefillProtocol.validate_scheduler_output(scheduler_output)
 
 
-def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
+def test_gpu_native_prefill_uses_normal_batched_scheduling():
     speculative_config = SpeculativeConfig(
         method="retrospec",
         num_speculative_tokens=4,
@@ -381,7 +381,7 @@ def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
     )
     scheduler = create_scheduler(
         max_num_seqs=2,
-        max_num_batched_tokens=4,
+        max_num_batched_tokens=16,
         max_model_len=32,
         speculative_config=speculative_config,
         device_config=DeviceConfig(device="cpu"),
@@ -396,48 +396,17 @@ def test_retrospec_layer_major_prefill_is_scheduled_exclusively():
 
     scheduler_output = scheduler.schedule()
 
-    assert scheduler_output.num_scheduled_tokens == {"prefill-0": 8}
+    assert scheduler_output.num_scheduled_tokens == {"prefill-0": 8, "prefill-1": 8}
     assert scheduler_output.retrospec_generation_token_budgets == {
-        "prefill-0": requests[0].max_tokens
+        "prefill-0": requests[0].max_tokens,
+        "prefill-1": requests[1].max_tokens,
     }
-    assert len(scheduler.running) == 1
-    assert len(scheduler.waiting) == 1
-    assert scheduler_output.retrospec_layer_major_prefill == (
-        RetroSpecLayerMajorPrefillDescriptor(
-            request_id="prefill-0",
-            prompt_num_tokens=8,
-            scheduled_start=0,
-            scheduled_end=8,
-            resident_start_block=1,
-            num_logical_blocks=1,
-        )
-    )
-
-    # Once the first request enters decode, a capacity-safe second prefill
-    # owns the next batch exclusively instead of mixing with the decode row.
-    requests[0].num_computed_tokens = requests[0].num_prompt_tokens
-    requests[0].append_output_token_ids(1)
-    scheduler_output = scheduler.schedule()
-
-    assert scheduler_output.num_scheduled_tokens == {"prefill-1": 8}
-    assert scheduler_output.retrospec_generation_token_budgets == {
-        "prefill-1": requests[1].max_tokens
-    }
-    assert scheduler_output.retrospec_layer_major_prefill == (
-        RetroSpecLayerMajorPrefillDescriptor(
-            request_id="prefill-1",
-            prompt_num_tokens=8,
-            scheduled_start=0,
-            scheduled_end=8,
-            resident_start_block=1,
-            num_logical_blocks=1,
-        )
-    )
+    assert scheduler_output.retrospec_layer_major_prefill is None
     assert len(scheduler.running) == 2
     assert len(scheduler.waiting) == 0
 
 
-def test_retrospec_layer_major_prefill_defers_when_native_pool_is_full():
+def test_gpu_native_prefill_defers_when_native_pool_is_full():
     speculative_config = SpeculativeConfig(
         method="retrospec",
         num_speculative_tokens=4,
@@ -446,7 +415,7 @@ def test_retrospec_layer_major_prefill_defers_when_native_pool_is_full():
     )
     scheduler = create_scheduler(
         max_num_seqs=2,
-        max_num_batched_tokens=4,
+        max_num_batched_tokens=8,
         max_model_len=32,
         num_blocks=2,
         speculative_config=speculative_config,
@@ -580,7 +549,7 @@ def test_retrospec_empty_index_request_does_not_reserve_ticket():
     assert scheduler._retrospec_gpu_index_footprints == {}
 
 
-def test_retrospec_pp_layer_major_prefill_blocks_pipeline_fill():
+def test_retrospec_pp_prefill_blocks_pipeline_fill_without_layer_major():
     speculative_config = SpeculativeConfig(
         method="retrospec",
         num_speculative_tokens=4,
@@ -605,7 +574,7 @@ def test_retrospec_pp_layer_major_prefill_blocks_pipeline_fill():
     first = scheduler.schedule()
     blocked = scheduler.schedule()
 
-    assert first.retrospec_layer_major_prefill is not None
+    assert first.retrospec_layer_major_prefill is None
     assert first.retrospec_pp_batch_id == 0
     assert blocked.total_num_scheduled_tokens == 0
     assert blocked.retrospec_pp_batch_id is None
@@ -634,7 +603,7 @@ def test_short_prompt_uses_native_chunked_prefill():
     assert scheduler_output.retrospec_layer_major_prefill is None
 
 
-def test_layer_major_prefill_allocates_only_sink_and_resident_suffix():
+def test_gpu_native_chunked_prefill_keeps_allocated_kv_blocks():
     speculative_config = SpeculativeConfig(
         method="retrospec",
         num_speculative_tokens=4,
@@ -659,18 +628,15 @@ def test_layer_major_prefill_allocates_only_sink_and_resident_suffix():
 
     scheduler_output = scheduler.schedule()
 
-    descriptor = scheduler_output.retrospec_layer_major_prefill
-    assert descriptor is not None
-    assert scheduler_output.num_scheduled_tokens == {"long-prefill": 64}
-    assert descriptor.resident_start_block == 2
-    assert descriptor.num_logical_blocks == 5
+    assert scheduler_output.retrospec_layer_major_prefill is None
+    assert scheduler_output.num_scheduled_tokens == {"long-prefill": 8}
 
     block_ids = scheduler.kv_cache_manager.get_block_ids("long-prefill")[0]
-    assert len(block_ids) == 5
-    assert block_ids[0] != KV_CACHE_NULL_BLOCK_ID
-    assert block_ids[1] == KV_CACHE_NULL_BLOCK_ID
-    assert all(block_id != KV_CACHE_NULL_BLOCK_ID for block_id in block_ids[2:])
-    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks - 4
+    assert block_ids
+    assert all(block_id != KV_CACHE_NULL_BLOCK_ID for block_id in block_ids)
+    assert manager.block_pool.get_num_free_blocks() == (
+        initial_free_blocks - len(block_ids)
+    )
 
     scheduler.kv_cache_manager.free(request)
 
@@ -736,7 +702,7 @@ def test_layer_major_prefill_capacity_probe_is_side_effect_free():
     assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
 
 
-def test_layer_major_prefill_keeps_native_blocks_without_complete_cluster():
+def test_gpu_native_prefill_keeps_blocks_without_complete_cluster():
     speculative_config = SpeculativeConfig(
         method="retrospec",
         num_speculative_tokens=4,
@@ -746,7 +712,7 @@ def test_layer_major_prefill_keeps_native_blocks_without_complete_cluster():
     )
     scheduler = create_scheduler(
         max_num_seqs=1,
-        max_num_batched_tokens=8,
+        max_num_batched_tokens=64,
         max_model_len=128,
         speculative_config=speculative_config,
         device_config=DeviceConfig(device="cpu"),
@@ -762,22 +728,20 @@ def test_layer_major_prefill_keeps_native_blocks_without_complete_cluster():
 
     scheduler_output = scheduler.schedule()
 
-    descriptor = scheduler_output.retrospec_layer_major_prefill
-    assert descriptor is not None
-    assert descriptor.resident_start_block == 1
-    assert descriptor.retired_start_block == descriptor.retired_end_block
+    assert scheduler_output.retrospec_layer_major_prefill is None
+    assert scheduler_output.num_scheduled_tokens == {"empty-cluster-prefill": 64}
 
     block_ids = scheduler.kv_cache_manager.get_block_ids("empty-cluster-prefill")[0]
-    assert len(block_ids) == 5
+    assert len(block_ids) == 4
     assert all(block_id != KV_CACHE_NULL_BLOCK_ID for block_id in block_ids)
-    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks - 5
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks - 4
 
     scheduler.kv_cache_manager.free(request)
 
     assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
 
 
-def test_layer_major_prefill_keeps_cluster_remainder_blocks_native():
+def test_gpu_native_prefill_keeps_cluster_remainder_blocks_native():
     speculative_config = SpeculativeConfig(
         method="retrospec",
         num_speculative_tokens=4,
@@ -787,7 +751,7 @@ def test_layer_major_prefill_keeps_cluster_remainder_blocks_native():
     )
     scheduler = create_scheduler(
         max_num_seqs=1,
-        max_num_batched_tokens=8,
+        max_num_batched_tokens=128,
         max_model_len=256,
         speculative_config=speculative_config,
         device_config=DeviceConfig(device="cpu"),
@@ -801,15 +765,12 @@ def test_layer_major_prefill_keeps_cluster_remainder_blocks_native():
 
     scheduler_output = scheduler.schedule()
 
-    descriptor = scheduler_output.retrospec_layer_major_prefill
-    assert descriptor is not None
-    assert descriptor.resident_start_block == 5
-    assert descriptor.num_logical_blocks == 9
+    assert scheduler_output.retrospec_layer_major_prefill is None
+    assert scheduler_output.num_scheduled_tokens == {"cluster-remainder-prefill": 128}
 
     block_ids = scheduler.kv_cache_manager.get_block_ids("cluster-remainder-prefill")[0]
-    assert block_ids[0] != KV_CACHE_NULL_BLOCK_ID
-    assert all(block_id == KV_CACHE_NULL_BLOCK_ID for block_id in block_ids[1:5])
-    assert all(block_id != KV_CACHE_NULL_BLOCK_ID for block_id in block_ids[5:])
+    assert len(block_ids) == 8
+    assert all(block_id != KV_CACHE_NULL_BLOCK_ID for block_id in block_ids)
 
 
 def test_scheduler_applies_actual_layer_major_prefill_completion():

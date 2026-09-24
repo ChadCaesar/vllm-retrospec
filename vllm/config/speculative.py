@@ -162,10 +162,15 @@ class SpeculativeConfig:
 
     # RetroSpec decoding configuration
     retrospec_retrieval_ratio: float = Field(default=0.018, gt=0, lt=1)
-    """Fraction of indexed token clusters computed exactly during sparse
-    attention."""
+    """Fraction of indexed clusters read as exact KV during GPU-native draft.
+    Sparse and expanded verification may read additional selected clusters."""
     retrospec_estimation_ratio: float = Field(default=0.232, ge=0, lt=1)
-    """Fraction of indexed token clusters represented by K/V summaries."""
+    """Fraction of indexed clusters added after exact draft retrieval. Draft
+    represents them by K/V summaries; verification can read them exactly."""
+    retrospec_sparse_verify_exact_fraction: float = Field(default=0.875, ge=0, le=1)
+    """Fraction of top-k estimation clusters read as exact native KV during
+    GPU-native sparse verification. Draft keeps centroid estimation; expanded
+    verification reads every selected cluster exactly."""
     retrospec_cache_ratio: float = Field(default=0.0, ge=0, le=1)
     """Fraction of CPU-backed cluster pages retained in the GPU resident cache.
     A value of zero automatically provisions approximately three sparse
@@ -207,10 +212,9 @@ class SpeculativeConfig:
     """Maximum total pinned-memory budget in GiB shared by all RetroSpec
     D2H/H2D staging rings. Long-lived CPU data is stored in pageable memory."""
     retrospec_max_gpu_index_memory: float = Field(default=4.0, gt=0)
-    """Maximum GPU-memory budget in GiB for persistent RetroSpec cluster
-    summaries and page descriptors in each worker. The scheduler uses a
-    conservative packed-arena projection for request admission, while the
-    worker keeps the final authoritative allocation check."""
+    """GPU-memory budget in GiB for RetroSpec cluster summaries, page
+    descriptors and workspaces per worker. The GPU worker reserves this amount
+    from its KV-cache allocation; the scheduler uses it for request admission."""
     retrospec_prefill_warmup_multiplier: int = Field(default=4, ge=1)
     """Maximum number of clusters admitted from the final prefill query,
     relative to the normal sparse retrieval-cluster count. Admission is also
@@ -294,6 +298,7 @@ class SpeculativeConfig:
                 [
                     self.retrospec_retrieval_ratio,
                     self.retrospec_estimation_ratio,
+                    self.retrospec_sparse_verify_exact_fraction,
                     self.retrospec_cache_ratio,
                     self.retrospec_index_segment_size,
                     self.retrospec_prefill_tile_size,

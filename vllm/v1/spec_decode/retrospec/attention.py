@@ -3,7 +3,6 @@
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
 from enum import IntEnum
 
 import torch
@@ -11,62 +10,15 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.attention import Attention
-from vllm.utils.mem_constants import GiB_bytes, MiB_bytes
-from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionImpl,
     FlashAttentionMetadata,
 )
-from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
-from .capacity import get_retrospec_exact_attention_partition_capacity
-from .cluster_store import (
-    RetroSpecCompactResolvedClusterPages,
-    RetroSpecCompactVerificationResolvedPages,
-    RetroSpecResolvedClusterPages,
-)
-from .execution import (
-    RetroSpecCompactExactPageTable,
-    RetroSpecCompactKVSource,
-    RetroSpecEstimationKVSource,
-    RetroSpecExactAttentionWorkspace,
-    RetroSpecExactKVSource,
-    RetroSpecExactPageKVSource,
-    RetroSpecExactPrimaryKVSource,
-    RetroSpecFullVerificationKVSource,
-    RetroSpecRankedDraftKVSource,
-)
-from .index import RetroSpecAttentionLevel
+from .gpu_native import RetroSpecGPUNativeIndex
 from .performance import RetroSpecPerformanceStats
 from .pipeline import RetroSpecAttentionMassStats
-from .segmented_index import (
-    RetroSpecIndexedTokenAttentionSelection,
-    RetroSpecRankedDraftAttentionSelection,
-    RetroSpecSegmentedTokenIndex,
-    RetroSpecTokenAttentionSelection,
-)
-from .workspace import exact_attention_query_capacity
-
-RetroSpecSelection = (
-    RetroSpecTokenAttentionSelection
-    | RetroSpecIndexedTokenAttentionSelection
-    | RetroSpecRankedDraftAttentionSelection
-)
-
-
-@dataclass(frozen=True)
-class _RetroSpecFullVerificationBatch:
-    request_ids: tuple[str, ...]
-    context_lens: tuple[int, ...]
-    query_lens: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class _RetroSpecPrefillQueryHint:
-    query: torch.Tensor
-    scale: float
-
 
 LayerForward = Callable[..., torch.Tensor]
 
@@ -134,6 +86,10 @@ class RetroSpecSparseAttention:
         assert block_size is not None
 
         self.device = device
+        if config.retrospec_replay_mode != "off":
+            raise ValueError(
+                "RetroSpec GPU-native mode does not support resident replay"
+            )
         parallel_config = getattr(vllm_config, "parallel_config", None)
         self.tensor_parallel_size = getattr(parallel_config, "tensor_parallel_size", 1)
         self.reduce_draft_attention_mass = (
@@ -149,9 +105,6 @@ class RetroSpecSparseAttention:
         self.block_size = block_size
         self.num_speculative_tokens = config.num_speculative_tokens
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
-        self.max_verification_tokens = exact_attention_query_capacity(
-            self.max_batch_size, self.num_speculative_tokens
-        )
 
         self.performance_stats = RetroSpecPerformanceStats(
             device=device,
@@ -172,68 +125,24 @@ class RetroSpecSparseAttention:
                 8,
             ),
         )
-        cpu_page_slab_size_mib = getattr(
-            config, "retrospec_cpu_page_slab_size_mib", 256
-        )
-        cpu_page_initial_slab_size_mib = getattr(
-            config,
-            "retrospec_cpu_page_initial_slab_size_mib",
-            min(8, cpu_page_slab_size_mib),
-        )
-
-        self.index = RetroSpecSegmentedTokenIndex(
+        self.index = RetroSpecGPUNativeIndex(
             block_size=block_size,
             num_speculative_tokens=config.num_speculative_tokens,
             retrieval_ratio=config.retrospec_retrieval_ratio,
             estimation_ratio=config.retrospec_estimation_ratio,
+            sparse_verify_exact_fraction=getattr(
+                config, "retrospec_sparse_verify_exact_fraction", 0.875
+            ),
             prefill_segment_size_tokens=config.retrospec_index_segment_size,
             generation_update_interval=config.retrospec_index_update_interval,
             blocks_per_cluster=config.retrospec_blocks_per_cluster,
             num_kmeans_iterations=config.retrospec_kmeans_iterations,
-            max_model_len=vllm_config.model_config.max_model_len,
-            max_pending_cluster_builds=config.retrospec_max_pending_cluster_builds,
-            cpu_page_build_workers=config.retrospec_cpu_page_build_workers,
-            full_verify_gather_workers=(config.retrospec_full_verify_gather_workers),
-            cache_ratio=config.retrospec_cache_ratio,
-            pin_memory=device.type == "cuda" and is_pin_memory_available(),
-            max_resident_requests=vllm_config.scheduler_config.max_num_seqs,
-            prefill_warmup_multiplier=getattr(
-                config,
-                "retrospec_prefill_warmup_multiplier",
-                4,
-            ),
-            cpu_page_initial_slab_bytes=(cpu_page_initial_slab_size_mib * MiB_bytes),
-            cpu_page_slab_bytes=cpu_page_slab_size_mib * MiB_bytes,
-            max_pinned_memory_bytes=int(
-                getattr(config, "retrospec_max_pinned_memory", 1.0) * GiB_bytes
-            ),
-            max_gpu_index_memory_bytes=int(
-                getattr(config, "retrospec_max_gpu_index_memory", 4.0) * GiB_bytes
-            ),
-            replay_mode=getattr(config, "retrospec_replay_mode", "off"),
-            performance_stats=(
-                self.performance_stats if self.performance_stats.enabled else None
-            ),
-        )
-
-        exact_partition_capacity = get_retrospec_exact_attention_partition_capacity(
-            vllm_config, block_size
-        )
-        self.exact_attention_workspace = RetroSpecExactAttentionWorkspace(
-            page_size=block_size,
-            max_num_queries=self.max_verification_tokens,
-            partition_capacity=exact_partition_capacity,
+            performance_stats=self.performance_stats,
         )
 
         self.proposal_request_ids: tuple[str, ...] = ()
         self.proposal_context_lens: tuple[int, ...] = ()
         self.proposal_round = 0
-
-        self.full_verification_batch: _RetroSpecFullVerificationBatch | None = None
-
-        # request_id -> exclusive logical block boundary already retired.
-        # Block 0 remains the permanent exact sink.
-        self._retired_block_ends: dict[str, int] = {}
 
         self.index_update_active = False
         self.index_update_request_ids: tuple[str, ...] = ()
@@ -249,11 +158,7 @@ class RetroSpecSparseAttention:
         self.batch_size = 0
         self.parallel_request_indices: torch.Tensor | None = None
         self.parallel_token_indices: torch.Tensor | None = None
-
-        self._layer_major_prefill_capture_layer: str | None = None
-        self._layer_major_prefill_query_hints: dict[
-            str, _RetroSpecPrefillQueryHint
-        ] = {}
+        self.parallel_bonus_start_index: int | None = None
 
         self.attention_mass_layer_count = 0
         self.attention_mass_sum = torch.zeros(
@@ -265,7 +170,7 @@ class RetroSpecSparseAttention:
 
     @property
     def uses_full_verification_offload(self) -> bool:
-        return True
+        return False
 
     @contextmanager
     def index_update_context(
@@ -351,164 +256,37 @@ class RetroSpecSparseAttention:
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
     ) -> torch.cuda.Event | None:
-        """Stage one complete prompt layer without using forward hooks."""
-        if self.in_proposal:
-            raise RuntimeError("Cannot build a prefill index during a proposal")
-        if self.index_update_active:
-            raise RuntimeError(
-                "Layer-major prefill cannot overlap a normal index update"
-            )
-        if self.index.has_staged_request_layer(layer_name, request_id):
-            raise RuntimeError(
-                f"Layer {layer_name!r} is already staged for {request_id!r}"
-            )
-
-        return self.index.build_or_update(
-            layer_name=layer_name,
-            request_ids=(request_id,),
-            seq_lens=(seq_len,),
-            is_prefill=(True,),
-            rows=(0,),
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_table=block_table,
-            defer_cpu_store=True,
-            prefill_complete=(True,),
-        )
+        del layer_name, request_id, seq_len, key_cache, value_cache, block_table
+        raise NotImplementedError("GPU-native RetroSpec uses ordinary chunked prefill")
 
     @contextmanager
-    def capture_layer_major_prefill_query(
-        self,
-        layer_name: str,
-    ) -> Iterator[None]:
-        if not self.index.cluster_store.pin_memory:
-            yield
-            return
-        if self.in_proposal:
-            raise RuntimeError("Cannot capture a prefill query during proposal")
-        if self._layer_major_prefill_capture_layer is not None:
-            raise RuntimeError("Layer-major prefill query capture cannot be nested")
-        if layer_name in self._layer_major_prefill_query_hints:
-            raise RuntimeError(
-                f"Layer-major prefill query for {layer_name!r} was captured twice"
-            )
-
-        self._layer_major_prefill_capture_layer = layer_name
-        try:
-            yield
-        except BaseException:
-            self._layer_major_prefill_query_hints.pop(layer_name, None)
-            raise
-        finally:
-            self._layer_major_prefill_capture_layer = None
-
-        if layer_name not in self._layer_major_prefill_query_hints:
-            raise RuntimeError(
-                f"Layer-major prefill did not capture a query for {layer_name!r}"
-            )
-
-    def _maybe_capture_layer_major_prefill_query(
-        self,
-        layer_name: str,
-        layer: torch.nn.Module,
-        query: torch.Tensor,
-    ) -> None:
-        if self._layer_major_prefill_capture_layer != layer_name:
-            return
-
-        impl = getattr(layer, "impl", None)
-        if not isinstance(impl, FlashAttentionImpl):
-            raise RuntimeError(
-                "Layer-major prefill query capture requires FlashAttention"
-            )
-        if query.ndim != 3 or query.shape[0] == 0:
-            raise ValueError(
-                "Layer-major prefill query must have shape "
-                "[num_tokens, num_query_heads, head_size]"
-            )
-
-        self._layer_major_prefill_query_hints[layer_name] = _RetroSpecPrefillQueryHint(
-            query=query[-1:].detach().clone(),
-            scale=impl.scale,
-        )
+    def capture_layer_major_prefill_query(self, layer_name: str) -> Iterator[None]:
+        del layer_name
+        raise NotImplementedError("GPU-native RetroSpec uses ordinary chunked prefill")
+        yield
 
     def commit_layer_major_prefill(
-        self,
-        request_id: str,
-        layer_names: Sequence[str],
+        self, request_id: str, layer_names: Sequence[str]
     ) -> None:
-        """Publish every layer and enqueue final-prefill cache hints."""
-        layer_names = tuple(layer_names)
-        self.index.flush_staged_updates()
-        query_hints = {
-            layer_name: (hint.query, hint.scale)
-            for layer_name in layer_names
-            if (hint := self._layer_major_prefill_query_hints.get(layer_name))
-            is not None
-            and self.index.has_cluster_pages(layer_name, (request_id,))
-        }
-        self._layer_major_prefill_query_hints.clear()
-        if query_hints:
-            with self.performance_stats.cpu_timer("prefill_hint_submit_wall"):
-                self.index.prefetch_final_prefill_queries(
-                    request_ids=(request_id,),
-                    query_hints=query_hints,
-                )
+        del request_id, layer_names
+        raise NotImplementedError("GPU-native RetroSpec uses ordinary chunked prefill")
 
     def abort_layer_major_prefill(self) -> None:
-        self._layer_major_prefill_capture_layer = None
-        self._layer_major_prefill_query_hints.clear()
         self.index.discard_staged_updates()
 
     def has_retired_kv_blocks(self, request_ids: Sequence[str]) -> bool:
-        if not self.uses_full_verification_offload:
-            return False
-
-        return any(
-            self._retired_block_ends.get(request_id, 1) > 1
-            for request_id in request_ids
-        )
+        del request_ids
+        return False
 
     def take_kv_cache_retirement_ranges(
         self,
         request_ids: Sequence[str],
     ) -> list[tuple[str, int, int]]:
-        """Return newly replaceable native block ranges."""
-        if not self.uses_full_verification_offload:
-            return []
-        if self.index.has_staged_updates:
-            raise RuntimeError("Cannot retire KV blocks before index commit")
-
-        layer_names = tuple(self.original_forwards)
-        retirements: list[tuple[str, int, int]] = []
-
-        for request_id in request_ids:
-            indexed_end = self.index.get_fully_stored_indexed_end(
-                request_id,
-                layer_names,
-            )
-            new_end_block = indexed_end // self.block_size
-            old_end_block = self._retired_block_ends.get(request_id, 1)
-
-            if new_end_block < old_end_block:
-                raise RuntimeError(
-                    f"Stored index for {request_id!r} moved behind retired KV"
-                )
-            if new_end_block == old_end_block:
-                continue
-
-            retirements.append((request_id, old_end_block, new_end_block))
-            self._retired_block_ends[request_id] = new_end_block
-
-        return retirements
+        del request_ids
+        return []
 
     def remove_requests(self, request_ids: Sequence[str]) -> None:
-        request_ids = tuple(request_ids)
-
         self.index.remove_requests(request_ids)
-
-        for request_id in request_ids:
-            self._retired_block_ends.pop(request_id, None)
 
     @staticmethod
     def _validate_layer(
@@ -607,97 +385,11 @@ class RetroSpecSparseAttention:
         context_lens: Sequence[int],
         query_lens: Sequence[int],
     ) -> Iterator[None]:
-        if self.in_proposal:
-            raise RuntimeError("Full verification cannot run during a proposal")
-        if self.step_active:
-            raise RuntimeError("A RetroSpec proposal step is still active")
-        if self.mode != RetroSpecAttentionMode.PASSTHROUGH:
-            raise RuntimeError("A RetroSpec attention context is already active")
-        if not self.original_forwards:
-            raise RuntimeError(
-                "RetroSpec attention must be installed before full verification"
-            )
-        if not self.uses_full_verification_offload:
-            raise RuntimeError(
-                "Full-verification offload requires a CPU-backed segmented index"
-            )
-
-        request_ids = tuple(request_ids)
-        context_lens = tuple(int(length) for length in context_lens)
-        query_lens = tuple(int(length) for length in query_lens)
-
-        if not request_ids:
-            raise ValueError("Full verification requires at least one request")
-        if len(context_lens) != len(request_ids):
-            raise ValueError("context_lens must match request_ids")
-        if len(query_lens) != len(request_ids):
-            raise ValueError("query_lens must match request_ids")
-        if any(length < 0 for length in context_lens):
-            raise ValueError("Full-verification context lengths must be non-negative")
-        if any(length <= 0 for length in query_lens):
-            raise ValueError("Full-verification query lengths must be positive")
-
-        for request_id, context_len in zip(request_ids, context_lens):
-            retired_end_block = self._retired_block_ends.get(request_id, 1)
-            if retired_end_block <= 1:
-                continue
-
-            retired_end = retired_end_block * self.block_size
-            if context_len < retired_end:
-                raise RuntimeError(
-                    f"Request {request_id!r} rolled back to {context_len}, "
-                    f"behind retired KV boundary {retired_end}"
-                )
-
-        transaction_timer = self.performance_stats.start_cuda_timer(
-            "full_verify_transaction"
+        del request_ids, context_lens, query_lens
+        raise RuntimeError(
+            "GPU-native full verification uses the original vLLM attention path"
         )
-        residency_started = False
-        pipeline_started = False
-        try:
-            with self.performance_stats.cpu_timer("full_verify_transaction_wall"):
-                try:
-                    self.index.prepare_full_verification(
-                        request_ids,
-                        context_lens,
-                        tuple(self.original_forwards),
-                    )
-                    self.index.begin_full_verification_residency(request_ids)
-                    residency_started = True
-                    if self.device.type == "cuda":
-                        layer_num_kv_heads = {
-                            layer_name: impl.num_kv_heads
-                            for layer_name, (impl, _) in self.original_forwards.items()
-                        }
-                        self.index.begin_full_verification_pipeline(
-                            request_ids,
-                            layer_num_kv_heads,
-                            self.device,
-                        )
-                        pipeline_started = True
-                    self.performance_stats.add_counter(
-                        "full_verify_requests", len(request_ids)
-                    )
-                    self.performance_stats.add_counter(
-                        "full_verify_query_tokens", sum(query_lens)
-                    )
-                    self.full_verification_batch = _RetroSpecFullVerificationBatch(
-                        request_ids=request_ids,
-                        context_lens=context_lens,
-                        query_lens=query_lens,
-                    )
-                    self.mode = RetroSpecAttentionMode.FULL_VERIFY
-                    yield
-                finally:
-                    self.performance_stats.stop_cuda_timer(transaction_timer)
-                    self.mode = RetroSpecAttentionMode.PASSTHROUGH
-                    self.full_verification_batch = None
-                    if pipeline_started:
-                        self.index.end_full_verification_pipeline()
-                    if residency_started:
-                        self.index.end_full_verification_residency()
-        finally:
-            self.performance_stats.maybe_log()
+        yield  # Keep the context-manager contract for callers.
 
     @contextmanager
     def proposal_context(
@@ -759,7 +451,7 @@ class RetroSpecSparseAttention:
 
     @property
     def selection_provenance_enabled(self) -> bool:
-        return self.index.selection_provenance.enabled
+        return False
 
     def begin_step(
         self,
@@ -790,6 +482,7 @@ class RetroSpecSparseAttention:
         self.active_mask = active_mask
         self.parallel_request_indices = None
         self.parallel_token_indices = None
+        self.parallel_bonus_start_index = None
 
         self.attention_mass_sum[: self.batch_size].zero_()
         self.attention_mass_layer_count = 0
@@ -800,6 +493,7 @@ class RetroSpecSparseAttention:
         mode: RetroSpecAttentionMode,
         request_indices: torch.Tensor,
         token_indices: torch.Tensor,
+        bonus_start_index: int | None = None,
     ) -> None:
         if not self.in_proposal:
             raise RuntimeError(
@@ -830,6 +524,11 @@ class RetroSpecSparseAttention:
             raise ValueError("A parallel verification step cannot be empty.")
         if num_tokens > self.max_parallel_tokens:
             raise ValueError("Parallel verification exceeds the configured capacity.")
+        if bonus_start_index is not None:
+            if mode != RetroSpecAttentionMode.SPARSE_VERIFY:
+                raise ValueError("Bonus rows require sparse verification.")
+            if not 0 < bonus_start_index < num_tokens:
+                raise ValueError("bonus_start_index must split ordinary and bonus rows")
         self.mode = mode
         self.step_index = -1
         self.batch_size = num_tokens
@@ -838,34 +537,10 @@ class RetroSpecSparseAttention:
         )
         self.parallel_request_indices = request_indices
         self.parallel_token_indices = token_indices
+        self.parallel_bonus_start_index = bonus_start_index
 
         self.attention_mass_sum[: self.batch_size].zero_()
         self.attention_mass_layer_count = 0
-        if self.device.type == "cuda":
-            level = (
-                RetroSpecAttentionLevel.SPARSE
-                if mode == RetroSpecAttentionMode.SPARSE_VERIFY
-                else RetroSpecAttentionLevel.EXPANDED
-            )
-            layer_names = tuple(
-                layer_name
-                for layer_name in self.original_forwards
-                if self.index.has_cluster_pages(layer_name, self.proposal_request_ids)
-            )
-            try:
-                self.index.begin_indexed_verification_transaction(
-                    level,
-                    layer_names,
-                    request_indices,
-                    token_indices,
-                )
-            except BaseException:
-                self.mode = RetroSpecAttentionMode.PASSTHROUGH
-                self.batch_size = 0
-                self.active_mask = None
-                self.parallel_request_indices = None
-                self.parallel_token_indices = None
-                raise
         self.step_active = True
 
     def _should_reduce_attention_mass(self) -> bool:
@@ -909,6 +584,7 @@ class RetroSpecSparseAttention:
         self.batch_size = 0
         self.parallel_request_indices = None
         self.parallel_token_indices = None
+        self.parallel_bonus_start_index = None
         self.attention_mass_layer_count = 0
 
         return RetroSpecAttentionMassStats(
@@ -928,6 +604,7 @@ class RetroSpecSparseAttention:
             self.batch_size = 0
             self.parallel_request_indices = None
             self.parallel_token_indices = None
+            self.parallel_bonus_start_index = None
             self.attention_mass_layer_count = 0
 
     def end_step(self) -> torch.Tensor:
@@ -937,39 +614,11 @@ class RetroSpecSparseAttention:
         self.index.flush_sparse_verification_prefetch()
 
     def maybe_prime_full_verification(self, num_candidate_tokens: int) -> bool:
-        """Start speculative full-verification H2D while sparse verify runs."""
+        """Native full verification has no pages to prefetch."""
         if not self.in_proposal:
             raise RuntimeError("Full-verification priming requires a proposal")
-        if num_candidate_tokens <= 0:
-            return False
-        if self.device.type != "cuda" or not self.index.cluster_store.pin_memory:
-            return False
-        if not self.proposal_context_lens:
-            return False
-        if max(self.proposal_context_lens) < self.index.prefill_segment_size_tokens:
-            self.performance_stats.add_counter("full_verify_prime_context_skipped")
-            return False
-
-        layer_num_kv_heads = {
-            layer_name: impl.num_kv_heads
-            for layer_name, (impl, _) in self.original_forwards.items()
-        }
-        return self.index.prime_full_verification_pipeline(
-            self.proposal_request_ids,
-            layer_num_kv_heads,
-            self.device,
-        )
-
-    def _get_indexed_selection(
-        self, layer_name: str, level: RetroSpecAttentionLevel
-    ) -> RetroSpecIndexedTokenAttentionSelection:
-        request_indices = self.parallel_request_indices
-        token_indices = self.parallel_token_indices
-        if request_indices is None or token_indices is None:
-            raise RuntimeError("No parallel verification plan is active")
-        return self.index.get_indexed_selection(
-            layer_name, level, request_indices, token_indices
-        )
+        del num_candidate_tokens
+        return False
 
     def _maybe_update_index(
         self,
@@ -990,7 +639,6 @@ class RetroSpecSparseAttention:
             key_cache=key_cache,
             value_cache=value_cache,
             block_table=attn_metadata.block_table,
-            defer_cpu_store=True,
             prefill_complete=self.index_update_prefill_complete,
         )
 
@@ -1009,11 +657,6 @@ class RetroSpecSparseAttention:
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.mode == RetroSpecAttentionMode.PASSTHROUGH:
-            self._maybe_capture_layer_major_prefill_query(
-                layer_name,
-                layer,
-                query,
-            )
             result = original_forward(
                 layer,
                 query,
@@ -1044,18 +687,9 @@ class RetroSpecSparseAttention:
             )
 
         if self.mode == RetroSpecAttentionMode.FULL_VERIFY:
-            result = self._full_verification_forward(
-                layer_name,
-                impl,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
+            raise RuntimeError(
+                "GPU-native full verification must use the original attention"
             )
-            self._maybe_update_index(layer_name, kv_cache, attn_metadata)
-            return result
 
         if not self.step_active or self.active_mask is None:
             raise RuntimeError("RetroSpec attention ran without an active step")
@@ -1071,563 +705,6 @@ class RetroSpecSparseAttention:
             kv_cache,
             attn_metadata,
             output,
-        )
-
-    @staticmethod
-    def _run_grouped_reference_attention(
-        impl: FlashAttentionImpl,
-        query: torch.Tensor,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-        token_counts: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reference grouped attention for weighted centroids and CPU fallback.
-
-        Args:
-            query:
-                [batch, num_query_heads, head_size]
-            keys/values:
-                [batch, num_kv_heads, max_num_vectors, head_size]
-            token_counts:
-                [batch, num_kv_heads, max_num_vectors]. A value of one
-                represents an exact token. A value larger than one represents
-                an estimation centroid for that many tokens.
-        """
-        batch_size, num_query_heads, head_size = query.shape
-        num_kv_heads = keys.shape[1]
-
-        if values.shape != keys.shape:
-            raise ValueError("Reference attention keys and values must match")
-        if token_counts.shape != keys.shape[:3]:
-            raise ValueError("Reference attention token counts do not match keys")
-        if num_query_heads % num_kv_heads != 0:
-            raise ValueError(
-                "The number of query heads must be divisible by the number of KV heads"
-            )
-
-        num_queries_per_kv = num_query_heads // num_kv_heads
-        grouped_query = query.float().view(
-            batch_size,
-            num_kv_heads,
-            num_queries_per_kv,
-            head_size,
-        )
-
-        logits = torch.einsum(
-            "bhgd,bhmd->bhgm",
-            grouped_query,
-            keys.float(),
-        )
-        logits *= impl.scale
-
-        token_counts_float = token_counts.float()
-        valid_mask = token_counts > 0
-
-        # Exact tokens have count one and therefore receive no correction.
-        # Estimation centroids receive the same log(cluster_size) correction
-        # as the existing RetroSpec estimation path.
-        logits += torch.log(token_counts_float.clamp_min(1)).unsqueeze(2)
-        logits.masked_fill_(
-            ~valid_mask.unsqueeze(2),
-            float("-inf"),
-        )
-
-        has_vectors = valid_mask.any(dim=2)
-        safe_logits = torch.where(
-            has_vectors[:, :, None, None],
-            logits,
-            torch.zeros_like(logits),
-        )
-
-        output_lse = torch.logsumexp(safe_logits, dim=-1)
-        output_lse = torch.where(
-            has_vectors[:, :, None],
-            output_lse,
-            torch.full_like(output_lse, float("-inf")),
-        )
-
-        safe_normalizer = torch.where(
-            has_vectors[:, :, None],
-            output_lse,
-            torch.zeros_like(output_lse),
-        )
-        weights = torch.exp(logits - safe_normalizer.unsqueeze(-1))
-        weights.masked_fill_(
-            ~valid_mask.unsqueeze(2),
-            0.0,
-        )
-
-        attention_output = torch.einsum(
-            "bhgm,bhmd->bhgd",
-            weights,
-            values.float(),
-        )
-        attention_output = attention_output.reshape(
-            batch_size,
-            num_query_heads,
-            head_size,
-        ).to(query.dtype)
-
-        output_lse = output_lse.reshape(
-            batch_size,
-            num_query_heads,
-        )
-        output_lse = output_lse.transpose(0, 1).contiguous()
-
-        return attention_output, output_lse
-
-    def _full_verification_forward(
-        self,
-        layer_name: str,
-        impl: FlashAttentionImpl,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        batch = self.full_verification_batch
-        if batch is None:
-            raise RuntimeError("No full-verification batch is active")
-        if not attn_metadata.causal:
-            raise RuntimeError("Full verification requires causal decoder attention")
-
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        if len(batch.request_ids) != attn_metadata.seq_lens.shape[0]:
-            raise RuntimeError(
-                "Full-verification request count does not match attention metadata"
-            )
-        if sum(batch.query_lens) != num_actual_tokens:
-            raise RuntimeError(
-                "Full-verification query lengths do not match num_actual_tokens"
-            )
-        if max(batch.query_lens) != attn_metadata.max_query_len:
-            raise RuntimeError(
-                "Full-verification query lengths do not match max_query_len"
-            )
-
-        full_timer = self.performance_stats.start_cuda_timer("full_verify_layer")
-        self.performance_stats.add_counter("full_verify_layers")
-
-        query = query[:num_actual_tokens]
-        key = key[:num_actual_tokens]
-        value = value[:num_actual_tokens]
-        key_cache, value_cache = kv_cache.unbind(0)
-
-        plan = self.index.build_full_verification_plan(
-            request_ids=batch.request_ids,
-            layer_name=layer_name,
-            seq_lens=batch.context_lens,
-            key_cache=key_cache,
-            block_table=attn_metadata.block_table,
-        )
-        clustered = plan.clustered_kv
-        if clustered is None and any(
-            descriptor.num_tokens for descriptor in plan.clustered_descriptors
-        ):
-            clustered = self.index.cluster_store.resolve_full_verification_tokens(
-                layer_name=layer_name,
-                descriptors=plan.clustered_descriptors,
-            )
-        clustered_source = None
-        if clustered is not None:
-            clustered_source = RetroSpecCompactKVSource(
-                key_tokens=clustered.key_tokens,
-                value_tokens=clustered.value_tokens,
-                token_offsets=clustered.token_offsets,
-                token_counts=clustered.token_counts,
-                max_tokens_per_head=clustered.max_tokens_per_head,
-                ready_event=clustered.ready_event,
-            )
-        source = RetroSpecFullVerificationKVSource(
-            primary=RetroSpecExactPrimaryKVSource(
-                key_cache=key_cache,
-                value_cache=value_cache,
-                block_table=attn_metadata.block_table,
-                token_indices=plan.primary_exact_token_indices,
-                token_mask=plan.primary_exact_token_mask,
-            ),
-            clustered=clustered_source,
-        )
-        cluster_output, cluster_lse, native_output, native_lse = (
-            self.exact_attention_workspace.run_parallel_full_verification(
-                source,
-                query,
-                key,
-                value,
-                impl.scale,
-                attn_metadata.query_start_loc,
-                attn_metadata.max_query_len,
-            )
-        )
-
-        merge_attn_states(
-            output[:num_actual_tokens],
-            cluster_output,
-            cluster_lse,
-            native_output,
-            native_lse,
-        )
-        self.performance_stats.stop_cuda_timer(full_timer)
-        return output
-
-    def _resolve_exact_kv_source(
-        self,
-        selection: RetroSpecSelection,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        prepared_pages: RetroSpecCompactVerificationResolvedPages | None = None,
-        pages_prepared: bool = False,
-    ) -> tuple[
-        RetroSpecExactKVSource,
-        RetroSpecResolvedClusterPages
-        | RetroSpecCompactResolvedClusterPages
-        | RetroSpecCompactVerificationResolvedPages
-        | None,
-    ]:
-        if isinstance(selection, RetroSpecRankedDraftAttentionSelection):
-            raise RuntimeError(
-                "Ranked DRAFT selection must use run_ranked_draft_proposal()"
-            )
-        indexed = isinstance(selection, RetroSpecIndexedTokenAttentionSelection)
-        if indexed:
-            layer_name = selection.layer_name
-            primary_token_indices = selection.primary_exact_token_indices
-            primary_token_mask = selection.primary_exact_token_mask
-            plan_row_indices = selection.plan_row_indices
-            if self.mode not in (
-                RetroSpecAttentionMode.SPARSE_VERIFY,
-                RetroSpecAttentionMode.EXPANDED_VERIFY,
-            ):
-                raise RuntimeError("Indexed plans are only valid during verification")
-            resolved_pages = (
-                prepared_pages
-                if pages_prepared
-                else self.index.resolve_indexed_verification_pages(selection)
-            )
-            if resolved_pages is None:
-                exact_page_token_counts = torch.empty(
-                    plan_row_indices.shape[0],
-                    primary_token_indices.shape[1],
-                    0,
-                    dtype=torch.int32,
-                    device=primary_token_indices.device,
-                )
-            else:
-                exact_page_token_counts = resolved_pages.page_token_counts
-        else:
-            layer_name = selection.plan.layer_name
-            primary_token_indices = selection.plan.primary_exact_token_indices
-            primary_token_mask = selection.plan.primary_exact_token_mask
-            plan_row_indices = None
-            resolved_pages = selection.resolved_pages
-            exact_cluster_ids = selection.exact_cluster_ids
-            exact_page_ids = selection.exact_page_ids
-            exact_page_token_counts = selection.exact_page_token_counts
-            if resolved_pages is None and exact_page_ids.numel():
-                resolved_pages = self.index.cluster_store.resolve_cluster_blocks(
-                    layer_name=layer_name,
-                    cluster_ids=exact_cluster_ids,
-                    logical_page_ids=exact_page_ids,
-                    mode="verification",
-                )
-
-        resident_pages = None
-        staging_pages = None
-        compact_pages = None
-        if resolved_pages is not None:
-            if isinstance(
-                resolved_pages,
-                (
-                    RetroSpecCompactResolvedClusterPages,
-                    RetroSpecCompactVerificationResolvedPages,
-                ),
-            ):
-                if resolved_pages.resident_key_pages.shape[0] > 0:
-                    resident_pages = RetroSpecExactPageKVSource(
-                        key_pages=resolved_pages.resident_key_pages,
-                        value_pages=resolved_pages.resident_value_pages,
-                        page_ids=resolved_pages.resident_page_ids,
-                    )
-                if (
-                    isinstance(
-                        resolved_pages, RetroSpecCompactVerificationResolvedPages
-                    )
-                    and resolved_pages.staging_key_pages.shape[0] > 0
-                ):
-                    staging_pages = RetroSpecExactPageKVSource(
-                        key_pages=resolved_pages.staging_key_pages,
-                        value_pages=resolved_pages.staging_value_pages,
-                        page_ids=resolved_pages.staging_page_ids,
-                        ready_event=resolved_pages.staging_ready_event,
-                    )
-                compact_pages = RetroSpecCompactExactPageTable(
-                    page_counts=resolved_pages.page_counts
-                )
-            else:
-                if resolved_pages.resident_key_pages.shape[0] > 0:
-                    resident_pages = RetroSpecExactPageKVSource(
-                        key_pages=resolved_pages.resident_key_pages,
-                        value_pages=resolved_pages.resident_value_pages,
-                        page_ids=resolved_pages.resident_page_ids,
-                        ready_event=resolved_pages.resident_ready_event,
-                    )
-                if resolved_pages.staging_key_pages.shape[0] > 0:
-                    staging_pages = RetroSpecExactPageKVSource(
-                        key_pages=resolved_pages.staging_key_pages,
-                        value_pages=resolved_pages.staging_value_pages,
-                        page_ids=resolved_pages.staging_page_ids,
-                        ready_event=resolved_pages.staging_ready_event,
-                    )
-
-        source = RetroSpecExactKVSource(
-            primary=RetroSpecExactPrimaryKVSource(
-                key_cache=key_cache,
-                value_cache=value_cache,
-                block_table=block_table,
-                token_indices=primary_token_indices,
-                token_mask=primary_token_mask,
-            ),
-            page_token_counts=exact_page_token_counts,
-            resident_pages=resident_pages,
-            staging_pages=staging_pages,
-            plan_row_indices=plan_row_indices,
-            compact_pages=compact_pages,
-        )
-
-        return source, resolved_pages
-
-    def _run_exact_attention(
-        self,
-        impl: FlashAttentionImpl,
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
-        selection: RetroSpecSelection,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if query.device.type != "cuda" or query.dtype not in (
-            torch.float16,
-            torch.bfloat16,
-        ):
-            exact_keys, exact_values, exact_token_mask = (
-                self.index.materialize_exact_reference(
-                    selection,
-                    key_cache,
-                    value_cache,
-                    attn_metadata.block_table,
-                )
-            )
-
-            if (
-                self.mode
-                in (
-                    RetroSpecAttentionMode.SPARSE_VERIFY,
-                    RetroSpecAttentionMode.EXPANDED_VERIFY,
-                )
-                and query.device.type == "cuda"
-                and selection.exact_page_ids.numel()
-            ):
-                self.index.cluster_store.admit_resident_clusters(
-                    layer_name=selection.plan.layer_name,
-                    cluster_ids=selection.exact_cluster_ids,
-                    page_ids=selection.exact_page_ids,
-                )
-
-            return self._run_grouped_reference_attention(
-                impl,
-                query,
-                exact_keys,
-                exact_values,
-                exact_token_mask.to(torch.int32),
-            )
-
-        stage_name = {
-            RetroSpecAttentionMode.DRAFT: "draft",
-            RetroSpecAttentionMode.SPARSE_VERIFY: "sparse_verify",
-            RetroSpecAttentionMode.EXPANDED_VERIFY: "expanded_verify",
-        }[self.mode]
-        with (
-            self.performance_stats.cpu_timer(f"{stage_name}_page_resolve_wall"),
-            self.performance_stats.cuda_timer(f"{stage_name}_page_resolve"),
-        ):
-            source, resolved_pages = self._resolve_exact_kv_source(
-                selection=selection,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                block_table=attn_metadata.block_table,
-            )
-        try:
-            with self.performance_stats.cuda_timer(f"{stage_name}_exact_attention"):
-                exact_output = self.exact_attention_workspace.run(
-                    source, query, impl.scale
-                )
-        finally:
-            if resolved_pages is not None and resolved_pages.read_lease is not None:
-                resolved_pages.read_lease.release()
-
-        miss_admission = getattr(resolved_pages, "miss_admission", None)
-        if miss_admission is not None:
-            with self.performance_stats.cpu_timer(
-                f"{stage_name}_resident_admit_submit"
-            ):
-                self.index.cluster_store.admit_verification_misses(miss_admission)
-
-        return exact_output
-
-    def _run_fused_proposal_attention(
-        self,
-        impl: FlashAttentionImpl,
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
-        selection: RetroSpecSelection,
-        output: torch.Tensor,
-        prepared_pages: RetroSpecCompactVerificationResolvedPages | None = None,
-        pages_prepared: bool = False,
-    ) -> torch.Tensor:
-        if isinstance(selection, RetroSpecRankedDraftAttentionSelection):
-            if self.mode != RetroSpecAttentionMode.DRAFT:
-                raise RuntimeError(
-                    "Ranked DRAFT selection cannot be used during verification"
-                )
-            resolved = selection.resolved_clusters
-            source = RetroSpecRankedDraftKVSource(
-                primary=RetroSpecExactPrimaryKVSource(
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    block_table=attn_metadata.block_table,
-                    token_indices=selection.plan.primary_exact_token_indices,
-                    token_mask=selection.plan.primary_exact_token_mask,
-                ),
-                request_slot_ids=selection.plan.request_slot_ids,
-                ranked_cluster_indices=selection.plan.ranked_cluster_indices,
-                candidate_counts=selection.plan.candidate_counts,
-                resident_bucket_ids=resolved.resident_bucket_ids,
-                sparse_retrieval_width=selection.plan.sparse_retrieval_width,
-                sparse_estimation_width=selection.plan.sparse_estimation_width,
-                retrieval_ratio=self.index.retrieval_ratio,
-                estimation_ratio=self.index.estimation_ratio,
-                cluster_keys=selection.arena.cluster_keys,
-                cluster_values=selection.arena.cluster_values,
-                cluster_token_counts=selection.arena.cluster_token_counts,
-                cluster_page_starts=selection.arena.cluster_page_starts,
-                cluster_page_counts=selection.arena.cluster_page_counts,
-                page_token_counts=selection.arena.page_token_counts,
-                cluster_offsets=selection.arena.cluster_offsets,
-                page_offsets=selection.arena.page_offsets,
-                resident_table_page_slots=resolved.resident_table_page_slots,
-                resident_key_pages=resolved.resident_key_pages,
-                resident_value_pages=resolved.resident_value_pages,
-            )
-            try:
-                with self.performance_stats.cuda_timer("draft_ranked_attention"):
-                    self.exact_attention_workspace.run_ranked_draft_proposal(
-                        source=source,
-                        query=query,
-                        scale=impl.scale,
-                        output=output,
-                    )
-            finally:
-                resolved.read_lease.release()
-            return output
-
-        stage_name = {
-            RetroSpecAttentionMode.DRAFT: "draft",
-            RetroSpecAttentionMode.SPARSE_VERIFY: "sparse_verify",
-            RetroSpecAttentionMode.EXPANDED_VERIFY: "expanded_verify",
-        }[self.mode]
-        with (
-            self.performance_stats.cpu_timer(f"{stage_name}_page_resolve_wall"),
-            self.performance_stats.cuda_timer(f"{stage_name}_page_resolve"),
-        ):
-            if pages_prepared:
-                source, resolved_pages = self._resolve_exact_kv_source(
-                    selection=selection,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    block_table=attn_metadata.block_table,
-                    prepared_pages=prepared_pages,
-                    pages_prepared=True,
-                )
-            else:
-                source, resolved_pages = self._resolve_exact_kv_source(
-                    selection=selection,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    block_table=attn_metadata.block_table,
-                )
-
-        estimation_keys, estimation_values, estimation_token_counts = (
-            self._get_grouped_estimation(selection)
-        )
-        estimation = RetroSpecEstimationKVSource(
-            keys=estimation_keys,
-            values=estimation_values,
-            token_counts=estimation_token_counts,
-            plan_row_indices=None,
-        )
-
-        try:
-            with self.performance_stats.cuda_timer(f"{stage_name}_fused_attention"):
-                self.exact_attention_workspace.run_proposal(
-                    source=source,
-                    estimation=estimation,
-                    query=query,
-                    scale=impl.scale,
-                    output=output,
-                )
-        finally:
-            if (
-                not pages_prepared
-                and resolved_pages is not None
-                and resolved_pages.read_lease is not None
-            ):
-                resolved_pages.read_lease.release()
-
-        miss_admission = getattr(resolved_pages, "miss_admission", None)
-        if not pages_prepared and miss_admission is not None:
-            with self.performance_stats.cpu_timer(
-                f"{stage_name}_resident_admit_submit"
-            ):
-                self.index.cluster_store.admit_verification_misses(miss_admission)
-
-        return output
-
-    @staticmethod
-    def _get_grouped_estimation(
-        selection: RetroSpecSelection,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return estimation tensors in grouped KV-head layout."""
-        return (
-            selection.estimation_keys,
-            selection.estimation_values,
-            selection.estimation_token_counts,
-        )
-
-    @classmethod
-    def _run_estimation_attention(
-        cls,
-        impl: FlashAttentionImpl,
-        query: torch.Tensor,
-        selection: RetroSpecSelection,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the reference weighted-centroid attention path."""
-        (
-            estimation_keys,
-            estimation_values,
-            estimation_token_counts,
-        ) = cls._get_grouped_estimation(selection)
-
-        return cls._run_grouped_reference_attention(
-            impl,
-            query,
-            estimation_keys,
-            estimation_values,
-            estimation_token_counts,
         )
 
     def _sparse_forward(
@@ -1658,130 +735,46 @@ class RetroSpecSparseAttention:
         if not self.index.has_cluster_pages(layer_name, self.proposal_request_ids):
             self.performance_stats.add_counter("proposal_native_fallback_layers")
             result = original_forward(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                None,
-                None,
+                layer, query, key, value, kv_cache, attn_metadata, output, None, None
             )
             self.attention_mass_sum[: self.batch_size].add_(1.0)
             self.attention_mass_layer_count += 1
             return result
 
-        query = query[:num_actual_tokens]
+        if self.mode not in (
+            RetroSpecAttentionMode.DRAFT,
+            RetroSpecAttentionMode.SPARSE_VERIFY,
+            RetroSpecAttentionMode.EXPANDED_VERIFY,
+        ):
+            raise RuntimeError(f"Unexpected RetroSpec attention mode: {self.mode}")
+
+        request_indices = self.parallel_request_indices
+        token_indices = self.parallel_token_indices
+        if self.mode != RetroSpecAttentionMode.DRAFT and request_indices is None:
+            request_indices = torch.arange(
+                num_actual_tokens, dtype=torch.int32, device=query.device
+            )
+            token_indices = torch.full_like(request_indices, self.step_index)
+
         key_cache, value_cache = kv_cache.unbind(0)
-
-        if self.mode == RetroSpecAttentionMode.DRAFT:
-            with self.performance_stats.cuda_timer("draft_selection_total"):
-                selection = self.index.select_segmented(
-                    request_ids=self.proposal_request_ids,
-                    layer_name=layer_name,
-                    query=query,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    block_table=attn_metadata.block_table,
-                    seq_lens=attn_metadata.seq_lens,
-                    active_mask=self.active_mask,
-                    scale=impl.scale,
-                    plan_slot=self.step_index,
-                    proposal_round=self.proposal_round,
-                )
-        else:
-            if self.mode == RetroSpecAttentionMode.SPARSE_VERIFY:
-                level = RetroSpecAttentionLevel.SPARSE
-            elif self.mode == RetroSpecAttentionMode.EXPANDED_VERIFY:
-                level = RetroSpecAttentionLevel.EXPANDED
-            else:
-                raise RuntimeError(f"Unexpected RetroSpec attention mode: {self.mode}")
-
-            prepared_pages = None
-            pages_prepared = False
-            if has_parallel_plan and query.device.type == "cuda":
-                with self.performance_stats.cuda_timer("verification_plan_index"):
-                    selection, prepared_pages = (
-                        self.index.consume_indexed_verification_layer(
-                            layer_name,
-                            self.parallel_request_indices,
-                            self.parallel_token_indices,
-                        )
-                    )
-                pages_prepared = True
-            elif has_parallel_plan:
-                with self.performance_stats.cuda_timer("verification_plan_index"):
-                    selection = self._get_indexed_selection(layer_name, level)
-            else:
-                request_indices = torch.arange(
-                    query.shape[0], dtype=torch.int64, device=query.device
-                )
-                token_indices = torch.full_like(request_indices, self.step_index)
-                with self.performance_stats.cuda_timer("verification_plan_index"):
-                    selection = self.index.get_indexed_selection(
-                        layer_name,
-                        level,
-                        request_indices,
-                        token_indices,
-                    )
-            if query.device.type != "cuda" or query.dtype not in (
-                torch.float16,
-                torch.bfloat16,
-            ):
-                selection = self.index.materialize_indexed_reference(selection)
-
-        stage_name = {
-            RetroSpecAttentionMode.DRAFT: "draft",
-            RetroSpecAttentionMode.SPARSE_VERIFY: "sparse_verify",
-            RetroSpecAttentionMode.EXPANDED_VERIFY: "expanded_verify",
-        }[self.mode]
-        can_use_fused_proposal = query.device.type == "cuda" and query.dtype in (
-            torch.float16,
-            torch.bfloat16,
+        attention_mass = self.index.forward(
+            layer_name=layer_name,
+            query=query[:num_actual_tokens],
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=attn_metadata.block_table,
+            seq_lens=attn_metadata.seq_lens,
+            active_mask=self.active_mask,
+            scale=impl.scale,
+            output=output[:num_actual_tokens],
+            step=self.step_index,
+            expanded=self.mode == RetroSpecAttentionMode.EXPANDED_VERIFY,
+            sparse_verify=self.mode == RetroSpecAttentionMode.SPARSE_VERIFY,
+            request_indices=request_indices,
+            token_indices=token_indices,
+            bonus_start_index=self.parallel_bonus_start_index,
         )
-        if can_use_fused_proposal:
-            self._run_fused_proposal_attention(
-                impl=impl,
-                query=query,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                attn_metadata=attn_metadata,
-                selection=selection,
-                output=output[:num_actual_tokens],
-                prepared_pages=(
-                    prepared_pages
-                    if self.mode != RetroSpecAttentionMode.DRAFT
-                    else None
-                ),
-                pages_prepared=(
-                    pages_prepared
-                    if self.mode != RetroSpecAttentionMode.DRAFT
-                    else False
-                ),
-            )
-        else:
-            exact_output, exact_lse = self._run_exact_attention(
-                impl,
-                query,
-                key_cache,
-                value_cache,
-                attn_metadata,
-                selection,
-            )
-            with self.performance_stats.cuda_timer(f"{stage_name}_estimation_merge"):
-                estimation_output, estimation_lse = self._run_estimation_attention(
-                    impl, query, selection
-                )
-                merge_attn_states(
-                    output[:num_actual_tokens],
-                    exact_output,
-                    exact_lse,
-                    estimation_output,
-                    estimation_lse,
-                )
-
-        self.attention_mass_sum[: self.batch_size].add_(selection.attention_mass)
+        self.performance_stats.add_counter("gpu_native_cluster_attention_layers")
+        self.attention_mass_sum[: self.batch_size].add_(attention_mass)
         self.attention_mass_layer_count += 1
-
         return output

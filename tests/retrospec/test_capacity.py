@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""GPU-native capacity contracts.
+
+The branch keeps complete target KV on GPU. Offload working-set and
+CPU-staging capacity tests do not describe its runtime memory policy.
+"""
+
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -19,33 +25,19 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.spec_decode.retrospec.capacity import (
     RetroSpecGPUIndexFootprint,
-    RetroSpecLongContextCapacity,
-    build_retrospec_long_context_capacity,
     estimate_retrospec_gpu_index_arena_bytes,
     estimate_retrospec_gpu_index_footprint,
-    get_retrospec_exact_attention_partition_capacity,
-    get_retrospec_exact_attention_source_token_capacity,
     get_retrospec_gpu_index_descriptor_bytes,
-    get_retrospec_native_working_set_tokens,
     is_retrospec_long_context_enabled,
-)
-from vllm.v1.spec_decode.retrospec.workspace import (
-    exact_attention_partition_capacity,
-    exact_attention_primary_token_capacity,
-    exact_attention_query_capacity,
-    exact_attention_source_token_capacity,
-    exact_attention_workspace_size_bytes,
 )
 
 pytestmark = pytest.mark.cpu_test
 
 
-def make_capacity_config(
+def make_config(
     *,
     max_model_len: int = 65536,
     max_num_seqs: int = 1,
-    max_num_batched_tokens: int = 4096,
-    long_prefill_token_threshold: int = 0,
     **overrides: Any,
 ) -> VllmConfig:
     spec_values = {
@@ -55,7 +47,6 @@ def make_capacity_config(
         "retrospec_index_update_interval": 1024,
         "retrospec_blocks_per_cluster": 1,
         "retrospec_retrieval_ratio": 0.018,
-        "retrospec_cache_ratio": 0.0,
         **overrides,
     }
     return cast(
@@ -64,14 +55,21 @@ def make_capacity_config(
             speculative_config=SimpleNamespace(**spec_values),
             scheduler_config=SimpleNamespace(
                 max_num_seqs=max_num_seqs,
-                max_num_batched_tokens=max_num_batched_tokens,
-                long_prefill_token_threshold=long_prefill_token_threshold,
+                max_num_batched_tokens=1024,
+                long_prefill_token_threshold=0,
+                enable_chunked_prefill=True,
+                disable_hybrid_kv_cache_manager=False,
             ),
             model_config=SimpleNamespace(
                 max_model_len=max_model_len,
+                original_max_model_len=max_model_len,
                 get_num_attention_heads=lambda _: 8,
             ),
-            parallel_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=1,
+            ),
+            cache_config=SimpleNamespace(num_gpu_blocks_override=None),
         ),
     )
 
@@ -102,127 +100,41 @@ def make_scheduler_kv_cache_config(num_layers: int = 2) -> KVCacheConfig:
     )
 
 
-def make_engine_config(
-    *,
-    max_model_len: int = 65536,
-    max_num_seqs: int = 1,
-    enable_chunked_prefill: bool = True,
-) -> VllmConfig:
-    return cast(
-        VllmConfig,
-        SimpleNamespace(
-            model_config=SimpleNamespace(
-                max_model_len=max_model_len,
-                original_max_model_len=max_model_len,
-                get_num_attention_heads=lambda _: 8,
-            ),
-            scheduler_config=SimpleNamespace(
-                max_num_seqs=max_num_seqs,
-                max_num_batched_tokens=1024,
-                long_prefill_token_threshold=0,
-                enable_chunked_prefill=enable_chunked_prefill,
-                disable_hybrid_kv_cache_manager=False,
-            ),
-            speculative_config=SimpleNamespace(
-                method="retrospec",
-                num_speculative_tokens=64,
-                retrospec_index_segment_size=8192,
-                retrospec_index_update_interval=1024,
-                retrospec_blocks_per_cluster=1,
-                retrospec_retrieval_ratio=0.018,
-                retrospec_cache_ratio=0.0,
-            ),
-            parallel_config=SimpleNamespace(
-                decode_context_parallel_size=1,
-                prefill_context_parallel_size=1,
-            ),
-            cache_config=SimpleNamespace(num_gpu_blocks_override=None),
-        ),
-    )
-
-
-def test_retrospec_long_context_mode_detection():
-    config = make_capacity_config()
-    assert is_retrospec_long_context_enabled(config)
-
-    config.model_config.max_model_len = (
-        config.speculative_config.retrospec_index_segment_size
-    )
+def test_gpu_native_never_uses_offload_working_set_capacity():
+    config = make_config(max_model_len=65536)
     assert not is_retrospec_long_context_enabled(config)
-
-    config.model_config.max_model_len += 1
-    assert is_retrospec_long_context_enabled(config)
-
+    config.model_config.max_model_len = 8192
+    assert not is_retrospec_long_context_enabled(config)
     config.speculative_config.method = "ngram"
     assert not is_retrospec_long_context_enabled(config)
 
 
-def test_native_working_set_includes_unretired_prefill_chunk():
-    config = make_capacity_config()
-
-    # sink 16 + segment 8192 + recent 80 + prefill 4096 + lookahead 64
-    assert get_retrospec_native_working_set_tokens(config, 16) == 12448
-
-
-def test_native_working_set_honors_long_prefill_threshold():
-    config = make_capacity_config(long_prefill_token_threshold=1024)
-    assert get_retrospec_native_working_set_tokens(config, 16) == 9376
-
-
-def test_native_working_set_uses_larger_generation_update_interval():
-    config = make_capacity_config(retrospec_index_update_interval=16384)
-
-    assert get_retrospec_native_working_set_tokens(config, 16) == 20640
-
-
-def test_native_working_set_does_not_preallocate_for_max_num_seqs():
-    config = make_capacity_config(max_num_seqs=2)
-
-    assert get_retrospec_native_working_set_tokens(config, 16) == 12448
-
-
-def test_native_working_set_is_capped_by_max_model_len():
-    config = make_capacity_config(max_model_len=4096)
-    assert get_retrospec_native_working_set_tokens(config, 16) == 4096
-
-
 def test_gpu_index_footprint_matches_stable_cluster_and_page_layout():
-    config = make_capacity_config(max_model_len=2048)
-    kv_cache_config = make_scheduler_kv_cache_config()
-
+    config = make_config(max_model_len=2048)
     footprint = estimate_retrospec_gpu_index_footprint(
-        config, kv_cache_config, max_context_tokens=1024
+        config, make_scheduler_kv_cache_config(), max_context_tokens=1024
     )
-
-    # Stable indexed range is 928 tokens: 58 clusters and at most 116 pages.
-    assert footprint == RetroSpecGPUIndexFootprint(
-        cluster_capacity=64,
-        page_capacity=128,
-    )
+    assert footprint == RetroSpecGPUIndexFootprint(64, 128)
 
 
 def test_gpu_index_footprint_is_empty_before_stable_prefix_exists():
-    config = make_capacity_config(max_model_len=2048)
-
+    config = make_config(max_model_len=2048)
     footprint = estimate_retrospec_gpu_index_footprint(
         config, make_scheduler_kv_cache_config(), max_context_tokens=80
     )
-
     assert footprint == RetroSpecGPUIndexFootprint(0, 0)
 
 
 def test_gpu_index_descriptor_bytes_match_worker_tensor_layout():
-    config = make_capacity_config(max_num_seqs=4)
-    kv_cache_config = make_scheduler_kv_cache_config(num_layers=2)
-
-    descriptor_bytes = get_retrospec_gpu_index_descriptor_bytes(config, kv_cache_config)
-
-    # Per request/layer: 44 scalar bytes plus one int32 per KV head.
+    config = make_config(max_num_seqs=4)
+    descriptor_bytes = get_retrospec_gpu_index_descriptor_bytes(
+        config, make_scheduler_kv_cache_config(num_layers=2)
+    )
     assert descriptor_bytes == 2 * 4 * (44 + 4 * 2)
 
 
-def test_gpu_index_arena_projects_packed_power_of_two_growth():
-    config = make_capacity_config(max_num_seqs=4)
+def test_gpu_index_arena_projects_packed_growth():
+    config = make_config(max_num_seqs=4)
     kv_cache_config = make_scheduler_kv_cache_config(num_layers=2)
     footprint = RetroSpecGPUIndexFootprint(64, 128)
 
@@ -235,16 +147,14 @@ def test_gpu_index_arena_projects_packed_power_of_two_growth():
     three_requests = estimate_retrospec_gpu_index_arena_bytes(
         config, kv_cache_config, (footprint, footprint, footprint)
     )
-
     assert one_request < two_requests < three_requests
     assert three_requests > 2 * one_request
 
 
 def test_gpu_index_arena_ignores_empty_request_footprints():
-    config = make_capacity_config()
+    config = make_config()
     kv_cache_config = make_scheduler_kv_cache_config()
     footprint = RetroSpecGPUIndexFootprint(64, 128)
-
     expected = estimate_retrospec_gpu_index_arena_bytes(
         config, kv_cache_config, (footprint,)
     )
@@ -253,295 +163,47 @@ def test_gpu_index_arena_ignores_empty_request_footprints():
         kv_cache_config,
         (RetroSpecGPUIndexFootprint(0, 0), footprint),
     )
-
     assert actual == expected
     assert estimate_retrospec_gpu_index_arena_bytes(config, kv_cache_config, ()) == 0
 
 
-def test_exact_attention_capacity_includes_cluster_page_fragmentation():
-    config = make_capacity_config(max_model_len=65536)
+def test_long_prompt_requires_complete_native_kv_capacity():
+    config = make_config(max_model_len=65536)
+    spec = next(iter(make_kv_cache_specs(num_layers=1).values()))
+    full_context_blocks = config.model_config.max_model_len // spec.block_size
 
-    assert get_retrospec_exact_attention_source_token_capacity(config, 16) == 139168
-    assert get_retrospec_exact_attention_partition_capacity(config, 16) == 256
+    with pytest.raises(ValueError, match="max seq len"):
+        get_kv_cache_configs(config, [{"layer.0": spec}], [1000 * spec.page_size_bytes])
 
-
-def test_exact_attention_capacity_covers_32k_to_64k_boundary():
-    capacity_32k = get_retrospec_exact_attention_partition_capacity(
-        make_capacity_config(max_model_len=32768), 16
-    )
-    capacity_64k = get_retrospec_exact_attention_partition_capacity(
-        make_capacity_config(max_model_len=65536), 16
-    )
-
-    assert capacity_32k == 128
-    assert capacity_64k == 256
-
-
-def test_exact_attention_capacity_covers_fixed_primary_plan_width():
-    config = make_capacity_config(
-        max_model_len=8192,
-        retrospec_index_segment_size=1024,
-        retrospec_index_update_interval=1024,
-        num_speculative_tokens=16,
-        retrospec_retrieval_ratio=0.25,
-    )
-
-    assert get_retrospec_exact_attention_source_token_capacity(config, 16) == 17360
-    assert get_retrospec_exact_attention_partition_capacity(config, 16) == 32
-
-
-def test_exact_attention_capacity_helpers_match_runtime_layout():
-    primary_capacity = exact_attention_primary_token_capacity(
-        max_model_len=8192,
-        prefill_segment_size=1024,
-        generation_update_interval=1024,
-        num_speculative_tokens=16,
-        block_size=16,
-    )
-    source_capacity = exact_attention_source_token_capacity(
-        primary_capacity,
-        cluster_page_slot_capacity=1025,
-        page_size=16,
-    )
-
-    assert primary_capacity == 1072
-    assert source_capacity == 17472
-    assert exact_attention_partition_capacity(source_capacity) == 32
-    assert exact_attention_query_capacity(8, 64) == 520
-
-
-@pytest.mark.parametrize(
-    ("helper", "args", "message"),
-    [
-        (
-            exact_attention_primary_token_capacity,
-            (0, 1024, 1024, 16, 16),
-            "max_model_len must be positive",
-        ),
-        (
-            exact_attention_query_capacity,
-            (0, 16),
-            "max_num_seqs must be positive",
-        ),
-        (
-            exact_attention_source_token_capacity,
-            (-1, 0, 16),
-            "primary_token_capacity must be non-negative",
-        ),
-        (
-            exact_attention_source_token_capacity,
-            (0, -1, 16),
-            "cluster_page_slot_capacity must be non-negative",
-        ),
-        (
-            exact_attention_source_token_capacity,
-            (0, 0, 0),
-            "page_size must be positive",
-        ),
-    ],
-)
-def test_exact_attention_capacity_helpers_reject_invalid_dimensions(
-    helper: Any,
-    args: tuple[int, ...],
-    message: str,
-):
-    with pytest.raises(ValueError, match=message):
-        helper(*args)
-
-
-def test_exact_attention_workspace_size_matches_tensor_layout():
-    workspace_bytes = exact_attention_workspace_size_bytes(
-        max_num_queries=1024,
-        num_query_heads=8,
-        head_size=64,
-        dtype_size=2,
-        partition_capacity=128,
-    )
-    expected_bytes = (
-        1024 * 8 * 128 * 64 * 2
-        + 1024 * 8 * 128 * 2 * 4
-        + 2 * 1024 * 8 * 64 * 2
-        + 2 * 1024 * 8 * 4
-        + 1024 * 8 * (64 * 2 + 2 * 4)
-    )
-
-    assert workspace_bytes == expected_bytes
-
-
-@pytest.mark.parametrize("max_num_source_tokens", [0, -1])
-def test_exact_attention_partition_capacity_rejects_invalid_source_capacity(
-    max_num_source_tokens: int,
-):
-    with pytest.raises(ValueError, match="max_num_source_tokens must be positive"):
-        exact_attention_partition_capacity(max_num_source_tokens)
-
-
-def test_capacity_reserves_null_block_and_auxiliary_buffers():
-    config = make_capacity_config()
-    specs = make_kv_cache_specs()
-    capacity = build_retrospec_long_context_capacity(config, specs)
-
-    assert capacity.native_working_set_tokens == 12448
-    assert capacity.native_num_blocks == 779
-    assert capacity.native_memory_bytes == sum(
-        capacity.native_num_blocks * spec.page_size_bytes for spec in specs.values()
-    )
-    assert capacity.auxiliary_memory_bytes > 0
-    assert capacity.total_memory_bytes > capacity.native_memory_bytes
-
-
-def test_capacity_scales_only_shared_verification_workspace_with_max_num_seqs():
-    single = build_retrospec_long_context_capacity(
-        make_capacity_config(max_num_seqs=1), make_kv_cache_specs()
-    )
-    multiple = build_retrospec_long_context_capacity(
-        make_capacity_config(max_num_seqs=2), make_kv_cache_specs()
-    )
-
-    assert multiple.native_working_set_tokens == single.native_working_set_tokens
-    assert multiple.native_num_blocks == single.native_num_blocks
-    assert multiple.native_memory_bytes == single.native_memory_bytes
-    assert multiple.auxiliary_memory_bytes > single.auxiliary_memory_bytes
-
-
-def test_capacity_caps_persistent_index_reservation_at_gpu_index_budget():
-    default_budget = build_retrospec_long_context_capacity(
-        make_capacity_config(), make_kv_cache_specs()
-    )
-    limited_budget = build_retrospec_long_context_capacity(
-        make_capacity_config(retrospec_max_gpu_index_memory=1e-6),
-        make_kv_cache_specs(),
-    )
-
-    assert limited_budget.auxiliary_memory_bytes < default_budget.auxiliary_memory_bytes
-
-
-def test_capacity_rejects_unaligned_segment_size():
-    config = make_capacity_config(retrospec_index_segment_size=1000)
-
-    with pytest.raises(ValueError, match="divisible by block_size"):
-        build_retrospec_long_context_capacity(config, make_kv_cache_specs())
-
-
-def test_capacity_rejects_unaligned_generation_update_interval():
-    config = make_capacity_config(retrospec_index_update_interval=1000)
-
-    with pytest.raises(ValueError, match="retrospec_index_update_interval"):
-        build_retrospec_long_context_capacity(config, make_kv_cache_specs())
-
-
-def test_kv_config_uses_native_working_set_for_long_prompt_capacity(monkeypatch):
-    config = make_engine_config()
-    spec = next(iter(make_kv_cache_specs().values()))
-    capacity = RetroSpecLongContextCapacity(
-        native_working_set_tokens=144,
-        native_num_blocks=10,
-        native_memory_bytes=10 * spec.page_size_bytes,
-        auxiliary_memory_bytes=spec.page_size_bytes,
-    )
-    monkeypatch.setattr(
-        "vllm.v1.spec_decode.retrospec.capacity.build_retrospec_long_context_capacity",
-        lambda *_: capacity,
-    )
-
-    available_memory = capacity.total_memory_bytes + spec.page_size_bytes
+    available_blocks = full_context_blocks + 128
     kv_cache_configs = get_kv_cache_configs(
-        config,
-        [{"layer.0": spec}],
-        [available_memory],
+        config, [{"layer.0": spec}], [available_blocks * spec.page_size_bytes]
     )
-
-    assert kv_cache_configs[0].num_blocks == capacity.native_num_blocks
+    assert kv_cache_configs[0].num_blocks == available_blocks
     assert kv_cache_configs[0].kv_cache_tensors[0].size == (
-        capacity.native_memory_bytes
+        available_blocks * spec.page_size_bytes
     )
 
 
-def test_kv_config_uses_estimated_long_context_capacity():
-    config = make_engine_config()
-    specs = make_kv_cache_specs(num_layers=32)
-    capacity = build_retrospec_long_context_capacity(config, specs)
-    available_memory = (
-        capacity.total_memory_bytes + next(iter(specs.values())).page_size_bytes
-    )
-
-    kv_cache_configs = get_kv_cache_configs(config, [specs], [available_memory])
-
-    assert kv_cache_configs[0].num_blocks == capacity.native_num_blocks
-    assert sum(tensor.size for tensor in kv_cache_configs[0].kv_cache_tensors) == (
-        capacity.native_memory_bytes
-    )
+def test_multiple_scheduler_slots_do_not_reduce_native_kv_allocation():
+    spec = next(iter(make_kv_cache_specs(num_layers=1).values()))
+    available_blocks = 5000
+    memory = available_blocks * spec.page_size_bytes
+    single = get_kv_cache_configs(
+        make_config(max_num_seqs=1), [{"layer.0": spec}], [memory]
+    )[0]
+    multiple = get_kv_cache_configs(
+        make_config(max_num_seqs=2), [{"layer.0": spec}], [memory]
+    )[0]
+    assert single.num_blocks == multiple.num_blocks == available_blocks
 
 
-def test_kv_config_keeps_normal_capacity_below_segment_threshold():
-    config = make_engine_config(max_model_len=16, max_num_seqs=2)
-    spec = next(iter(make_kv_cache_specs().values()))
-    available_memory = 10 * spec.page_size_bytes
-
-    kv_cache_configs = get_kv_cache_configs(
-        config,
-        [{"layer.0": spec}],
-        [available_memory],
-    )
-
-    assert kv_cache_configs[0].num_blocks == 10
-    assert kv_cache_configs[0].kv_cache_tensors[0].size == available_memory
-
-
-def test_long_context_concurrency_uses_native_working_set():
-    config = make_capacity_config()
-    spec = next(iter(make_kv_cache_specs().values()))
-    capacity = build_retrospec_long_context_capacity(config, {"layer.0": spec})
+def test_max_concurrency_uses_complete_native_context():
+    config = make_config(max_model_len=65536)
+    spec = next(iter(make_kv_cache_specs(num_layers=1).values()))
     kv_cache_config = KVCacheConfig(
-        num_blocks=2 * capacity.native_num_blocks,
+        num_blocks=8192,
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["layer.0"], spec)],
     )
-
     assert get_max_concurrency_for_kv_cache_config(config, kv_cache_config) == 2.0
-
-
-def test_long_context_capacity_rejects_disabled_chunked_prefill():
-    config = make_engine_config(
-        max_num_seqs=2,
-        enable_chunked_prefill=False,
-    )
-    spec = next(iter(make_kv_cache_specs().values()))
-
-    with pytest.raises(ValueError, match="enable_chunked_prefill=True"):
-        get_kv_cache_configs(config, [{"layer.0": spec}], [spec.page_size_bytes])
-
-
-def test_long_context_capacity_accepts_multiple_scheduler_slots():
-    config = make_engine_config(max_model_len=131072, max_num_seqs=2)
-    specs = make_kv_cache_specs(num_layers=32)
-    capacity = build_retrospec_long_context_capacity(config, specs)
-    available_memory = (
-        capacity.total_memory_bytes + next(iter(specs.values())).page_size_bytes
-    )
-
-    kv_cache_configs = get_kv_cache_configs(config, [specs], [available_memory])
-
-    assert kv_cache_configs[0].num_blocks == capacity.native_num_blocks
-
-
-def test_long_context_capacity_checks_auxiliary_reserve(monkeypatch):
-    config = make_engine_config()
-    spec = next(iter(make_kv_cache_specs().values()))
-    capacity = RetroSpecLongContextCapacity(
-        native_working_set_tokens=144,
-        native_num_blocks=10,
-        native_memory_bytes=10 * spec.page_size_bytes,
-        auxiliary_memory_bytes=10 * spec.page_size_bytes,
-    )
-    monkeypatch.setattr(
-        "vllm.v1.spec_decode.retrospec.capacity.build_retrospec_long_context_capacity",
-        lambda *_: capacity,
-    )
-
-    with pytest.raises(ValueError, match="auxiliary RetroSpec buffers"):
-        get_kv_cache_configs(
-            config,
-            [{"layer.0": spec}],
-            [capacity.total_memory_bytes - 1],
-        )

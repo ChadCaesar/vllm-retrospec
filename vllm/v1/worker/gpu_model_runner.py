@@ -3054,10 +3054,19 @@ class GPUModelRunner(
 
         drafter = getattr(self, "drafter", None)
         if isinstance(drafter, RetroSpecProposer) and not self.use_async_scheduling:
+            valid_sampled_counts = tuple(
+                len(token_ids) for token_ids in valid_sampled_token_ids
+            )
             drafter.record_sampled_proposal_outcomes(
                 req_ids_output_copy,
-                tuple(len(token_ids) for token_ids in valid_sampled_token_ids),
+                valid_sampled_counts,
             )
+            if spec_decode_metadata is not None:
+                drafter.record_verified_proposal_outcomes(
+                    spec_decode_metadata.num_draft_tokens,
+                    valid_sampled_counts,
+                    req_ids_output_copy,
+                )
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -4714,6 +4723,11 @@ class GPUModelRunner(
             proposal_active_mask=proposal_active_mask,
             remaining_generation_tokens=remaining_generation_tokens,
             valid_sampled_tokens_count=valid_sampled_tokens_count,
+            previous_proposed_counts=(
+                state.spec_decode_metadata.num_draft_tokens
+                if state.spec_decode_metadata is not None
+                else None
+            ),
             num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             materialize_output=get_pp_group().is_last_rank,
         )

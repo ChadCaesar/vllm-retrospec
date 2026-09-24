@@ -277,7 +277,7 @@ def test_draft_transition_trace_records_only_stopping_requests(monkeypatch):
     assert payload["records"][0]["reason_names"] == ["MAX_DRAFT_TOKENS"]
 
 
-def test_initialize_cudagraph_keys_registers_original_piecewise_buckets():
+def test_initialize_cudagraph_keys_defers_dynamic_layout_capture():
     dispatcher = Mock()
     dispatcher.register_piecewise_cudagraph_sizes.return_value = (
         1,
@@ -306,15 +306,9 @@ def test_initialize_cudagraph_keys_registers_original_piecewise_buckets():
         32,
     )
 
-    dispatcher.register_piecewise_cudagraph_sizes.assert_called_once_with(
-        "retrospec_proposal", {1, 2, 4, 8, 16, 32}
-    )
-    dispatcher.has_piecewise_cudagraph_namespace.assert_called_once_with(
-        "retrospec_proposal"
-    )
-    assert proposer._cudagraph_registration_failure is None
-    assert proposer._graph_input_ids.data_ptr() == runner_input_ids.data_ptr()
-    assert proposer._graph_positions.data_ptr() == runner_positions.data_ptr()
+    dispatcher.register_piecewise_cudagraph_sizes.assert_not_called()
+    dispatcher.has_piecewise_cudagraph_namespace.assert_not_called()
+    assert proposer._cudagraph_registration_failure == "gpu_native_dynamic_layout"
 
 
 def test_initialize_cudagraph_keys_records_piecewise_disabled():
@@ -328,7 +322,7 @@ def test_initialize_cudagraph_keys_records_piecewise_disabled():
     proposer.initialize_cudagraph_keys(CUDAGraphMode.FULL_DECODE_ONLY, [1, 2, 4], 4)
 
     dispatcher.register_piecewise_cudagraph_sizes.assert_not_called()
-    assert proposer._cudagraph_registration_failure == "piecewise_disabled"
+    assert proposer._cudagraph_registration_failure == "gpu_native_dynamic_layout"
 
 
 def test_initialize_cudagraph_keys_skips_unsupported_data_parallelism():
@@ -347,7 +341,7 @@ def test_initialize_cudagraph_keys_skips_unsupported_data_parallelism():
     proposer.initialize_cudagraph_keys(CUDAGraphMode.PIECEWISE, [1, 2, 4], 4)
 
     dispatcher.register_piecewise_cudagraph_sizes.assert_not_called()
-    assert proposer._cudagraph_registration_failure == "data_parallel"
+    assert proposer._cudagraph_registration_failure == "gpu_native_dynamic_layout"
 
 
 def test_initialize_cudagraph_keys_requires_runner_input_workspace():
@@ -361,7 +355,7 @@ def test_initialize_cudagraph_keys_requires_runner_input_workspace():
     proposer.initialize_cudagraph_keys(CUDAGraphMode.PIECEWISE, [1, 2, 4], 4)
 
     dispatcher.register_piecewise_cudagraph_sizes.assert_not_called()
-    assert proposer._cudagraph_registration_failure == "missing_input_workspace"
+    assert proposer._cudagraph_registration_failure == "gpu_native_dynamic_layout"
 
 
 def test_pipeline_graph_receive_destination_uses_runner_workspace():
@@ -549,7 +543,7 @@ def test_piecewise_model_inputs_preserve_eager_views():
     dispatcher.dispatch_piecewise_cudagraph.assert_not_called()
 
 
-def test_piecewise_model_inputs_pad_persistent_graph_workspace():
+def test_piecewise_model_inputs_keep_eager_views_for_dynamic_layout():
     dispatcher = Mock(
         dispatch_piecewise_cudagraph=Mock(
             return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4))
@@ -575,16 +569,13 @@ def test_piecewise_model_inputs_pad_persistent_graph_workspace():
     )
 
     graph_input_ids, graph_positions, graph_slots, mode, descriptor = result
-    assert graph_input_ids.data_ptr() == proposer._graph_input_ids.data_ptr()
-    assert graph_positions.data_ptr() == proposer._graph_positions.data_ptr()
-    assert graph_input_ids.tolist() == [3, 4, 5, 0]
-    assert graph_positions.tolist() == [7, 8, 9, 0]
-    assert graph_slots.tolist() == [11, 12, 13, -1]
-    assert mode == CUDAGraphMode.PIECEWISE
-    assert descriptor == BatchDescriptor(4)
-    dispatcher.dispatch_piecewise_cudagraph.assert_called_once_with(
-        "retrospec_proposal", 3
-    )
+    assert graph_input_ids is input_ids
+    assert graph_positions is positions
+    assert graph_slots is slot_mapping
+    assert graph_slots.tolist() == [11, 12, 13]
+    assert mode == CUDAGraphMode.NONE
+    assert descriptor == BatchDescriptor(3)
+    dispatcher.dispatch_piecewise_cudagraph.assert_not_called()
 
 
 def test_piecewise_model_inputs_fall_back_when_bucket_exceeds_capacity():
@@ -683,14 +674,14 @@ def test_retrospec_proposer_rejects_unsupported_features(
         RetroSpecProposer(config, torch.device("cpu"), runner)
 
 
-def test_retrospec_proposer_accepts_cpu_offloaded_cluster_pages():
+def test_retrospec_proposer_uses_gpu_native_full_verification():
     proposer = RetroSpecProposer(
         make_vllm_config(),
         torch.device("cpu"),
         make_runner(),
     )
 
-    assert proposer.uses_full_verification_offload
+    assert not proposer.uses_full_verification_offload
 
 
 def test_retrospec_proposer_delegates_full_verification_context():
@@ -1151,7 +1142,7 @@ def test_model_step_sanitizes_input_ids_for_inactive_rows(monkeypatch):
     )
 
 
-def test_model_step_replays_padded_piecewise_graph_without_padding_policy_rows(
+def test_model_step_uses_unpadded_dynamic_layout_without_padding_policy_rows(
     monkeypatch,
 ):
     dispatcher = Mock(
@@ -1186,9 +1177,9 @@ def test_model_step_replays_padded_piecewise_graph_without_padding_policy_rows(
     class FakeModel(torch.nn.Module):
         def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds):
             assert intermediate_tensors is None
-            assert input_ids.tolist() == [7, 0, 0, 0]
-            assert positions.tolist() == [3, 0, 0, 0]
-            return torch.zeros((4, 4))
+            assert input_ids.tolist() == [7, 0]
+            assert positions.tolist() == [3, 0]
+            return torch.zeros((2, 4))
 
         def compute_logits(self, hidden_states):
             assert hidden_states.shape == (2, 4)
@@ -1229,11 +1220,11 @@ def test_model_step_replays_padded_piecewise_graph_without_padding_policy_rows(
     )
 
     context = forward_context_kwargs[0]
-    assert context["num_tokens"] == 4
-    assert context["cudagraph_runtime_mode"] == CUDAGraphMode.PIECEWISE
-    assert context["batch_descriptor"] == BatchDescriptor(4)
+    assert context["num_tokens"] == 2
+    assert context["cudagraph_runtime_mode"] == CUDAGraphMode.NONE
+    assert context["batch_descriptor"] is None
     slot_mapping = context["slot_mapping"]["model.layers.0.self_attn.attn"]
-    assert slot_mapping.tolist() == [3, -1, -1, -1]
+    assert slot_mapping.tolist() == [3, -1]
     active_mask = proposer.sparse_attention.begin_step.call_args.args[2]
     assert active_mask.tolist() == [True, False]
 
@@ -1319,6 +1310,128 @@ def make_parallel_verification_output(
         margin=None if margin is None else torch.tensor(margin),
         attention_mass=torch.tensor(attention_mass),
     )
+
+
+def test_sparse_bonus_pairs_append_only_with_capacity_and_budget():
+    proposer = RetroSpecProposer(make_vllm_config(), torch.device("cpu"), make_runner())
+    proposer._sparse_bonus_enabled = True
+    initialize_verification(
+        proposer,
+        torch.tensor([[10, 20, -1, -1], [11, 21, 31, -1]], dtype=torch.int32),
+        torch.tensor([2, 1], dtype=torch.int32),
+        pending_counts=torch.tensor([0, 2], dtype=torch.int32),
+    )
+    starts = proposer.state.pending_counts.clone()
+    active = proposer.state.active_mask.clone()
+    requests, steps = proposer._build_verification_pairs(
+        2, starts, proposer.state.draft_counts, active
+    )
+    combined_requests, combined_steps, bonus_requests = (
+        proposer._append_sparse_bonus_pairs(
+            2,
+            requests,
+            steps,
+            starts,
+            proposer.state.draft_counts,
+            active,
+            make_sampling_metadata(all_greedy=True),
+        )
+    )
+
+    assert combined_requests.tolist() == [0, 0, 1, 0]
+    assert combined_steps.tolist() == [0, 1, 2, 2]
+    assert bonus_requests.tolist() == [0]
+
+    proposer._sparse_bonus_enabled = False
+    ordinary_requests, ordinary_steps, no_bonus = proposer._append_sparse_bonus_pairs(
+        2,
+        requests,
+        steps,
+        starts,
+        proposer.state.draft_counts,
+        active,
+        make_sampling_metadata(all_greedy=True),
+    )
+    assert ordinary_requests.shape[0] == 3
+    assert ordinary_steps.shape[0] == 3
+    assert no_bonus.numel() == 0
+
+    proposer._sparse_bonus_enabled = True
+    proposer.max_parallel_tokens = 3
+    _, _, no_capacity = proposer._append_sparse_bonus_pairs(
+        2,
+        requests,
+        steps,
+        starts,
+        proposer.state.draft_counts,
+        active,
+        make_sampling_metadata(all_greedy=True),
+    )
+    assert no_capacity.numel() == 0
+    proposer.max_parallel_tokens = (
+        proposer.max_batch_size * proposer.num_speculative_tokens
+    )
+
+    _, _, processed_sampling = proposer._append_sparse_bonus_pairs(
+        2,
+        requests,
+        steps,
+        starts,
+        proposer.state.draft_counts,
+        active,
+        replace(make_sampling_metadata(all_greedy=True), no_penalties=False),
+    )
+    assert processed_sampling.numel() == 0
+
+
+def test_sparse_bonus_is_discarded_for_request_with_verification_boundary(monkeypatch):
+    proposer = RetroSpecProposer(make_vllm_config(), torch.device("cpu"), make_runner())
+    proposer._sparse_bonus_enabled = True
+    initialize_verification(
+        proposer,
+        torch.tensor([[10, 20, -1, -1], [11, 21, -1, -1]], dtype=torch.int32),
+        torch.tensor([2, 2], dtype=torch.int32),
+    )
+    observed: list[tuple[list[int], list[int], int | None]] = []
+
+    def fake_run_parallel_verification(
+        batch_size,
+        request_indices,
+        token_indices,
+        common_attn_metadata,
+        sampling_metadata,
+        attention_mode,
+        bonus_start_index=None,
+    ):
+        if attention_mode == RetroSpecAttentionMode.EXPANDED_VERIFY:
+            return make_parallel_verification_output([1], [1], [99])
+        observed.append(
+            (request_indices.tolist(), token_indices.tolist(), bonus_start_index)
+        )
+        return make_parallel_verification_output(
+            request_indices.tolist(),
+            token_indices.tolist(),
+            [10, 20, 11, 99, 30, 31],
+        )
+
+    monkeypatch.setattr(
+        proposer, "_run_parallel_verification", fake_run_parallel_verification
+    )
+    verification = proposer._verify_draft_tokens(
+        2,
+        ["request-0", "request-1"],
+        1,
+        torch.zeros(2, dtype=torch.int32),
+        make_common_metadata([1, 1]),
+        make_sampling_metadata(all_greedy=True),
+    )
+
+    assert observed == [([0, 0, 1, 1, 0, 1], [0, 1, 0, 1, 2, 2], 4)]
+    assert verification.verified_counts.tolist() == [2, 2]
+    assert verification.bonus_mask is not None
+    assert verification.bonus_mask.tolist() == [True, False]
+    assert verification.bonus_token_ids is not None
+    assert verification.bonus_token_ids.tolist() == [30, 31]
 
 
 @pytest.mark.parametrize(
@@ -1889,6 +2002,155 @@ def test_sync_bookkeeping_records_committed_proposal_before_finish():
     assert proposer._last_committed_proposal_counts == {"first": 2, "second": 0}
 
 
+def test_verified_proposal_outcomes_use_consumed_lengths_not_next_proposal():
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_stats_interval_seconds=60.0),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer._last_proposed_counts.update({"first": 64, "second": 64})
+
+    proposer.record_verified_proposal_outcomes((4, 8, 0), (3, 9, 1))
+
+    counters = proposer.performance_stats._cpu_counters
+    assert counters["proposal_verified_rounds"] == 2
+    assert counters["proposal_verified_tokens"] == 12
+    assert counters["proposal_accepted_tokens"] == 10
+    assert counters["proposal_rejected_tokens"] == 2
+    assert counters["proposal_fully_accepted"] == 1
+
+
+def test_verified_proposal_outcomes_reject_mismatched_rows():
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_stats_interval_seconds=60.0),
+        torch.device("cpu"),
+        make_runner(),
+    )
+
+    with pytest.raises(ValueError, match="equal length"):
+        proposer.record_verified_proposal_outcomes((4,), (3, 2))
+
+    with pytest.raises(ValueError, match="equal length"):
+        proposer.record_verified_proposal_outcomes((4,), (3,), ("first", "second"))
+
+
+def test_full_verify_feedback_limits_only_low_acceptance_request():
+    proposer = RetroSpecProposer(
+        make_vllm_config(
+            max_model_len=128,
+            num_speculative_tokens=64,
+            retrospec_max_draft_tokens=8,
+            retrospec_stats_interval_seconds=0.0,
+        ),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer._feedback_horizon_enabled = True
+    proposer.record_verified_proposal_outcomes((64, 64), (15, 33), ("low", "high"))
+
+    budgets = proposer._prepare_proposal_token_budgets(
+        [100, 100], torch.ones(2, dtype=torch.int32), ("low", "high")
+    )
+
+    assert budgets.tolist() == [16, 64]
+    assert proposer._feedback_horizons == {"low": 16}
+    proposer.remove_requests({"low"})
+    assert "low" not in proposer._feedback_horizons
+
+
+def test_full_verify_feedback_recovers_after_three_fully_accepted_rounds():
+    proposer = RetroSpecProposer(
+        make_vllm_config(
+            max_model_len=128,
+            num_speculative_tokens=64,
+            retrospec_max_draft_tokens=8,
+        ),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer._feedback_horizon_enabled = True
+    proposer.record_verified_proposal_outcomes((64,), (15,), ("request",))
+    proposer.record_verified_proposal_outcomes((16,), (17,), ("request",))
+    proposer.record_verified_proposal_outcomes((16,), (9,), ("request",))
+    assert proposer._feedback_recovery["request"] == 0
+
+    for _ in range(3):
+        proposer.record_verified_proposal_outcomes((16,), (17,), ("request",))
+
+    assert "request" not in proposer._feedback_horizons
+    budgets = proposer._prepare_proposal_token_budgets(
+        [100], torch.ones(1, dtype=torch.int32), ("request",)
+    )
+    assert budgets.tolist() == [64]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "tp_size,pp_size,host_enabled", [(1, 1, True), (2, 1, False), (1, 2, False)]
+)
+def test_full_verify_feedback_uses_device_state_for_multiple_ranks(
+    tp_size, pp_size, host_enabled
+):
+    config = make_vllm_config(
+        max_model_len=128,
+        num_speculative_tokens=64,
+        retrospec_max_draft_tokens=8,
+    )
+    config.parallel_config.tensor_parallel_size = tp_size
+    config.parallel_config.pipeline_parallel_size = pp_size
+    proposer = RetroSpecProposer(config, torch.device("cuda"), make_runner())
+
+    assert proposer._feedback_horizon_enabled is host_enabled
+    assert proposer._feedback_device_enabled is not host_enabled
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_device_feedback_tracks_reordered_requests_and_clears_reused_slot():
+    config = make_vllm_config(
+        max_model_len=128, num_speculative_tokens=64, retrospec_max_draft_tokens=8
+    )
+    config.parallel_config.tensor_parallel_size = 2
+    device = torch.device("cuda", torch.cuda.current_device())
+    proposer = RetroSpecProposer(config, device, make_runner())
+    sampled = torch.ones(2, dtype=torch.int32, device=device)
+
+    initial = proposer._prepare_proposal_token_budgets(
+        [100, 100], sampled, ("low", "high")
+    )
+    assert initial.tolist() == [64, 64]
+    proposer._update_device_feedback_horizon(
+        ("low", "high"),
+        (64, 64),
+        torch.tensor([15, 33], dtype=torch.int32, device=device),
+    )
+    reordered = proposer._prepare_proposal_token_budgets(
+        [100, 100], sampled, ("high", "low")
+    )
+    assert reordered.tolist() == [64, 16]
+
+    for _ in range(3):
+        proposer._update_device_feedback_horizon(
+            ("high", "low"),
+            (0, 16),
+            torch.tensor([1, 17], dtype=torch.int32, device=device),
+        )
+    recovered = proposer._prepare_proposal_token_budgets(
+        [100, 100], sampled, ("high", "low")
+    )
+    assert recovered.tolist() == [64, 64]
+
+    proposer._update_device_feedback_horizon(
+        ("high", "low"),
+        (0, 64),
+        torch.tensor([1, 15], dtype=torch.int32, device=device),
+    )
+    proposer.remove_requests({"low"})
+    reused = proposer._prepare_proposal_token_budgets(
+        [100, 100], sampled, ("high", "new")
+    )
+    assert reused.tolist() == [64, 64]
+
+
 def test_verify_unchanged_sparse_tokens_keeps_complete_prefix(monkeypatch):
     proposer = RetroSpecProposer(make_vllm_config(), torch.device("cpu"), make_runner())
     initialize_verification(
@@ -2268,6 +2530,84 @@ def test_verify_only_processes_current_logical_draft_interval(monkeypatch):
     assert verification.require_full.tolist() == [True]
 
 
+def test_sparse_bonus_seeds_next_round_without_committing_early(
+    monkeypatch,
+):
+    proposer = RetroSpecProposer(
+        make_vllm_config(retrospec_max_draft_tokens=2),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    draft_calls: list[tuple[int, int, int]] = []
+    verified_rounds: list[tuple[int, int, list[int]]] = []
+
+    def fake_run_draft_step(
+        batch_size,
+        draft_index,
+        common_attn_metadata,
+        active_mask,
+        sampling_metadata,
+    ):
+        draft_calls.append(
+            (
+                draft_index,
+                int(proposer.input_ids[0]),
+                int(proposer.positions[0]),
+            )
+        )
+        return (
+            torch.tensor([draft_index + 1], dtype=torch.int32),
+            None,
+            torch.ones(batch_size),
+        )
+
+    def fake_verify(
+        batch_size,
+        request_ids,
+        proposal_round,
+        round_start_counts,
+        common_attn_metadata,
+        sampling_metadata,
+    ):
+        verified_rounds.append(
+            (
+                int(round_start_counts[0]),
+                int(proposer.state.draft_counts[0]),
+                proposer._draft_token_ids[0].tolist(),
+            )
+        )
+        if proposal_round == 1:
+            return RetroSpecVerificationResult(
+                verified_counts=torch.tensor([2], dtype=torch.int32),
+                require_full=torch.tensor([False]),
+                bonus_mask=torch.tensor([True]),
+                bonus_token_ids=torch.tensor([99], dtype=torch.int32),
+            )
+        return RetroSpecVerificationResult(
+            verified_counts=torch.tensor([2], dtype=torch.int32),
+            require_full=torch.tensor([True]),
+        )
+
+    monkeypatch.setattr(
+        proposer.sparse_attention,
+        "proposal_context",
+        lambda _request_ids, _context_lens=None: nullcontext(),
+    )
+    monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)
+
+    result = run_proposal(
+        proposer,
+        torch.tensor([7], dtype=torch.int32),
+        make_sampling_metadata(all_greedy=True),
+        make_common_metadata([2]),
+    )
+
+    assert draft_calls == [(0, 7, 2), (1, 1, 3), (3, 99, 5)]
+    assert verified_rounds == [(0, 2, [1, 2, -1, -1]), (2, 2, [1, 2, 99, 4])]
+    assert result == [[1, 2, 99, 4]]
+
+
 def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
     proposer = RetroSpecProposer(
         make_vllm_config(
@@ -2278,8 +2618,6 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
         make_runner(),
     )
     round_starts: list[list[int]] = []
-    set_proposal_round = Mock()
-    proposer.sparse_attention.index.selection_provenance.mode = "trace"
 
     def fake_run_draft_step(
         batch_size,
@@ -2316,11 +2654,6 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
         "proposal_context",
         lambda _request_ids, _context_lens=None: nullcontext(),
     )
-    monkeypatch.setattr(
-        proposer.sparse_attention,
-        "set_proposal_round",
-        set_proposal_round,
-    )
     monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
     monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)
 
@@ -2332,7 +2665,6 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
     )
 
     assert round_starts == [[0], [2]]
-    assert [call.args[0] for call in set_proposal_round.call_args_list] == [1, 2]
     assert result == [[1, 2, 3, 4]]
     assert proposer.state.pending_counts.tolist() == [4]
     assert proposer.state.stage.tolist() == [int(RetroSpecStage.FULL_VERIFY)]
@@ -2347,6 +2679,9 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
         "proposal_requests": 1,
         "draft_round_requests": 2,
         "draft_tokens": 4,
+        "sparse_bonus_admitted": 0,
+        "feedback_horizon_reductions": 0,
+        "feedback_horizon_restores": 0,
         "verified_tokens": 4,
         "proposed_tokens": 4,
         "resident_cluster_hits": 0,
@@ -2552,7 +2887,7 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     proposer.sparse_attention.end_step_statistics.assert_called_once_with()
 
 
-def test_parallel_verification_replays_padded_piecewise_graph(monkeypatch):
+def test_parallel_verification_uses_unpadded_dynamic_layout(monkeypatch):
     dispatcher = Mock(
         dispatch_piecewise_cudagraph=Mock(
             return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4))
@@ -2588,9 +2923,9 @@ def test_parallel_verification_replays_padded_piecewise_graph(monkeypatch):
     class FakeModel(torch.nn.Module):
         def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds):
             assert intermediate_tensors is None
-            assert input_ids.tolist() == [8, 10, 11, 0]
-            assert positions.tolist() == [5, 4, 6, 0]
-            return torch.zeros((4, 4))
+            assert input_ids.tolist() == [8, 10, 11]
+            assert positions.tolist() == [5, 4, 6]
+            return torch.zeros((3, 4))
 
         def compute_logits(self, hidden_states):
             assert hidden_states.shape == (3, 4)
@@ -2628,11 +2963,11 @@ def test_parallel_verification_replays_padded_piecewise_graph(monkeypatch):
     assert result.token_indices.tolist() == [0, 1, 1]
     assert result.token_ids.tolist() == [1, 0, 1]
     context = forward_context_kwargs[0]
-    assert context["num_tokens"] == 4
-    assert context["cudagraph_runtime_mode"] == CUDAGraphMode.PIECEWISE
-    assert context["batch_descriptor"] == BatchDescriptor(4)
+    assert context["num_tokens"] == 3
+    assert context["cudagraph_runtime_mode"] == CUDAGraphMode.NONE
+    assert context["batch_descriptor"] is None
     slot_mapping = context["slot_mapping"]["model.layers.0.self_attn.attn"]
-    assert slot_mapping.tolist() == [13, 4, 14, -1]
+    assert slot_mapping.tolist() == [13, 4, 14]
     begin_args = proposer.sparse_attention.begin_parallel_step.call_args.args
     assert torch.equal(begin_args[1], torch.tensor([1, 0, 1], dtype=torch.int64))
     assert torch.equal(begin_args[2], torch.tensor([0, 1, 1], dtype=torch.int64))

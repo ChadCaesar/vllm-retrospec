@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 class RetroSpecVerificationResult:
     verified_counts: torch.Tensor
     require_full: torch.Tensor
+    bonus_mask: torch.Tensor | None = None
+    bonus_token_ids: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,9 @@ class RetroSpecParallelVerificationOutput:
 
 class RetroSpecProposer:
     _CUDAGRAPH_NAMESPACE = "retrospec_proposal"
+    _LOW_ACCEPTANCE_HORIZON = 16
+    _LOW_ACCEPTANCE_MIN_PROPOSAL = 32
+    _LOW_ACCEPTANCE_RECOVERY_ROUNDS = 3
 
     def __init__(
         self,
@@ -116,6 +121,7 @@ class RetroSpecProposer:
         self.block_size = block_size
 
         self.policy = RetroSpecDecisionPolicy(config)
+        self._sparse_bonus_enabled = device.type == "cuda"
         self.transition_tracer = RetroSpecTransitionTracer(
             config.retrospec_trace_transitions
         )
@@ -226,6 +232,19 @@ class RetroSpecProposer:
         self._verification_token_indices = torch.empty(
             self.max_parallel_tokens, dtype=torch.int64, device=device
         )
+        self._verification_bonus_requests = torch.empty(
+            self.max_batch_size, dtype=torch.int64, device=device
+        )
+        self._verification_bonus_candidates = torch.zeros(
+            self.max_batch_size, dtype=torch.bool, device=device
+        )
+        self._verification_bonus_admitted = torch.zeros_like(
+            self._verification_bonus_candidates
+        )
+        self._verification_bonus_token_ids = torch.full(
+            (self.max_batch_size,), -1, dtype=torch.int32, device=device
+        )
+        self._bonus_ready_mask = torch.zeros_like(self._verification_bonus_candidates)
         self._verification_round_starts = torch.empty(
             self.max_parallel_tokens, dtype=torch.int32, device=device
         )
@@ -288,6 +307,56 @@ class RetroSpecProposer:
         )
         self._proposal_token_budgets.cpu.fill_(self.num_speculative_tokens)
         self._proposal_token_budgets.gpu.fill_(self.num_speculative_tokens)
+        # Single-rank output bookkeeping supplies host feedback. Multi-rank
+        # workers derive the same feedback from target results on each GPU.
+        parallel_config = vllm_config.parallel_config
+        self._feedback_horizon_enabled = (
+            device.type == "cuda"
+            and getattr(parallel_config, "tensor_parallel_size", 1) == 1
+            and getattr(parallel_config, "pipeline_parallel_size", 1) == 1
+            and self.num_speculative_tokens > self._LOW_ACCEPTANCE_HORIZON
+        )
+        self._feedback_device_enabled = (
+            device.type == "cuda"
+            and not self._feedback_horizon_enabled
+            and self.num_speculative_tokens > self._LOW_ACCEPTANCE_HORIZON
+        )
+        self._feedback_horizon_budgets = CpuGpuBuffer(
+            self.max_batch_size,
+            dtype=torch.int32,
+            device=device,
+            pin_memory=is_pin_memory_available(),
+            with_numpy=True,
+        )
+        self._feedback_horizons: dict[str, int] = {}
+        self._feedback_recovery: dict[str, int] = {}
+        self._feedback_device_horizons = torch.full(
+            (self.max_batch_size,),
+            self.num_speculative_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._feedback_device_recovery = torch.zeros(
+            self.max_batch_size,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._feedback_request_slots: dict[str, int] = {}
+        self._feedback_free_slots = list(range(self.max_batch_size - 1, -1, -1))
+        self._feedback_slot_ids = CpuGpuBuffer(
+            self.max_batch_size,
+            dtype=torch.int64,
+            device=device,
+            pin_memory=is_pin_memory_available(),
+            with_numpy=True,
+        )
+        self._feedback_prior_counts = CpuGpuBuffer(
+            self.max_batch_size,
+            dtype=torch.int32,
+            device=device,
+            pin_memory=is_pin_memory_available(),
+            with_numpy=True,
+        )
         self._seen_proposal_request_ids: set[str] = set()
         self._last_proposed_counts: dict[str, int] = {}
         self._last_committed_proposal_counts: dict[str, int] = {}
@@ -297,6 +366,12 @@ class RetroSpecProposer:
         request_ids = tuple(request_ids)
         self.index_update_state.remove_requests(request_ids)
         self.sparse_attention.remove_requests(request_ids)
+        for request_id in request_ids:
+            self._feedback_horizons.pop(request_id, None)
+            self._feedback_recovery.pop(request_id, None)
+            slot = self._feedback_request_slots.pop(request_id, None)
+            if slot is not None:
+                self._feedback_free_slots.append(slot)
 
     def record_previous_proposal_outcomes(
         self,
@@ -352,6 +427,137 @@ class RetroSpecProposer:
             self._last_committed_proposal_counts[request_id] = min(
                 proposed_count, max(int(valid_count) - 1, 0)
             )
+
+    def record_verified_proposal_outcomes(
+        self,
+        proposed_counts: Sequence[int],
+        valid_sampled_token_counts: Sequence[int],
+        request_ids: Sequence[str] | None = None,
+    ) -> None:
+        """Count outcomes using the proposal consumed by this target pass.
+
+        A new proposal may already have replaced ``_last_proposed_counts`` by
+        the time synchronous output bookkeeping runs, so that mapping cannot
+        identify the proposal whose tokens were just verified.
+        """
+        if len(proposed_counts) != len(valid_sampled_token_counts):
+            raise ValueError("Proposal and sampled-token counts must have equal length")
+        if request_ids is not None and len(request_ids) != len(proposed_counts):
+            raise ValueError("Request IDs and proposal counts must have equal length")
+
+        rounds = proposed = accepted = fully_accepted = 0
+        for row, (proposed_count, valid_count) in enumerate(
+            zip(proposed_counts, valid_sampled_token_counts)
+        ):
+            if proposed_count <= 0:
+                continue
+            committed_count = min(proposed_count, max(int(valid_count) - 1, 0))
+            if self._feedback_horizon_enabled and request_ids is not None:
+                self._update_feedback_horizon(
+                    request_ids[row], proposed_count, committed_count
+                )
+            rounds += 1
+            proposed += proposed_count
+            accepted += committed_count
+            fully_accepted += committed_count == proposed_count
+
+        if not self.performance_stats.enabled:
+            return
+        self.performance_stats.add_counter("proposal_verified_rounds", rounds)
+        self.performance_stats.add_counter("proposal_verified_tokens", proposed)
+        self.performance_stats.add_counter("proposal_accepted_tokens", accepted)
+        self.performance_stats.add_counter(
+            "proposal_rejected_tokens", proposed - accepted
+        )
+        self.performance_stats.add_counter("proposal_fully_accepted", fully_accepted)
+
+    def _update_feedback_horizon(
+        self, request_id: str, proposed_count: int, accepted_count: int
+    ) -> None:
+        if (
+            proposed_count >= self._LOW_ACCEPTANCE_MIN_PROPOSAL
+            and accepted_count * 5 < proposed_count * 2
+        ):
+            if request_id not in self._feedback_horizons:
+                self.performance_stats.add_counter("feedback_horizon_reductions")
+            self._feedback_horizons[request_id] = self._LOW_ACCEPTANCE_HORIZON
+            self._feedback_recovery[request_id] = 0
+        elif request_id in self._feedback_horizons and proposed_count >= 8:
+            if accepted_count == proposed_count:
+                recovered = self._feedback_recovery.get(request_id, 0) + 1
+                if recovered >= self._LOW_ACCEPTANCE_RECOVERY_ROUNDS:
+                    del self._feedback_horizons[request_id]
+                    self._feedback_recovery.pop(request_id, None)
+                    self.performance_stats.add_counter("feedback_horizon_restores")
+                else:
+                    self._feedback_recovery[request_id] = recovered
+            else:
+                self._feedback_recovery[request_id] = 0
+
+    def _feedback_slots_for_requests(self, request_ids: Sequence[str]) -> torch.Tensor:
+        slots = []
+        for request_id in request_ids:
+            slot = self._feedback_request_slots.get(request_id)
+            if slot is None:
+                if not self._feedback_free_slots:
+                    raise RuntimeError("RetroSpec feedback request slots are exhausted")
+                slot = self._feedback_free_slots.pop()
+                self._feedback_request_slots[request_id] = slot
+                self._feedback_device_horizons[slot] = self.num_speculative_tokens
+                self._feedback_device_recovery[slot] = 0
+            slots.append(slot)
+        self._feedback_slot_ids.np[: len(slots)] = slots
+        return self._feedback_slot_ids.copy_to_gpu(len(slots))
+
+    def _update_device_feedback_horizon(
+        self,
+        request_ids: Sequence[str],
+        previous_proposed_counts: Sequence[int] | None,
+        valid_sampled_token_counts: torch.Tensor,
+    ) -> None:
+        if not self._feedback_device_enabled or previous_proposed_counts is None:
+            return
+        if len(previous_proposed_counts) != len(request_ids):
+            raise ValueError("Previous proposal counts must match request IDs")
+        batch_size = len(request_ids)
+        slots = self._feedback_slots_for_requests(request_ids)
+        self._feedback_prior_counts.np[:batch_size] = previous_proposed_counts
+        proposed = self._feedback_prior_counts.copy_to_gpu(batch_size)
+        accepted = torch.minimum(
+            proposed, (valid_sampled_token_counts - 1).clamp(min=0)
+        )
+        horizons = self._feedback_device_horizons.index_select(0, slots)
+        recovery = self._feedback_device_recovery.index_select(0, slots)
+        reduced = (proposed >= self._LOW_ACCEPTANCE_MIN_PROPOSAL) & (
+            accepted * 5 < proposed * 2
+        )
+        low_horizon = horizons == self._LOW_ACCEPTANCE_HORIZON
+        eligible_recovery = low_horizon & (proposed >= 8)
+        fully_accepted = eligible_recovery & (accepted == proposed)
+        next_recovery = torch.where(
+            reduced,
+            0,
+            torch.where(
+                eligible_recovery,
+                torch.where(fully_accepted, recovery + 1, 0),
+                recovery,
+            ),
+        )
+        restored = fully_accepted & (
+            next_recovery >= self._LOW_ACCEPTANCE_RECOVERY_ROUNDS
+        )
+        next_horizons = torch.where(
+            reduced,
+            self._LOW_ACCEPTANCE_HORIZON,
+            torch.where(restored, self.num_speculative_tokens, horizons),
+        )
+        next_recovery = torch.where(restored, 0, next_recovery)
+        self._feedback_device_horizons.index_copy_(0, slots, next_horizons)
+        self._feedback_device_recovery.index_copy_(0, slots, next_recovery)
+        self.performance_stats.add_gpu_counter(
+            "feedback_horizon_reductions", reduced & ~low_horizon
+        )
+        self.performance_stats.add_gpu_counter("feedback_horizon_restores", restored)
 
     @property
     def uses_full_verification_offload(self) -> bool:
@@ -592,53 +798,10 @@ class RetroSpecProposer:
         capture_sizes: Sequence[int],
         max_capture_size: int,
     ) -> None:
-        if self.speculative_config.enforce_eager:
-            self._cudagraph_registration_failure = "eager"
-            return
-
-        dispatcher = getattr(self.runner, "cudagraph_dispatcher", None)
-        if dispatcher is None:
-            self._cudagraph_registration_failure = "missing_dispatcher"
-            return
-        if not cudagraph_mode.has_mode(CUDAGraphMode.PIECEWISE):
-            self._cudagraph_registration_failure = "piecewise_disabled"
-            return
-
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        if parallel_config is not None and parallel_config.data_parallel_size > 1:
-            self._cudagraph_registration_failure = "data_parallel"
-            return
-
-        runner_input_ids = getattr(getattr(self.runner, "input_ids", None), "gpu", None)
-        runner_positions = getattr(getattr(self.runner, "positions", None), "gpu", None)
-        if (
-            not isinstance(runner_input_ids, torch.Tensor)
-            or not isinstance(runner_positions, torch.Tensor)
-            or runner_input_ids.numel() < self.max_parallel_tokens
-            or runner_positions.numel() < self.max_parallel_tokens
-        ):
-            self._cudagraph_registration_failure = "missing_input_workspace"
-            return
-
-        self._graph_input_ids = runner_input_ids[: self.max_parallel_tokens]
-        self._graph_positions = runner_positions[: self.max_parallel_tokens]
-
-        limit = min(self.max_parallel_tokens, max_capture_size)
-        sizes = {size for size in capture_sizes if 0 < size <= limit}
-        sizes.update(
-            capacity
-            for capacity in (self.max_batch_size, self.max_parallel_tokens)
-            if 0 < capacity <= limit
-        )
-        registered = dispatcher.register_piecewise_cudagraph_sizes(
-            self._CUDAGRAPH_NAMESPACE, sizes
-        )
-        self._cudagraph_registration_failure = (
-            None
-            if registered
-            and dispatcher.has_piecewise_cudagraph_namespace(self._CUDAGRAPH_NAMESPACE)
-            else "missing_key"
-        )
+        del cudagraph_mode, capture_sizes, max_capture_size
+        # Native cluster layouts are allocated per active request. Capture is
+        # deferred until those layouts have stable graph-safe addresses.
+        self._cudagraph_registration_failure = "gpu_native_dynamic_layout"
 
     def _get_attention_metadata_builder(self) -> AttentionMetadataBuilder:
         if self.attn_metadata_builder is not None:
@@ -783,6 +946,7 @@ class RetroSpecProposer:
         self,
         remaining_generation_tokens: Sequence[int],
         valid_sampled_tokens_count: torch.Tensor,
+        request_ids: Sequence[str] | None = None,
     ) -> torch.Tensor:
         batch_size = len(remaining_generation_tokens)
         if batch_size > self.max_batch_size:
@@ -800,6 +964,26 @@ class RetroSpecProposer:
         proposal_token_budgets = self._proposal_token_budgets.copy_to_gpu(batch_size)
         proposal_token_budgets.sub_(valid_sampled_tokens_count)
         proposal_token_budgets.clamp_(min=0, max=self.num_speculative_tokens)
+        if self._feedback_horizon_enabled and request_ids is not None:
+            if len(request_ids) != batch_size:
+                raise ValueError("request_ids must match the proposal batch size")
+            if any(request_id in self._feedback_horizons for request_id in request_ids):
+                self._feedback_horizon_budgets.np[:batch_size] = [
+                    self._feedback_horizons.get(request_id, self.num_speculative_tokens)
+                    for request_id in request_ids
+                ]
+                torch.minimum(
+                    proposal_token_budgets,
+                    self._feedback_horizon_budgets.copy_to_gpu(batch_size),
+                    out=proposal_token_budgets,
+                )
+        elif self._feedback_device_enabled and request_ids is not None:
+            slots = self._feedback_slots_for_requests(request_ids)
+            torch.minimum(
+                proposal_token_budgets,
+                self._feedback_device_horizons.index_select(0, slots),
+                out=proposal_token_budgets,
+            )
         return proposal_token_budgets
 
     def _record_cudagraph_fallback(self, stage_name: str, reason: str) -> None:
@@ -809,47 +993,9 @@ class RetroSpecProposer:
     def _dispatch_piecewise_cudagraph(
         self, num_tokens: int, capacity: int, stage_name: str
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
-        eager_descriptor = BatchDescriptor(num_tokens)
-
-        if self.speculative_config.enforce_eager:
-            self.performance_stats.add_counter(f"{stage_name}_cudagraph_eager")
-            return CUDAGraphMode.NONE, eager_descriptor
-
-        if getattr(self.vllm_config, "lora_config", None) is not None:
-            self._record_cudagraph_fallback(stage_name, "lora")
-            return CUDAGraphMode.NONE, eager_descriptor
-
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        if parallel_config is not None and parallel_config.data_parallel_size > 1:
-            self._record_cudagraph_fallback(stage_name, "data_parallel")
-            return CUDAGraphMode.NONE, eager_descriptor
-
-        dispatcher = getattr(self.runner, "cudagraph_dispatcher", None)
-        if dispatcher is None:
-            self._record_cudagraph_fallback(stage_name, "missing_dispatcher")
-            return CUDAGraphMode.NONE, eager_descriptor
-        if self._cudagraph_registration_failure is not None:
-            self._record_cudagraph_fallback(
-                stage_name, self._cudagraph_registration_failure
-            )
-            return CUDAGraphMode.NONE, eager_descriptor
-
-        cudagraph_mode, batch_descriptor = dispatcher.dispatch_piecewise_cudagraph(
-            self._CUDAGRAPH_NAMESPACE, num_tokens
-        )
-        if cudagraph_mode != CUDAGraphMode.PIECEWISE:
-            self._record_cudagraph_fallback(stage_name, "missing_key")
-            return CUDAGraphMode.NONE, eager_descriptor
-        if batch_descriptor.num_tokens > capacity:
-            self._record_cudagraph_fallback(stage_name, "capacity")
-            return CUDAGraphMode.NONE, eager_descriptor
-
-        self.performance_stats.add_counter(f"{stage_name}_cudagraph_replay")
-        self.performance_stats.add_counter(
-            f"{stage_name}_cudagraph_padding_tokens",
-            batch_descriptor.num_tokens - num_tokens,
-        )
-        return cudagraph_mode, batch_descriptor
+        del capacity
+        self.performance_stats.add_counter(f"{stage_name}_cudagraph_eager")
+        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
 
     def _prepare_piecewise_model_inputs(
         self,
@@ -1113,6 +1259,10 @@ class RetroSpecProposer:
 
         # Draft counts describe only tokens generated during this round.
         self.state.reset_draft_counts(self.state.active_mask)
+        bonus_ready = self._bonus_ready_mask[:batch_size]
+        bonus_ready.logical_and_(draft_round_mask)
+        self.state.add_draft_counts(bonus_ready.to(torch.int32))
+        bonus_ready.zero_()
         return draft_round_mask, round_start_counts
 
     def _prepare_next_draft_step(
@@ -1266,6 +1416,55 @@ class RetroSpecProposer:
         )
         token_indices.add_(round_starts)
         return request_indices, token_indices
+
+    def _append_sparse_bonus_pairs(
+        self,
+        batch_size: int,
+        request_indices: torch.Tensor,
+        token_indices: torch.Tensor,
+        round_start_counts: torch.Tensor,
+        draft_counts: torch.Tensor,
+        verification_active: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Append one unverified next-token query per eligible request."""
+        empty_requests = self._verification_bonus_requests[:0]
+        num_pairs = request_indices.numel()
+        if (
+            not self._sparse_bonus_enabled
+            or self.policy.max_draft_tokens <= 1
+            or self.policy.draft_margin_threshold is not None
+            or self.policy.hit_attn_threshold is not None
+            or not self._can_use_raw_greedy_verification_sampling(sampling_metadata)
+            or num_pairs >= self.max_parallel_tokens
+        ):
+            return request_indices, token_indices, empty_requests
+
+        next_steps = round_start_counts + draft_counts
+        next_positions = self.proposal_start_positions[:batch_size] + next_steps + 1
+        candidates = self._verification_bonus_candidates[:batch_size]
+        candidates.copy_(verification_active)
+        candidates.logical_and_(next_steps + 1 < self.policy.pending_limit)
+        candidates.logical_and_(
+            next_steps + 1 < self._proposal_token_budgets.gpu[:batch_size]
+        )
+        candidates.logical_and_(next_positions < self.max_model_len - 1)
+        candidates.logical_and_(
+            next_positions < self.index_update_state.next_update_positions
+        )
+        bonus_requests = self._compact_mask_indices(
+            candidates, self._verification_bonus_requests
+        )
+        bonus_requests = bonus_requests[: self.max_parallel_tokens - num_pairs]
+        num_bonus = bonus_requests.numel()
+        if num_bonus == 0:
+            return request_indices, token_indices, empty_requests
+
+        combined_requests = self._verification_request_indices[: num_pairs + num_bonus]
+        combined_tokens = self._verification_token_indices[: num_pairs + num_bonus]
+        combined_requests[num_pairs:].copy_(bonus_requests)
+        combined_tokens[num_pairs:].copy_(next_steps.index_select(0, bonus_requests))
+        return combined_requests, combined_tokens, bonus_requests
 
     def _find_first_boundary_indices(
         self,
@@ -1499,6 +1698,7 @@ class RetroSpecProposer:
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
         attention_mode: RetroSpecAttentionMode,
+        bonus_start_index: int | None = None,
     ) -> RetroSpecParallelVerificationOutput:
         assert self.model is not None
         if attention_mode not in (
@@ -1526,6 +1726,11 @@ class RetroSpecProposer:
             raise ValueError("Parallel verification requires at least one token")
         if num_tokens > self.max_parallel_tokens:
             raise ValueError("Parallel verification exceeds the configured capacity")
+        if bonus_start_index is not None:
+            if attention_mode != RetroSpecAttentionMode.SPARSE_VERIFY:
+                raise ValueError("Bonus rows require sparse verification")
+            if not 0 < bonus_start_index < num_tokens:
+                raise ValueError("bonus_start_index must split ordinary and bonus rows")
 
         stage_name = (
             "sparse_verify"
@@ -1610,9 +1815,17 @@ class RetroSpecProposer:
                 layer_name: forward_slot_mapping for layer_name in self.attn_layer_names
             }
 
-            self.sparse_attention.begin_parallel_step(
-                attention_mode, request_indices, token_indices
-            )
+            if bonus_start_index is None:
+                self.sparse_attention.begin_parallel_step(
+                    attention_mode, request_indices, token_indices
+                )
+            else:
+                self.sparse_attention.begin_parallel_step(
+                    attention_mode,
+                    request_indices,
+                    token_indices,
+                    bonus_start_index=bonus_start_index,
+                )
 
         try:
             with (
@@ -1946,29 +2159,69 @@ class RetroSpecProposer:
             draft_counts,
             verification_active,
         )
+        num_draft_pairs = request_indices.numel()
         self.performance_stats.add_counter(
             "sparse_verify_tokens",
-            request_indices.numel(),
+            num_draft_pairs,
         )
 
-        if request_indices.numel() == 0:
+        if num_draft_pairs == 0:
             return RetroSpecVerificationResult(
                 verified_counts=self._verification_verified_counts[:batch_size].zero_(),
                 require_full=self._verification_require_full[:batch_size].zero_(),
             )
 
+        combined_requests, combined_tokens, bonus_requests = (
+            self._append_sparse_bonus_pairs(
+                batch_size,
+                request_indices,
+                token_indices,
+                round_start_counts,
+                draft_counts,
+                verification_active,
+                sampling_metadata,
+            )
+        )
+        num_bonus = bonus_requests.numel()
+        self.performance_stats.add_counter("sparse_bonus_queries", num_bonus)
         self.state.set_stage(verification_active, RetroSpecStage.SPARSE_VERIFY)
         with self.performance_stats.cpu_timer("full_verify_prime_submit"):
             self.sparse_attention.maybe_prime_full_verification(request_indices.numel())
 
-        sparse = self._run_parallel_verification(
-            batch_size,
-            request_indices,
-            token_indices,
-            common_attn_metadata,
-            sampling_metadata,
-            RetroSpecAttentionMode.SPARSE_VERIFY,
-        )
+        if num_bonus:
+            sparse = self._run_parallel_verification(
+                batch_size,
+                combined_requests,
+                combined_tokens,
+                common_attn_metadata,
+                sampling_metadata,
+                RetroSpecAttentionMode.SPARSE_VERIFY,
+                bonus_start_index=num_draft_pairs,
+            )
+            bonus_token_ids = self._verification_bonus_token_ids[:batch_size]
+            bonus_token_ids.fill_(-1)
+            bonus_token_ids.index_copy_(
+                0, bonus_requests, sparse.token_ids[num_draft_pairs:]
+            )
+            sparse = replace(
+                sparse,
+                request_indices=sparse.request_indices[:num_draft_pairs],
+                token_indices=sparse.token_indices[:num_draft_pairs],
+                token_ids=sparse.token_ids[:num_draft_pairs],
+                margin=sparse.margin[:num_draft_pairs]
+                if sparse.margin is not None
+                else None,
+                attention_mass=sparse.attention_mass[:num_draft_pairs],
+            )
+        else:
+            sparse = self._run_parallel_verification(
+                batch_size,
+                request_indices,
+                token_indices,
+                common_attn_metadata,
+                sampling_metadata,
+                RetroSpecAttentionMode.SPARSE_VERIFY,
+            )
         sparse_boundary_timer = self.performance_stats.start_cuda_timer(
             "sparse_verify_boundary"
         )
@@ -2085,6 +2338,15 @@ class RetroSpecProposer:
         )
         run_expanded.logical_and_(boundary_request_mask)
         run_expanded.masked_fill_(require_full, False)
+        bonus_admitted = self._verification_bonus_admitted[:batch_size]
+        bonus_admitted.zero_()
+        if num_bonus:
+            bonus_admitted[bonus_requests] = ~boundary_request_mask.index_select(
+                0, bonus_requests
+            ) & (
+                verified_counts.index_select(0, bonus_requests)
+                == draft_counts.index_select(0, bonus_requests)
+            )
         self.performance_stats.add_gpu_histogram(
             "sparse_to_expanded_prefix", verified_counts, run_expanded
         )
@@ -2231,7 +2493,14 @@ class RetroSpecProposer:
         self.state.set_stage(verification_active, RetroSpecStage.DRAFT)
         self.state.set_stage(require_full, RetroSpecStage.FULL_VERIFY)
 
-        return RetroSpecVerificationResult(verified_counts, require_full)
+        bonus_admitted.logical_and_(~require_full)
+        bonus_admitted.logical_and_(~run_expanded)
+        return RetroSpecVerificationResult(
+            verified_counts,
+            require_full,
+            bonus_admitted if num_bonus else None,
+            self._verification_bonus_token_ids[:batch_size] if num_bonus else None,
+        )
 
     @torch.inference_mode()
     def propose(
@@ -2244,6 +2513,7 @@ class RetroSpecProposer:
         proposal_active_mask: torch.Tensor,
         remaining_generation_tokens: Sequence[int],
         valid_sampled_tokens_count: torch.Tensor,
+        previous_proposed_counts: Sequence[int] | None = None,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
         materialize_output: bool = True,
     ) -> list[list[int]]:
@@ -2264,6 +2534,7 @@ class RetroSpecProposer:
         proposal_token_budgets = self._prepare_proposal_token_budgets(
             remaining_generation_tokens,
             valid_sampled_tokens_count,
+            request_ids,
         )
         effective_proposal_active_mask = proposal_active_mask & (
             proposal_token_budgets > 0
@@ -2279,6 +2550,7 @@ class RetroSpecProposer:
         )
 
         self._draft_token_ids[:batch_size].fill_(-1)
+        self._bonus_ready_mask[:batch_size].zero_()
 
         seq_lens = common_attn_metadata.seq_lens
         if num_rejected_tokens_gpu is not None:
@@ -2477,6 +2749,37 @@ class RetroSpecProposer:
                     last_pending_tokens,
                     self.proposal_input_ids[:batch_size],
                 )
+                if (
+                    verification.bonus_mask is not None
+                    and verification.bonus_token_ids is not None
+                ):
+                    bonus_ready = verification.bonus_mask & can_defer_full
+                    bonus_steps = (
+                        self.state.pending_counts.clamp(
+                            max=self.num_speculative_tokens - 1
+                        )
+                        .long()
+                        .unsqueeze(1)
+                    )
+                    existing_tokens = self._draft_token_ids[:batch_size].gather(
+                        1, bonus_steps
+                    )
+                    bonus_tokens = torch.where(
+                        bonus_ready,
+                        verification.bonus_token_ids,
+                        existing_tokens.squeeze(1),
+                    )
+                    self._draft_token_ids[:batch_size].scatter_(
+                        1, bonus_steps, bonus_tokens.unsqueeze(1)
+                    )
+                    self.positions[:batch_size].add_(bonus_ready.to(torch.int64))
+                    self._bonus_ready_mask[:batch_size].copy_(bonus_ready)
+                    self.performance_stats.add_gpu_counter(
+                        "sparse_bonus_admitted", bonus_ready
+                    )
+                    next_round_input_ids = torch.where(
+                        bonus_ready, bonus_tokens, next_round_input_ids
+                    )
                 next_round_input_ids = self._synchronize_pipeline_control(
                     batch_size, next_round_input_ids
                 )
@@ -2491,6 +2794,9 @@ class RetroSpecProposer:
         self.performance_stats.add_gpu_counter(
             "proposed_tokens",
             self.state.pending_counts,
+        )
+        self._update_device_feedback_horizon(
+            request_ids, previous_proposed_counts, valid_sampled_tokens_count
         )
         if not materialize_output:
             if self.performance_stats.enabled:

@@ -65,6 +65,9 @@ class RetroSpecPerformanceStats:
         "proposal_requests",
         "draft_round_requests",
         "draft_tokens",
+        "sparse_bonus_admitted",
+        "feedback_horizon_reductions",
+        "feedback_horizon_restores",
         "verified_tokens",
         "proposed_tokens",
         "resident_cluster_hits",
@@ -543,6 +546,8 @@ class RetroSpecPerformanceStats:
         prefetch_wave_opportunities = prefetch_waves + prefetch_coalesced
         terminal_proposed = counters.get("terminal_proposal_tokens", 0)
         terminal_wasted = counters.get("terminal_wasted_proposal_tokens", 0)
+        verified_proposed = counters.get("proposal_verified_tokens", 0)
+        verified_accepted = counters.get("proposal_accepted_tokens", 0)
 
         def cudagraph_replay_rate(stage_name: str) -> float:
             replay = counters.get(f"{stage_name}_cudagraph_replay", 0)
@@ -565,6 +570,7 @@ class RetroSpecPerformanceStats:
             "prefetch_backpressure_rate=%.3f, "
             "prefetch_records/wave=%.2f, "
             "terminal_waste_rate=%.3f, "
+            "proposal_accept_rate=%.3f, "
             "draft_graph_replay=%.3f, "
             "sparse_verify_graph_replay=%.3f, "
             "expanded_verify_graph_replay=%.3f}; "
@@ -594,6 +600,7 @@ class RetroSpecPerformanceStats:
             self._ratio(prefetch_backpressured, prefetch_waves),
             self._ratio(counters.get("prefetch_wave_records", 0), prefetch_waves),
             self._ratio(terminal_wasted, terminal_proposed),
+            self._ratio(verified_accepted, verified_proposed),
             cudagraph_replay_rate("draft"),
             cudagraph_replay_rate("sparse_verify"),
             cudagraph_replay_rate("expanded_verify"),

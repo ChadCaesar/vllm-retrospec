@@ -356,6 +356,22 @@ class Worker(WorkerBase):
         self.available_kv_cache_memory_bytes = (
             self.requested_memory - profile_result.non_kv_cache_memory
         )
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.method == "retrospec":
+            index_reserve_bytes = int(
+                speculative_config.retrospec_max_gpu_index_memory * (1 << 30)
+            )
+            self.available_kv_cache_memory_bytes -= index_reserve_bytes
+            if self.available_kv_cache_memory_bytes <= 0:
+                raise ValueError(
+                    "RetroSpec GPU index reservation leaves no room for the KV cache. "
+                    "Reduce retrospec_max_gpu_index_memory or increase the "
+                    "GPU memory budget."
+                )
+            logger.info(
+                "Reserved %s GiB for the dynamic RetroSpec GPU index and workspaces",
+                format_gib(index_reserve_bytes),
+            )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(

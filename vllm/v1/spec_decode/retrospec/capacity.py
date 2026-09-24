@@ -48,7 +48,9 @@ def is_retrospec_long_context_enabled(vllm_config: VllmConfig) -> bool:
     config = vllm_config.speculative_config
     if config is None or config.method != "retrospec":
         return False
-    return vllm_config.model_config.max_model_len > config.retrospec_index_segment_size
+    # The GPU-native branch retains the complete native KV cache. It cannot
+    # use the smaller offload working-set capacity or retire native blocks.
+    return False
 
 
 def get_retrospec_native_working_set_tokens(

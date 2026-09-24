@@ -258,15 +258,9 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
-        self.enable_retrospec_layer_major_prefill = (
-            speculative_config is not None
-            and speculative_config.method == "retrospec"
-            and not self.is_encoder_decoder
-            and self.dcp_world_size == 1
-            and self.pcp_world_size == 1
-            and self.connector is None
-            and self.ec_connector is None
-        )
+        # Native KV persists on GPU, so regular chunked prefill never needs
+        # the offload-oriented layer-major execution protocol.
+        self.enable_retrospec_layer_major_prefill = False
         self.retrospec_layer_major_prefill_threshold = (
             speculative_config.retrospec_index_segment_size
             if self.enable_retrospec_layer_major_prefill
