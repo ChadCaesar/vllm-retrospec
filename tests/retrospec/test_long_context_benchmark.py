@@ -30,6 +30,8 @@ def test_benchmark_uses_default_draft_limit(monkeypatch, tmp_path):
     args = parse_args()
 
     assert args.max_draft_tokens == 8
+    assert args.retrieval_ratio == 0.050
+    assert args.draft_rank_dtype == "native"
     assert args.prefill_tile_size == 32768
 
 
@@ -38,6 +40,7 @@ def test_benchmark_profile_controls_observation_interval():
         "num_speculative_tokens": 64,
         "retrieval_ratio": 0.018,
         "estimation_ratio": 0.232,
+        "draft_rank_dtype": "native",
         "cache_ratio": 0.0,
         "index_segment_size": 8192,
         "index_update_interval": 1024,
@@ -64,6 +67,7 @@ def test_benchmark_profile_controls_observation_interval():
     assert profile["retrospec_stats_interval_seconds"] == 2.0
     assert profile["retrospec_stats_cuda_timing_level"] == "detailed"
     assert profile["retrospec_stats_cuda_sample_interval"] == 4
+    assert profile["retrospec_draft_rank_dtype"] == "native"
     assert profile["enforce_eager"] is False
 
 

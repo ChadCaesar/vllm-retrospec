@@ -30,6 +30,11 @@ class _NativeLayerRecord:
     counts: torch.Tensor
     token_indices: torch.Tensor
     cluster_offsets: torch.Tensor
+    key_storage: torch.Tensor | None = None
+    value_storage: torch.Tensor | None = None
+    count_storage: torch.Tensor | None = None
+    token_storage: torch.Tensor | None = None
+    offset_storage: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,9 @@ class _NativeBatchLayer:
     token_indices: torch.Tensor
     cluster_offsets: torch.Tensor
     indexed_ends: torch.Tensor
+    request_slots: torch.Tensor | None = None
+    quantized_keys: torch.Tensor | None = None
+    key_scales: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +75,39 @@ class _NativeAttentionWorkspace:
     output: torch.Tensor
     maximum: torch.Tensor
     denominator: torch.Tensor
+
+
+@triton.jit
+def _scatter_cluster_tokens_kernel(
+    assignments,
+    token_offsets,
+    cluster_offsets,
+    token_indices,
+    assignment_stride: tl.constexpr,
+    offset_stride: tl.constexpr,
+    cluster_stride: tl.constexpr,
+    output_stride: tl.constexpr,
+    num_tokens: tl.constexpr,
+    first_token: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    head = tl.program_id(0)
+    tokens = tl.program_id(1) * block_size + tl.arange(0, block_size)
+    valid = tokens < num_tokens
+    clusters = tl.load(
+        assignments + head * assignment_stride + tokens, mask=valid, other=0
+    )
+    offsets = tl.load(
+        token_offsets + head * offset_stride + tokens, mask=valid, other=0
+    )
+    starts = tl.load(
+        cluster_offsets + head * cluster_stride + clusters, mask=valid, other=0
+    )
+    tl.store(
+        token_indices + head * output_stride + starts + offsets,
+        first_token + tokens,
+        mask=valid,
+    )
 
 
 @triton.jit
@@ -126,6 +167,81 @@ def _cluster_rank_dot_kernel(
         + groups[:, None] * logits_s2
         + clusters[None, :],
         products,
+        mask=(groups[:, None] < num_groups) & (clusters[None, :] < num_clusters),
+    )
+
+
+@triton.jit
+def _cluster_rank_int8_kernel(
+    query,
+    keys,
+    key_scales,
+    logits,
+    request_rows,
+    query_s0: tl.constexpr,
+    query_s1: tl.constexpr,
+    query_s2: tl.constexpr,
+    keys_s0: tl.constexpr,
+    keys_s1: tl.constexpr,
+    keys_s2: tl.constexpr,
+    scale_s0: tl.constexpr,
+    scale_s1: tl.constexpr,
+    logits_s0: tl.constexpr,
+    logits_s1: tl.constexpr,
+    logits_s2: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_groups: tl.constexpr,
+    num_clusters: tl.constexpr,
+    head_size: tl.constexpr,
+    block_c: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    cluster_tile = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    row = batch_head // num_heads
+    head = batch_head % num_heads
+    request = tl.load(request_rows + row).to(tl.int32)
+    groups = tl.arange(0, 16)
+    clusters = cluster_tile * block_c + tl.arange(0, block_c)
+    dimensions = tl.arange(0, block_d)
+    q = tl.load(
+        query
+        + row * query_s0
+        + head * query_s1
+        + groups[:, None] * query_s2
+        + dimensions[None, :],
+        mask=(groups[:, None] < num_groups) & (dimensions[None, :] < head_size),
+        other=0,
+    ).to(tl.float32)
+    q_scale = tl.maximum(tl.max(tl.abs(q), 1) / 127.0, 1.0e-8)
+    scaled_q = q / q_scale[:, None]
+    rounded_q = tl.where(
+        scaled_q >= 0, tl.floor(scaled_q + 0.5), tl.ceil(scaled_q - 0.5)
+    )
+    q_int8 = tl.minimum(tl.maximum(rounded_q, -127.0), 127.0).to(tl.int8)
+    k_int8 = tl.load(
+        keys
+        + request * keys_s0
+        + head * keys_s1
+        + clusters[:, None] * keys_s2
+        + dimensions[None, :],
+        mask=(clusters[:, None] < num_clusters) & (dimensions[None, :] < head_size),
+        other=0,
+    )
+    k_scale = tl.load(
+        key_scales + request * scale_s0 + head * scale_s1 + clusters,
+        mask=clusters < num_clusters,
+        other=0,
+    )
+    products = tl.dot(q_int8, tl.trans(k_int8), out_dtype=tl.int32)
+    approximate = products.to(tl.float32) * q_scale[:, None] * k_scale[None, :]
+    tl.store(
+        logits
+        + row * logits_s0
+        + head * logits_s1
+        + groups[:, None] * logits_s2
+        + clusters[None, :],
+        approximate,
         mask=(groups[:, None] < num_groups) & (clusters[None, :] < num_clusters),
     )
 
@@ -216,7 +332,6 @@ def _cluster_mass_kernel(
     ranking_width: tl.constexpr,
     retrieval_ratio: tl.constexpr,
     estimation_ratio: tl.constexpr,
-    sparse_verify_exact_fraction: tl.constexpr,
     block_h: tl.constexpr,
     block_k: tl.constexpr,
 ):
@@ -236,10 +351,8 @@ def _cluster_mass_kernel(
         tl.ceil(counts.to(tl.float32) * estimation_ratio).to(tl.int32),
         counts - retrieval,
     )
-    verification_end = retrieval + tl.ceil(
-        estimation.to(tl.float32) * sparse_verify_exact_fraction
-    ).to(tl.int32)
-    expanded_end = retrieval + estimation
+    verification_end = tl.minimum(retrieval * 2, retrieval + estimation)
+    expanded_end = tl.minimum(retrieval * 3, retrieval + estimation)
     values = tl.load(
         ranked_scores
         + row * scores_s0
@@ -291,6 +404,7 @@ def _native_sparse_attention_kernel(
     indexed_ends,
     seq_lens,
     request_indices,
+    layout_slots,
     output,
     partial_output,
     partial_maximum,
@@ -330,7 +444,6 @@ def _native_sparse_attention_kernel(
     estimation_ratio: tl.constexpr,
     expanded: tl.constexpr,
     sparse_verify: tl.constexpr,
-    sparse_verify_exact_fraction: tl.constexpr,
     num_kv_heads: tl.constexpr,
     queries_per_kv: tl.constexpr,
     num_clusters: tl.constexpr,
@@ -347,6 +460,7 @@ def _native_sparse_attention_kernel(
     partition = tl.program_id(2)
     kv_head = query_head // queries_per_kv
     request = tl.load(request_indices + row).to(tl.int32)
+    request = tl.load(layout_slots + request).to(tl.int32)
     seq_len = tl.load(seq_lens + row).to(tl.int32)
     indexed_end = tl.load(indexed_ends + request).to(tl.int32)
     candidate_count = tl.load(candidate_counts + row * count_row_s0 + kv_head).to(
@@ -362,11 +476,9 @@ def _native_sparse_attention_kernel(
     )
     estimation_end = tl.minimum(retrieval_count + estimation_count, candidate_count)
     if expanded:
-        retrieval_count = estimation_end
+        retrieval_count = tl.minimum(retrieval_count * 3, estimation_end)
     elif sparse_verify:
-        retrieval_count += tl.ceil(
-            estimation_count.to(tl.float32) * sparse_verify_exact_fraction
-        ).to(tl.int32)
+        retrieval_count = tl.minimum(retrieval_count * 2, estimation_end)
 
     dimensions = tl.arange(0, block_d)
     dimension_mask = dimensions < head_size
@@ -561,6 +673,7 @@ def _native_grouped_sparse_attention_kernel(
     indexed_ends,
     seq_lens,
     request_indices,
+    layout_slots,
     output,
     partial_output,
     partial_maximum,
@@ -600,7 +713,6 @@ def _native_grouped_sparse_attention_kernel(
     estimation_ratio: tl.constexpr,
     expanded: tl.constexpr,
     sparse_verify: tl.constexpr,
-    sparse_verify_exact_fraction: tl.constexpr,
     num_kv_heads: tl.constexpr,
     queries_per_kv: tl.constexpr,
     num_clusters: tl.constexpr,
@@ -623,6 +735,7 @@ def _native_grouped_sparse_attention_kernel(
     token_offsets = tl.arange(0, block_t)
     estimate_offsets = tl.arange(0, block_e)
     request = tl.load(request_indices + row).to(tl.int32)
+    request = tl.load(layout_slots + request).to(tl.int32)
     seq_len = tl.load(seq_lens + row).to(tl.int32)
     indexed_end = tl.load(indexed_ends + request).to(tl.int32)
     candidate_count = tl.load(candidate_counts + row * count_row_s0 + kv_head).to(
@@ -638,11 +751,9 @@ def _native_grouped_sparse_attention_kernel(
     )
     estimation_end = retrieval_count + estimation_count
     if expanded:
-        retrieval_count = estimation_end
+        retrieval_count = tl.minimum(retrieval_count * 3, estimation_end)
     elif sparse_verify:
-        retrieval_count += tl.ceil(
-            estimation_count.to(tl.float32) * sparse_verify_exact_fraction
-        ).to(tl.int32)
+        retrieval_count = tl.minimum(retrieval_count * 2, estimation_end)
 
     q = tl.load(
         query
@@ -885,7 +996,7 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
         generation_update_interval: int,
         blocks_per_cluster: int,
         num_kmeans_iterations: int,
-        sparse_verify_exact_fraction: float = 0.875,
+        draft_rank_dtype: str = "native",
         performance_stats: RetroSpecPerformanceStats | None = None,
     ) -> None:
         super().__init__(
@@ -896,7 +1007,9 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
         self.generation_update_interval = generation_update_interval
         self.tokens_per_cluster = blocks_per_cluster * block_size
         self.num_kmeans_iterations = num_kmeans_iterations
-        self.sparse_verify_exact_fraction = sparse_verify_exact_fraction
+        if draft_rank_dtype not in ("int8", "native"):
+            raise ValueError("draft_rank_dtype must be 'int8' or 'native'")
+        self.draft_rank_dtype = draft_rank_dtype
         self.performance_stats = performance_stats
         self._records: dict[str, dict[str, _NativeLayerRecord]] = {}
         self._staged: dict[tuple[str, str], _NativeLayerRecord | None] = {}
@@ -905,6 +1018,9 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
         self._active_cluster_counts: dict[str, int] = {}
         self._workspaces: dict[str, _NativeBatchLayer] = {}
         self._workspace_generations: dict[str, int] = {}
+        self._arena_slots: dict[str, dict[str, int]] = {}
+        self._arena_free_slots: dict[str, list[int]] = {}
+        self._arena_versions: dict[str, dict[str, _NativeLayerRecord]] = {}
         self._plans: dict[str, dict[int, _NativeRankedPlan]] = {}
         self._plan_workspaces: dict[str, _NativePlanWorkspace] = {}
         self._active_plan_workspaces: dict[str, _NativePlanWorkspace] = {}
@@ -915,6 +1031,89 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
     @property
     def has_staged_updates(self) -> bool:
         return bool(self._staged)
+
+    @staticmethod
+    def _append_record(
+        record: _NativeLayerRecord, part: _NativeLayerRecord
+    ) -> _NativeLayerRecord:
+        old_clusters = record.counts.shape[1]
+        old_tokens = record.token_indices.shape[1]
+        total_clusters = old_clusters + part.counts.shape[1]
+        total_tokens = old_tokens + part.token_indices.shape[1]
+        old_key_storage = (
+            record.key_storage if record.key_storage is not None else record.keys
+        )
+        old_value_storage = (
+            record.value_storage if record.value_storage is not None else record.values
+        )
+        old_count_storage = (
+            record.count_storage if record.count_storage is not None else record.counts
+        )
+        old_token_storage = (
+            record.token_storage
+            if record.token_storage is not None
+            else record.token_indices
+        )
+        old_offset_storage = (
+            record.offset_storage
+            if record.offset_storage is not None
+            else record.cluster_offsets
+        )
+        cluster_capacity = triton.next_power_of_2(
+            max(total_clusters, old_key_storage.shape[1])
+        )
+        token_capacity = triton.next_power_of_2(
+            max(total_tokens, old_token_storage.shape[1])
+        )
+        if old_key_storage.shape[1] < total_clusters:
+            key_storage = record.keys.new_empty(
+                record.keys.shape[0], cluster_capacity, record.keys.shape[2]
+            )
+            value_storage = record.values.new_empty(
+                record.values.shape[0], cluster_capacity, record.values.shape[2]
+            )
+            count_storage = record.counts.new_empty(
+                record.counts.shape[0], cluster_capacity
+            )
+            offset_storage = record.cluster_offsets.new_empty(
+                record.cluster_offsets.shape[0], cluster_capacity + 1
+            )
+            key_storage[:, :old_clusters].copy_(record.keys)
+            value_storage[:, :old_clusters].copy_(record.values)
+            count_storage[:, :old_clusters].copy_(record.counts)
+            offset_storage[:, : old_clusters + 1].copy_(record.cluster_offsets)
+        else:
+            key_storage = old_key_storage
+            value_storage = old_value_storage
+            count_storage = old_count_storage
+            offset_storage = old_offset_storage
+        if old_token_storage.shape[1] < total_tokens:
+            token_storage = record.token_indices.new_empty(
+                record.token_indices.shape[0], token_capacity
+            )
+            token_storage[:, :old_tokens].copy_(record.token_indices)
+        else:
+            token_storage = old_token_storage
+        key_storage[:, old_clusters:total_clusters].copy_(part.keys)
+        value_storage[:, old_clusters:total_clusters].copy_(part.values)
+        count_storage[:, old_clusters:total_clusters].copy_(part.counts)
+        token_storage[:, old_tokens:total_tokens].copy_(part.token_indices)
+        offset_storage[:, old_clusters + 1 : total_clusters + 1].copy_(
+            part.cluster_offsets[:, 1:] + old_tokens
+        )
+        return _NativeLayerRecord(
+            part.indexed_end,
+            key_storage[:, :total_clusters],
+            value_storage[:, :total_clusters],
+            count_storage[:, :total_clusters],
+            token_storage[:, :total_tokens],
+            offset_storage[:, : total_clusters + 1],
+            key_storage,
+            value_storage,
+            count_storage,
+            token_storage,
+            offset_storage,
+        )
 
     def has_staged_request_layer(self, layer_name: str, request_id: str) -> bool:
         return (layer_name, request_id) in self._staged
@@ -1010,39 +1209,56 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
                     raise RuntimeError(
                         "GPU-native clustering phase is not cluster-aligned"
                     )
-                logical_blocks = torch.arange(
-                    phase_start // self.block_size,
-                    (phase_start + phase_size) // self.block_size,
-                    dtype=torch.int64,
-                    device=block_table.device,
-                )
-                physical_blocks = (
-                    block_table[row].index_select(0, logical_blocks).long()
-                )
-                num_heads, head_size = key_cache.shape[2:]
-                token_keys = (
-                    key_cache.index_select(0, physical_blocks)
-                    .reshape(phase_size, num_heads, head_size)
-                    .transpose(0, 1)
-                    .contiguous()
-                )
-                token_values = (
-                    value_cache.index_select(0, physical_blocks)
-                    .reshape(phase_size, num_heads, head_size)
-                    .transpose(0, 1)
-                    .contiguous()
-                )
-                clustered = segmented_kmeans(
-                    token_keys,
-                    token_values,
-                    phase_size,
-                    self.tokens_per_cluster,
-                    self.num_kmeans_iterations,
-                )
-                order = torch.argsort(clustered.assignments, dim=1, stable=True)
-                token_indices = (order + phase_start).to(torch.int32)
-                counts = clustered.cluster_sizes.to(torch.int32)
-                offsets = F.pad(counts.cumsum(1, dtype=torch.int32), (1, 0))
+                with self._cuda_timer("gpu_native_index_gather"):
+                    logical_blocks = torch.arange(
+                        phase_start // self.block_size,
+                        (phase_start + phase_size) // self.block_size,
+                        dtype=torch.int64,
+                        device=block_table.device,
+                    )
+                    physical_blocks = (
+                        block_table[row].index_select(0, logical_blocks).long()
+                    )
+                    num_heads, head_size = key_cache.shape[2:]
+                    token_keys = (
+                        key_cache.index_select(0, physical_blocks)
+                        .reshape(phase_size, num_heads, head_size)
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+                    token_values = (
+                        value_cache.index_select(0, physical_blocks)
+                        .reshape(phase_size, num_heads, head_size)
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+                with self._cuda_timer("gpu_native_index_kmeans"):
+                    clustered = segmented_kmeans(
+                        token_keys,
+                        token_values,
+                        phase_size,
+                        self.tokens_per_cluster,
+                        self.num_kmeans_iterations,
+                    )
+                with self._cuda_timer("gpu_native_index_reverse"):
+                    counts = clustered.cluster_sizes.to(torch.int32)
+                    offsets = F.pad(counts.cumsum(1, dtype=torch.int32), (1, 0))
+                    token_indices = torch.empty_like(clustered.assignments)
+                    _scatter_cluster_tokens_kernel[
+                        (num_heads, triton.cdiv(phase_size, 256))
+                    ](
+                        clustered.assignments,
+                        clustered.token_offsets_in_cluster,
+                        offsets,
+                        token_indices,
+                        clustered.assignments.stride(0),
+                        clustered.token_offsets_in_cluster.stride(0),
+                        offsets.stride(0),
+                        token_indices.stride(0),
+                        phase_size,
+                        phase_start,
+                        256,
+                    )
                 parts.append(
                     _NativeLayerRecord(
                         phase_start + phase_size,
@@ -1055,19 +1271,12 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
                 )
                 phase_start += phase_size
 
-            for part in parts:
-                if record is None:
-                    record = part
-                else:
-                    counts = torch.cat((record.counts, part.counts), 1)
-                    record = _NativeLayerRecord(
-                        part.indexed_end,
-                        torch.cat((record.keys, part.keys), 1),
-                        torch.cat((record.values, part.values), 1),
-                        counts,
-                        torch.cat((record.token_indices, part.token_indices), 1),
-                        F.pad(counts.cumsum(1, dtype=torch.int32), (1, 0)),
-                    )
+            with self._cuda_timer("gpu_native_index_append"):
+                for part in parts:
+                    if record is None:
+                        record = part
+                    else:
+                        record = self._append_record(record, part)
             assert record is not None
             self._staged[key] = record
         return None
@@ -1101,9 +1310,17 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
 
     def remove_requests(self, request_ids: Sequence[str]) -> None:
         removed = set(request_ids)
-        for records in self._records.values():
+        for layer_name, records in self._records.items():
             for request_id in removed:
                 records.pop(request_id, None)
+                slot = self._arena_slots.get(layer_name, {}).pop(request_id, None)
+                if slot is not None:
+                    self._arena_free_slots.setdefault(layer_name, []).append(slot)
+                    self._arena_versions.get(layer_name, {}).pop(request_id, None)
+                    workspace = self._workspaces.get(layer_name)
+                    if workspace is not None:
+                        workspace.counts[slot].zero_()
+                        workspace.indexed_ends[slot] = self.block_size
         for key in tuple(self._staged):
             if key[1] in removed:
                 del self._staged[key]
@@ -1137,22 +1354,34 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
         cached = self._batch_layers.get(layer_name)
         if cached is not None:
             return cached
-        records = [
-            self._records.get(layer_name, {}).get(request_id)
-            for request_id in self._request_ids
-        ]
+        layer_records = self._records.get(layer_name, {})
+        records = [layer_records.get(request_id) for request_id in self._request_ids]
         present = next((record for record in records if record is not None), None)
         if present is None:
             raise RuntimeError("GPU-native layer has no cluster index")
         heads, _, head_size = present.keys.shape
-        max_clusters = max(
+        max_clusters = max(record.counts.shape[1] for record in layer_records.values())
+        max_tokens = max(
+            record.token_indices.shape[1] for record in layer_records.values()
+        )
+        active_clusters = max(
             record.counts.shape[1] if record is not None else 0 for record in records
         )
-        max_tokens = max(
+        active_tokens = max(
             record.token_indices.shape[1] if record is not None else 0
             for record in records
         )
         batch = len(records)
+        slots = self._arena_slots.setdefault(layer_name, {})
+        free_slots = self._arena_free_slots.setdefault(layer_name, [])
+        for request_id in layer_records:
+            if request_id not in slots:
+                slots[request_id] = (
+                    free_slots.pop()
+                    if free_slots
+                    else max(slots.values(), default=0) + 1
+                )
+        required_slots = max(slots.values(), default=0) + 1
         workspace = self._workspaces.get(layer_name)
         if (
             workspace is None
@@ -1161,14 +1390,22 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
                 device.index is not None and workspace.keys.device.index != device.index
             )
             or workspace.keys.dtype != dtype
-            or workspace.keys.shape[0] < batch
+            or workspace.keys.shape[0] < required_slots
             or workspace.keys.shape[1] != heads
             or workspace.keys.shape[2] < max_clusters
             or workspace.keys.shape[3] != head_size
             or workspace.token_indices.shape[2] < max_tokens
+            or (
+                self.draft_rank_dtype == "int8"
+                and dtype in (torch.float16, torch.bfloat16)
+                and workspace.quantized_keys is None
+            )
         ):
             batch_capacity = triton.next_power_of_2(
-                max(batch, workspace.keys.shape[0] if workspace is not None else 1)
+                max(
+                    required_slots,
+                    workspace.keys.shape[0] if workspace is not None else 2,
+                )
             )
             cluster_capacity = triton.next_power_of_2(
                 max(
@@ -1219,30 +1456,101 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
                     dtype=torch.int32,
                     device=device,
                 ),
+                quantized_keys=(
+                    torch.empty(
+                        batch_capacity,
+                        heads,
+                        cluster_capacity,
+                        head_size,
+                        dtype=torch.int8,
+                        device=device,
+                    )
+                    if self.draft_rank_dtype == "int8"
+                    and dtype in (torch.float16, torch.bfloat16)
+                    else None
+                ),
+                key_scales=(
+                    torch.empty(
+                        batch_capacity,
+                        heads,
+                        cluster_capacity,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    if self.draft_rank_dtype == "int8"
+                    and dtype in (torch.float16, torch.bfloat16)
+                    else None
+                ),
             )
             self._workspaces[layer_name] = workspace
             self._workspace_generations[layer_name] = (
                 self._workspace_generations.get(layer_name, 0) + 1
             )
-        workspace.counts[:batch].zero_()
-        workspace.indexed_ends[:batch].fill_(self.block_size)
-        for row, record in enumerate(records):
-            if record is None:
+            self._arena_versions[layer_name] = {}
+            workspace.counts[0].zero_()
+            workspace.indexed_ends[0] = self.block_size
+        versions = self._arena_versions.setdefault(layer_name, {})
+        for request_id, record in layer_records.items():
+            if versions.get(request_id) is record:
                 continue
+            slot = slots[request_id]
             clusters = record.counts.shape[1]
             num_tokens = record.token_indices.shape[1]
-            workspace.keys[row, :, :clusters].copy_(record.keys)
-            workspace.values[row, :, :clusters].copy_(record.values)
-            workspace.counts[row, :, :clusters].copy_(record.counts)
-            workspace.token_indices[row, :, :num_tokens].copy_(record.token_indices)
-            workspace.cluster_offsets[row, :, : clusters + 1].copy_(
+            workspace.counts[slot].zero_()
+            workspace.keys[slot, :, :clusters].copy_(record.keys)
+            workspace.values[slot, :, :clusters].copy_(record.values)
+            if workspace.quantized_keys is not None:
+                assert workspace.key_scales is not None
+                with self._cuda_timer("gpu_native_index_quantize"):
+                    centered = record.keys.float()
+                    scales = (centered.abs().amax(dim=-1) / 127.0).clamp_min(1.0e-8)
+                    workspace.quantized_keys[slot, :, :clusters].copy_(
+                        (centered / scales.unsqueeze(-1))
+                        .round()
+                        .clamp(-127, 127)
+                        .to(torch.int8)
+                    )
+                    workspace.key_scales[slot, :, :clusters].copy_(scales)
+            workspace.counts[slot, :, :clusters].copy_(record.counts)
+            workspace.token_indices[slot, :, :num_tokens].copy_(record.token_indices)
+            workspace.cluster_offsets[slot, :, : clusters + 1].copy_(
                 record.cluster_offsets
             )
-            workspace.indexed_ends[row] = record.indexed_end
-        self._batch_layers[layer_name] = workspace
-        self._active_cluster_counts[layer_name] = max_clusters
-        self._prepare_plan_workspace(layer_name, workspace, batch, device)
-        return workspace
+            workspace.indexed_ends[slot] = record.indexed_end
+            resident_record = _NativeLayerRecord(
+                record.indexed_end,
+                workspace.keys[slot, :, :clusters],
+                workspace.values[slot, :, :clusters],
+                workspace.counts[slot, :, :clusters],
+                workspace.token_indices[slot, :, :num_tokens],
+                workspace.cluster_offsets[slot, :, : clusters + 1],
+            )
+            layer_records[request_id] = resident_record
+            versions[request_id] = resident_record
+        request_slots = torch.tensor(
+            [slots.get(request_id, 0) for request_id in self._request_ids],
+            dtype=torch.int32,
+            device=device,
+        )
+        layout = _NativeBatchLayer(
+            workspace.keys[:, :, :active_clusters],
+            workspace.values[:, :, :active_clusters],
+            workspace.counts[:, :, :active_clusters],
+            workspace.token_indices[:, :, :active_tokens],
+            workspace.cluster_offsets[:, :, : active_clusters + 1],
+            workspace.indexed_ends,
+            request_slots,
+            workspace.quantized_keys[:, :, :active_clusters]
+            if workspace.quantized_keys is not None
+            else None,
+            workspace.key_scales[:, :, :active_clusters]
+            if workspace.key_scales is not None
+            else None,
+        )
+        self._batch_layers[layer_name] = layout
+        self._active_cluster_counts[layer_name] = active_clusters
+        self._prepare_plan_workspace(layer_name, layout, batch, device)
+        return layout
 
     def _prepare_plan_workspace(
         self,
@@ -1332,6 +1640,7 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
         topk_values: torch.Tensor | None = None,
         logits_buffer: torch.Tensor | None = None,
         request_rows: torch.Tensor | None = None,
+        exact: bool = False,
     ) -> _NativeRankedPlan:
         batch, query_heads, head_size = query.shape
         if request_rows is not None:
@@ -1342,6 +1651,13 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
                 torch.int64,
             ):
                 raise ValueError("Mapped rank request rows must be GPU integers")
+        mapped_rows = request_rows
+        if layout.request_slots is not None:
+            mapped_rows = (
+                layout.request_slots.index_select(0, request_rows.long())
+                if request_rows is not None
+                else layout.request_slots[:batch]
+            )
         heads, clusters = layout.counts.shape[1:]
         group_size = query_heads // heads
         if (
@@ -1350,11 +1666,11 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
             > 65536
         ):
             mapped_layout = layout
-            if request_rows is not None:
+            if mapped_rows is not None:
                 mapped_layout = _NativeBatchLayer(
-                    keys=layout.keys.index_select(0, request_rows.long()),
+                    keys=layout.keys.index_select(0, mapped_rows.long()),
                     values=layout.values,
-                    counts=layout.counts.index_select(0, request_rows.long()),
+                    counts=layout.counts.index_select(0, mapped_rows.long()),
                     token_indices=layout.token_indices,
                     cluster_offsets=layout.cluster_offsets,
                     indexed_ends=layout.indexed_ends,
@@ -1372,6 +1688,48 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
             return output
         grouped_query = query.reshape(batch, heads, group_size, head_size)
         if (
+            not exact
+            and self.draft_rank_dtype == "int8"
+            and layout.quantized_keys is not None
+            and layout.key_scales is not None
+            and query.dtype in (torch.float16, torch.bfloat16)
+            and group_size <= 16
+            and 32 <= head_size <= 256
+        ):
+            logits = logits_buffer
+            if logits is None:
+                logits = torch.empty(
+                    batch,
+                    heads,
+                    group_size,
+                    clusters,
+                    dtype=torch.float32,
+                    device=query.device,
+                )
+            if mapped_rows is None:
+                mapped_rows = torch.arange(
+                    batch, dtype=torch.int32, device=query.device
+                )
+            with self._cuda_timer("gpu_native_rank_dot"):
+                _cluster_rank_int8_kernel[(triton.cdiv(clusters, 128), batch * heads)](
+                    grouped_query,
+                    layout.quantized_keys,
+                    layout.key_scales,
+                    logits,
+                    mapped_rows,
+                    *grouped_query.stride()[:3],
+                    *layout.quantized_keys.stride()[:3],
+                    *layout.key_scales.stride()[:2],
+                    *logits.stride()[:3],
+                    heads,
+                    group_size,
+                    clusters,
+                    head_size,
+                    128,
+                    max(32, triton.next_power_of_2(head_size)),
+                    num_warps=4,
+                )
+        elif (
             query.dtype in (torch.float16, torch.bfloat16)
             and layout.keys.dtype == query.dtype
             and group_size <= 16
@@ -1387,27 +1745,28 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
                     dtype=torch.float32,
                     device=query.device,
                 )
-            _cluster_rank_dot_kernel[(triton.cdiv(clusters, 128), batch * heads)](
-                grouped_query,
-                layout.keys,
-                logits,
-                request_rows if request_rows is not None else query,
-                *grouped_query.stride()[:3],
-                *layout.keys.stride()[:3],
-                *logits.stride()[:3],
-                heads,
-                group_size,
-                clusters,
-                head_size,
-                128,
-                triton.next_power_of_2(head_size),
-                request_rows is not None,
-                num_warps=4,
-            )
+            with self._cuda_timer("gpu_native_rank_dot"):
+                _cluster_rank_dot_kernel[(triton.cdiv(clusters, 128), batch * heads)](
+                    grouped_query,
+                    layout.keys,
+                    logits,
+                    mapped_rows if mapped_rows is not None else query,
+                    *grouped_query.stride()[:3],
+                    *layout.keys.stride()[:3],
+                    *logits.stride()[:3],
+                    heads,
+                    group_size,
+                    clusters,
+                    head_size,
+                    128,
+                    triton.next_power_of_2(head_size),
+                    mapped_rows is not None,
+                    num_warps=4,
+                )
         else:
             keys = (
-                layout.keys.index_select(0, request_rows.long())
-                if request_rows is not None
+                layout.keys.index_select(0, mapped_rows.long())
+                if mapped_rows is not None
                 else layout.keys[:batch]
             )
             logits = torch.einsum(
@@ -1429,7 +1788,7 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
             active_mask,
             scores,
             candidates,
-            request_rows if request_rows is not None else query,
+            mapped_rows if mapped_rows is not None else query,
             *logits.stride(),
             layout.counts.stride(0),
             layout.counts.stride(1),
@@ -1441,7 +1800,7 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
             scale,
             triton.next_power_of_2(group_size),
             triton.next_power_of_2(clusters),
-            request_rows is not None,
+            mapped_rows is not None,
             num_warps=8 if clusters <= 2048 else 16,
         )
         sparse_width = min(ceil(clusters * self.retrieval_ratio), clusters)
@@ -1449,21 +1808,23 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
             ceil(clusters * self.estimation_ratio), clusters - sparse_width
         )
         if output is None:
-            ranked_scores, ranked = torch.topk(
-                scores, k=sparse_width + estimation_width, dim=2, sorted=True
-            )
+            with self._cuda_timer("gpu_native_rank_topk"):
+                ranked_scores, ranked = torch.topk(
+                    scores, k=sparse_width + estimation_width, dim=2, sorted=True
+                )
             sparse_mass = torch.empty(batch, dtype=torch.float32, device=query.device)
             verification_mass = torch.empty_like(sparse_mass)
             expanded_mass = torch.empty_like(sparse_mass)
         else:
             assert topk_values is not None
-            ranked_scores, ranked = torch.topk(
-                scores,
-                k=sparse_width + estimation_width,
-                dim=2,
-                sorted=True,
-                out=(topk_values, output.ranked),
-            )
+            with self._cuda_timer("gpu_native_rank_topk"):
+                ranked_scores, ranked = torch.topk(
+                    scores,
+                    k=sparse_width + estimation_width,
+                    dim=2,
+                    sorted=True,
+                    out=(topk_values, output.ranked),
+                )
             sparse_mass = output.sparse_mass
             verification_mass = output.verification_mass
             expanded_mass = output.expanded_mass
@@ -1480,7 +1841,6 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
             ranked_scores.shape[2],
             self.retrieval_ratio,
             self.estimation_ratio,
-            self.sparse_verify_exact_fraction,
             triton.next_power_of_2(heads),
             triton.next_power_of_2(ranked_scores.shape[2]),
             num_warps=4,
@@ -1503,11 +1863,19 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
             torch.einsum(
                 "bhgd,bhcd->bhgc",
                 query.reshape(batch, heads, group_size, head_size).float(),
-                layout.keys[:batch].float(),
+                (
+                    layout.keys.index_select(0, layout.request_slots[:batch].long())
+                    if layout.request_slots is not None
+                    else layout.keys[:batch]
+                ).float(),
             )
             * scale
         )
-        counts = layout.counts[:batch]
+        counts = (
+            layout.counts.index_select(0, layout.request_slots[:batch].long())
+            if layout.request_slots is not None
+            else layout.counts[:batch]
+        )
         valid = (counts > 0) & active_mask[:, None, None]
         logits += counts.clamp_min(1).float().log()[:, :, None, :]
         probabilities = torch.softmax(
@@ -1530,14 +1898,11 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
         sparse_mass = (
             (ranked_scores * (rank_ids < retrieval[:, :, None])).sum(2).mean(1)
         )
-        verification_end = (
-            retrieval
-            + torch.ceil(estimation.float() * self.sparse_verify_exact_fraction).int()
-        )
+        verification_end = torch.minimum(retrieval * 2, retrieval + estimation)
         verification_mass = (
             (ranked_scores * (rank_ids < verification_end[:, :, None])).sum(2).mean(1)
         )
-        expanded_end = retrieval + estimation
+        expanded_end = torch.minimum(retrieval * 3, retrieval + estimation)
         expanded_mass = (
             (ranked_scores * (rank_ids < expanded_end[:, :, None])).sum(2).mean(1)
         )
@@ -1637,7 +2002,7 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
         ):
             raise ValueError("Bonus plan steps must be GPU integers")
         plan = self._compute_rank_draft(
-            query, scale, active_mask, layout, request_rows=request_rows
+            query, scale, active_mask, layout, request_rows=request_rows, exact=True
         )
         workspace = self._active_plan_workspaces[layer_name]
         rows = request_rows.long()
@@ -1747,10 +2112,13 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
             )
             if token_indices is None:
                 raise ValueError("Verification requires draft token indices")
-            if bonus_start_index is not None:
-                if not sparse_verify or not 0 < bonus_start_index < query.shape[0]:
-                    raise ValueError("Bonus rows require a sparse verification suffix")
-                with self._cuda_timer("gpu_native_bonus_rank"):
+            if bonus_start_index is not None and (
+                not sparse_verify or not 0 < bonus_start_index < query.shape[0]
+            ):
+                raise ValueError("Bonus rows require a sparse verification suffix")
+            # Draft rows reuse their ranking; only bonus rows lack a plan.
+            if sparse_verify and bonus_start_index is not None:
+                with self._cuda_timer("gpu_native_sparse_rank"):
                     self._rank_parallel_bonus(
                         layer_name,
                         query[bonus_start_index:],
@@ -1833,6 +2201,9 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
                 layout.indexed_ends,
                 seq_lens,
                 request_indices,
+                layout.request_slots
+                if layout.request_slots is not None
+                else request_indices,
                 output,
                 partial_output,
                 partial_maximum,
@@ -1866,7 +2237,6 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
                 self.estimation_ratio,
                 expanded,
                 sparse_verify,
-                self.sparse_verify_exact_fraction,
                 heads,
                 queries_per_kv,
                 layout.counts.shape[2],
@@ -1923,6 +2293,9 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
         self._batch_layers.clear()
         self._workspaces.clear()
         self._workspace_generations.clear()
+        self._arena_slots.clear()
+        self._arena_free_slots.clear()
+        self._arena_versions.clear()
         self._plans.clear()
         self._plan_workspaces.clear()
         self._active_plan_workspaces.clear()

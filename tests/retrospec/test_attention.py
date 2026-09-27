@@ -35,11 +35,11 @@ def make_controller(
                 num_speculative_tokens=num_speculative_tokens,
                 retrospec_retrieval_ratio=0.125,
                 retrospec_estimation_ratio=0.25,
-                retrospec_sparse_verify_exact_fraction=0.875,
                 retrospec_index_segment_size=64,
                 retrospec_index_update_interval=32,
                 retrospec_blocks_per_cluster=1,
                 retrospec_kmeans_iterations=2,
+                retrospec_draft_rank_dtype="int8",
                 retrospec_hit_attn_threshold=None,
                 retrospec_retrieval_attn_threshold=None,
                 retrospec_expanded_attn_threshold=None,
@@ -65,7 +65,6 @@ def test_gpu_native_controller_uses_native_kv_and_shared_statistics():
     assert not controller.selection_provenance_enabled
     assert controller.max_parallel_tokens == 8
     assert controller.index.performance_stats is controller.performance_stats
-    assert controller.index.sparse_verify_exact_fraction == 0.875
     assert not controller.has_retired_kv_blocks(["request"])
     assert controller.take_kv_cache_retirement_ranges(["request"]) == []
 

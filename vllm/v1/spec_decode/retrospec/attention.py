@@ -130,13 +130,11 @@ class RetroSpecSparseAttention:
             num_speculative_tokens=config.num_speculative_tokens,
             retrieval_ratio=config.retrospec_retrieval_ratio,
             estimation_ratio=config.retrospec_estimation_ratio,
-            sparse_verify_exact_fraction=getattr(
-                config, "retrospec_sparse_verify_exact_fraction", 0.875
-            ),
             prefill_segment_size_tokens=config.retrospec_index_segment_size,
             generation_update_interval=config.retrospec_index_update_interval,
             blocks_per_cluster=config.retrospec_blocks_per_cluster,
             num_kmeans_iterations=config.retrospec_kmeans_iterations,
+            draft_rank_dtype=config.retrospec_draft_rank_dtype,
             performance_stats=self.performance_stats,
         )
 

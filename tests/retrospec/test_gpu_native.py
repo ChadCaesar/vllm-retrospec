@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -104,6 +106,89 @@ def test_gpu_native_rank_maps_verification_rows_to_request_slots(clusters: int) 
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_gpu_native_int8_draft_rank_has_high_exact_overlap() -> None:
+    torch.manual_seed(130)
+    device = torch.device("cuda")
+    index = RetroSpecGPUNativeIndex(
+        block_size=16,
+        num_speculative_tokens=8,
+        retrieval_ratio=0.125,
+        estimation_ratio=0.25,
+        prefill_segment_size_tokens=32,
+        generation_update_interval=16,
+        blocks_per_cluster=1,
+        num_kmeans_iterations=1,
+        draft_rank_dtype="int8",
+    )
+    heads, clusters, head_size = 2, 256, 64
+    keys = torch.randn(heads, clusters, head_size, device=device, dtype=torch.bfloat16)
+    counts = torch.full((heads, clusters), 16, device=device, dtype=torch.int32)
+    record = _NativeLayerRecord(
+        indexed_end=16 + clusters * 16,
+        keys=keys,
+        values=keys,
+        counts=counts,
+        token_indices=torch.empty(
+            heads, clusters * 16, device=device, dtype=torch.int32
+        ),
+        cluster_offsets=torch.arange(clusters + 1, device=device, dtype=torch.int32)
+        .expand(heads, -1)
+        .contiguous()
+        * 16,
+    )
+    index._records["layer"] = {"request": record}
+    index.begin_proposal(("request",))
+    try:
+        layout = index._batch_layer("layer", device, torch.bfloat16)
+        assert layout.quantized_keys is not None
+        query = torch.randn(
+            1, heads * 4, head_size, device=device, dtype=torch.bfloat16
+        )
+        active = torch.ones(1, device=device, dtype=torch.bool)
+        approximate = index._compute_rank_draft(query, head_size**-0.5, active, layout)
+        exact = index._compute_rank_draft(
+            query, head_size**-0.5, active, layout, exact=True
+        )
+        retrieval = 32
+        selected = approximate.ranked[0, :, :retrieval]
+        overlap = (selected[:, :, None] == exact.ranked[0, :, None, :retrieval]).any(2)
+        assert overlap.float().mean().item() >= 0.9
+        assert torch.equal(exact.candidate_counts, approximate.candidate_counts)
+    finally:
+        index.end_proposal()
+
+
+def test_gpu_native_mass_uses_one_two_three_exact_zones() -> None:
+    index = RetroSpecGPUNativeIndex(
+        block_size=16,
+        num_speculative_tokens=4,
+        retrieval_ratio=0.125,
+        estimation_ratio=0.5,
+        prefill_segment_size_tokens=32,
+        generation_update_interval=16,
+        blocks_per_cluster=1,
+        num_kmeans_iterations=1,
+    )
+    keys = torch.eye(8).reshape(1, 1, 8, 8)
+    layout = _NativeBatchLayer(
+        keys=keys,
+        values=keys,
+        counts=torch.ones(1, 1, 8, dtype=torch.int32),
+        token_indices=torch.empty(1, 1, 0, dtype=torch.int32),
+        cluster_offsets=torch.empty(1, 1, 0, dtype=torch.int32),
+        indexed_ends=torch.zeros(1, dtype=torch.int32),
+    )
+    query = torch.tensor([[[4.0, 3.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0]]])
+    plan = index._compute_rank_draft_torch(
+        query, 1.0, torch.ones(1, dtype=torch.bool), layout
+    )
+    scores = torch.softmax(query[0, 0], dim=0).sort(descending=True).values
+    torch.testing.assert_close(plan.sparse_mass, scores[:1].sum().reshape(1))
+    torch.testing.assert_close(plan.verification_mass, scores[:2].sum().reshape(1))
+    torch.testing.assert_close(plan.expanded_mass, scores[:3].sum().reshape(1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_gpu_native_bonus_rank_plan_uses_request_and_step_slots() -> None:
     torch.manual_seed(70)
     device = torch.device("cuda")
@@ -192,13 +277,9 @@ def _reference_attention(
         )
         total = retrieval + estimation
         if expanded:
-            retrieval = total
+            retrieval = min(retrieval * 3, total)
         elif sparse_verify:
-            retrieval += int(
-                torch.ceil(
-                    torch.tensor(estimation * index.sparse_verify_exact_fraction)
-                )
-            )
+            retrieval = min(retrieval * 2, total)
         keys = []
         values = []
         weights = []
@@ -262,6 +343,13 @@ def test_gpu_native_clustered_draft_and_expanded_attention(query_heads: int) -> 
     index.flush_staged_updates()
     record = index._records["layer"]["request"]
     assert record.indexed_end == 96
+    assert torch.equal(
+        record.token_indices.sort(dim=1).values,
+        torch.arange(16, 96, device=device, dtype=torch.int32).expand(2, -1),
+    )
+    assert torch.equal(
+        record.cluster_offsets[:, -1], torch.full((2,), 80, device=device)
+    )
     assert all(
         tensor.is_cuda
         for tensor in (
@@ -320,28 +408,31 @@ def test_gpu_native_clustered_draft_and_expanded_attention(query_heads: int) -> 
             atol=2e-2,
             rtol=2e-2,
         )
+        verify_query = -query
         sparse_output = torch.empty_like(query)
-        index.forward(
-            layer_name="layer",
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_table=block_table,
-            seq_lens=torch.tensor([128], device=device, dtype=torch.int32),
-            active_mask=torch.ones(1, device=device, dtype=torch.bool),
-            scale=32**-0.5,
-            output=sparse_output,
-            step=-1,
-            sparse_verify=True,
-            request_indices=torch.tensor([0], device=device, dtype=torch.int32),
-            token_indices=torch.tensor([0], device=device, dtype=torch.int32),
-        )
+        with patch.object(index, "_rank_parallel_bonus") as rank_bonus:
+            index.forward(
+                layer_name="layer",
+                query=verify_query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=block_table,
+                seq_lens=torch.tensor([128], device=device, dtype=torch.int32),
+                active_mask=torch.ones(1, device=device, dtype=torch.bool),
+                scale=32**-0.5,
+                output=sparse_output,
+                step=-1,
+                sparse_verify=True,
+                request_indices=torch.tensor([0], device=device, dtype=torch.int32),
+                token_indices=torch.tensor([0], device=device, dtype=torch.int32),
+            )
+        rank_bonus.assert_not_called()
         torch.testing.assert_close(
             sparse_output,
             _reference_attention(
                 index,
                 "layer",
-                query,
+                verify_query,
                 key_cache,
                 value_cache,
                 0,
@@ -351,10 +442,12 @@ def test_gpu_native_clustered_draft_and_expanded_attention(query_heads: int) -> 
             atol=2e-2,
             rtol=2e-2,
         )
+        sparse_ranked = index._plans["layer"][0].ranked.clone()
+        assert torch.equal(sparse_ranked, first_ranked)
         expanded_output = torch.empty_like(query)
         index.forward(
             layer_name="layer",
-            query=query,
+            query=verify_query,
             key_cache=key_cache,
             value_cache=value_cache,
             block_table=block_table,
@@ -370,11 +463,12 @@ def test_gpu_native_clustered_draft_and_expanded_attention(query_heads: int) -> 
         torch.testing.assert_close(
             expanded_output,
             _reference_attention(
-                index, "layer", query, key_cache, value_cache, 0, True
+                index, "layer", verify_query, key_cache, value_cache, 0, True
             ),
             atol=2e-2,
             rtol=2e-2,
         )
+        assert torch.equal(index._plans["layer"][0].ranked, sparse_ranked)
     finally:
         index.end_proposal()
 
@@ -547,27 +641,32 @@ def test_gpu_native_workspace_reuses_addresses_and_grows_on_demand() -> None:
     index.begin_proposal(("first",))
     first = index._batch_layer("layer", device, torch.float32)
     first_address = first.keys.data_ptr()
+    resident_record = index._records["layer"]["first"]
+    assert resident_record.keys.data_ptr() == first.keys[1].data_ptr()
     plan_address = index._active_plan_workspaces["layer"].ranked.data_ptr()
-    assert first.keys.shape[:3] == (1, 1, 1)
+    assert first.keys.shape[:3] == (2, 1, 1)
+    assert first.request_slots.tolist() == [1]
     index._active_plan_workspaces["layer"].candidate_counts.fill_(7)
     index.end_proposal()
 
     index.begin_proposal(("first",))
     reused = index._batch_layer("layer", device, torch.float32)
     assert reused.keys.data_ptr() == first_address
+    assert index._records["layer"]["first"] is resident_record
     reused_plan = index._active_plan_workspaces["layer"]
     assert reused_plan.ranked.data_ptr() == plan_address
-    assert not reused_plan.candidate_counts.any()
+    assert not reused_plan.candidate_counts[:, :1].any()
     index.end_proposal()
 
     index._records["layer"]["second"] = record(5)
     index.begin_proposal(("first", "second"))
     grown = index._batch_layer("layer", device, torch.float32)
-    assert grown.keys.shape[:3] == (2, 1, 8)
+    assert grown.keys.shape[:3] == (4, 1, 5)
+    assert grown.request_slots.tolist() == [1, 2]
     assert grown.keys.data_ptr() != first_address
     assert index._active_plan_workspaces["layer"].ranked.data_ptr() != plan_address
     assert torch.equal(
-        grown.counts[0, 0, 1:], torch.zeros(7, device=device, dtype=torch.int32)
+        grown.counts[1, 0, 1:], torch.zeros(4, device=device, dtype=torch.int32)
     )
     query = torch.randn(2, 2, 32, device=device)
     active = torch.tensor([True, False], device=device)
@@ -701,7 +800,7 @@ def test_gpu_native_large_cluster_rank_matches_reference() -> None:
             query, head_size**-0.5, active_mask, layout
         )
         assert torch.equal(fused.candidate_counts, reference.candidate_counts)
-        expanded_width = 2 * int(
+        expanded_width = 3 * int(
             torch.ceil(torch.tensor(clusters * index.retrieval_ratio))
         )
         assert torch.equal(

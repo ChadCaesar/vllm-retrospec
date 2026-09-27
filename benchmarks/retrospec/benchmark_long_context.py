@@ -4,6 +4,7 @@
 """Run one reproducible RetroSpec long-context request per process."""
 
 import argparse
+import hashlib
 import json
 import subprocess
 import threading
@@ -86,8 +87,11 @@ def parse_args() -> argparse.Namespace:
             "may stop the block earlier."
         ),
     )
-    parser.add_argument("--retrieval-ratio", type=float, default=0.018)
+    parser.add_argument("--retrieval-ratio", type=float, default=0.050)
     parser.add_argument("--estimation-ratio", type=float, default=0.232)
+    parser.add_argument(
+        "--draft-rank-dtype", choices=("int8", "native"), default="native"
+    )
     parser.add_argument("--cache-ratio", type=float, default=0.0)
     parser.add_argument("--index-segment-size", type=int, default=8192)
     parser.add_argument("--index-update-interval", type=int, default=1024)
@@ -132,6 +136,7 @@ def build_speculative_config(args: argparse.Namespace) -> dict[str, Any]:
         "num_speculative_tokens": args.num_speculative_tokens,
         "retrospec_retrieval_ratio": args.retrieval_ratio,
         "retrospec_estimation_ratio": args.estimation_ratio,
+        "retrospec_draft_rank_dtype": args.draft_rank_dtype,
         "retrospec_cache_ratio": args.cache_ratio,
         "retrospec_index_segment_size": args.index_segment_size,
         "retrospec_index_update_interval": args.index_update_interval,
@@ -234,11 +239,15 @@ def main() -> None:
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "num_speculative_tokens": args.num_speculative_tokens,
             "max_draft_tokens": args.max_draft_tokens,
+            "draft_rank_dtype": args.draft_rank_dtype,
             "max_gpu_index_memory": args.max_gpu_index_memory,
             "requested_context_len": args.context_len,
             "actual_prompt_tokens": len(output.prompt_token_ids),
             "requested_output_tokens": args.max_tokens,
             "generated_tokens": output_tokens,
+            "generated_token_ids_sha256": hashlib.sha256(
+                json.dumps(completion.token_ids, separators=(",", ":")).encode()
+            ).hexdigest(),
             "finish_reason": completion.finish_reason,
             "answer": answer,
             "answer_found": answer in completion.text,

@@ -24,9 +24,8 @@ def test_retrospec_defaults():
     assert config.method == "retrospec"
     assert config.model == "retrospec"
     assert config.enforce_eager is True
-    assert config.retrospec_retrieval_ratio == pytest.approx(0.018)
+    assert config.retrospec_retrieval_ratio == pytest.approx(0.050)
     assert config.retrospec_estimation_ratio == pytest.approx(0.232)
-    assert config.retrospec_sparse_verify_exact_fraction == pytest.approx(0.875)
     assert config.retrospec_cache_ratio == pytest.approx(0.0)
     assert config.retrospec_index_segment_size == 8192
     assert config.retrospec_prefill_tile_size == 32768
@@ -43,6 +42,7 @@ def test_retrospec_defaults():
     assert config.retrospec_index_update_interval == 1024
     assert config.retrospec_min_draft_tokens == 1
     assert config.retrospec_max_draft_tokens == 8
+    assert config.retrospec_draft_rank_dtype == "native"
     assert config.retrospec_draft_margin_threshold is None
     assert config.retrospec_sparse_margin_threshold is None
     assert config.retrospec_expanded_margin_threshold is None
@@ -107,6 +107,16 @@ def test_retrospec_expanded_budget():
         )
 
 
+def test_retrospec_rejects_removed_sparse_fraction():
+    with pytest.raises(ValueError, match="retrospec_sparse_verify_exact_fraction"):
+        make_retrospec_config(retrospec_sparse_verify_exact_fraction=0.875)
+
+
+def test_retrospec_rejects_invalid_draft_rank_dtype():
+    with pytest.raises(ValueError, match="retrospec_draft_rank_dtype"):
+        make_retrospec_config(retrospec_draft_rank_dtype="float8")
+
+
 def test_retrospec_accepts_piecewise_cudagraph_execution():
     config = make_retrospec_config(enforce_eager=False)
 
@@ -129,8 +139,6 @@ def test_retrospec_inherits_target_enforce_eager(target_enforce_eager: bool):
         ("retrospec_retrieval_ratio", 1.0),
         ("retrospec_estimation_ratio", -0.01),
         ("retrospec_estimation_ratio", 1.0),
-        ("retrospec_sparse_verify_exact_fraction", -0.01),
-        ("retrospec_sparse_verify_exact_fraction", 1.01),
         ("retrospec_cache_ratio", -0.01),
         ("retrospec_cache_ratio", 1.01),
         ("retrospec_index_segment_size", 0),
@@ -224,7 +232,6 @@ def test_retrospec_clears_prompt_lookup_fields():
     [
         ("retrospec_retrieval_ratio", 0.02),
         ("retrospec_estimation_ratio", 0.25),
-        ("retrospec_sparse_verify_exact_fraction", 0.5),
         ("retrospec_cache_ratio", 0.1),
         ("retrospec_index_segment_size", 2048),
         ("retrospec_prefill_tile_size", 4096),
@@ -233,6 +240,7 @@ def test_retrospec_clears_prompt_lookup_fields():
         ("retrospec_index_update_interval", 2048),
         ("retrospec_min_draft_tokens", 2),
         ("retrospec_max_draft_tokens", 20),
+        ("retrospec_draft_rank_dtype", "int8"),
         ("num_speculative_tokens", 80),
     ],
 )
