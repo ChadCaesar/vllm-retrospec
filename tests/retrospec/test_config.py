@@ -6,7 +6,13 @@ from typing import Any
 
 import pytest
 
-from vllm.config import ParallelConfig, SpeculativeConfig
+from vllm.config import (
+    CompilationConfig,
+    DeviceConfig,
+    ParallelConfig,
+    SpeculativeConfig,
+    VllmConfig,
+)
 
 
 def make_retrospec_config(**overrides: Any) -> SpeculativeConfig:
@@ -59,6 +65,46 @@ def test_retrospec_defaults():
     assert repr(config) == (
         "SpeculativeConfig(method='retrospec', model=None, num_spec_tokens=64)"
     )
+
+
+def test_retrospec_enables_fused_rms_norm_by_default():
+    config = VllmConfig(
+        speculative_config=make_retrospec_config(),
+        device_config=DeviceConfig("cpu"),
+    )
+
+    assert config.compilation_config.is_custom_op_enabled("rms_norm")
+    assert config.compilation_config.custom_ops.count("+rms_norm") == 1
+
+
+@pytest.mark.parametrize(
+    "custom_ops", [["none"], ["none", "-rms_norm"], ["all", "-rms_norm"]]
+)
+def test_retrospec_respects_explicit_rms_norm_opt_out(custom_ops: list[str]):
+    config = VllmConfig(
+        speculative_config=make_retrospec_config(),
+        compilation_config=CompilationConfig(custom_ops=custom_ops),
+        device_config=DeviceConfig("cpu"),
+    )
+
+    assert not config.compilation_config.is_custom_op_enabled("rms_norm")
+    assert "+rms_norm" not in config.compilation_config.custom_ops
+
+
+def test_retrospec_does_not_duplicate_explicit_rms_norm_opt_in():
+    config = VllmConfig(
+        speculative_config=make_retrospec_config(),
+        compilation_config=CompilationConfig(custom_ops=["none", "+rms_norm"]),
+        device_config=DeviceConfig("cpu"),
+    )
+
+    assert config.compilation_config.custom_ops.count("+rms_norm") == 1
+
+
+def test_non_retrospec_does_not_enable_fused_rms_norm_by_default():
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+
+    assert not config.compilation_config.is_custom_op_enabled("rms_norm")
 
 
 def test_retrospec_requires_num_speculative_tokens():
