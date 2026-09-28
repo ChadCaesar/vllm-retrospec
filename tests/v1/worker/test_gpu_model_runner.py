@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -43,6 +45,14 @@ from vllm.v1.worker.utils import AttentionGroup
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE = current_platform.device_type
+
+
+@pytest.fixture(autouse=True)
+def restore_default_dtype():
+    previous_dtype = torch.get_default_dtype()
+    yield
+    if torch.get_default_dtype() != previous_dtype:
+        torch.set_default_dtype(previous_dtype)
 
 
 def initialize_kv_cache(runner: GPUModelRunner):
@@ -337,6 +347,59 @@ def test_update_states_request_resumed(model_runner, dist_init):
     assert _is_req_added(model_runner, req_id)
     assert _is_req_scheduled(model_runner, req_id)
     assert _is_req_state_block_table_match(model_runner, req_id)
+
+
+def test_update_states_restores_accepted_tokens_after_pp_batch_gap(
+    model_runner, dist_init, monkeypatch
+):
+    req_id = "req_0"
+    model_runner._update_states(_schedule_new_request(req_id))
+    model_runner.requests[req_id].output_token_ids = [10]
+    model_runner._update_states(
+        SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+        )
+    )
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False),
+    )
+    cached_req_data = CachedRequestData(
+        req_ids=[req_id],
+        resumed_req_ids=set(),
+        new_token_ids=[[12]],
+        all_token_ids={req_id: [1, 2, 3, 10, 11, 12]},
+        new_block_ids=[None],
+        num_computed_tokens=[5],
+        num_output_tokens=[3],
+    )
+    model_runner._update_states(
+        SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=cached_req_data,
+            num_scheduled_tokens={req_id: 2},
+            total_num_scheduled_tokens=2,
+            scheduled_spec_decode_tokens={req_id: [13]},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+        )
+    )
+
+    assert model_runner.requests[req_id].output_token_ids == [10, 11, 12]
+    req_index = model_runner.input_batch.req_id_to_index[req_id]
+    cached_tokens = model_runner.input_batch.token_ids_cpu[req_index, 3:7]
+    assert cached_tokens.tolist() == [10, 11, 12, 13]
 
 
 def test_get_nans_in_logits(model_runner, dist_init):

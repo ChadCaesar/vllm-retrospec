@@ -254,20 +254,29 @@ class RetroSpecSparseAttention:
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
     ) -> torch.cuda.Event | None:
-        del layer_name, request_id, seq_len, key_cache, value_cache, block_table
-        raise NotImplementedError("GPU-native RetroSpec uses ordinary chunked prefill")
+        self.index.build_or_update(
+            layer_name=layer_name,
+            request_ids=(request_id,),
+            seq_lens=(seq_len,),
+            is_prefill=(True,),
+            rows=(0,),
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            prefill_complete=(True,),
+        )
+        return None
 
     @contextmanager
     def capture_layer_major_prefill_query(self, layer_name: str) -> Iterator[None]:
         del layer_name
-        raise NotImplementedError("GPU-native RetroSpec uses ordinary chunked prefill")
         yield
 
     def commit_layer_major_prefill(
         self, request_id: str, layer_names: Sequence[str]
     ) -> None:
         del request_id, layer_names
-        raise NotImplementedError("GPU-native RetroSpec uses ordinary chunked prefill")
+        self.index.flush_staged_updates()
 
     def abort_layer_major_prefill(self) -> None:
         self.index.discard_staged_updates()

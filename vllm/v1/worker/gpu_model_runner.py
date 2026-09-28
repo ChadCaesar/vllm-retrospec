@@ -1132,18 +1132,29 @@ class GPUModelRunner(
                     # sampled token ids back because there's no direct communication
                     # between the first-stage worker and the last-stage worker.
                     new_token_ids = req_data.new_token_ids[i]
-                    # Add the sampled token(s) from the previous step (if any).
-                    # This doesn't include "unverified" tokens like spec tokens.
-                    num_new_tokens = (
-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
-                    )
-                    if num_new_tokens == 1:
-                        # Avoid slicing list in most common case.
-                        req_state.output_token_ids.append(new_token_ids[-1])
-                    elif num_new_tokens > 0:
-                        req_state.output_token_ids.extend(
-                            new_token_ids[-num_new_tokens:]
+                    all_token_ids = req_data.all_token_ids.get(req_id)
+                    if req_index is None and all_token_ids is not None:
+                        # A request absent from the previous PP batch can have
+                        # accepted spec tokens that are not in new_token_ids.
+                        # Restore its full committed output before re-adding it.
+                        req_state.output_token_ids = all_token_ids[
+                            req_state.num_prompt_tokens :
+                        ]
+                    else:
+                        # Add the sampled token(s) from the previous step (if any).
+                        # This doesn't include "unverified" tokens like spec tokens.
+                        num_new_tokens = (
+                            num_computed_tokens
+                            + len(new_token_ids)
+                            - req_state.num_tokens
                         )
+                        if num_new_tokens == 1:
+                            # Avoid slicing list in most common case.
+                            req_state.output_token_ids.append(new_token_ids[-1])
+                        elif num_new_tokens > 0:
+                            req_state.output_token_ids.extend(
+                                new_token_ids[-num_new_tokens:]
+                            )
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure. Align the cached state.
@@ -3381,13 +3392,16 @@ class GPUModelRunner(
             prompt_token_ids = torch.tensor(
                 request.prompt_token_ids, dtype=torch.int64, device=self.device
             )
-        hidden_states = protocol.prepare_layer_prefill_input(
+        hidden_states, residual_states = protocol.prepare_layer_prefill_input(
             stage=stage,
             layer_model=layer_model,
             prompt_token_ids=prompt_token_ids,
             intermediate_tensors=intermediate_tensors,
             prompt_num_tokens=prompt_num_tokens,
         )
+        has_residual_input = residual_states is not None
+        if residual_states is None:
+            residual_states = torch.empty_like(hidden_states)
         builder = drafter.get_attention_metadata_builder()
         tile_planner = self.retrospec_layer_prefill_tile_planner
         if tile_planner is None:
@@ -3504,15 +3518,22 @@ class GPUModelRunner(
                                 layer_index,
                                 positions[tile_start:tile_end],
                                 hidden_states[tile_start:tile_end],
-                                None,
+                                residual_states[tile_start:tile_end]
+                                if has_residual_input
+                                else None,
                             )
 
-                        if tile_residual is not None:
-                            tile_hidden = tile_hidden + tile_residual
+                        if tile_residual is None:
+                            raise RuntimeError(
+                                "Layer-major prefill layer did not return residual"
+                            )
+                        # The first layer may return its input hidden slice as residual.
+                        residual_states[tile_start:tile_end].copy_(tile_residual)
                         hidden_states[tile_start:tile_end].copy_(tile_hidden)
 
                     stats.stop_cuda_timer(compute_timer)
                     compute_timer = None
+                    has_residual_input = True
 
                     assert full_prompt_tile is not None
                     key_cache, value_cache = workspace.kv_cache.unbind(0)
@@ -3571,10 +3592,14 @@ class GPUModelRunner(
                 spec_decode_metadata=None,
                 common_attn_metadata=common_metadata,
             )
-            return protocol.make_layer_prefill_output(stage, hidden_states)
+            return protocol.make_layer_prefill_output(
+                stage, hidden_states, residual_states
+            )
 
-        last_hidden_state = layer_model.finalize_hidden_states(hidden_states[-1:], None)
-        del hidden_states
+        last_hidden_state = layer_model.finalize_hidden_states(
+            hidden_states[-1:], residual_states[-1:]
+        )
+        del hidden_states, residual_states
         logits = self.model.compute_logits(last_hidden_state)
         if logits is None:
             raise RuntimeError("Layer-major prefill did not produce logits")

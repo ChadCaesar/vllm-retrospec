@@ -258,9 +258,11 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
-        # Native KV persists on GPU, so regular chunked prefill never needs
-        # the offload-oriented layer-major execution protocol.
-        self.enable_retrospec_layer_major_prefill = False
+        # Long GPU-native prompts use the layer-major executor, but retain
+        # every native KV block for the final target-model verification.
+        self.enable_retrospec_layer_major_prefill = (
+            speculative_config is not None and speculative_config.method == "retrospec"
+        )
         self.retrospec_layer_major_prefill_threshold = (
             speculative_config.retrospec_index_segment_size
             if self.enable_retrospec_layer_major_prefill
@@ -480,6 +482,7 @@ class Scheduler(SchedulerInterface):
             num_recent_blocks=num_recent_blocks,
             blocks_per_cluster=self.retrospec_blocks_per_cluster,
             num_lookahead_tokens=self.num_lookahead_tokens,
+            retain_all_kv=True,
         )
 
     def _select_retrospec_layer_major_prefill_request(self) -> str | None:
@@ -1136,6 +1139,7 @@ class Scheduler(SchedulerInterface):
                         num_recent_blocks=num_recent_blocks,
                         blocks_per_cluster=self.retrospec_blocks_per_cluster,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        retain_all_kv=True,
                     )
                     if allocation is None:
                         new_blocks = None

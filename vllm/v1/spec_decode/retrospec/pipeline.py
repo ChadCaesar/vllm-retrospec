@@ -104,6 +104,7 @@ class RetroSpecPipelineProtocol:
     """Fixed-capacity GPU communication protocol for RetroSpec PP."""
 
     _HIDDEN_STATES_KEY = "retrospec_hidden_states"
+    _RESIDUAL_KEY = "retrospec_residual"
     _MODEL_HIDDEN_STATES_KEY = "hidden_states"
     _MODEL_RESIDUAL_KEY = "residual"
     _MODEL_TENSOR_KEYS = frozenset({_MODEL_HIDDEN_STATES_KEY, _MODEL_RESIDUAL_KEY})
@@ -216,7 +217,7 @@ class RetroSpecPipelineProtocol:
         prompt_token_ids: torch.Tensor | None,
         intermediate_tensors: IntermediateTensors | None,
         prompt_num_tokens: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if prompt_num_tokens <= 0:
             raise ValueError("prompt_num_tokens must be greater than zero")
 
@@ -233,7 +234,7 @@ class RetroSpecPipelineProtocol:
                 raise ValueError(
                     "Prompt token IDs do not match the layer-prefill descriptor"
                 )
-            return layer_model.embed_input_ids(prompt_token_ids)
+            return layer_model.embed_input_ids(prompt_token_ids), None
 
         if prompt_token_ids is not None:
             raise RuntimeError(
@@ -254,12 +255,23 @@ class RetroSpecPipelineProtocol:
             )
         if hidden_states.device != self.device:
             raise ValueError("RetroSpec PP hidden-state payload is on the wrong device")
-        return hidden_states
+        residual = intermediate_tensors.tensors.get(self._RESIDUAL_KEY)
+        if residual is None:
+            raise RuntimeError("RetroSpec PP payload does not contain residual")
+        if (
+            residual.shape != hidden_states.shape
+            or residual.dtype != hidden_states.dtype
+        ):
+            raise ValueError("Invalid RetroSpec PP residual payload shape or dtype")
+        if residual.device != self.device:
+            raise ValueError("RetroSpec PP residual payload is on the wrong device")
+        return hidden_states, residual
 
     def make_layer_prefill_output(
         self,
         stage: RetroSpecPipelineStage,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
     ) -> IntermediateTensors:
         if stage.is_last:
             raise RuntimeError(
@@ -269,9 +281,19 @@ class RetroSpecPipelineProtocol:
             raise ValueError("RetroSpec PP hidden states must be two-dimensional")
         if hidden_states.device != self.device:
             raise ValueError("RetroSpec PP hidden states are on the wrong device")
+        if (
+            residual.shape != hidden_states.shape
+            or residual.dtype != hidden_states.dtype
+        ):
+            raise ValueError("RetroSpec PP residual has an invalid shape or dtype")
+        if residual.device != self.device:
+            raise ValueError("RetroSpec PP residual is on the wrong device")
 
         return IntermediateTensors(
-            {self._HIDDEN_STATES_KEY: hidden_states.contiguous()}
+            {
+                self._HIDDEN_STATES_KEY: hidden_states.contiguous(),
+                self._RESIDUAL_KEY: residual.contiguous(),
+            }
         )
 
     def _proposal_activation_shapes(

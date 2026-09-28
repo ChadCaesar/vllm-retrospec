@@ -400,10 +400,24 @@ def test_native_full_verification_has_no_transfer_or_retirement():
         controller.maybe_prime_full_verification(8)
 
 
-def test_legacy_layer_major_prefill_is_not_used_by_gpu_native_mode():
+def test_layer_major_prefill_builds_gpu_index_and_commits():
     controller = make_controller()
-    with pytest.raises(NotImplementedError, match="ordinary chunked prefill"):
+    keys = torch.empty(4, 16, 2, 8)
+    values = torch.empty_like(keys)
+    block_table = torch.arange(4, dtype=torch.int32).unsqueeze(0)
+    with (
+        patch.object(controller.index, "build_or_update") as build,
+        patch.object(controller.index, "flush_staged_updates") as flush,
+    ):
+        controller.stage_layer_major_prefill_layer(
+            "layer", "request", 64, keys, values, block_table
+        )
+        build.assert_called_once()
+        assert build.call_args.kwargs["prefill_complete"] == (True,)
+        with controller.capture_layer_major_prefill_query("layer"):
+            pass
         controller.commit_layer_major_prefill("request", ["layer"])
+        flush.assert_called_once_with()
 
 
 def test_install_and_uninstall_restore_original_attention_forward():

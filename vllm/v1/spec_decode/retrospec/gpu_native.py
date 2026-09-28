@@ -2007,7 +2007,7 @@ class RetroSpecGPUNativeIndex(RetroSpecIndexBase):
         workspace = self._active_plan_workspaces[layer_name]
         rows = request_rows.long()
         steps = token_steps.long()
-        workspace.ranked[steps, rows] = plan.ranked
+        workspace.ranked[steps, rows, :, : plan.ranked.shape[-1]] = plan.ranked
         workspace.candidate_counts[steps, rows] = plan.candidate_counts
         workspace.sparse_mass[steps, rows] = plan.sparse_mass
         workspace.verification_mass[steps, rows] = plan.verification_mass

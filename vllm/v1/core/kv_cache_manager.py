@@ -407,8 +407,9 @@ class KVCacheManager:
         num_recent_blocks: int,
         blocks_per_cluster: int,
         num_lookahead_tokens: int,
+        retain_all_kv: bool = False,
     ) -> tuple[int, int, tuple[int, ...]]:
-        """Build the sparse logical layout used by layer-major prefill."""
+        """Build the native KV layout used by layer-major prefill."""
         if prompt_num_tokens <= 0:
             raise ValueError("prompt_num_tokens must be positive")
         if prompt_num_tokens > self.max_model_len:
@@ -436,10 +437,14 @@ class KVCacheManager:
         )
         resident_start_block = 1 + num_clustered_blocks
 
-        resident_block_indices = (
-            0,
-            *range(resident_start_block, num_logical_blocks),
-        )
+        if retain_all_kv:
+            resident_start_block = 1
+            resident_block_indices = tuple(range(num_logical_blocks))
+        else:
+            resident_block_indices = (
+                0,
+                *range(resident_start_block, num_logical_blocks),
+            )
         return (
             num_logical_blocks,
             resident_start_block,
@@ -453,6 +458,7 @@ class KVCacheManager:
         num_recent_blocks: int,
         blocks_per_cluster: int,
         num_lookahead_tokens: int,
+        retain_all_kv: bool = False,
     ) -> bool:
         """Return whether layer-major prefill can allocate without mutation."""
         if request.num_computed_tokens != 0:
@@ -465,6 +471,7 @@ class KVCacheManager:
             num_recent_blocks,
             blocks_per_cluster,
             num_lookahead_tokens,
+            retain_all_kv,
         )
         return len(resident_block_indices) <= self.block_pool.get_num_free_blocks()
 
@@ -475,8 +482,9 @@ class KVCacheManager:
         num_recent_blocks: int,
         blocks_per_cluster: int,
         num_lookahead_tokens: int,
+        retain_all_kv: bool = False,
     ) -> tuple[KVCacheBlocks, int, int] | None:
-        """Allocate native blocks outside the cluster-backed prompt prefix."""
+        """Allocate native blocks required by layer-major prefill."""
         if request.num_computed_tokens != 0:
             raise ValueError("Layer-major prefill requires an uncomputed prompt")
 
@@ -489,6 +497,7 @@ class KVCacheManager:
             num_recent_blocks,
             blocks_per_cluster,
             num_lookahead_tokens,
+            retain_all_kv,
         )
 
         blocks = self.coordinator.allocate_retrospec_prefill_blocks(

@@ -604,6 +604,7 @@ def test_gpu_native_rollback_drops_uncommitted_clusters() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_gpu_native_workspace_reuses_addresses_and_grows_on_demand() -> None:
+    torch.manual_seed(101)
     device = torch.device("cuda")
     index = RetroSpecGPUNativeIndex(
         block_size=16,
@@ -709,6 +710,78 @@ def test_gpu_native_workspace_reuses_addresses_and_grows_on_demand() -> None:
     assert shrunk_plan.ranked[0, 0, 0].item() == 0
     assert torch.equal(shrunk_plan.ranked, shrunk_reference.ranked)
     torch.testing.assert_close(shrunk_plan.sparse_mass, shrunk_reference.sparse_mass)
+    bonus_rows = torch.tensor([0], device=device)
+    bonus_steps = torch.tensor([1], device=device)
+    shrunk_bonus = index._rank_parallel_bonus(
+        "layer",
+        small_query,
+        32**-0.5,
+        bonus_rows,
+        bonus_steps,
+        small_active,
+        shrunk,
+    )
+    assert torch.equal(
+        index._active_plan_workspaces["layer"].ranked[
+            bonus_steps, bonus_rows, :, : shrunk_bonus.ranked.shape[-1]
+        ],
+        shrunk_bonus.ranked,
+    )
+    # A reused plan can be wider than the active one-cluster request. Make its
+    # unused tail valid-but-wrong so an accidental read changes the result.
+    index._active_plan_workspaces["layer"].ranked[..., 1:].zero_()
+    key_cache = torch.randn(2, 16, 1, 32, device=device)
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.arange(2, device=device, dtype=torch.int32).expand(2, -1)
+    index.forward(
+        layer_name="layer",
+        query=small_query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table[:1],
+        seq_lens=torch.tensor([32], device=device, dtype=torch.int32),
+        active_mask=small_active,
+        scale=32**-0.5,
+        output=torch.empty_like(small_query),
+        step=0,
+    )
+    verify_query = torch.randn(2, 2, 32, device=device)
+    verify_rows = torch.zeros(2, device=device, dtype=torch.int32)
+    verify_steps = torch.arange(2, device=device, dtype=torch.int32)
+    flat_keys = key_cache[:, :, 0].reshape(32, 32)
+    flat_values = value_cache[:, :, 0].reshape(32, 32)
+    expected = torch.stack(
+        [
+            torch.stack(
+                [
+                    torch.softmax(flat_keys @ verify_query[row, head] * 32**-0.5, dim=0)
+                    @ flat_values
+                    for head in range(2)
+                ]
+            )
+            for row in range(2)
+        ]
+    )
+    for expanded in (False, True):
+        output = torch.empty_like(verify_query)
+        index.forward(
+            layer_name="layer",
+            query=verify_query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            seq_lens=torch.full((2,), 32, device=device, dtype=torch.int32),
+            active_mask=torch.ones(2, device=device, dtype=torch.bool),
+            scale=32**-0.5,
+            output=output,
+            step=-1,
+            expanded=expanded,
+            sparse_verify=not expanded,
+            request_indices=verify_rows,
+            token_indices=verify_steps,
+            bonus_start_index=1 if not expanded else None,
+        )
+        torch.testing.assert_close(output, expected, atol=1e-4, rtol=1e-4)
     index.end_proposal()
 
     index.begin_proposal(("first", "second"))

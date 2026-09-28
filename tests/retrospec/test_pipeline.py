@@ -210,7 +210,7 @@ def test_first_pipeline_stage_embeds_prompt_tokens():
     stage = RetroSpecPipelineStage(0, 2, 0, 2)
     token_ids = torch.tensor([2, 4, 6], dtype=torch.int64)
 
-    hidden_states = protocol.prepare_layer_prefill_input(
+    hidden_states, residual = protocol.prepare_layer_prefill_input(
         stage=stage,
         layer_model=model,
         prompt_token_ids=token_ids,
@@ -222,27 +222,56 @@ def test_first_pipeline_stage_embeds_prompt_tokens():
         hidden_states,
         torch.tensor([[2.0, 2.0, 2.0], [4.0, 4.0, 4.0], [6.0, 6.0, 6.0]]),
     )
+    assert residual is None
 
 
-def test_nonfirst_pipeline_stage_consumes_and_emits_contiguous_hidden_states():
+def test_nonfirst_pipeline_stage_preserves_hidden_and_residual():
     protocol = make_protocol()
     model = FakeLayerModel(start_layer=2, end_layer=4)
     stage = RetroSpecPipelineStage(1, 3, 2, 4)
     hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4).T
-    intermediate = IntermediateTensors({protocol._HIDDEN_STATES_KEY: hidden_states})
+    residual = hidden_states + 1
+    intermediate = IntermediateTensors(
+        {
+            protocol._HIDDEN_STATES_KEY: hidden_states,
+            protocol._RESIDUAL_KEY: residual,
+        }
+    )
 
-    received = protocol.prepare_layer_prefill_input(
+    received_hidden, received_residual = protocol.prepare_layer_prefill_input(
         stage=stage,
         layer_model=model,
         prompt_token_ids=None,
         intermediate_tensors=intermediate,
         prompt_num_tokens=4,
     )
-    output = protocol.make_layer_prefill_output(stage, received)
+    output = protocol.make_layer_prefill_output(
+        stage, received_hidden, received_residual
+    )
 
-    assert received.data_ptr() == hidden_states.data_ptr()
+    assert received_hidden.data_ptr() == hidden_states.data_ptr()
+    assert received_residual.data_ptr() == residual.data_ptr()
     assert output[protocol._HIDDEN_STATES_KEY].is_contiguous()
+    assert output[protocol._RESIDUAL_KEY].is_contiguous()
     torch.testing.assert_close(output[protocol._HIDDEN_STATES_KEY], hidden_states)
+    torch.testing.assert_close(output[protocol._RESIDUAL_KEY], residual)
+
+
+def test_nonfirst_pipeline_stage_rejects_missing_residual():
+    protocol = make_protocol()
+    model = FakeLayerModel(start_layer=2, end_layer=4)
+    stage = RetroSpecPipelineStage(1, 3, 2, 4)
+    hidden_states = torch.zeros(4, 3)
+    intermediate = IntermediateTensors({protocol._HIDDEN_STATES_KEY: hidden_states})
+
+    with pytest.raises(RuntimeError, match="does not contain residual"):
+        protocol.prepare_layer_prefill_input(
+            stage=stage,
+            layer_model=model,
+            prompt_token_ids=None,
+            intermediate_tensors=intermediate,
+            prompt_num_tokens=4,
+        )
 
 
 def test_attention_mass_reduction_weights_pipeline_stages_by_layer_count():
