@@ -138,7 +138,10 @@ def make_retrospec_proposal_runner(
 
 def call_retrospec_proposal(runner: GPUModelRunner) -> list[list[int]]:
     pp_group = SimpleNamespace(is_last_rank=True)
-    with patch("vllm.v1.worker.gpu_model_runner.get_pp_group", return_value=pp_group):
+    with patch(
+        "vllm.v1.worker.retrospec_runner_pipeline.get_pp_group",
+        return_value=pp_group,
+    ):
         return runner.propose_draft_token_ids(
             scheduler_output=SimpleNamespace(
                 total_num_scheduled_tokens=2,
@@ -197,7 +200,10 @@ def test_nonfinal_pipeline_rank_saves_proposal_state():
     common_attn_metadata = SimpleNamespace()
     pp_group = SimpleNamespace(world_size=2, is_last_rank=False)
 
-    with patch("vllm.v1.worker.gpu_model_runner.get_pp_group", return_value=pp_group):
+    with patch(
+        "vllm.v1.worker.retrospec_runner_pipeline.get_pp_group",
+        return_value=pp_group,
+    ):
         runner._save_retrospec_pipeline_proposal_state(
             scheduler_output, spec_decode_metadata, common_attn_metadata
         )
@@ -224,7 +230,10 @@ def test_nonfinal_pipeline_rank_participates_without_materializing_output():
     )
     pp_group = SimpleNamespace(is_last_rank=False)
 
-    with patch("vllm.v1.worker.gpu_model_runner.get_pp_group", return_value=pp_group):
+    with patch(
+        "vllm.v1.worker.retrospec_runner_pipeline.get_pp_group",
+        return_value=pp_group,
+    ):
         result = runner._run_retrospec_pipeline_proposal(state, sampled_token_ids=None)
 
     assert result == []
@@ -424,11 +433,11 @@ def test_estimate_layer_prefill_future_memory_uses_actual_prompt_length():
 
     with (
         patch(
-            "vllm.v1.worker.gpu_model_runner.estimate_retrospec_gpu_index_footprint",
+            "vllm.v1.worker.retrospec_runner_prefill.estimate_retrospec_gpu_index_footprint",
             return_value=footprint,
         ) as estimate_footprint,
         patch(
-            "vllm.v1.worker.gpu_model_runner.estimate_retrospec_gpu_index_arena_bytes",
+            "vllm.v1.worker.retrospec_runner_prefill.estimate_retrospec_gpu_index_arena_bytes",
             return_value=1234,
         ) as estimate_arena,
     ):
