@@ -1074,7 +1074,7 @@ def test_run_draft_step_preserves_attention_seq_lens_dtype(monkeypatch):
     proposer.input_ids[0] = 1
     proposer.positions[0] = 3
     monkeypatch.setattr(
-        "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
+        "vllm.v1.spec_decode.retrospec.runtime.proposer_draft.set_forward_context",
         lambda *args, **kwargs: nullcontext(),
     )
 
@@ -1133,7 +1133,7 @@ def test_model_step_sanitizes_input_ids_for_inactive_rows(monkeypatch):
         return_value=attention_stats(2)
     )
     monkeypatch.setattr(
-        "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
+        "vllm.v1.spec_decode.retrospec.runtime.proposer_draft.set_forward_context",
         lambda *args, **kwargs: nullcontext(),
     )
 
@@ -1211,7 +1211,7 @@ def test_model_step_replays_padded_piecewise_graph_without_padding_policy_rows(
         return_value=attention_stats(2)
     )
     monkeypatch.setattr(
-        "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
+        "vllm.v1.spec_decode.retrospec.runtime.proposer_draft.set_forward_context",
         fake_forward_context,
     )
 
@@ -2519,7 +2519,7 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
         return_value=attention_stats(3)
     )
     monkeypatch.setattr(
-        "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
+        "vllm.v1.spec_decode.retrospec.runtime.proposer_verification.set_forward_context",
         lambda *args, **kwargs: nullcontext(),
     )
 
@@ -2610,7 +2610,7 @@ def test_parallel_verification_replays_padded_piecewise_graph(monkeypatch):
         return_value=attention_stats(3)
     )
     monkeypatch.setattr(
-        "vllm.v1.spec_decode.retrospec.proposer.set_forward_context",
+        "vllm.v1.spec_decode.retrospec.runtime.proposer_verification.set_forward_context",
         fake_forward_context,
     )
 
