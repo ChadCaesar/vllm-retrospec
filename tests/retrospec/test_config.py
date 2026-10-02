@@ -6,7 +6,14 @@ from typing import Any
 
 import pytest
 
-from vllm.config import ParallelConfig, SpeculativeConfig
+from vllm.config import (
+    CompilationConfig,
+    DeviceConfig,
+    ModelConfig,
+    ParallelConfig,
+    SpeculativeConfig,
+    VllmConfig,
+)
 
 
 def make_retrospec_config(**overrides: Any) -> SpeculativeConfig:
@@ -63,6 +70,92 @@ def test_retrospec_defaults():
 def test_retrospec_requires_num_speculative_tokens():
     with pytest.raises(ValueError, match="num_speculative_tokens"):
         SpeculativeConfig(method="retrospec")
+
+
+def test_retrospec_enables_fused_rms_norm_by_default():
+    config = VllmConfig(
+        speculative_config=make_retrospec_config(),
+        device_config=DeviceConfig("cpu"),
+    )
+
+    assert config.compilation_config.is_custom_op_enabled("rms_norm")
+    assert config.compilation_config.custom_ops.count("+rms_norm") == 1
+
+
+def test_retrospec_pp_keeps_native_rms_norm_by_default():
+    config = VllmConfig(
+        speculative_config=make_retrospec_config(),
+        parallel_config=ParallelConfig(pipeline_parallel_size=2),
+        device_config=DeviceConfig("cpu"),
+    )
+
+    assert not config.compilation_config.is_custom_op_enabled("rms_norm")
+    assert "+rms_norm" not in config.compilation_config.custom_ops
+
+
+def test_retrospec_eager_keeps_existing_custom_ops_default(tmp_path, monkeypatch):
+    from transformers import Qwen2Config
+
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_safetensors_metadata",
+        lambda *args, **kwargs: None,
+    )
+    model_path = tmp_path / "model"
+    Qwen2Config(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=512,
+        architectures=["Qwen2ForCausalLM"],
+    ).save_pretrained(model_path)
+    model_config = ModelConfig(
+        model=str(model_path),
+        max_model_len=128,
+        enforce_eager=True,
+        dtype="float16",
+    )
+    config = VllmConfig(
+        model_config=model_config,
+        speculative_config=make_retrospec_config(target_model_config=model_config),
+        device_config=DeviceConfig("cpu"),
+    )
+
+    assert config.compilation_config.custom_ops == ["all"]
+    assert config.compilation_config.is_custom_op_enabled("rms_norm")
+
+
+@pytest.mark.parametrize(
+    "custom_ops", [["none"], ["none", "-rms_norm"], ["all", "-rms_norm"]]
+)
+def test_retrospec_respects_explicit_rms_norm_opt_out(custom_ops: list[str]):
+    config = VllmConfig(
+        speculative_config=make_retrospec_config(),
+        compilation_config=CompilationConfig(custom_ops=custom_ops),
+        device_config=DeviceConfig("cpu"),
+    )
+
+    assert not config.compilation_config.is_custom_op_enabled("rms_norm")
+    assert "+rms_norm" not in config.compilation_config.custom_ops
+
+
+def test_retrospec_does_not_duplicate_explicit_rms_norm_opt_in():
+    config = VllmConfig(
+        speculative_config=make_retrospec_config(),
+        compilation_config=CompilationConfig(custom_ops=["none", "+rms_norm"]),
+        device_config=DeviceConfig("cpu"),
+    )
+
+    assert config.compilation_config.custom_ops.count("+rms_norm") == 1
+
+
+def test_non_retrospec_does_not_enable_fused_rms_norm_by_default():
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+
+    assert not config.compilation_config.is_custom_op_enabled("rms_norm")
 
 
 def test_retrospec_draft_range():

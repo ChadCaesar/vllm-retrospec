@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -337,6 +339,61 @@ def test_update_states_request_resumed(model_runner, dist_init):
     assert _is_req_added(model_runner, req_id)
     assert _is_req_scheduled(model_runner, req_id)
     assert _is_req_state_block_table_match(model_runner, req_id)
+
+
+def test_pp_reentered_request_restores_accepted_spec_tokens(
+    model_runner, dist_init, monkeypatch
+):
+    req_id = "req_0"
+    model_runner.use_async_scheduling = False
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False),
+    )
+    model_runner._update_states(_schedule_new_request(req_id))
+
+    # The request leaves the persistent batch while the scheduler retains it.
+    model_runner._update_states(
+        SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+        )
+    )
+    assert req_id not in model_runner.input_batch.req_id_to_index
+    assert model_runner.requests[req_id].output_token_ids == []
+
+    # Only the newest token is sent incrementally; all_token_ids also contains
+    # accepted speculative tokens from the previous target pass.
+    committed_ids = [1, 2, 3, 7, 8, 9, 10, 11]
+    model_runner._update_states(
+        SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData(
+                req_ids=[req_id],
+                resumed_req_ids=set(),
+                new_token_ids=[[11]],
+                all_token_ids={req_id: committed_ids},
+                new_block_ids=[([],)],
+                num_computed_tokens=[7],
+                num_output_tokens=[5],
+            ),
+            num_scheduled_tokens={req_id: 1},
+            total_num_scheduled_tokens=1,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+        )
+    )
+    assert model_runner.requests[req_id].output_token_ids == committed_ids[3:]
 
 
 def test_get_nans_in_logits(model_runner, dist_init):

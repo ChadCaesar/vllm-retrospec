@@ -1132,18 +1132,30 @@ class GPUModelRunner(
                     # sampled token ids back because there's no direct communication
                     # between the first-stage worker and the last-stage worker.
                     new_token_ids = req_data.new_token_ids[i]
-                    # Add the sampled token(s) from the previous step (if any).
-                    # This doesn't include "unverified" tokens like spec tokens.
-                    num_new_tokens = (
-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
-                    )
-                    if num_new_tokens == 1:
-                        # Avoid slicing list in most common case.
-                        req_state.output_token_ids.append(new_token_ids[-1])
-                    elif num_new_tokens > 0:
-                        req_state.output_token_ids.extend(
-                            new_token_ids[-num_new_tokens:]
+                    if (
+                        req_index is None
+                        and (all_token_ids := req_data.all_token_ids.get(req_id))
+                        is not None
+                    ):
+                        # A request absent from the previous PP batch can have
+                        # accepted spec tokens that are not in new_token_ids.
+                        req_state.output_token_ids = all_token_ids[
+                            req_state.num_prompt_tokens :
+                        ]
+                    else:
+                        # Add the sampled token(s) from the previous step (if any).
+                        # This excludes unverified speculative tokens.
+                        num_new_tokens = (
+                            num_computed_tokens
+                            + len(new_token_ids)
+                            - req_state.num_tokens
                         )
+                        if num_new_tokens == 1:
+                            req_state.output_token_ids.append(new_token_ids[-1])
+                        elif num_new_tokens > 0:
+                            req_state.output_token_ids.extend(
+                                new_token_ids[-num_new_tokens:]
+                            )
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure. Align the cached state.

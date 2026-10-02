@@ -589,6 +589,8 @@ class VllmConfig:
 
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
+        # A nonempty custom-op list is authoritative, including ["none"].
+        explicit_custom_ops = bool(self.compilation_config.custom_ops)
 
         self.try_verify_and_update_config()
 
@@ -768,6 +770,20 @@ class VllmConfig:
                 self.compilation_config.custom_ops.append("none")
             else:
                 self.compilation_config.custom_ops.append("all")
+
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "retrospec"
+            and self.parallel_config.pipeline_parallel_size == 1
+            and not explicit_custom_ops
+            and "-rms_norm" not in self.compilation_config.custom_ops
+            and not self.compilation_config.is_custom_op_enabled("rms_norm")
+        ):
+            # Layer-major prefill calls decoder layers outside the compiled
+            # full-model graph, so native RMSNorm would run as separate ops.
+            # PP graph decoding regresses with this default; eager mode already
+            # enables the op through "all". Explicit choices remain authoritative.
+            self.compilation_config.custom_ops.append("+rms_norm")
 
         default_config = OPTIMIZATION_LEVEL_TO_CONFIG[self.optimization_level]
         self._apply_optimization_level_defaults(default_config)
