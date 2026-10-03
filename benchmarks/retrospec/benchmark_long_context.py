@@ -125,6 +125,49 @@ def load_sample(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"Sample index {args.sample_index} is outside {path}") from exc
 
 
+def select_short_needle_prompt(sample: dict[str, Any], max_chars: int) -> str:
+    """Keep the needle and final question in a bounded short-context prompt."""
+    if max_chars <= 0:
+        raise ValueError("Short needle prompt length must be positive")
+
+    prompt = sample["input"]
+    answer = str(sample["answer"])
+    question_start = prompt.rfind("\n\nQuestion:")
+    if not answer or question_start < 0:
+        raise ValueError("NIAH sample needs an answer and a final question")
+
+    document = prompt[:question_start]
+    answer_start = document.find(answer)
+    if answer_start < 0 or document.find(answer, answer_start + len(answer)) >= 0:
+        raise ValueError("NIAH document must contain the needle exactly once")
+
+    question = prompt[question_start:]
+    available_document_chars = max_chars - len(question)
+    if available_document_chars < len(answer):
+        raise ValueError("Short prompt limit cannot fit the needle and question")
+
+    start = max(
+        0,
+        min(
+            answer_start - available_document_chars // 2,
+            len(document) - available_document_chars,
+        ),
+    )
+    return document[start : start + available_document_chars] + question
+
+
+def append_needle_request_suffix(prompt: str, request_index: int) -> str:
+    """Differentiate requests while leaving the final NIAH question intact."""
+    question_start = prompt.rfind("\n\nQuestion:")
+    if question_start < 0:
+        raise ValueError("NIAH prompt needs a final question")
+    return (
+        prompt[:question_start]
+        + f"\nRequest {request_index}."
+        + prompt[question_start:]
+    )
+
+
 def build_speculative_config(args: argparse.Namespace) -> dict[str, Any]:
     replay_mode = getattr(args, "replay_mode", "off")
     config: dict[str, Any] = {

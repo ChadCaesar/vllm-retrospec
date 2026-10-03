@@ -619,6 +619,36 @@ def test_cluster_store_native_builder_writes_final_slabs_once(monkeypatch):
     )
 
 
+def test_native_page_builder_overwrites_full_pages_and_zeros_partial_padding():
+    key_slab = torch.full((3, 2, 1), -99, dtype=torch.float16)
+    value_slab = torch.full_like(key_slab, -99)
+    page_ids, page_counts, _, _ = ops.retrospec_build_cluster_pages(
+        (key_slab,),
+        (value_slab,),
+        torch.arange(3, dtype=torch.int64),
+        torch.tensor([[[2], [4], [1], [3]]], dtype=torch.float16),
+        torch.tensor([[[20], [40], [10], [30]]], dtype=torch.float16),
+        torch.tensor([[0, 1, 0, 0]], dtype=torch.int32),
+        torch.tensor([[3, 1]], dtype=torch.int32),
+        torch.tensor([[1, 0, 0, 2]], dtype=torch.int32),
+        2,
+        2,
+    )
+
+    torch.testing.assert_close(
+        key_slab.squeeze(-1),
+        torch.tensor([[1, 2], [3, 0], [4, 0]], dtype=torch.float16),
+    )
+    torch.testing.assert_close(
+        value_slab.squeeze(-1),
+        torch.tensor([[10, 20], [30, 0], [40, 0]], dtype=torch.float16),
+    )
+    torch.testing.assert_close(page_ids, torch.tensor([[[0, 1], [2, -1]]]))
+    torch.testing.assert_close(
+        page_counts, torch.tensor([[[2, 1], [1, 0]]], dtype=torch.int32)
+    )
+
+
 @pytest.mark.parametrize("invalid_assignment", [-1, 2])
 def test_cluster_store_rejects_assignment_outside_cluster_range(
     invalid_assignment,

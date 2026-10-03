@@ -770,16 +770,22 @@ class _LayerPrefetchDescriptorArena:
         cluster_ids = torch.tensor(
             [cluster_id for cluster_id, _ in ordered], dtype=torch.int64
         )
-        pages = torch.full((len(ordered), self.max_pages), -1, dtype=torch.int64)
-        counts = torch.empty(len(ordered), dtype=torch.int32)
-        groups = torch.empty(len(ordered), dtype=torch.int64)
-        for row, (_, descriptor) in enumerate(ordered):
-            page_count = len(descriptor.page_ids)
-            pages[row, :page_count] = torch.tensor(
-                descriptor.page_ids, dtype=torch.int64
-            )
-            counts[row] = page_count
-            groups[row] = self._group_id(descriptor.identity.group)
+        pages = torch.tensor(
+            [
+                descriptor.page_ids
+                + (-1,) * (self.max_pages - len(descriptor.page_ids))
+                for _, descriptor in ordered
+            ],
+            dtype=torch.int64,
+        )
+        counts = torch.tensor(
+            [len(descriptor.page_ids) for _, descriptor in ordered],
+            dtype=torch.int32,
+        )
+        groups = torch.tensor(
+            [self._group_id(descriptor.identity.group) for _, descriptor in ordered],
+            dtype=torch.int64,
+        )
         self.page_ids.index_copy_(0, cluster_ids, pages)
         self.page_counts.index_copy_(0, cluster_ids, counts)
         self.group_ids.index_copy_(0, cluster_ids, groups)

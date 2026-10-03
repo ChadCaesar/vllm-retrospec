@@ -1403,6 +1403,9 @@ class RetroSpecClusterPageStore(
         metadata_device: torch.device | None = None,
     ) -> RetroSpecClusterBlockTable:
         """Pack token KV into per-head, per-cluster backing pages."""
+        stats = self.performance_stats
+        measure = stats is not None and stats.enabled
+        phase_started = perf_counter() if measure else 0.0
         if cluster_start < 0:
             raise ValueError("cluster_start must be non-negative")
 
@@ -1447,10 +1450,20 @@ class RetroSpecClusterPageStore(
                 "cluster_pages_built",
                 total_pages,
             )
+        if measure:
+            stats.record_cpu_time(
+                "cluster_page_prepare_wall", perf_counter() - phase_started
+            )
 
+        phase_started = perf_counter() if measure else 0.0
         allocated_page_ids = pool.allocate(total_pages)
+        if measure:
+            stats.record_cpu_time(
+                "cluster_page_allocate_wall", perf_counter() - phase_started
+            )
 
         try:
+            phase_started = perf_counter() if measure else 0.0
             page_ids, page_token_counts, full_descriptor = pool.build_cluster_pages(
                 allocated_page_ids=allocated_page_ids,
                 token_keys=storage_keys,
@@ -1460,6 +1473,10 @@ class RetroSpecClusterPageStore(
                 token_offsets_in_cluster=storage_token_offsets,
                 num_workers=self.cpu_page_build_workers,
             )
+            if measure:
+                stats.record_cpu_time(
+                    "cluster_page_native_wall", perf_counter() - phase_started
+                )
         except Exception:
             pool.free(allocated_page_ids)
             raise
@@ -1467,6 +1484,7 @@ class RetroSpecClusterPageStore(
         cluster_ids: torch.Tensor | None = None
         with self._resident_state_lock:
             try:
+                phase_started = perf_counter() if measure else 0.0
                 cluster_ids = self._allocate_cluster_ids(
                     layer_name=layer_name,
                     request_id=request_id,
@@ -1475,7 +1493,16 @@ class RetroSpecClusterPageStore(
                     page_ids=page_ids,
                     page_token_counts=page_token_counts,
                 )
+                if measure:
+                    stats.record_cpu_time(
+                        "cluster_page_register_wall", perf_counter() - phase_started
+                    )
+                phase_started = perf_counter() if measure else 0.0
                 self._resize_resident_cache(layer_name, pool)
+                if measure:
+                    stats.record_cpu_time(
+                        "cluster_page_resize_wall", perf_counter() - phase_started
+                    )
             except Exception:
                 if cluster_ids is not None:
                     self._free_cluster_ids(layer_name, cluster_ids)

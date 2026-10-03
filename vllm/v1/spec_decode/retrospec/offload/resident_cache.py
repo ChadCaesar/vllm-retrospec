@@ -463,20 +463,41 @@ class RetroSpecResidentClusterCache:
         if not requires_rebuild:
             return False
 
+        stats = self.performance_stats
+        measure = stats is not None and stats.enabled
+        rebuild_started = perf_counter() if measure else 0.0
         previous_max_pages = self._handle_table_max_pages
         # A pending publication targets the current table allocation. Complete
         # it before replacing that allocation, then republish every live entry.
         self.synchronize_pending_copies()
+        if measure:
+            stats.record_cpu_time(
+                "resident_handle_table_pending_sync_wall",
+                perf_counter() - rebuild_started,
+            )
+            phase_started = perf_counter()
         update_stream = (
             torch.cuda.current_stream(self.device) if stream is None else stream
         )
         if self._handle_table_capacity and self._group_states:
             self._refresh_group_lru_from_gpu(self._group_states.keys(), update_stream)
+        if measure:
+            stats.record_cpu_time(
+                "resident_handle_table_lru_refresh_wall",
+                perf_counter() - phase_started,
+            )
+            phase_started = perf_counter()
         with torch.cuda.stream(update_stream):
             self._allocate_handle_table(
                 max(required_capacity, self._handle_table_capacity),
                 max(max_pages_per_cluster, self._handle_table_max_pages),
             )
+        if measure:
+            stats.record_cpu_time(
+                "resident_handle_table_allocate_wall",
+                perf_counter() - phase_started,
+            )
+            phase_started = perf_counter()
         entries = tuple(
             (
                 cluster_id,
@@ -486,18 +507,32 @@ class RetroSpecResidentClusterCache:
             for cluster_id in self._cluster_to_slots
         )
         published = self._write_handle_entries(entries, update_stream)
+        if measure:
+            stats.record_cpu_time(
+                "resident_handle_table_publish_wall",
+                perf_counter() - phase_started,
+            )
+            phase_started = perf_counter()
 
         # Readers immediately switch to the new tensor references after this
         # method returns. Complete this rare rebuild before releasing the
         # mutation guard so they cannot observe an uninitialized table.
         update_stream.synchronize()
+        if measure:
+            stats.record_cpu_time(
+                "resident_handle_table_final_sync_wall",
+                perf_counter() - phase_started,
+            )
         if published != len(entries):
             raise RuntimeError(
                 "Resident handle table rebuild did not publish every live cluster"
             )
 
-        stats = self.performance_stats
-        if stats is not None and stats.enabled:
+        if measure:
+            stats.record_cpu_time(
+                "resident_handle_table_rebuild_wall",
+                perf_counter() - rebuild_started,
+            )
             stats.add_counter("resident_handle_table_rebuilds")
             if self._handle_table_max_pages > previous_max_pages:
                 stats.add_counter("resident_handle_table_width_growths")

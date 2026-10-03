@@ -6,10 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from benchmarks.retrospec.benchmark_long_context import (
+    append_needle_request_suffix,
     build_speculative_config,
     parse_args,
+    select_short_needle_prompt,
     shutdown_llm,
 )
+from benchmarks.retrospec.benchmark_repeated import build_sampling_params
 from benchmarks.retrospec.summarize_long_context import summarize
 
 
@@ -73,6 +76,42 @@ def test_benchmark_shutdown_stops_engine_core():
     shutdown_llm(llm)
 
     llm.llm_engine.engine_core.shutdown.assert_called_once_with()
+
+
+def test_short_needle_prompt_keeps_unique_answer_and_question():
+    sample = {
+        "input": "A" * 100
+        + "needle 2387512 here"
+        + "B" * 100
+        + "\n\nQuestion: What is the number? Answer: ",
+        "answer": "2387512",
+    }
+
+    prompt = select_short_needle_prompt(sample, 90)
+
+    assert len(prompt) == 90
+    assert prompt.count("2387512") == 1
+    assert prompt.endswith("\n\nQuestion: What is the number? Answer: ")
+
+
+def test_request_suffix_keeps_final_question_at_end():
+    prompt = "Document with 2387512.\n\nQuestion: What is the number? Answer: "
+
+    modified = append_needle_request_suffix(prompt, 1)
+
+    assert modified.startswith("Document with 2387512.\nRequest 1.")
+    assert modified.endswith("\n\nQuestion: What is the number? Answer: ")
+
+
+def test_repeated_benchmark_separates_answer_and_fixed_length_modes():
+    answer = build_sampling_params(64, "2387512", "answer")
+    fixed = build_sampling_params(64, "2387512", "fixed")
+
+    assert answer.stop == ["2387512"]
+    assert answer.include_stop_str_in_output
+    assert not answer.ignore_eos
+    assert fixed.stop == []
+    assert fixed.ignore_eos
 
 
 def test_profile_summary_accumulates_intervals_by_rank(tmp_path):
