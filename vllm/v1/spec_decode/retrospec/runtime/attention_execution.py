@@ -7,12 +7,12 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionImpl,
     FlashAttentionMetadata,
 )
-from vllm.v1.spec_decode.retrospec.cluster_store import (
+from vllm.v1.spec_decode.retrospec.offload.cluster_store import (
     RetroSpecCompactResolvedClusterPages,
     RetroSpecCompactVerificationResolvedPages,
     RetroSpecResolvedClusterPages,
 )
-from vllm.v1.spec_decode.retrospec.execution import (
+from vllm.v1.spec_decode.retrospec.offload.execution import (
     RetroSpecCompactExactPageTable,
     RetroSpecEstimationKVSource,
     RetroSpecExactKVSource,
@@ -20,12 +20,12 @@ from vllm.v1.spec_decode.retrospec.execution import (
     RetroSpecExactPrimaryKVSource,
     RetroSpecRankedDraftKVSource,
 )
-from vllm.v1.spec_decode.retrospec.runtime.attention_types import RetroSpecAttentionMode
-from vllm.v1.spec_decode.retrospec.segmented_index import (
+from vllm.v1.spec_decode.retrospec.offload.segmented_index import (
     RetroSpecIndexedTokenAttentionSelection,
     RetroSpecRankedDraftAttentionSelection,
     RetroSpecTokenAttentionSelection,
 )
+from vllm.v1.spec_decode.retrospec.runtime.attention_types import RetroSpecAttentionMode
 
 RetroSpecSelection = (
     RetroSpecTokenAttentionSelection

@@ -20,13 +20,17 @@ from vllm.v1.attention.backends.flash_attn import (
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 from .capacity import get_retrospec_exact_attention_partition_capacity
-from .execution import (
+from .offload.execution import (
     RetroSpecCompactKVSource,
     RetroSpecExactAttentionWorkspace,
     RetroSpecExactPrimaryKVSource,
     RetroSpecFullVerificationKVSource,
 )
-from .index import RetroSpecAttentionLevel
+from .offload.index import RetroSpecAttentionLevel
+from .offload.segmented_index import (
+    RetroSpecIndexedTokenAttentionSelection,
+    RetroSpecSegmentedTokenIndex,
+)
 from .performance import RetroSpecPerformanceStats
 from .pipeline import RetroSpecAttentionMassStats
 from .runtime.attention_execution import (
@@ -36,10 +40,6 @@ from .runtime.attention_execution import (
     RetroSpecSelection as RetroSpecSelection,
 )
 from .runtime.attention_types import RetroSpecAttentionMode
-from .segmented_index import (
-    RetroSpecIndexedTokenAttentionSelection,
-    RetroSpecSegmentedTokenIndex,
-)
 from .workspace import exact_attention_query_capacity
 
 

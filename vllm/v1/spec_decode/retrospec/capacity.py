@@ -10,7 +10,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
 
-from .cluster_scoring import RESIDENT_CLUSTER_SCORE_TILE_SIZE
+from .offload.cluster_scoring import RESIDENT_CLUSTER_SCORE_TILE_SIZE
 from .workspace import (
     exact_attention_partition_capacity,
     exact_attention_primary_token_capacity,
