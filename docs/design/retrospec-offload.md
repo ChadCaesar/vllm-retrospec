@@ -28,7 +28,7 @@ flowchart LR
 | `cluster_store.py`, `cluster_store_support.py`, `page_pool.py` | Cluster identities and descriptors, CPU page slabs, allocation, staging, and cluster page ownership |
 | `cluster_prefetch.py`, `cluster_verification.py`, `verification_transfer.py` | Resident prefetch waves, verification miss resolution, and reusable full-layer transfer buffers |
 | `resident_cache.py`, `resident_cache_types.py`, `resident_cache_lookup.py`, `resident_cache_admission.py` | Bounded resident page state, stable access types, lookup paths, and admission/eviction paths. The public cache class remains in `resident_cache.py`. |
-| `resident_kernels.py`, `resident_kernel_impl.py`, `index_residency.py`, `pinned_memory.py` | Resident kernel launchers, Triton kernel bodies, GPU index arenas and bindings, and shared pinned-memory budget |
+| `resident_kernels.py`, `resident_kernel_impl.py`, `index_residency.py`, `index_residency_types.py`, `pinned_memory.py` | Resident kernel launchers and Triton bodies, GPU index manager and arena allocation, index data types and span allocator, and shared pinned-memory budget |
 | `cluster_scoring.py`, `selection_kernels.py`, `selection_provenance.py` | Cluster scoring, token plan packing and gathering, and replay trace provenance |
 | `clustering.py`, `clustering_kernels.py`, `execution.py`, `execution_kernels.py`, `index.py`, `cluster_identity.py` | Cluster construction, attention workspace and source types, Triton attention kernels, index base types, and stable cluster identity |
 
@@ -62,6 +62,11 @@ original modules while the Triton definitions live in the corresponding
 `*_kernels.py` or `*_kernel_impl.py` module. Keep launch signatures and kernel
 compile-time arguments together when changing an operator.
 
+The GPU index residency manager also remains at its original import path.
+Its data types and packed-span allocator live in `index_residency_types.py`;
+all manager methods remain in their original order. This keeps arena and
+pinned-summary operations on their original execution path.
+
 ## Verification
 
 Backend tests are grouped under `tests/retrospec/offload/`; the page store and
@@ -69,3 +74,5 @@ segmented index tests are split by responsibility. The full RetroSpec suite
 also exercises the unchanged public import paths. Performance configurations,
 generated-token comparisons, stage counters, and baseline limitations are
 recorded in `benchmarks/retrospec/version1_batch3_results.md`.
+The index type split and its performance comparisons are recorded in
+`benchmarks/retrospec/version1_index_results.md`.
