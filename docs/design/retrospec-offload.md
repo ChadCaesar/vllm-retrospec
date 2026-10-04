@@ -27,9 +27,10 @@ flowchart LR
 | `segmented_index.py`, `segmented_build.py`, `segmented_selection.py`, `segmented_verification.py`, `segmented_types.py` | Per-request segment state, background index construction, selection plans, indexed verification, and full verification pipeline |
 | `cluster_store.py`, `cluster_store_support.py`, `page_pool.py` | Cluster identities and descriptors, CPU page slabs, allocation, staging, and cluster page ownership |
 | `cluster_prefetch.py`, `cluster_verification.py`, `verification_transfer.py` | Resident prefetch waves, verification miss resolution, and reusable full-layer transfer buffers |
-| `resident_cache.py`, `resident_kernels.py`, `index_residency.py`, `pinned_memory.py` | Bounded resident pages, GPU index arenas and bindings, and shared pinned-memory budget |
+| `resident_cache.py`, `resident_cache_types.py`, `resident_cache_lookup.py`, `resident_cache_admission.py` | Bounded resident page state, stable access types, lookup paths, and admission/eviction paths. The public cache class remains in `resident_cache.py`. |
+| `resident_kernels.py`, `resident_kernel_impl.py`, `index_residency.py`, `pinned_memory.py` | Resident kernel launchers, Triton kernel bodies, GPU index arenas and bindings, and shared pinned-memory budget |
 | `cluster_scoring.py`, `selection_kernels.py`, `selection_provenance.py` | Cluster scoring, token plan packing and gathering, and replay trace provenance |
-| `clustering.py`, `clustering_kernels.py`, `execution.py`, `index.py`, `cluster_identity.py` | Cluster construction, exact and proposal attention kernels, index base types, and stable cluster identity |
+| `clustering.py`, `clustering_kernels.py`, `execution.py`, `execution_kernels.py`, `index.py`, `cluster_identity.py` | Cluster construction, attention workspace and source types, Triton attention kernels, index base types, and stable cluster identity |
 
 ## Request lifecycle
 
@@ -52,6 +53,14 @@ qualified paths are preserved for serialization. Runtime code imports the
 `offload/` implementation directly. The relocation leaves kernel bodies,
 launch arguments, stream order, buffer reuse, KV retirement, configuration
 defaults, and memory-budget formulas unchanged.
+
+Within the resident cache, the cache class binds the internal lookup and
+admission methods directly, preserving its original hot-path dispatch. The
+state types live in `resident_cache_types.py` and
+retain their original serialized module path. Kernel launchers stay in their
+original modules while the Triton definitions live in the corresponding
+`*_kernels.py` or `*_kernel_impl.py` module. Keep launch signatures and kernel
+compile-time arguments together when changing an operator.
 
 ## Verification
 
