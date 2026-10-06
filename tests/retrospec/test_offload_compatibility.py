@@ -50,6 +50,58 @@ def test_offload_class_keeps_original_import_and_pickle_path(
 
 
 @pytest.mark.parametrize(
+    "class_name",
+    [
+        "_PinnedStagingSlot",
+        "RetroSpecResidentPrefetchInput",
+        "_PinnedSelectionSlot",
+        "_PinnedVerificationMissSlot",
+        "_VerificationResolveGPUArena",
+        "_CPUPageSlab",
+        "_FullVerificationSourceSnapshot",
+        "_PinnedPageTransferSlot",
+        "RetroSpecCompactTokenRange",
+        "RetroSpecFullVerificationDescriptor",
+        "RetroSpecFullVerificationStaging",
+        "RetroSpecFullVerificationTicket",
+        "RetroSpecResolvedClusterPages",
+        "RetroSpecCompactResolvedClusterPages",
+        "RetroSpecRankedDraftResolvedClusters",
+        "RetroSpecCompactVerificationResolvedPages",
+        "RetroSpecVerificationMissAdmission",
+        "RetroSpecVerificationResolveRequest",
+        "_SubmittedVerificationResolve",
+    ],
+)
+def test_cluster_store_support_type_keeps_legacy_identity(class_name: str) -> None:
+    base = "vllm.v1.spec_decode.retrospec"
+    legacy = importlib.import_module(f"{base}.cluster_store")
+    support = importlib.import_module(f"{base}.offload.cluster_store_support")
+    staging_names = {
+        "_PinnedStagingSlot",
+        "RetroSpecResidentPrefetchInput",
+        "_PinnedSelectionSlot",
+        "_PinnedVerificationMissSlot",
+        "_VerificationResolveGPUArena",
+        "_CPUPageSlab",
+        "_FullVerificationSourceSnapshot",
+        "_PinnedPageTransferSlot",
+    }
+    implementation = (
+        "cluster_staging_types"
+        if class_name in staging_names
+        else "cluster_verification_types"
+    )
+    relocated = importlib.import_module(f"{base}.offload.{implementation}")
+    cls = getattr(legacy, class_name)
+
+    assert getattr(support, class_name) is cls
+    assert getattr(relocated, class_name) is cls
+    assert cls.__module__ == legacy.__name__
+    assert pickle.loads(pickle.dumps(cls)) is cls
+
+
+@pytest.mark.parametrize(
     ("module_name", "function_name"),
     [
         ("resident_kernels", "lookup_resident_handles"),

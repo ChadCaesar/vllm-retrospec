@@ -25,7 +25,7 @@ flowchart LR
 | Modules under `offload/` | Responsibility |
 | --- | --- |
 | `segmented_index.py`, `segmented_build.py`, `segmented_selection.py`, `segmented_verification.py`, `segmented_types.py` | Per-request segment state, background index construction, selection plans, indexed verification, and full verification pipeline |
-| `cluster_store.py`, `cluster_store_support.py`, `page_pool.py` | Cluster identities and descriptors, CPU page slabs, allocation, staging, and cluster page ownership |
+| `cluster_store.py`, `cluster_store_support.py`, `cluster_staging_types.py`, `cluster_verification_types.py`, `page_pool.py` | Cluster page ownership, prefetch state, pinned and GPU staging buffers, verification descriptors and resolved page types, and CPU page slabs |
 | `cluster_prefetch.py`, `cluster_verification.py`, `verification_transfer.py` | Resident prefetch waves, verification miss resolution, and reusable full-layer transfer buffers |
 | `resident_cache.py`, `resident_cache_types.py`, `resident_cache_lookup.py`, `resident_cache_admission.py` | Bounded resident page state, stable access types, lookup paths, and admission/eviction paths. The public cache class remains in `resident_cache.py`. |
 | `resident_kernels.py`, `resident_kernel_impl.py`, `index_residency.py`, `index_residency_types.py`, `pinned_memory.py` | Resident kernel launchers and Triton bodies, GPU index manager and arena allocation, index data types and span allocator, and shared pinned-memory budget |
@@ -67,6 +67,12 @@ Its data types and packed-span allocator live in `index_residency_types.py`;
 all manager methods remain in their original order. This keeps arena and
 pinned-summary operations on their original execution path.
 
+The page-store support module re-exports the staging and verification types
+from their focused modules. All page-store methods continue to import those
+types through `cluster_store_support.py`; the legacy `cluster_store` import and
+serialized class paths remain valid. This split does not move page-store,
+prefetch, or verification execution methods.
+
 ## Verification
 
 Backend tests are grouped under `tests/retrospec/offload/`; the page store and
@@ -76,3 +82,6 @@ generated-token comparisons, stage counters, and baseline limitations are
 recorded in `benchmarks/retrospec/version1_batch3_results.md`.
 The index type split and its performance comparisons are recorded in
 `benchmarks/retrospec/version1_index_results.md`.
+The page-store support type split, full benchmark matrix, and per-repeat data
+are recorded in `benchmarks/retrospec/version1_support_results.md` and
+`benchmarks/retrospec/version1_support_runs.tsv`.
