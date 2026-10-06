@@ -118,3 +118,44 @@ def test_resident_kernel_entry_keeps_original_import_path(
     assert getattr(original_module, function_name) is getattr(
         implementation_module, function_name
     )
+
+
+@pytest.mark.parametrize(
+    ("module_name", "kernel_name"),
+    [
+        ("resident_kernel_helpers", "_resident_handle_hash"),
+        ("resident_kernel_helpers", "_find_resident_buckets"),
+        ("resident_kernel_helpers", "_record_resident_lookup_statistics"),
+        ("resident_draft_kernel_impl", "_resolve_compact_draft_pages_kernel"),
+        ("resident_draft_kernel_impl", "_resolve_ranked_draft_buckets_kernel"),
+        (
+            "resident_draft_kernel_impl",
+            "_finalize_ranked_compact_draft_attention_kernel",
+        ),
+        ("resident_verification_kernel_impl", "_reset_verification_miss_hash_kernel"),
+        (
+            "resident_verification_kernel_impl",
+            "_resolve_compact_verification_pages_vector_kernel",
+        ),
+        (
+            "resident_verification_kernel_impl",
+            "_map_compact_verification_miss_indices_kernel",
+        ),
+        (
+            "resident_verification_kernel_impl",
+            "_scatter_compact_staging_page_ids_kernel",
+        ),
+    ],
+)
+def test_resident_kernel_body_keeps_original_import(
+    module_name: str, kernel_name: str
+) -> None:
+    base = "vllm.v1.spec_decode.retrospec.offload"
+    original = importlib.import_module(f"{base}.resident_kernel_impl")
+    relocated = importlib.import_module(f"{base}.{module_name}")
+    launcher = importlib.import_module(f"{base}.resident_kernels")
+    legacy = importlib.import_module("vllm.v1.spec_decode.retrospec.resident_kernels")
+
+    assert getattr(original, kernel_name) is getattr(relocated, kernel_name)
+    assert getattr(launcher, kernel_name) is getattr(relocated, kernel_name)
+    assert getattr(legacy, kernel_name) is getattr(relocated, kernel_name)

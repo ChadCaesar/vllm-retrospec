@@ -28,7 +28,7 @@ flowchart LR
 | `cluster_store.py`, `cluster_store_support.py`, `cluster_staging_types.py`, `cluster_verification_types.py`, `page_pool.py` | Cluster page ownership, prefetch state, pinned and GPU staging buffers, verification descriptors and resolved page types, and CPU page slabs |
 | `cluster_prefetch.py`, `cluster_verification.py`, `verification_transfer.py` | Resident prefetch waves, verification miss resolution, and reusable full-layer transfer buffers |
 | `resident_cache.py`, `resident_cache_types.py`, `resident_cache_lookup.py`, `resident_cache_admission.py` | Bounded resident page state, stable access types, lookup paths, and admission/eviction paths. The public cache class remains in `resident_cache.py`. |
-| `resident_kernels.py`, `resident_kernel_impl.py`, `index_residency.py`, `index_residency_types.py`, `pinned_memory.py` | Resident kernel launchers and Triton bodies, GPU index manager and arena allocation, index data types and span allocator, and shared pinned-memory budget |
+| `resident_kernels.py`, `resident_kernel_impl.py`, `resident_kernel_helpers.py`, `resident_draft_kernel_impl.py`, `resident_verification_kernel_impl.py`, `index_residency.py`, `index_residency_types.py`, `pinned_memory.py` | Resident launchers and lookup/table kernels, shared Triton lookup helpers, draft and verification kernels, GPU index state and types, and pinned-memory budget |
 | `cluster_scoring.py`, `selection_kernels.py`, `selection_provenance.py` | Cluster scoring, token plan packing and gathering, and replay trace provenance |
 | `clustering.py`, `clustering_kernels.py`, `execution.py`, `execution_kernels.py`, `index.py`, `cluster_identity.py` | Cluster construction, attention workspace and source types, Triton attention kernels, index base types, and stable cluster identity |
 
@@ -62,6 +62,11 @@ original modules while the Triton definitions live in the corresponding
 `*_kernels.py` or `*_kernel_impl.py` module. Keep launch signatures and kernel
 compile-time arguments together when changing an operator.
 
+Resident Triton helper, draft, and verification definitions have separate
+modules. `resident_kernel_impl.py` re-exports the relocated definitions so the
+existing launcher imports remain valid. All kernel bodies and launcher calls
+retain their original AST; the split changes only their source location.
+
 The GPU index residency manager also remains at its original import path.
 Its data types and packed-span allocator live in `index_residency_types.py`;
 all manager methods remain in their original order. This keeps arena and
@@ -85,3 +90,6 @@ The index type split and its performance comparisons are recorded in
 The page-store support type split, full benchmark matrix, and per-repeat data
 are recorded in `benchmarks/retrospec/version1_support_results.md` and
 `benchmarks/retrospec/version1_support_runs.tsv`.
+The resident Triton kernel split, full benchmark matrix, and per-repeat data
+are recorded in `benchmarks/retrospec/version1_kernel_results.md` and
+`benchmarks/retrospec/version1_kernel_runs.tsv`.
