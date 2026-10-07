@@ -28,7 +28,9 @@ flowchart LR
 | `cluster_store.py`, `cluster_store_support.py`, `cluster_staging_types.py`, `cluster_verification_types.py`, `page_pool.py` | Cluster page ownership, prefetch state, pinned and GPU staging buffers, verification descriptors and resolved page types, and CPU page slabs |
 | `cluster_prefetch.py`, `cluster_verification.py`, `verification_transfer.py` | Resident prefetch waves, verification miss resolution, and reusable full-layer transfer buffers |
 | `resident_cache.py`, `resident_cache_types.py`, `resident_cache_lookup.py`, `resident_cache_admission.py` | Bounded resident page state, stable access types, lookup paths, and admission/eviction paths. The public cache class remains in `resident_cache.py`. |
-| `resident_kernels.py`, `resident_kernel_impl.py`, `resident_kernel_helpers.py`, `resident_draft_kernel_impl.py`, `resident_verification_kernel_impl.py`, `index_residency.py`, `index_residency_types.py`, `pinned_memory.py` | Resident launchers and lookup/table kernels, shared Triton lookup helpers, draft and verification kernels, GPU index state and types, and pinned-memory budget |
+| `resident_kernels.py`, `resident_lookup_launchers.py`, `resident_draft_launchers.py`, `resident_verification_launchers.py` | Compatible resident launcher exports and focused lookup/table, draft, and verification launchers |
+| `resident_kernel_impl.py`, `resident_kernel_helpers.py`, `resident_draft_kernel_impl.py`, `resident_verification_kernel_impl.py` | Triton lookup/table kernels, shared lookup helpers, and draft and verification kernels |
+| `index_residency.py`, `index_residency_types.py`, `pinned_memory.py` | GPU index state and types, and pinned-memory budget |
 | `cluster_scoring.py`, `selection_kernels.py`, `selection_provenance.py` | Cluster scoring, token plan packing and gathering, and replay trace provenance |
 | `clustering.py`, `clustering_kernels.py`, `execution.py`, `execution_kernels.py`, `index.py`, `cluster_identity.py` | Cluster construction, attention workspace and source types, Triton attention kernels, index base types, and stable cluster identity |
 
@@ -57,10 +59,12 @@ defaults, and memory-budget formulas unchanged.
 Within the resident cache, the cache class binds the internal lookup and
 admission methods directly, preserving its original hot-path dispatch. The
 state types live in `resident_cache_types.py` and
-retain their original serialized module path. Kernel launchers stay in their
-original modules while the Triton definitions live in the corresponding
-`*_kernels.py` or `*_kernel_impl.py` module. Keep launch signatures and kernel
-compile-time arguments together when changing an operator.
+retain their original serialized module path. Resident lookup/table, draft,
+and verification launchers live in focused modules, while
+`resident_kernels.py` re-exports the original callable names. Their Triton
+definitions live in the corresponding `*_kernel_impl.py` modules. Keep launch
+signatures and kernel compile-time arguments together when changing an
+operator. All nine launcher function ASTs match the original module.
 
 Resident Triton helper, draft, and verification definitions have separate
 modules. `resident_kernel_impl.py` re-exports the relocated definitions so the
@@ -93,3 +97,6 @@ are recorded in `benchmarks/retrospec/version1_support_results.md` and
 The resident Triton kernel split, full benchmark matrix, and per-repeat data
 are recorded in `benchmarks/retrospec/version1_kernel_results.md` and
 `benchmarks/retrospec/version1_kernel_runs.tsv`.
+The resident launcher split and its compatibility, stage, and performance
+checks are recorded in `benchmarks/retrospec/version1_launcher_results.md`
+and `benchmarks/retrospec/version1_launcher_runs.tsv`.

@@ -159,3 +159,29 @@ def test_resident_kernel_body_keeps_original_import(
     assert getattr(original, kernel_name) is getattr(relocated, kernel_name)
     assert getattr(launcher, kernel_name) is getattr(relocated, kernel_name)
     assert getattr(legacy, kernel_name) is getattr(relocated, kernel_name)
+
+
+@pytest.mark.parametrize(
+    ("module_name", "function_name"),
+    [
+        ("resident_lookup_launchers", "lookup_resident_handles"),
+        ("resident_lookup_launchers", "compact_resident_misses"),
+        ("resident_lookup_launchers", "scatter_staging_page_ids"),
+        ("resident_lookup_launchers", "update_resident_handles"),
+        ("resident_lookup_launchers", "publish_resident_table_bindings"),
+        ("resident_draft_launchers", "resolve_compact_draft_pages"),
+        ("resident_draft_launchers", "resolve_ranked_draft_buckets"),
+        ("resident_verification_launchers", "resolve_compact_verification_pages"),
+        ("resident_verification_launchers", "scatter_compact_staging_page_ids"),
+    ],
+)
+def test_resident_launcher_keeps_original_import(
+    module_name: str, function_name: str
+) -> None:
+    base = "vllm.v1.spec_decode.retrospec"
+    original = importlib.import_module(f"{base}.offload.resident_kernels")
+    relocated = importlib.import_module(f"{base}.offload.{module_name}")
+    legacy = importlib.import_module(f"{base}.resident_kernels")
+
+    assert getattr(original, function_name) is getattr(relocated, function_name)
+    assert getattr(legacy, function_name) is getattr(relocated, function_name)
