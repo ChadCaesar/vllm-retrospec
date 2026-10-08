@@ -61,11 +61,8 @@ def mark_installed(controller: RetroSpecSparseAttention) -> None:
 def test_gpu_native_controller_uses_native_kv_and_shared_statistics():
     controller = make_controller(max_num_seqs=2, num_speculative_tokens=4)
 
-    assert not controller.uses_full_verification_offload
     assert controller.max_parallel_tokens == 8
     assert controller.index.performance_stats is controller.performance_stats
-    assert not controller.has_retired_kv_blocks(["request"])
-    assert controller.take_kv_cache_retirement_ranges(["request"]) == []
 
 
 def test_gpu_native_controller_rejects_legacy_resident_replay():
@@ -363,14 +360,9 @@ def test_parallel_sparse_verification_passes_request_rows_to_native_index():
     original_forward.assert_not_called()
 
 
-def test_native_full_verification_has_no_transfer_or_retirement():
+def test_native_full_verification_does_not_prime_transfer():
     controller = make_controller()
     mark_installed(controller)
-    with (
-        pytest.raises(RuntimeError, match="original vLLM attention"),
-        controller.full_verification_context(["request"], [32], [1]),
-    ):
-        pass
     with controller.proposal_context(["request"]):
         assert not controller.maybe_prime_full_verification(8)
     with pytest.raises(RuntimeError, match="requires a proposal"):

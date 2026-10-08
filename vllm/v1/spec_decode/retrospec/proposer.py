@@ -14,7 +14,6 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionMetadataBuilder, CommonAttentionMetadata
-from vllm.v1.outputs import KVCacheRetirement
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -359,45 +358,6 @@ class RetroSpecProposer(
         self._last_proposed_counts: dict[str, int] = {}
         self._last_committed_proposal_counts: dict[str, int] = {}
         self._closed = False
-
-    @property
-    def uses_full_verification_offload(self) -> bool:
-        return self.sparse_attention.uses_full_verification_offload
-
-    def full_verification_context(
-        self,
-        request_ids: Sequence[str],
-        context_lens: Sequence[int],
-        query_lens: Sequence[int],
-    ):
-        return self.sparse_attention.full_verification_context(
-            request_ids,
-            context_lens,
-            query_lens,
-        )
-
-    def has_retired_kv_blocks(self, request_ids: Sequence[str]) -> bool:
-        return self.sparse_attention.has_retired_kv_blocks(request_ids)
-
-    def take_kv_cache_retirements(
-        self,
-        request_ids: Sequence[str],
-    ) -> list[KVCacheRetirement]:
-        ranges = self.sparse_attention.take_kv_cache_retirement_ranges(request_ids)
-        if not ranges:
-            return []
-        if self.kv_cache_group_id is None:
-            raise RuntimeError("RetroSpec KV cache group has not been initialized")
-
-        return [
-            KVCacheRetirement(
-                request_id=request_id,
-                kv_cache_group_id=self.kv_cache_group_id,
-                start_block=start_block,
-                end_block=end_block,
-            )
-            for request_id, start_block, end_block in ranges
-        ]
 
     def needs_index_update(
         self,

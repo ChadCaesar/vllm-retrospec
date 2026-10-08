@@ -510,39 +510,6 @@ def test_retrospec_proposer_rejects_unsupported_features(
         RetroSpecProposer(config, torch.device("cpu"), runner)
 
 
-def test_retrospec_proposer_uses_gpu_native_full_verification():
-    proposer = RetroSpecProposer(
-        make_vllm_config(),
-        torch.device("cpu"),
-        make_runner(),
-    )
-
-    assert not proposer.uses_full_verification_offload
-
-
-def test_retrospec_proposer_delegates_full_verification_context():
-    proposer = RetroSpecProposer(
-        make_vllm_config(),
-        torch.device("cpu"),
-        make_runner(),
-    )
-    expected = nullcontext()
-    proposer.sparse_attention.full_verification_context = Mock(return_value=expected)
-
-    result = proposer.full_verification_context(
-        request_ids=["request"],
-        context_lens=[5],
-        query_lens=[2],
-    )
-
-    assert result is expected
-    proposer.sparse_attention.full_verification_context.assert_called_once_with(
-        ["request"],
-        [5],
-        [2],
-    )
-
-
 def test_retrospec_proposer_delegates_phase_aware_index_updates():
     proposer = RetroSpecProposer(
         make_vllm_config(),
@@ -571,7 +538,7 @@ def test_retrospec_proposer_delegates_phase_aware_index_updates():
     )
 
 
-def test_retrospec_proposer_attaches_kv_cache_group_to_retirement():
+def test_retrospec_proposer_resolves_kv_cache_group():
     proposer = RetroSpecProposer(
         make_vllm_config(),
         torch.device("cpu"),
@@ -588,14 +555,4 @@ def test_retrospec_proposer_attaches_kv_cache_group_to_retirement():
         ),
     )
     proposer.validate_same_kv_cache_group(kv_cache_config)
-    proposer.sparse_attention.take_kv_cache_retirement_ranges = Mock(
-        return_value=[("request", 1, 4)]
-    )
-
-    retirements = proposer.take_kv_cache_retirements(["request"])
-
-    assert len(retirements) == 1
-    assert retirements[0].request_id == "request"
-    assert retirements[0].kv_cache_group_id == 1
-    assert retirements[0].start_block == 1
-    assert retirements[0].end_block == 4
+    assert proposer.kv_cache_group_id == 1

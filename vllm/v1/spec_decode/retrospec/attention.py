@@ -165,10 +165,6 @@ class RetroSpecSparseAttention:
         self.original_forwards: dict[str, tuple[FlashAttentionImpl, LayerForward]] = {}
         self.forward_wrappers: dict[str, _RetroSpecLayerForward] = {}
 
-    @property
-    def uses_full_verification_offload(self) -> bool:
-        return False
-
     @contextmanager
     def index_update_context(
         self,
@@ -280,17 +276,6 @@ class RetroSpecSparseAttention:
     def abort_layer_major_prefill(self) -> None:
         self.index.discard_staged_updates()
 
-    def has_retired_kv_blocks(self, request_ids: Sequence[str]) -> bool:
-        del request_ids
-        return False
-
-    def take_kv_cache_retirement_ranges(
-        self,
-        request_ids: Sequence[str],
-    ) -> list[tuple[str, int, int]]:
-        del request_ids
-        return []
-
     def remove_requests(self, request_ids: Sequence[str]) -> None:
         self.index.remove_requests(request_ids)
 
@@ -382,19 +367,6 @@ class RetroSpecSparseAttention:
             self.index.close()
         finally:
             self.performance_stats.flush("shutdown")
-
-    @contextmanager
-    def full_verification_context(
-        self,
-        request_ids: Sequence[str],
-        context_lens: Sequence[int],
-        query_lens: Sequence[int],
-    ) -> Iterator[None]:
-        del request_ids, context_lens, query_lens
-        raise RuntimeError(
-            "GPU-native full verification uses the original vLLM attention path"
-        )
-        yield  # Keep the context-manager contract for callers.
 
     @contextmanager
     def proposal_context(
