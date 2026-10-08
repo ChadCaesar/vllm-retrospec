@@ -113,22 +113,7 @@ class RetroSpecGPUNativeIndex(
             return nullcontext()
         return self.performance_stats.cuda_timer(name)
 
-    def configure_sparse_prefetch_wave(self, num_layers: int) -> None:
-        del num_layers
-
     def flush_sparse_verification_prefetch(self) -> None:
-        pass
-
-    def begin_indexed_verification_transaction(self, *args: object) -> None:
-        pass
-
-    def end_indexed_verification_transaction(self) -> None:
-        pass
-
-    def prime_full_verification_pipeline(self, *args: object, **kwargs: object) -> bool:
-        return False
-
-    def prefetch_final_prefill_queries(self, *args: object, **kwargs: object) -> None:
         pass
 
     def close(self) -> None:

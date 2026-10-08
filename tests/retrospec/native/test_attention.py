@@ -204,11 +204,7 @@ def test_parallel_verification_tracks_request_and_token_rows():
         assert controller.parallel_bonus_start_index == 2
         controller.attention_mass_sum[:3].fill_(0.5)
         controller.attention_mass_layer_count = 1
-        with patch.object(
-            controller.index, "end_indexed_verification_transaction"
-        ) as end:
-            torch.testing.assert_close(controller.end_step(), torch.full((3,), 0.5))
-            end.assert_called_once_with()
+        torch.testing.assert_close(controller.end_step(), torch.full((3,), 0.5))
         assert controller.parallel_request_indices is None
         assert controller.parallel_bonus_start_index is None
 

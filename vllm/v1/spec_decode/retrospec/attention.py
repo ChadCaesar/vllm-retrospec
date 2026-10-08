@@ -360,7 +360,6 @@ class RetroSpecSparseAttention:
         for layer_name, layer in layers.items():
             validated_layers[layer_name] = self._validate_layer(layer_name, layer)
 
-        self.index.configure_sparse_prefetch_wave(len(validated_layers))
         for layer_name, impl in validated_layers.items():
             original_forward = impl.forward
             wrapper = _RetroSpecLayerForward(self, layer_name, original_forward)
@@ -581,9 +580,6 @@ class RetroSpecSparseAttention:
         attention_mass_sum = self.attention_mass_sum[: self.batch_size]
         attention_mass_sum = self._synchronize_attention_mass_sum(attention_mass_sum)
 
-        if self.parallel_request_indices is not None:
-            self.index.end_indexed_verification_transaction()
-
         self.mode = RetroSpecAttentionMode.PASSTHROUGH
         self.step_active = False
         self.step_index = -1
@@ -601,18 +597,15 @@ class RetroSpecSparseAttention:
 
     def abort_step(self) -> None:
         """Release verification state after a failed model forward."""
-        try:
-            self.index.end_indexed_verification_transaction()
-        finally:
-            self.mode = RetroSpecAttentionMode.PASSTHROUGH
-            self.step_active = False
-            self.step_index = -1
-            self.active_mask = None
-            self.batch_size = 0
-            self.parallel_request_indices = None
-            self.parallel_token_indices = None
-            self.parallel_bonus_start_index = None
-            self.attention_mass_layer_count = 0
+        self.mode = RetroSpecAttentionMode.PASSTHROUGH
+        self.step_active = False
+        self.step_index = -1
+        self.active_mask = None
+        self.batch_size = 0
+        self.parallel_request_indices = None
+        self.parallel_token_indices = None
+        self.parallel_bonus_start_index = None
+        self.attention_mass_layer_count = 0
 
     def end_step(self) -> torch.Tensor:
         return self.end_step_statistics().mean()
