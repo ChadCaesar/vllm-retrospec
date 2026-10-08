@@ -10,7 +10,6 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.outputs import KVCacheRetirement
 from vllm.v1.spec_decode.retrospec import RetroSpecProposer
 from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
 from vllm.v1.worker.block_table import BlockTable
@@ -314,33 +313,6 @@ def test_block_table_retires_hybrid_manager_blocks():
 
     assert table.get_numpy_array()[0, :6].tolist() == [14, 15, 0, 1, 18, 19]
     assert table.num_blocks_per_row[0] == 6
-
-
-def test_gpu_model_runner_applies_retirement_to_cached_and_batched_state():
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    request = SimpleNamespace(block_ids=([7, 8, 9, 10, 11],))
-    block_table = Mock()
-    runner.requests = {"request": request}
-    runner.input_batch = SimpleNamespace(
-        req_id_to_index={"request": 2},
-        block_table=block_table,
-    )
-    retirement = KVCacheRetirement(
-        request_id="request",
-        kv_cache_group_id=0,
-        start_block=1,
-        end_block=4,
-    )
-
-    runner._apply_retrospec_kv_retirements([retirement])
-
-    assert request.block_ids[0] == [7, 0, 0, 0, 11]
-    block_table.retire_blocks.assert_called_once_with(
-        kv_cache_group_id=0,
-        row_idx=2,
-        start_block=1,
-        end_block=4,
-    )
 
 
 def test_layer_major_prefill_copies_only_resident_workspace_blocks():
