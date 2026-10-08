@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -361,15 +360,8 @@ class RetroSpecRunnerPrefillMixin:
                         tile_end = tile.scheduled_end
                         per_layer_metadata = {layer_name: attn_metadata}
                         per_layer_slot_mapping = {layer_name: tile.slot_mapping}
-                        capture_context = (
-                            drafter.capture_layer_major_prefill_query(layer_name)
-                            if tile.scheduled_end == prompt_num_tokens
-                            else nullcontext()
-                        )
-
                         with (
                             workspace.bind_layer(layer_name, attention_layer),
-                            capture_context,
                             set_forward_context(
                                 per_layer_metadata,
                                 self.vllm_config,
@@ -401,7 +393,7 @@ class RetroSpecRunnerPrefillMixin:
 
                     assert full_prompt_tile is not None
                     key_cache, value_cache = workspace.kv_cache.unbind(0)
-                    reuse_ready_event = drafter.stage_layer_major_prefill_layer(
+                    drafter.stage_layer_major_prefill_layer(
                         layer_name=layer_name,
                         request_id=descriptor.request_id,
                         seq_len=prompt_num_tokens,
@@ -416,7 +408,7 @@ class RetroSpecRunnerPrefillMixin:
                         source_block_ids,
                         destination_block_ids,
                     )
-                    workspace.end_layer(reuse_ready_event)
+                    workspace.end_layer()
                 except BaseException:
                     stats.stop_cuda_timer(compute_timer)
                     workspace.abort_layer()

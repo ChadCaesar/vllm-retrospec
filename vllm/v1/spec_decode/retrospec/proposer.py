@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
-from contextlib import AbstractContextManager
 from time import perf_counter
 from typing import TYPE_CHECKING
 
@@ -397,8 +396,8 @@ class RetroSpecProposer(
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
-    ) -> torch.cuda.Event | None:
-        return self.sparse_attention.stage_layer_major_prefill_layer(
+    ) -> None:
+        self.sparse_attention.stage_layer_major_prefill_layer(
             layer_name,
             request_id,
             seq_len,
@@ -406,11 +405,6 @@ class RetroSpecProposer(
             value_cache,
             block_table,
         )
-
-    def capture_layer_major_prefill_query(
-        self, layer_name: str
-    ) -> AbstractContextManager[None]:
-        return self.sparse_attention.capture_layer_major_prefill_query(layer_name)
 
     def commit_layer_major_prefill(self, request_id: str) -> None:
         self.sparse_attention.commit_layer_major_prefill(

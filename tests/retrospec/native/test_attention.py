@@ -383,8 +383,6 @@ def test_layer_major_prefill_builds_gpu_index_and_commits():
         )
         build.assert_called_once()
         assert build.call_args.kwargs["prefill_complete"] == (True,)
-        with controller.capture_layer_major_prefill_query("layer"):
-            pass
         controller.commit_layer_major_prefill("request", ["layer"])
         flush.assert_called_once_with()
 

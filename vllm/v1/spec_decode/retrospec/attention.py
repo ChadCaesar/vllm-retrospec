@@ -248,7 +248,7 @@ class RetroSpecSparseAttention:
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
-    ) -> torch.cuda.Event | None:
+    ) -> None:
         self.index.build_or_update(
             layer_name=layer_name,
             request_ids=(request_id,),
@@ -260,12 +260,6 @@ class RetroSpecSparseAttention:
             block_table=block_table,
             prefill_complete=(True,),
         )
-        return None
-
-    @contextmanager
-    def capture_layer_major_prefill_query(self, layer_name: str) -> Iterator[None]:
-        del layer_name
-        yield
 
     def commit_layer_major_prefill(
         self, request_id: str, layer_names: Sequence[str]
