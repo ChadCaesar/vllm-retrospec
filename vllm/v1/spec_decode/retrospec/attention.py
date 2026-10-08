@@ -140,7 +140,6 @@ class RetroSpecSparseAttention:
 
         self.proposal_request_ids: tuple[str, ...] = ()
         self.proposal_context_lens: tuple[int, ...] = ()
-        self.proposal_round = 0
 
         self.index_update_active = False
         self.index_update_request_ids: tuple[str, ...] = ()
@@ -423,7 +422,6 @@ class RetroSpecSparseAttention:
         try:
             self.proposal_request_ids = request_ids
             self.proposal_context_lens = normalized_context_lens
-            self.proposal_round = 0
 
             self.in_proposal = True
             yield
@@ -437,7 +435,6 @@ class RetroSpecSparseAttention:
             self.parallel_request_indices = None
             self.parallel_token_indices = None
             self.attention_mass_layer_count = 0
-            self.proposal_round = 0
 
             try:
                 self.index.flush_sparse_verification_prefetch()
@@ -445,19 +442,6 @@ class RetroSpecSparseAttention:
                 self.index.end_proposal()
                 self.proposal_request_ids = ()
                 self.proposal_context_lens = ()
-
-    def set_proposal_round(self, proposal_round: int) -> None:
-        if not self.in_proposal:
-            raise RuntimeError("Proposal round may be set only inside proposal_context")
-        if proposal_round <= 0:
-            raise ValueError("proposal_round must be positive")
-        if proposal_round < self.proposal_round:
-            raise ValueError("proposal_round must be monotonic")
-        self.proposal_round = proposal_round
-
-    @property
-    def selection_provenance_enabled(self) -> bool:
-        return False
 
     def begin_step(
         self,

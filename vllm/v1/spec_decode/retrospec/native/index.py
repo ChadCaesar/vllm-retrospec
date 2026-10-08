@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.triton_utils import triton
-from vllm.v1.spec_decode.retrospec.clustering import segmented_kmeans
+from vllm.v1.spec_decode.retrospec.cluster import segmented_kmeans
 from vllm.v1.spec_decode.retrospec.native.kernels import (
     _NativeBatchLayer,
     _NativeLayerRecord,

@@ -7,7 +7,7 @@ from contextlib import AbstractContextManager, nullcontext
 
 import torch
 
-from vllm.v1.spec_decode.retrospec.clustering import segmented_kmeans
+from vllm.v1.spec_decode.retrospec.cluster import segmented_kmeans
 from vllm.v1.spec_decode.retrospec.legacy.cluster_store import (
     RetroSpecClusterBlockTable,
     RetroSpecFullVerificationDescriptor,

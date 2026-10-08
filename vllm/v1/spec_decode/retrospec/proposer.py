@@ -561,9 +561,6 @@ class RetroSpecProposer(
                 )
                 if token_index >= self.num_speculative_tokens:
                     break
-                if self.sparse_attention.selection_provenance_enabled:
-                    self.sparse_attention.set_proposal_round(proposal_round)
-
                 self.performance_stats.add_gpu_counter(
                     "draft_round_requests",
                     draft_round_mask,

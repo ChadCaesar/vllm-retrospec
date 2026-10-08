@@ -62,7 +62,6 @@ def test_gpu_native_controller_uses_native_kv_and_shared_statistics():
     controller = make_controller(max_num_seqs=2, num_speculative_tokens=4)
 
     assert not controller.uses_full_verification_offload
-    assert not controller.selection_provenance_enabled
     assert controller.max_parallel_tokens == 8
     assert controller.index.performance_stats is controller.performance_stats
     assert not controller.has_retired_kv_blocks(["request"])
@@ -95,7 +94,6 @@ def test_proposal_context_requires_installed_attention_and_restores_state():
             assert controller.in_proposal
             assert controller.proposal_request_ids == ("request",)
             assert controller.proposal_context_lens == (32,)
-            controller.set_proposal_round(2)
             with (
                 pytest.raises(RuntimeError, match="cannot be nested"),
                 controller.proposal_context(["other"]),
@@ -109,7 +107,6 @@ def test_proposal_context_requires_installed_attention_and_restores_state():
     assert not controller.in_proposal
     assert controller.proposal_request_ids == ()
     assert controller.proposal_context_lens == ()
-    assert controller.proposal_round == 0
     assert controller.mode == RetroSpecAttentionMode.PASSTHROUGH
 
 
@@ -123,22 +120,6 @@ def test_proposal_context_rejects_invalid_lengths(context_lens: list[int]):
     ):
         pass
     assert not controller.in_proposal
-
-
-def test_proposal_round_is_scoped_and_monotonic():
-    controller = make_controller()
-    mark_installed(controller)
-    with pytest.raises(RuntimeError, match="only inside proposal_context"):
-        controller.set_proposal_round(1)
-
-    with controller.proposal_context(["request"]):
-        controller.set_proposal_round(1)
-        controller.set_proposal_round(3)
-        assert controller.proposal_round == 3
-        with pytest.raises(ValueError, match="monotonic"):
-            controller.set_proposal_round(2)
-        with pytest.raises(ValueError, match="positive"):
-            controller.set_proposal_round(0)
 
 
 def test_draft_step_statistics_reset_after_completion():
