@@ -25,7 +25,7 @@ flowchart LR
 | Modules under `offload/` | Responsibility |
 | --- | --- |
 | `segmented_index.py`, `segmented_build.py`, `segmented_selection.py`, `segmented_verification.py`, `segmented_types.py` | Per-request segment state, background index construction, selection plans, indexed verification, and full verification pipeline |
-| `cluster_store.py`, `cluster_store_support.py`, `cluster_staging_types.py`, `cluster_verification_types.py`, `page_pool.py` | Cluster page ownership, prefetch state, pinned and GPU staging buffers, verification descriptors and resolved page types, and CPU page slabs |
+| `cluster_store.py`, `cluster_store_metadata.py`, `cluster_store_support.py`, `cluster_staging_types.py`, `cluster_verification_types.py`, `page_pool.py` | Cluster page ownership, stable-handle lifecycle and infrequent metadata queries, prefetch state, pinned and GPU staging buffers, verification descriptors and resolved page types, and CPU page slabs |
 | `cluster_prefetch.py`, `cluster_verification.py`, `verification_transfer.py` | Resident prefetch waves, verification miss resolution, and reusable full-layer transfer buffers |
 | `resident_cache.py`, `resident_cache_types.py`, `resident_cache_lookup.py`, `resident_cache_admission.py` | Bounded resident page state, stable access types, lookup paths, and admission/eviction paths. The public cache class remains in `resident_cache.py`. |
 | `resident_kernels.py`, `resident_lookup_launchers.py`, `resident_draft_launchers.py`, `resident_verification_launchers.py` | Compatible resident launcher exports and focused lookup/table, draft, and verification launchers |
@@ -77,10 +77,14 @@ all manager methods remain in their original order. This keeps arena and
 pinned-summary operations on their original execution path.
 
 The page-store support module re-exports the staging and verification types
-from their focused modules. All page-store methods continue to import those
-types through `cluster_store_support.py`; the legacy `cluster_store` import and
-serialized class paths remain valid. This split does not move page-store,
-prefetch, or verification execution methods.
+from their focused modules. Stable cluster-handle allocation and release,
+plus infrequent identity, page-width, and allocation-count queries live in
+`cluster_store_metadata.py`. `RetroSpecClusterPageStore` binds those five
+methods directly, preserving its MRO and method lookup path. Decode-time
+validation, group lookup, and CPU page-descriptor materialization remain on
+the page-store class. The legacy `cluster_store` import and serialized class
+paths remain valid. Prefetch, verification, staging, and storage execution
+methods remain in their existing modules.
 
 ## Verification
 
@@ -100,3 +104,7 @@ are recorded in `benchmarks/retrospec/version1_kernel_results.md` and
 The resident launcher split and its compatibility, stage, and performance
 checks are recorded in `benchmarks/retrospec/version1_launcher_results.md`
 and `benchmarks/retrospec/version1_launcher_runs.tsv`.
+The page-store handle split, tests, and paired performance results are recorded
+in `benchmarks/retrospec/version1_store_results.md` and
+`benchmarks/retrospec/version1_store_runs.tsv`; the controlled prefill
+measurements are in `benchmarks/retrospec/version1_store_prefill_runs.tsv`.
