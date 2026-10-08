@@ -90,21 +90,5 @@ methods remain in their existing modules.
 
 Backend tests are grouped under `tests/retrospec/offload/`; the page store and
 segmented index tests are split by responsibility. The full RetroSpec suite
-also exercises the unchanged public import paths. Performance configurations,
-generated-token comparisons, stage counters, and baseline limitations are
-recorded in `benchmarks/retrospec/version1_batch3_results.md`.
-The index type split and its performance comparisons are recorded in
-`benchmarks/retrospec/version1_index_results.md`.
-The page-store support type split, full benchmark matrix, and per-repeat data
-are recorded in `benchmarks/retrospec/version1_support_results.md` and
-`benchmarks/retrospec/version1_support_runs.tsv`.
-The resident Triton kernel split, full benchmark matrix, and per-repeat data
-are recorded in `benchmarks/retrospec/version1_kernel_results.md` and
-`benchmarks/retrospec/version1_kernel_runs.tsv`.
-The resident launcher split and its compatibility, stage, and performance
-checks are recorded in `benchmarks/retrospec/version1_launcher_results.md`
-and `benchmarks/retrospec/version1_launcher_runs.tsv`.
-The page-store handle split, tests, and paired performance results are recorded
-in `benchmarks/retrospec/version1_store_results.md` and
-`benchmarks/retrospec/version1_store_runs.tsv`; the controlled prefill
-measurements are in `benchmarks/retrospec/version1_store_prefill_runs.tsv`.
+also exercises the unchanged public import paths. Long-context performance can
+be measured with the scripts in `benchmarks/retrospec/`.
