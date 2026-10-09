@@ -16,7 +16,6 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import (
     DraftTokenIds,
-    KVCacheRetirement,
     ModelRunnerOutput,
     RetroSpecLayerMajorPrefillCompletion,
 )
@@ -259,47 +258,6 @@ def test_retrospec_pp_protects_in_flight_requests_from_preemption():
 
     assert scheduler._select_preemption_victim() is None
     assert not scheduler.reset_prefix_cache(reset_running_requests=True)
-
-
-def test_scheduler_applies_worker_kv_cache_retirement():
-    scheduler = Scheduler.__new__(Scheduler)
-    scheduler.kv_cache_manager = Mock()
-    scheduler.requests = {
-        "request": SimpleNamespace(is_finished=lambda: False),
-    }
-    scheduler_output = SchedulerOutput.make_empty()
-    scheduler_output.num_scheduled_tokens = {"request": 1}
-    retirement = KVCacheRetirement(
-        request_id="request",
-        kv_cache_group_id=2,
-        start_block=1,
-        end_block=5,
-    )
-
-    scheduler._apply_kv_cache_retirements(scheduler_output, [retirement])
-
-    scheduler.kv_cache_manager.retire_blocks.assert_called_once_with(
-        request_id="request",
-        kv_cache_group_id=2,
-        start_block=1,
-        end_block=5,
-    )
-
-
-def test_scheduler_rejects_retirement_for_unscheduled_request():
-    scheduler = Scheduler.__new__(Scheduler)
-    scheduler.kv_cache_manager = Mock()
-    scheduler.requests = {}
-    scheduler_output = SchedulerOutput.make_empty()
-    retirement = KVCacheRetirement(
-        request_id="request",
-        kv_cache_group_id=0,
-        start_block=1,
-        end_block=2,
-    )
-
-    with pytest.raises(RuntimeError, match="unscheduled request"):
-        scheduler._apply_kv_cache_retirements(scheduler_output, [retirement])
 
 
 def make_layer_major_scheduler_output(

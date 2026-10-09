@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""GPU-native capacity contracts.
-
-The branch keeps complete target KV on GPU. Offload working-set and
-CPU-staging capacity tests do not describe its runtime memory policy.
-"""
+"""GPU-native capacity contracts."""
 
 from types import SimpleNamespace
 from typing import Any, cast
@@ -28,7 +24,6 @@ from vllm.v1.spec_decode.retrospec.capacity import (
     estimate_retrospec_gpu_index_arena_bytes,
     estimate_retrospec_gpu_index_footprint,
     get_retrospec_gpu_index_descriptor_bytes,
-    is_retrospec_long_context_enabled,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -98,15 +93,6 @@ def make_scheduler_kv_cache_config(num_layers: int = 2) -> KVCacheConfig:
             )
         ],
     )
-
-
-def test_gpu_native_never_uses_offload_working_set_capacity():
-    config = make_config(max_model_len=65536)
-    assert not is_retrospec_long_context_enabled(config)
-    config.model_config.max_model_len = 8192
-    assert not is_retrospec_long_context_enabled(config)
-    config.speculative_config.method = "ngram"
-    assert not is_retrospec_long_context_enabled(config)
 
 
 def test_gpu_index_footprint_matches_stable_cluster_and_page_layout():

@@ -571,20 +571,6 @@ def test_propose_accumulates_multiple_draft_rounds(monkeypatch):
         "feedback_horizon_restores": 0,
         "verified_tokens": 4,
         "proposed_tokens": 4,
-        "resident_cluster_hits": 0,
-        "resident_cluster_misses": 0,
-        "draft_compact_resident_pages": 0,
-        "draft_compact_selected_clusters": 0,
-        "resident_bound_direct_hits": 0,
-        "resident_hash_fallback_lookups": 0,
-        "resident_hash_fallback_hits": 0,
-        "resident_hash_fallback_misses": 0,
-        "resident_hash_probe_steps": 0,
-        "resident_hash_max_probe": 0,
-        "resident_binding_invalidations": 0,
-        "verification_lookup_clusters": 0,
-        "verification_resident_hits": 0,
-        "verification_resident_misses": 0,
     }
     assert stats._cpu_times["proposal_wall"][1] == 1
 

@@ -17,8 +17,8 @@ Scheduler admission and PP batch state
 | Scheduler | `vllm/v1/core/sched/retrospec_admission.py`, `retrospec_pipeline.py` | GPU index tickets, exclusive prefill admission, PP batch ownership and completion |
 | Runner | `vllm/v1/worker/retrospec_runner_prefill.py`, `retrospec_runner_pipeline.py`, `retrospec_runner_state.py` | Layer-major prefill, PP proposal handoff and temporary state |
 | Drafting | `vllm/v1/spec_decode/retrospec/proposer.py`, `proposal/` | Request state, model execution, draft sampling, feedback and verification |
-| Sparse attention | `attention.py`, `gpu_native.py`, `native/` | Attention dispatch, GPU index construction and ranking, resident sparse attention kernels |
-| Shared sizing | `capacity.py`, `constants.py` | GPU index memory sizing and small shared constants |
+| Sparse attention | `attention.py`, `gpu_native.py`, `native/` | Attention dispatch, GPU index construction and ranking, sparse attention kernels |
+| Shared sizing | `capacity.py` | GPU index memory sizing |
 
 The public classes and import paths stay in their original modules. The original classes compose implementation mixins; calls use the same kernels, launch parameters, buffers, CUDA streams and graph paths as before the split. A method's module globals now live in its implementation module, which matters when tests patch a dependency.
 
@@ -30,28 +30,17 @@ retrospec/
   proposal/                                   model, draft, sampling, verification, feedback
   native/                                     index, rank, attention, shared types
     kernels/                                  build, rank, attention Triton kernels
-  legacy/                                     public legacy entry points
-    store/                                    page storage, prefetch, transfer
-    segmented/                                index build, scoring, selection, verification
-    attention/                                legacy proposal and verification attention
-    residency/{cache,index,kernels,ops}/      resident data and GPU operations
 ```
 
-Private implementation module paths changed as part of this organization; callers should use the original public modules. The tests mirror this split under `tests/retrospec/{native,proposal,legacy,integration}/`, with reusable fixtures in `support/`.
-
-## Isolated legacy path
-
-`vllm/v1/spec_decode/retrospec/legacy/` contains the CPU-backed segmented index and resident page store. Its subpackages separate index construction, scoring, selection, verification, page storage, prefetch, resident lookup and transfer. The original flat public module paths remain compatibility aliases. Active GPU-native imports use `constants.py` rather than importing legacy scoring for a constant.
-
-The legacy path remains tested and importable. It is not selected by `method="retrospec"` in the current runner.
+Private implementation module paths changed as part of this organization; callers should use the current public modules. The tests mirror this split under `tests/retrospec/{native,proposal,integration}/`, with reusable fixtures in `support/`.
 
 ## Compatibility and performance gates
 
-Do not change configuration defaults or validation, public Python imports, native operator signatures, numerical policy, memory budget formulas, kernel bodies or launch parameters as part of structural moves. Check output tokens and phase statistics for every benchmark mode; compare latency, throughput and peak GPU memory on the same model, data, device and configuration. Warm up and repeat measurements. Investigate an approximately 3% difference and revert or repair a repeatable regression.
+For structural changes to the active GPU-native path, preserve configuration defaults and validation, public Python imports, native operator signatures, numerical policy, memory budget formulas, kernel bodies and launch parameters. Check output tokens and phase statistics for every benchmark mode; compare latency, throughput and peak GPU memory on the same model, data, device and configuration. Warm up and repeat measurements. Investigate an approximately 3% difference and revert or repair a repeatable regression.
 
 The pre-refactor baseline on two RTX 4090 GPUs passed all 808 `tests/retrospec` tests. With Llama-3-8B-Instruct-Gradient-1048k and NIAH 120k, TP=2 eager completed a 119,957-token prompt. PP=2 at 120k failed at KV allocation on the baseline: 14.68 GiB required versus 10.12 GiB available per GPU. A shorter input is not evidence for PP=2 at 120k.
 
-Run `pytest -q tests/retrospec` in the `vllm` conda environment with this checkout on `PYTHONPATH`. The focused test files cover the current proposer and GPU index, scheduler and runner integration, and the legacy index, resident cache, page store and kernels. Use `benchmarks/retrospec/benchmark_long_context.py` for the Qwen 30k and Llama 120k comparisons.
+Run `pytest -q tests/retrospec` in the `vllm` conda environment with this checkout on `PYTHONPATH`. The focused test files cover the current proposer and GPU index plus scheduler and runner integration. Use `benchmarks/retrospec/benchmark_long_context.py` for the Qwen 30k and Llama 120k comparisons.
 
 ## Refactor comparison on 2026-09-30
 

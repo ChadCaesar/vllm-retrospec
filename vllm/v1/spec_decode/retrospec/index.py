@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from enum import IntEnum
 from math import ceil
 
 import torch
-
-
-class RetroSpecAttentionLevel(IntEnum):
-    SPARSE = 0
-    EXPANDED = 1
 
 
 class RetroSpecIndexBase:

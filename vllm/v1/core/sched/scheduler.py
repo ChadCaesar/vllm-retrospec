@@ -57,7 +57,6 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import (
     DraftTokenIds,
-    KVCacheRetirement,
     KVConnectorOutput,
     ModelRunnerOutput,
 )
@@ -1434,29 +1433,6 @@ class Scheduler(
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
-    def _apply_kv_cache_retirements(
-        self,
-        scheduler_output: SchedulerOutput,
-        retirements: list[KVCacheRetirement],
-    ) -> None:
-        for retirement in retirements:
-            request_id = retirement.request_id
-            if request_id not in scheduler_output.num_scheduled_tokens:
-                raise RuntimeError(
-                    f"Worker retired KV blocks for unscheduled request {request_id!r}"
-                )
-
-            request = self.requests.get(request_id)
-            if request is None or request.is_finished():
-                continue
-
-            self.kv_cache_manager.retire_blocks(
-                request_id=request_id,
-                kv_cache_group_id=retirement.kv_cache_group_id,
-                start_block=retirement.start_block,
-                end_block=retirement.end_block,
-            )
-
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1473,10 +1449,6 @@ class Scheduler(
         self._update_retrospec_layer_major_prefill_completion(
             scheduler_output,
             model_runner_output.retrospec_layer_major_prefill_completion,
-        )
-        self._apply_kv_cache_retirements(
-            scheduler_output,
-            model_runner_output.kv_cache_retirements,
         )
         self._complete_retrospec_pp_batch(scheduler_output)
 

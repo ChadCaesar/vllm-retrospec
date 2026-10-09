@@ -92,15 +92,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--draft-rank-dtype", choices=("int8", "native"), default="native"
     )
-    parser.add_argument("--cache-ratio", type=float, default=0.0)
     parser.add_argument("--index-segment-size", type=int, default=8192)
     parser.add_argument("--index-update-interval", type=int, default=1024)
     parser.add_argument("--prefill-tile-size", type=int, default=32768)
     parser.add_argument("--blocks-per-cluster", type=int, default=1)
     parser.add_argument("--kmeans-iterations", type=int, default=10)
-    parser.add_argument("--cpu-page-build-workers", type=int, default=4)
-    parser.add_argument("--full-verify-gather-workers", type=int, default=4)
-    parser.add_argument("--max-pinned-memory", type=float, default=1.0)
     parser.add_argument("--max-gpu-index-memory", type=float, default=4.0)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--stats-interval", type=float, default=1.0)
@@ -111,11 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph", action="store_true")
     parser.add_argument("--native", action="store_true")
     parser.add_argument("--sync-attention-gates", action="store_true")
-    parser.add_argument(
-        "--replay-mode",
-        choices=("off", "trace", "freeze_resident", "ready_selected"),
-        default="off",
-    )
+    parser.add_argument("--trace-transitions", action="store_true")
     return parser.parse_args()
 
 
@@ -130,27 +122,21 @@ def load_sample(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_speculative_config(args: argparse.Namespace) -> dict[str, Any]:
-    replay_mode = getattr(args, "replay_mode", "off")
     config: dict[str, Any] = {
         "method": "retrospec",
         "num_speculative_tokens": args.num_speculative_tokens,
         "retrospec_retrieval_ratio": args.retrieval_ratio,
         "retrospec_estimation_ratio": args.estimation_ratio,
         "retrospec_draft_rank_dtype": args.draft_rank_dtype,
-        "retrospec_cache_ratio": args.cache_ratio,
         "retrospec_index_segment_size": args.index_segment_size,
         "retrospec_index_update_interval": args.index_update_interval,
         "retrospec_prefill_tile_size": args.prefill_tile_size,
         "retrospec_blocks_per_cluster": args.blocks_per_cluster,
         "retrospec_kmeans_iterations": args.kmeans_iterations,
-        "retrospec_cpu_page_build_workers": args.cpu_page_build_workers,
-        "retrospec_full_verify_gather_workers": args.full_verify_gather_workers,
-        "retrospec_max_pinned_memory": args.max_pinned_memory,
         "retrospec_max_gpu_index_memory": args.max_gpu_index_memory,
         "retrospec_min_draft_tokens": args.min_draft_tokens,
         "retrospec_max_draft_tokens": args.max_draft_tokens,
-        "retrospec_replay_mode": replay_mode,
-        "retrospec_trace_transitions": replay_mode != "off",
+        "retrospec_trace_transitions": args.trace_transitions,
         "retrospec_stats_interval_seconds": (
             args.stats_interval if args.profile else 0.0
         ),
@@ -231,7 +217,7 @@ def main() -> None:
                 args.profile_sample_interval if args.profile else 0
             ),
             "graph": args.graph,
-            "replay_mode": args.replay_mode,
+            "trace_transitions": args.trace_transitions,
             "tensor_parallel_size": args.tensor_parallel_size,
             "pipeline_parallel_size": args.pipeline_parallel_size,
             "max_num_batched_tokens": args.max_num_batched_tokens,

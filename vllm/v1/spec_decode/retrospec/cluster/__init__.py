@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Segmented clustering shared by the native and legacy RetroSpec indexes."""
+"""Segmented clustering for the GPU-native RetroSpec index."""
 
 from .algorithm import (
     SegmentedKMeansResult,

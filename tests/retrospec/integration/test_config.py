@@ -32,19 +32,11 @@ def test_retrospec_defaults():
     assert config.enforce_eager is True
     assert config.retrospec_retrieval_ratio == pytest.approx(0.050)
     assert config.retrospec_estimation_ratio == pytest.approx(0.232)
-    assert config.retrospec_cache_ratio == pytest.approx(0.0)
     assert config.retrospec_index_segment_size == 8192
     assert config.retrospec_prefill_tile_size == 32768
     assert config.retrospec_blocks_per_cluster == 1
     assert config.retrospec_kmeans_iterations == 10
-    assert config.retrospec_max_pending_cluster_builds == 2
-    assert config.retrospec_cpu_page_build_workers == 4
-    assert config.retrospec_full_verify_gather_workers == 4
-    assert config.retrospec_cpu_page_initial_slab_size_mib == 8
-    assert config.retrospec_cpu_page_slab_size_mib == 256
-    assert config.retrospec_max_pinned_memory == pytest.approx(1.0)
     assert config.retrospec_max_gpu_index_memory == pytest.approx(4.0)
-    assert config.retrospec_prefill_warmup_multiplier == 4
     assert config.retrospec_index_update_interval == 1024
     assert config.retrospec_min_draft_tokens == 1
     assert config.retrospec_max_draft_tokens == 8
@@ -56,7 +48,6 @@ def test_retrospec_defaults():
     assert config.retrospec_retrieval_attn_threshold is None
     assert config.retrospec_expanded_attn_threshold is None
     assert config.retrospec_trace_transitions is False
-    assert config.retrospec_replay_mode == "off"
     assert config.retrospec_stats_interval_seconds == pytest.approx(0.0)
     assert config.retrospec_stats_cuda_timing_level == "coarse"
     assert config.retrospec_stats_cuda_sample_interval == 8
@@ -158,6 +149,25 @@ def test_retrospec_rejects_removed_sparse_fraction():
         make_retrospec_config(retrospec_sparse_verify_exact_fraction=0.875)
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "retrospec_cache_ratio",
+        "retrospec_max_pending_cluster_builds",
+        "retrospec_cpu_page_build_workers",
+        "retrospec_full_verify_gather_workers",
+        "retrospec_cpu_page_initial_slab_size_mib",
+        "retrospec_cpu_page_slab_size_mib",
+        "retrospec_max_pinned_memory",
+        "retrospec_prefill_warmup_multiplier",
+        "retrospec_replay_mode",
+    ],
+)
+def test_retrospec_rejects_removed_offload_options(field: str):
+    with pytest.raises(ValueError, match=field):
+        make_retrospec_config(**{field: 1})
+
+
 def test_retrospec_rejects_invalid_draft_rank_dtype():
     with pytest.raises(ValueError, match="retrospec_draft_rank_dtype"):
         make_retrospec_config(retrospec_draft_rank_dtype="float8")
@@ -185,20 +195,11 @@ def test_retrospec_inherits_target_enforce_eager(target_enforce_eager: bool):
         ("retrospec_retrieval_ratio", 1.0),
         ("retrospec_estimation_ratio", -0.01),
         ("retrospec_estimation_ratio", 1.0),
-        ("retrospec_cache_ratio", -0.01),
-        ("retrospec_cache_ratio", 1.01),
         ("retrospec_index_segment_size", 0),
         ("retrospec_prefill_tile_size", 0),
         ("retrospec_blocks_per_cluster", 0),
         ("retrospec_kmeans_iterations", 0),
-        ("retrospec_max_pending_cluster_builds", 0),
-        ("retrospec_cpu_page_build_workers", 0),
-        ("retrospec_full_verify_gather_workers", 0),
-        ("retrospec_cpu_page_initial_slab_size_mib", 0),
-        ("retrospec_cpu_page_slab_size_mib", 0),
-        ("retrospec_max_pinned_memory", 0.0),
         ("retrospec_max_gpu_index_memory", 0.0),
-        ("retrospec_prefill_warmup_multiplier", 0),
         ("retrospec_index_update_interval", 0),
         ("num_speculative_tokens", 0),
         ("retrospec_min_draft_tokens", 0),
@@ -255,14 +256,6 @@ def test_retrospec_rejects_context_parallel_execution(
         make_retrospec_config(target_parallel_config=parallel_config)
 
 
-def test_retrospec_rejects_initial_cpu_slab_larger_than_maximum():
-    with pytest.raises(ValueError, match="initial_slab_size"):
-        make_retrospec_config(
-            retrospec_cpu_page_initial_slab_size_mib=16,
-            retrospec_cpu_page_slab_size_mib=8,
-        )
-
-
 def test_retrospec_clears_prompt_lookup_fields():
     config = make_retrospec_config(
         prompt_lookup_min=2,
@@ -278,7 +271,6 @@ def test_retrospec_clears_prompt_lookup_fields():
     [
         ("retrospec_retrieval_ratio", 0.02),
         ("retrospec_estimation_ratio", 0.25),
-        ("retrospec_cache_ratio", 0.1),
         ("retrospec_index_segment_size", 2048),
         ("retrospec_prefill_tile_size", 4096),
         ("retrospec_blocks_per_cluster", 8),
@@ -306,16 +298,8 @@ def test_retrospec_hash_tracks_execution_structure(field: str, value: Any):
         ("retrospec_hit_attn_threshold", 0.1),
         ("retrospec_retrieval_attn_threshold", 0.1),
         ("retrospec_expanded_attn_threshold", 0.1),
-        ("retrospec_max_pending_cluster_builds", 4),
-        ("retrospec_cpu_page_build_workers", 8),
-        ("retrospec_full_verify_gather_workers", 8),
-        ("retrospec_cpu_page_initial_slab_size_mib", 16),
-        ("retrospec_cpu_page_slab_size_mib", 512),
-        ("retrospec_max_pinned_memory", 2.0),
         ("retrospec_max_gpu_index_memory", 8.0),
-        ("retrospec_prefill_warmup_multiplier", 8),
         ("retrospec_trace_transitions", True),
-        ("retrospec_replay_mode", "trace"),
         ("retrospec_stats_interval_seconds", 5.0),
         ("retrospec_stats_cuda_timing_level", "detailed"),
         ("retrospec_stats_cuda_sample_interval", 1),

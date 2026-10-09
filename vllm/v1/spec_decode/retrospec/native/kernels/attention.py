@@ -152,8 +152,7 @@ def _native_sparse_attention_kernel(
                 running_sum = running_sum * previous_scale + tl.sum(weights, 0)
                 running_max = next_max
 
-    # Top-k cluster tokens are looked up through a compact reverse index. No
-    # gathered KV page or CPU-resident cache is involved.
+    # Top-k cluster tokens are looked up through a compact reverse index.
     for rank in range(partition, retrieval_count, num_partitions):
         cluster = tl.load(
             ranked_clusters + row * ranked_s0 + kv_head * ranked_s1 + rank

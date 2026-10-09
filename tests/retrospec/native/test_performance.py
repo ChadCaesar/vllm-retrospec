@@ -82,12 +82,7 @@ def test_gpu_counter_buffer_returns_stable_named_offsets():
         log_interval_seconds=1.0,
     )
 
-    names = (
-        "resident_cluster_hits",
-        "resident_cluster_misses",
-        "draft_compact_resident_pages",
-        "draft_compact_selected_clusters",
-    )
+    names = ("proposal_requests", "draft_tokens", "verified_tokens")
     buffer, indices = stats.get_gpu_counter_buffer(names)
 
     assert buffer.data_ptr() == stats._gpu_counters.data_ptr()
@@ -239,21 +234,6 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     stats.add_counter("sparse_verify_tokens", 8)
     stats.add_counter("expanded_verify_tokens", 2)
     stats.add_counter("full_verify_requests", 1)
-    stats.add_gpu_counter("resident_cluster_hits", torch.tensor([9]))
-    stats.add_gpu_counter("resident_cluster_misses", torch.tensor([1]))
-    stats.add_gpu_counter("draft_compact_selected_clusters", torch.tensor([10]))
-    stats.add_gpu_counter("resident_bound_direct_hits", torch.tensor([6]))
-    stats.add_gpu_counter("resident_hash_fallback_lookups", torch.tensor([4]))
-    stats.add_gpu_counter("resident_hash_fallback_hits", torch.tensor([3]))
-    stats.add_gpu_counter("resident_hash_fallback_misses", torch.tensor([1]))
-    stats.add_gpu_counter("resident_hash_probe_steps", torch.tensor([7]))
-    stats.add_gpu_counter("resident_hash_max_probe", torch.tensor([3]))
-    stats.add_gpu_counter("resident_binding_invalidations", torch.tensor([2]))
-    stats.add_counter("prefetch_submitted", 3)
-    stats.add_counter("prefetch_waves_submitted", 3)
-    stats.add_counter("prefetch_waves_coalesced", 1)
-    stats.add_counter("prefetch_backpressure_waits", 1)
-    stats.add_counter("prefetch_wave_records", 9)
     stats.add_counter("draft_cudagraph_replay", 3)
     stats.add_counter("draft_cudagraph_fallback", 1)
     stats.add_counter("sparse_verify_cudagraph_replay", 2)
@@ -262,10 +242,7 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     stats.add_gpu_counter("draft_tokens", torch.tensor([3, 5]))
     stats.add_gpu_counter("verified_tokens", torch.tensor([2, 4]))
     stats.add_gpu_counter("proposed_tokens", torch.tensor([2, 3]))
-    stats.add_gpu_counter("verification_lookup_clusters", torch.tensor([10]))
-    stats.add_gpu_counter("verification_resident_hits", torch.tensor([9]))
-    stats.add_gpu_counter("verification_resident_misses", torch.tensor([1]))
-    stats.observe_peak("cluster_build_queue_depth", 2)
+    stats.observe_peak("layer_prefill_tile_tokens", 1024)
     stats.record_cpu_time("proposal_wall", 0.012)
 
     stats.maybe_log()
@@ -275,20 +252,10 @@ def test_stats_log_counts_ratios_and_timings(monkeypatch: pytest.MonkeyPatch):
     assert "proposal_requests=2" in message
     assert "draft_tokens=8" in message
     assert "verified_tokens=6" in message
-    assert "cluster_build_queue_depth=2" in message
+    assert "layer_prefill_tile_tokens=1024" in message
     assert "draft_tokens/request=4.00" in message
     assert "expanded/sparse=0.250" in message
     assert "full/request=0.500" in message
-    assert "resident_hit_rate=0.900" in message
-    assert "resident_bound_hit_rate=0.750" in message
-    assert "resident_hash_fallback_rate=0.400" in message
-    assert "resident_hash_fallback_hit_rate=0.750" in message
-    assert "resident_hash_avg_probe=1.75" in message
-    assert "resident_binding_invalidation_rate=0.250" in message
-    assert "verification_hit_rate=0.900" in message
-    assert "prefetch_coalesce_rate=0.250" in message
-    assert "prefetch_backpressure_rate=0.333" in message
-    assert "prefetch_records/wave=3.00" in message
     assert "draft_graph_replay=0.750" in message
     assert "sparse_verify_graph_replay=1.000" in message
     assert "expanded_verify_graph_replay=0.000" in message

@@ -41,15 +41,11 @@ def test_benchmark_profile_controls_observation_interval():
         "retrieval_ratio": 0.018,
         "estimation_ratio": 0.232,
         "draft_rank_dtype": "native",
-        "cache_ratio": 0.0,
         "index_segment_size": 8192,
         "index_update_interval": 1024,
         "prefill_tile_size": 8192,
         "blocks_per_cluster": 1,
         "kmeans_iterations": 10,
-        "cpu_page_build_workers": 4,
-        "full_verify_gather_workers": 4,
-        "max_pinned_memory": 1.0,
         "max_gpu_index_memory": 4.0,
         "min_draft_tokens": 1,
         "max_draft_tokens": 16,
@@ -58,6 +54,7 @@ def test_benchmark_profile_controls_observation_interval():
         "profile_sample_interval": 4,
         "graph": True,
         "sync_attention_gates": False,
+        "trace_transitions": False,
     }
 
     quiet = build_speculative_config(SimpleNamespace(**common, profile=False))
@@ -69,6 +66,7 @@ def test_benchmark_profile_controls_observation_interval():
     assert profile["retrospec_stats_cuda_sample_interval"] == 4
     assert profile["retrospec_draft_rank_dtype"] == "native"
     assert profile["enforce_eager"] is False
+    assert not profile["retrospec_trace_transitions"]
 
 
 def test_benchmark_shutdown_stops_engine_core():

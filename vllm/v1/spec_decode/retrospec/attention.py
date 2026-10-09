@@ -86,10 +86,6 @@ class RetroSpecSparseAttention:
         assert block_size is not None
 
         self.device = device
-        if config.retrospec_replay_mode != "off":
-            raise ValueError(
-                "RetroSpec GPU-native mode does not support resident replay"
-            )
         parallel_config = getattr(vllm_config, "parallel_config", None)
         self.tensor_parallel_size = getattr(parallel_config, "tensor_parallel_size", 1)
         self.reduce_draft_attention_mass = (

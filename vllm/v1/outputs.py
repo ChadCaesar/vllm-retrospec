@@ -155,16 +155,6 @@ class ECConnectorOutput:
 
 
 @dataclass(frozen=True)
-class KVCacheRetirement:
-    """A logical KV block range that no longer owns native GPU blocks."""
-
-    request_id: str
-    kv_cache_group_id: int
-    start_block: int
-    end_block: int
-
-
-@dataclass(frozen=True)
 class RetroSpecLayerMajorPrefillCompletion:
     """Actual prompt position completed by a layer-major prefill execution."""
 
@@ -212,9 +202,6 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
-
-    # Native GPU KV blocks replaced by CPU-backed clustered storage.
-    kv_cache_retirements: list[KVCacheRetirement] = field(default_factory=list)
 
     # Actual completion returned by an isolated layer-major prefill execution.
     retrospec_layer_major_prefill_completion: (

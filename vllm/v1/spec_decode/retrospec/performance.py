@@ -56,8 +56,8 @@ class _PendingCudaSample:
 class RetroSpecPerformanceStats:
     """Low-overhead, opt-in RetroSpec performance statistics.
 
-    CPU counters may be updated from background workers. Request-stage counters
-    remain on the model device and are copied to the CPU only once per logging
+    Host counters record runner and proposer work. Request-stage counters
+    remain on the model device and are copied to the CPU once per logging
     interval. CUDA timings use events and do not synchronize when recorded.
     """
 
@@ -70,20 +70,6 @@ class RetroSpecPerformanceStats:
         "feedback_horizon_restores",
         "verified_tokens",
         "proposed_tokens",
-        "resident_cluster_hits",
-        "resident_cluster_misses",
-        "draft_compact_resident_pages",
-        "draft_compact_selected_clusters",
-        "resident_bound_direct_hits",
-        "resident_hash_fallback_lookups",
-        "resident_hash_fallback_hits",
-        "resident_hash_fallback_misses",
-        "resident_hash_probe_steps",
-        "resident_hash_max_probe",
-        "resident_binding_invalidations",
-        "verification_lookup_clusters",
-        "verification_resident_hits",
-        "verification_resident_misses",
     )
     _GPU_HISTOGRAM_NAMES = (
         "draft_to_sparse_tokens",
@@ -499,7 +485,7 @@ class RetroSpecPerformanceStats:
         }
 
         # The counter synchronization completes main-stream CUDA timers. Timers
-        # from transfer streams remain queued until their events finish.
+        # on other streams remain queued until their events finish.
         self._drain_cuda_samples(wait_for_completion=wait_for_cuda)
 
         with self._lock:
@@ -528,22 +514,6 @@ class RetroSpecPerformanceStats:
         sparse_tokens = counters.get("sparse_verify_tokens", 0)
         expanded_tokens = counters.get("expanded_verify_tokens", 0)
         full_requests = counters.get("full_verify_requests", 0)
-        resident_hits = counters.get("resident_cluster_hits", 0)
-        resident_misses = counters.get("resident_cluster_misses", 0)
-        selected_clusters = counters.get("draft_compact_selected_clusters", 0)
-        bound_direct_hits = counters.get("resident_bound_direct_hits", 0)
-        fallback_lookups = counters.get("resident_hash_fallback_lookups", 0)
-        fallback_hits = counters.get("resident_hash_fallback_hits", 0)
-        fallback_misses = counters.get("resident_hash_fallback_misses", 0)
-        fallback_probe_steps = counters.get("resident_hash_probe_steps", 0)
-        binding_invalidations = counters.get("resident_binding_invalidations", 0)
-        bound_attempts = bound_direct_hits + binding_invalidations
-        verification_hits = counters.get("verification_resident_hits", 0)
-        verification_misses = counters.get("verification_resident_misses", 0)
-        prefetch_waves = counters.get("prefetch_waves_submitted", 0)
-        prefetch_coalesced = counters.get("prefetch_waves_coalesced", 0)
-        prefetch_backpressured = counters.get("prefetch_backpressure_waits", 0)
-        prefetch_wave_opportunities = prefetch_waves + prefetch_coalesced
         terminal_proposed = counters.get("terminal_proposal_tokens", 0)
         terminal_wasted = counters.get("terminal_wasted_proposal_tokens", 0)
         verified_proposed = counters.get("proposal_verified_tokens", 0)
@@ -559,16 +529,7 @@ class RetroSpecPerformanceStats:
             "RetroSpec performance over %.2fs (reason=%s): counters={%s}; "
             "peaks={%s}; histograms={%s}; "
             "derived={draft_tokens/request=%.2f, expanded/sparse=%.3f, "
-            "full/request=%.3f, resident_hit_rate=%.3f, "
-            "resident_bound_hit_rate=%.3f, "
-            "resident_hash_fallback_rate=%.3f, "
-            "resident_hash_fallback_hit_rate=%.3f, "
-            "resident_hash_avg_probe=%.2f, "
-            "resident_binding_invalidation_rate=%.3f, "
-            "verification_hit_rate=%.3f, "
-            "prefetch_coalesce_rate=%.3f, "
-            "prefetch_backpressure_rate=%.3f, "
-            "prefetch_records/wave=%.2f, "
+            "full/request=%.3f, "
             "terminal_waste_rate=%.3f, "
             "proposal_accept_rate=%.3f, "
             "draft_graph_replay=%.3f, "
@@ -583,22 +544,6 @@ class RetroSpecPerformanceStats:
             self._ratio(draft_tokens, proposal_requests),
             self._ratio(expanded_tokens, sparse_tokens),
             self._ratio(full_requests, proposal_requests),
-            self._ratio(resident_hits, resident_hits + resident_misses),
-            self._ratio(bound_direct_hits, bound_attempts),
-            self._ratio(fallback_lookups, selected_clusters),
-            self._ratio(fallback_hits, fallback_hits + fallback_misses),
-            self._ratio(fallback_probe_steps, fallback_lookups),
-            self._ratio(binding_invalidations, bound_attempts),
-            self._ratio(
-                verification_hits,
-                verification_hits + verification_misses,
-            ),
-            self._ratio(
-                prefetch_coalesced,
-                prefetch_wave_opportunities,
-            ),
-            self._ratio(prefetch_backpressured, prefetch_waves),
-            self._ratio(counters.get("prefetch_wave_records", 0), prefetch_waves),
             self._ratio(terminal_wasted, terminal_proposed),
             self._ratio(verified_accepted, verified_proposed),
             cudagraph_replay_rate("draft"),

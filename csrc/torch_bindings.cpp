@@ -34,43 +34,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
            &get_cuda_view_from_cpu_tensor);
 
-  ops.def(
-      "retrospec_build_cluster_pages("
-      "Tensor[](a!) key_slabs, Tensor[](b!) value_slabs, "
-      "Tensor allocated_page_ids, Tensor token_keys, Tensor token_values, "
-      "Tensor assignments, Tensor cluster_token_counts, "
-      "Tensor token_offsets_in_cluster, int page_size, int num_workers) "
-      "-> (Tensor, Tensor, Tensor, Tensor)");
-  ops.impl("retrospec_build_cluster_pages", torch::kCPU,
-           &retrospec_build_cluster_pages);
-
-  ops.def(
-      "retrospec_gather_compact_kv("
-      "Tensor[] key_slabs, Tensor[] value_slabs, Tensor[] range_tables, "
-      "Tensor token_offsets, int destination_token_start, "
-      "Tensor! key_output, Tensor! value_output, int num_workers) -> ()");
-  ops.impl("retrospec_gather_compact_kv", torch::kCPU,
-           &retrospec_gather_compact_kv);
-
-  ops.def(
-      "retrospec_plan_prefetch_admissions("
-      "Tensor[] cluster_id_records, Tensor[] position_records, "
-      "Tensor[] count_records, int[] num_groups, int[] num_ranks, "
-      "Tensor[] descriptor_page_ids, Tensor[] descriptor_page_counts, "
-      "Tensor[] descriptor_group_ids, Tensor[] resident_states, "
-      "int[] page_capacities) "
-      "-> (Tensor[], Tensor[], Tensor[], Tensor[], Tensor[], Tensor)");
-  ops.impl("retrospec_plan_prefetch_admissions", torch::kCPU,
-           &retrospec_plan_prefetch_admissions);
-
-  ops.def(
-      "retrospec_gather_cluster_pages("
-      "Tensor[] key_slabs, Tensor[] value_slabs, Tensor page_ids, "
-      "int page_size, Tensor! key_output, Tensor! value_output, "
-      "int num_workers) -> ()");
-  ops.impl("retrospec_gather_cluster_pages", torch::kCPU,
-           &retrospec_gather_cluster_pages);
-
   // Attention ops
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.

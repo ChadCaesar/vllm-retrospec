@@ -12,7 +12,6 @@ from vllm.forward_context import BatchDescriptor
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.spec_decode.retrospec import RetroSpecProposer
 from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
-from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.gpu_model_runner import (
     GPUModelRunner,
     RetroSpecPipelineProposalState,
@@ -275,44 +274,6 @@ def test_list_draft_tokens_keep_proposal_request_order():
 
     assert draft_token_ids == [[1, 2], [3]]
     assert req_ids == ["request-a", "request-b"]
-
-
-def test_block_table_retires_standard_manager_blocks():
-    table = BlockTable(
-        block_size=2,
-        max_num_reqs=2,
-        max_num_blocks_per_req=8,
-        max_num_batched_tokens=8,
-        pin_memory=False,
-        device=torch.device("cpu"),
-        kernel_block_size=2,
-        cp_kv_cache_interleave_size=1,
-    )
-    table.add_row([7, 8, 9, 10, 11], row_idx=0)
-
-    table.retire_blocks(row_idx=0, start_block=1, end_block=4)
-
-    assert table.get_numpy_array()[0, :5].tolist() == [7, 0, 0, 0, 11]
-    assert table.num_blocks_per_row[0] == 5
-
-
-def test_block_table_retires_hybrid_manager_blocks():
-    table = BlockTable(
-        block_size=4,
-        max_num_reqs=2,
-        max_num_blocks_per_req=8,
-        max_num_batched_tokens=8,
-        pin_memory=False,
-        device=torch.device("cpu"),
-        kernel_block_size=2,
-        cp_kv_cache_interleave_size=1,
-    )
-    table.add_row([7, 8, 9], row_idx=0)
-
-    table.retire_blocks(row_idx=0, start_block=1, end_block=2)
-
-    assert table.get_numpy_array()[0, :6].tolist() == [14, 15, 0, 1, 18, 19]
-    assert table.num_blocks_per_row[0] == 6
 
 
 def test_layer_major_prefill_copies_only_resident_workspace_blocks():

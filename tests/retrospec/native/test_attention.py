@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Controller contracts shared by the GPU-native RetroSpec attention path.
-
-Kernel arithmetic and GPU index layout are covered by test_gpu_native.py.
-CPU page, resident-cache, and transfer-ring contracts belonged to the
-offload implementation and are intentionally absent from this branch.
-"""
+"""Controller contracts for the GPU-native RetroSpec attention path."""
 
 from types import SimpleNamespace
 from typing import Any, cast
@@ -25,7 +20,7 @@ pytestmark = pytest.mark.cpu_test
 
 
 def make_controller(
-    *, replay_mode: str = "off", max_num_seqs: int = 4, num_speculative_tokens: int = 8
+    *, max_num_seqs: int = 4, num_speculative_tokens: int = 8
 ) -> RetroSpecSparseAttention:
     config = cast(
         VllmConfig,
@@ -43,7 +38,6 @@ def make_controller(
                 retrospec_hit_attn_threshold=None,
                 retrospec_retrieval_attn_threshold=None,
                 retrospec_expanded_attn_threshold=None,
-                retrospec_replay_mode=replay_mode,
                 retrospec_stats_interval_seconds=0.0,
             ),
             scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
@@ -63,11 +57,6 @@ def test_gpu_native_controller_uses_native_kv_and_shared_statistics():
 
     assert controller.max_parallel_tokens == 8
     assert controller.index.performance_stats is controller.performance_stats
-
-
-def test_gpu_native_controller_rejects_legacy_resident_replay():
-    with pytest.raises(ValueError, match="does not support resident replay"):
-        make_controller(replay_mode="trace")
 
 
 def test_proposal_context_requires_installed_attention_and_restores_state():

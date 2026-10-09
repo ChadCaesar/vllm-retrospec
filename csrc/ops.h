@@ -186,47 +186,6 @@ void cutlass_mla_decode(torch::Tensor const& out, torch::Tensor const& q_nope,
 
 torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-retrospec_build_cluster_pages(const std::vector<torch::Tensor>& key_slabs,
-                              const std::vector<torch::Tensor>& value_slabs,
-                              const torch::Tensor& allocated_page_ids,
-                              const torch::Tensor& token_keys,
-                              const torch::Tensor& token_values,
-                              const torch::Tensor& assignments,
-                              const torch::Tensor& cluster_token_counts,
-                              const torch::Tensor& token_offsets_in_cluster,
-                              int64_t page_size, int64_t num_workers);
-
-void retrospec_gather_compact_kv(const std::vector<torch::Tensor>& key_slabs,
-                                 const std::vector<torch::Tensor>& value_slabs,
-                                 const std::vector<torch::Tensor>& range_tables,
-                                 const torch::Tensor& token_offsets,
-                                 int64_t destination_token_start,
-                                 torch::Tensor& key_output,
-                                 torch::Tensor& value_output,
-                                 int64_t num_workers);
-
-std::tuple<std::vector<torch::Tensor>, std::vector<torch::Tensor>,
-           std::vector<torch::Tensor>, std::vector<torch::Tensor>,
-           std::vector<torch::Tensor>, torch::Tensor>
-retrospec_plan_prefetch_admissions(
-    const std::vector<torch::Tensor>& cluster_id_records,
-    const std::vector<torch::Tensor>& position_records,
-    const std::vector<torch::Tensor>& count_records,
-    const std::vector<int64_t>& num_groups,
-    const std::vector<int64_t>& num_ranks,
-    const std::vector<torch::Tensor>& descriptor_page_ids,
-    const std::vector<torch::Tensor>& descriptor_page_counts,
-    const std::vector<torch::Tensor>& descriptor_group_ids,
-    const std::vector<torch::Tensor>& resident_states,
-    const std::vector<int64_t>& page_capacities);
-
-void retrospec_gather_cluster_pages(
-    const std::vector<torch::Tensor>& key_slabs,
-    const std::vector<torch::Tensor>& value_slabs,
-    const torch::Tensor& page_ids, int64_t page_size, torch::Tensor& key_output,
-    torch::Tensor& value_output, int64_t num_workers);
-
 #ifndef USE_ROCM
 
 torch::Tensor awq_gemm(torch::Tensor _in_feats, torch::Tensor _kernel,
