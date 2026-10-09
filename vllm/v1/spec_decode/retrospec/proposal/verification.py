@@ -3,7 +3,6 @@
 
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -13,16 +12,11 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.retrospec.attention import RetroSpecAttentionMode
 from vllm.v1.spec_decode.retrospec.decision import RetroSpecDecision, RetroSpecMetrics
-from vllm.v1.spec_decode.retrospec.state import RetroSpecStage
-
-if TYPE_CHECKING:
-    pass
-
-
 from vllm.v1.spec_decode.retrospec.proposal.types import (
     RetroSpecParallelVerificationOutput,
     RetroSpecVerificationResult,
 )
+from vllm.v1.spec_decode.retrospec.state import RetroSpecStage
 
 
 class RetroSpecVerificationMixin:
@@ -134,21 +128,9 @@ class RetroSpecVerificationMixin:
             per_layer_attn_metadata = {
                 layer_name: attn_metadata for layer_name in self.attn_layer_names
             }
-            (
-                model_input_ids,
-                model_positions,
-                forward_slot_mapping,
-                cudagraph_mode,
-                batch_descriptor,
-            ) = self._prepare_piecewise_model_inputs(
-                input_ids=input_ids,
-                positions=positions,
-                slot_mapping=slot_mapping,
-                slot_mapping_workspace=self._verification_slot_mapping,
-                stage_name=stage_name,
-            )
+            self.performance_stats.add_counter(f"{stage_name}_cudagraph_eager")
             per_layer_slot_mapping = {
-                layer_name: forward_slot_mapping for layer_name in self.attn_layer_names
+                layer_name: slot_mapping for layer_name in self.attn_layer_names
             }
 
             if bonus_start_index is None:
@@ -169,21 +151,16 @@ class RetroSpecVerificationMixin:
                 set_forward_context(
                     per_layer_attn_metadata,
                     self.vllm_config,
-                    num_tokens=batch_descriptor.num_tokens,
-                    cudagraph_runtime_mode=cudagraph_mode,
-                    batch_descriptor=(
-                        batch_descriptor
-                        if cudagraph_mode != CUDAGraphMode.NONE
-                        else None
-                    ),
+                    num_tokens=num_tokens,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    batch_descriptor=None,
                     slot_mapping=per_layer_slot_mapping,
                 ),
             ):
                 hidden_states = self._run_pipeline_stage_model(
-                    model_input_ids,
-                    model_positions,
-                    batch_descriptor.num_tokens,
-                    cudagraph_mode,
+                    input_ids,
+                    positions,
+                    num_tokens,
                     stage_name,
                 )
 
@@ -484,9 +461,6 @@ class RetroSpecVerificationMixin:
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
     ) -> RetroSpecVerificationResult:
-        with self.performance_stats.cpu_timer("draft_prefetch_backpressure"):
-            self.sparse_attention.flush_sparse_verification_prefetch()
-
         draft_counts = self.state.draft_counts
         verification_active = self.state.active_mask & (draft_counts > 0)
         request_indices, token_indices = self._build_verification_pairs(
@@ -521,9 +495,6 @@ class RetroSpecVerificationMixin:
         num_bonus = bonus_requests.numel()
         self.performance_stats.add_counter("sparse_bonus_queries", num_bonus)
         self.state.set_stage(verification_active, RetroSpecStage.SPARSE_VERIFY)
-        with self.performance_stats.cpu_timer("full_verify_prime_submit"):
-            self.sparse_attention.maybe_prime_full_verification(request_indices.numel())
-
         if num_bonus:
             sparse = self._run_parallel_verification(
                 batch_size,

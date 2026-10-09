@@ -113,9 +113,6 @@ class RetroSpecGPUNativeIndex(
             return nullcontext()
         return self.performance_stats.cuda_timer(name)
 
-    def flush_sparse_verification_prefetch(self) -> None:
-        pass
-
     def close(self) -> None:
         self._records.clear()
         self._staged.clear()

@@ -402,12 +402,9 @@ class RetroSpecSparseAttention:
             self.parallel_token_indices = None
             self.attention_mass_layer_count = 0
 
-            try:
-                self.index.flush_sparse_verification_prefetch()
-            finally:
-                self.index.end_proposal()
-                self.proposal_request_ids = ()
-                self.proposal_context_lens = ()
+            self.index.end_proposal()
+            self.proposal_request_ids = ()
+            self.proposal_context_lens = ()
 
     def begin_step(
         self,
@@ -559,16 +556,6 @@ class RetroSpecSparseAttention:
 
     def end_step(self) -> torch.Tensor:
         return self.end_step_statistics().mean()
-
-    def flush_sparse_verification_prefetch(self) -> None:
-        self.index.flush_sparse_verification_prefetch()
-
-    def maybe_prime_full_verification(self, num_candidate_tokens: int) -> bool:
-        """Native full verification has no pages to prefetch."""
-        if not self.in_proposal:
-            raise RuntimeError("Full-verification priming requires a proposal")
-        del num_candidate_tokens
-        return False
 
     def _maybe_update_index(
         self,

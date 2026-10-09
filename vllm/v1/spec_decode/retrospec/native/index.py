@@ -105,9 +105,6 @@ class RetroSpecNativeIndexMixin:
             offset_storage,
         )
 
-    def has_staged_request_layer(self, layer_name: str, request_id: str) -> bool:
-        return (layer_name, request_id) in self._staged
-
     def _desired_end(
         self,
         seq_len: int,
@@ -281,22 +278,6 @@ class RetroSpecNativeIndexMixin:
 
     def discard_staged_updates(self) -> None:
         self._staged.clear()
-
-    def get_fully_stored_indexed_end(
-        self, request_id: str, layer_names: Sequence[str]
-    ) -> int:
-        return (
-            min(
-                (
-                    self._records.get(name, {}).get(request_id).indexed_end
-                    if request_id in self._records.get(name, {})
-                    else self.block_size
-                )
-                for name in layer_names
-            )
-            if layer_names
-            else self.block_size
-        )
 
     def remove_requests(self, request_ids: Sequence[str]) -> None:
         removed = set(request_ids)

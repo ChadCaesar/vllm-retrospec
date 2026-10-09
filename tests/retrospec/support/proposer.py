@@ -191,7 +191,6 @@ def initialize_verification(
     pending_counts: torch.Tensor | None = None,
 ) -> None:
     batch_size = draft_token_ids.shape[0]
-    proposer.sparse_attention.maybe_prime_full_verification = Mock(return_value=False)
     proposer.state.begin_batch(batch_size)
     proposer.index_update_state.begin_batch(
         [f"request-{index}" for index in range(batch_size)],

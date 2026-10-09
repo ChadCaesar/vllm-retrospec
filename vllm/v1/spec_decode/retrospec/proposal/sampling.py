@@ -2,14 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import replace
-from typing import TYPE_CHECKING
 
 import torch
 
 from vllm.v1.sample.metadata import SamplingMetadata
-
-if TYPE_CHECKING:
-    pass
 
 
 class RetroSpecSamplingMixin:

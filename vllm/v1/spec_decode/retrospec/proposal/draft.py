@@ -1,17 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING
-
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.retrospec.attention import RetroSpecAttentionMode
 from vllm.v1.spec_decode.retrospec.state import RetroSpecStage
-
-if TYPE_CHECKING:
-    pass
 
 
 class RetroSpecDraftMixin:

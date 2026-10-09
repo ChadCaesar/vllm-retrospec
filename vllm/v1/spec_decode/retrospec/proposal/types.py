@@ -2,12 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass(frozen=True)

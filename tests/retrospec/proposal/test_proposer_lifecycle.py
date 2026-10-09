@@ -18,7 +18,6 @@ from tests.retrospec.support.proposer import (
     make_vllm_config,
 )
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.forward_context import BatchDescriptor
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.spec_decode.retrospec import (
@@ -194,95 +193,17 @@ def test_initialize_cudagraph_keys_requires_runner_input_workspace():
     assert proposer._cudagraph_registration_failure == "gpu_native_dynamic_layout"
 
 
-def test_pipeline_graph_receive_destination_uses_runner_workspace():
-    workspace = IntermediateTensors(
-        {
-            "hidden_states": torch.empty(8, 4),
-            "residual": torch.empty(8, 4),
-        }
-    )
-    destination = workspace[:4]
-    slice_workspace = Mock(return_value=destination)
-    proposer = RetroSpecProposer(
-        make_vllm_config(enforce_eager=False),
-        torch.device("cpu"),
-        make_runner(
-            intermediate_tensors=workspace,
-            sync_and_slice_intermediate_tensors=slice_workspace,
-        ),
-    )
-    stage = RetroSpecPipelineStage(1, 2, 1, 2)
-
-    result = proposer._get_pipeline_receive_destination(
-        stage, num_tokens=4, cudagraph_mode=CUDAGraphMode.PIECEWISE
-    )
-
-    assert result is destination
-    slice_workspace.assert_called_once_with(
-        4, intermediate_tensors=None, sync_self=False
-    )
-
-
-def test_pipeline_receive_destination_is_unused_for_first_or_eager_stage():
-    slice_workspace = Mock()
-    proposer = RetroSpecProposer(
-        make_vllm_config(),
-        torch.device("cpu"),
-        make_runner(
-            intermediate_tensors=None,
-            sync_and_slice_intermediate_tensors=slice_workspace,
-        ),
-    )
-
-    assert (
-        proposer._get_pipeline_receive_destination(
-            RetroSpecPipelineStage(0, 2, 0, 1),
-            num_tokens=4,
-            cudagraph_mode=CUDAGraphMode.PIECEWISE,
-        )
-        is None
-    )
-    assert (
-        proposer._get_pipeline_receive_destination(
-            RetroSpecPipelineStage(1, 2, 1, 2),
-            num_tokens=4,
-            cudagraph_mode=CUDAGraphMode.NONE,
-        )
-        is None
-    )
-    slice_workspace.assert_not_called()
-
-
-def test_pipeline_graph_receive_destination_requires_runner_workspace():
-    proposer = RetroSpecProposer(
-        make_vllm_config(enforce_eager=False),
-        torch.device("cpu"),
-        make_runner(intermediate_tensors=None),
-    )
-
-    with pytest.raises(RuntimeError, match="requires the runner"):
-        proposer._get_pipeline_receive_destination(
-            RetroSpecPipelineStage(1, 2, 1, 2),
-            num_tokens=4,
-            cudagraph_mode=CUDAGraphMode.PIECEWISE,
-        )
-
-
-def test_pipeline_stage_model_receives_into_graph_workspace():
+def test_pipeline_stage_model_receives_dynamic_input():
     workspace = IntermediateTensors(
         {
             "hidden_states": torch.empty(4, 4),
             "residual": torch.empty(4, 4),
         }
     )
-    slice_workspace = Mock(return_value=workspace)
     proposer = RetroSpecProposer(
-        make_vllm_config(enforce_eager=False),
+        make_vllm_config(),
         torch.device("cpu"),
-        make_runner(
-            intermediate_tensors=workspace,
-            sync_and_slice_intermediate_tensors=slice_workspace,
-        ),
+        make_runner(),
     )
     proposer.pipeline_stage = RetroSpecPipelineStage(1, 2, 1, 2)
     proposer.pipeline_protocol.receive_model_input = Mock(return_value=workspace)
@@ -295,12 +216,11 @@ def test_pipeline_stage_model_receives_into_graph_workspace():
         torch.zeros(4, dtype=torch.int32),
         positions,
         num_tokens=4,
-        cudagraph_mode=CUDAGraphMode.PIECEWISE,
         stage_name="draft",
     )
 
     proposer.pipeline_protocol.receive_model_input.assert_called_once_with(
-        proposer.pipeline_stage, 4, workspace
+        proposer.pipeline_stage, 4, None
     )
     model_kwargs = proposer.model.call_args.kwargs
     assert model_kwargs["input_ids"] is None
@@ -335,7 +255,6 @@ def test_pipeline_stage_model_times_nonfinal_send_only():
         torch.zeros(4, dtype=torch.int32),
         torch.arange(4),
         num_tokens=4,
-        cudagraph_mode=CUDAGraphMode.NONE,
         stage_name="sparse_verify",
     )
 
@@ -349,100 +268,6 @@ def test_pipeline_stage_model_times_nonfinal_send_only():
     proposer.pipeline_protocol.send_model_output.assert_called_once_with(
         proposer.pipeline_stage, output, 4
     )
-
-
-def test_piecewise_model_inputs_preserve_eager_views():
-    dispatcher = Mock()
-    proposer = RetroSpecProposer(
-        make_vllm_config(),
-        torch.device("cpu"),
-        make_runner(cudagraph_dispatcher=dispatcher),
-    )
-    input_ids = torch.tensor([3, 4], dtype=torch.int32)
-    positions = torch.tensor([7, 8], dtype=torch.int64)
-    slot_mapping = proposer._slot_mapping[:2]
-    slot_mapping.copy_(torch.tensor([11, 12]))
-
-    result = proposer._prepare_piecewise_model_inputs(
-        input_ids,
-        positions,
-        slot_mapping,
-        proposer._slot_mapping,
-        "draft",
-    )
-
-    assert result[0] is input_ids
-    assert result[1] is positions
-    assert result[2] is slot_mapping
-    assert result[3] == CUDAGraphMode.NONE
-    assert result[4] == BatchDescriptor(2)
-    dispatcher.dispatch_piecewise_cudagraph.assert_not_called()
-
-
-def test_piecewise_model_inputs_keep_eager_views_for_dynamic_layout():
-    dispatcher = Mock(
-        dispatch_piecewise_cudagraph=Mock(
-            return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4))
-        )
-    )
-    proposer = RetroSpecProposer(
-        make_vllm_config(enforce_eager=False),
-        torch.device("cpu"),
-        make_runner(cudagraph_dispatcher=dispatcher),
-    )
-    proposer._cudagraph_registration_failure = None
-    input_ids = torch.tensor([3, 4, 5], dtype=torch.int32)
-    positions = torch.tensor([7, 8, 9], dtype=torch.int64)
-    slot_mapping = proposer._slot_mapping[:3]
-    slot_mapping.copy_(torch.tensor([11, 12, 13]))
-
-    result = proposer._prepare_piecewise_model_inputs(
-        input_ids,
-        positions,
-        slot_mapping,
-        proposer._slot_mapping,
-        "draft",
-    )
-
-    graph_input_ids, graph_positions, graph_slots, mode, descriptor = result
-    assert graph_input_ids is input_ids
-    assert graph_positions is positions
-    assert graph_slots is slot_mapping
-    assert graph_slots.tolist() == [11, 12, 13]
-    assert mode == CUDAGraphMode.NONE
-    assert descriptor == BatchDescriptor(3)
-    dispatcher.dispatch_piecewise_cudagraph.assert_not_called()
-
-
-def test_piecewise_model_inputs_fall_back_when_bucket_exceeds_capacity():
-    dispatcher = Mock(
-        dispatch_piecewise_cudagraph=Mock(
-            return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(16))
-        )
-    )
-    proposer = RetroSpecProposer(
-        make_vllm_config(enforce_eager=False),
-        torch.device("cpu"),
-        make_runner(cudagraph_dispatcher=dispatcher),
-    )
-    proposer._cudagraph_registration_failure = None
-    input_ids = torch.tensor([3, 4, 5], dtype=torch.int32)
-    positions = torch.tensor([7, 8, 9], dtype=torch.int64)
-    slot_mapping = proposer._slot_mapping[:3]
-
-    result = proposer._prepare_piecewise_model_inputs(
-        input_ids,
-        positions,
-        slot_mapping,
-        proposer._slot_mapping,
-        "draft",
-    )
-
-    assert result[0] is input_ids
-    assert result[1] is positions
-    assert result[2] is slot_mapping
-    assert result[3] == CUDAGraphMode.NONE
-    assert result[4] == BatchDescriptor(3)
 
 
 def test_retrospec_proposer_loads_target_model():

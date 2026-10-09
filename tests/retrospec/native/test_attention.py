@@ -82,7 +82,6 @@ def test_proposal_context_requires_installed_attention_and_restores_state():
     with (
         patch.object(controller.index, "begin_proposal") as begin,
         patch.object(controller.index, "end_proposal") as end,
-        patch.object(controller.index, "flush_sparse_verification_prefetch") as flush,
     ):
         with (
             pytest.raises(LookupError, match="test failure"),
@@ -99,7 +98,6 @@ def test_proposal_context_requires_installed_attention_and_restores_state():
             raise LookupError("test failure")
 
         begin.assert_called_once_with(("request",))
-        flush.assert_called_once_with()
         end.assert_called_once_with()
     assert not controller.in_proposal
     assert controller.proposal_request_ids == ()
@@ -358,15 +356,6 @@ def test_parallel_sparse_verification_passes_request_rows_to_native_index():
         assert native_forward.call_args.kwargs["sparse_verify"] is True
         torch.testing.assert_close(controller.end_step(), torch.tensor([0.4, 0.8]))
     original_forward.assert_not_called()
-
-
-def test_native_full_verification_does_not_prime_transfer():
-    controller = make_controller()
-    mark_installed(controller)
-    with controller.proposal_context(["request"]):
-        assert not controller.maybe_prime_full_verification(8)
-    with pytest.raises(RuntimeError, match="requires a proposal"):
-        controller.maybe_prime_full_verification(8)
 
 
 def test_layer_major_prefill_builds_gpu_index_and_commits():

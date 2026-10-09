@@ -59,7 +59,6 @@ class RetroSpecProposer(
     RetroSpecSamplingMixin,
     RetroSpecVerificationMixin,
 ):
-    _CUDAGRAPH_NAMESPACE = "retrospec_proposal"
     _LOW_ACCEPTANCE_HORIZON = 16
     _LOW_ACCEPTANCE_MIN_PROPOSAL = 32
     _LOW_ACCEPTANCE_RECOVERY_ROUNDS = 3
@@ -146,12 +145,6 @@ class RetroSpecProposer(
         )
         self.positions = torch.zeros(
             self.max_batch_size, dtype=torch.int64, device=device
-        )
-        self._graph_input_ids = torch.zeros(
-            self.max_parallel_tokens, dtype=torch.int32, device=device
-        )
-        self._graph_positions = torch.zeros(
-            self.max_parallel_tokens, dtype=torch.int64, device=device
         )
         self._slot_mapping = torch.full(
             (self.max_batch_size,), PADDING_SLOT_ID, dtype=torch.int64, device=device

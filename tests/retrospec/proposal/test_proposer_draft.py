@@ -23,7 +23,6 @@ from tests.retrospec.support.proposer import (
     disable_pin_memory_for_cpu_tests as disable_pin_memory_for_cpu_tests,
 )
 from vllm.config import CUDAGraphMode
-from vllm.forward_context import BatchDescriptor
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.retrospec import (
     RetroSpecAttentionMode,
@@ -412,17 +411,11 @@ def test_model_step_sanitizes_input_ids_for_inactive_rows(monkeypatch):
 def test_model_step_uses_unpadded_dynamic_layout_without_padding_policy_rows(
     monkeypatch,
 ):
-    dispatcher = Mock(
-        dispatch_piecewise_cudagraph=Mock(
-            return_value=(CUDAGraphMode.PIECEWISE, BatchDescriptor(4))
-        )
-    )
     proposer = RetroSpecProposer(
         make_vllm_config(enforce_eager=False),
         torch.device("cpu"),
-        make_runner(cudagraph_dispatcher=dispatcher),
+        make_runner(),
     )
-    proposer._cudagraph_registration_failure = None
     common_attn_metadata = CommonAttentionMetadata(
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         seq_lens=torch.tensor([3, 3], dtype=torch.int32),

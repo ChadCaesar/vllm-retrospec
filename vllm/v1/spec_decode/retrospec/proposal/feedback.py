@@ -2,12 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Collection, Sequence
-from typing import TYPE_CHECKING
 
 import torch
-
-if TYPE_CHECKING:
-    pass
 
 
 class RetroSpecFeedbackMixin:

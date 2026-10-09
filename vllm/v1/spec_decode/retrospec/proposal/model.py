@@ -2,13 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from vllm.config import CUDAGraphMode
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import set_forward_context
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import AttentionMetadataBuilder, CommonAttentionMetadata
@@ -27,9 +26,6 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
-if TYPE_CHECKING:
-    pass
-
 
 class RetroSpecModelMixin:
     def _require_pipeline_stage(self) -> RetroSpecPipelineStage:
@@ -39,47 +35,20 @@ class RetroSpecModelMixin:
             )
         return self.pipeline_stage
 
-    def _get_pipeline_receive_destination(
-        self,
-        stage: RetroSpecPipelineStage,
-        num_tokens: int,
-        cudagraph_mode: CUDAGraphMode,
-    ) -> IntermediateTensors | None:
-        if stage.is_first or cudagraph_mode == CUDAGraphMode.NONE:
-            return None
-
-        if cudagraph_mode != CUDAGraphMode.PIECEWISE:
-            raise RuntimeError(
-                f"Unsupported RetroSpec proposal CUDA Graph mode: {cudagraph_mode}"
-            )
-        if self.runner.intermediate_tensors is None:
-            raise RuntimeError(
-                "RetroSpec PP PIECEWISE CUDA Graph replay requires the runner "
-                "intermediate-tensor workspace"
-            )
-
-        return self.runner.sync_and_slice_intermediate_tensors(
-            num_tokens, intermediate_tensors=None, sync_self=False
-        )
-
     def _run_pipeline_stage_model(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         num_tokens: int,
-        cudagraph_mode: CUDAGraphMode,
         stage_name: str,
     ) -> torch.Tensor | None:
         if self.model is None:
             raise RuntimeError("RetroSpec target model is not loaded")
 
         stage = self._require_pipeline_stage()
-        receive_destination = self._get_pipeline_receive_destination(
-            stage, num_tokens, cudagraph_mode
-        )
         if stage.is_first:
             intermediate_tensors = self.pipeline_protocol.receive_model_input(
-                stage, num_tokens, receive_destination
+                stage, num_tokens, None
             )
         else:
             with (
@@ -87,7 +56,7 @@ class RetroSpecModelMixin:
                 self.performance_stats.cuda_timer(f"{stage_name}_pipeline_receive"),
             ):
                 intermediate_tensors = self.pipeline_protocol.receive_model_input(
-                    stage, num_tokens, receive_destination
+                    stage, num_tokens, None
                 )
         model_output = self.model(
             input_ids=input_ids if stage.is_first else None,
@@ -335,70 +304,6 @@ class RetroSpecModelMixin:
             )
         return proposal_token_budgets
 
-    def _record_cudagraph_fallback(self, stage_name: str, reason: str) -> None:
-        self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback")
-        self.performance_stats.add_counter(f"{stage_name}_cudagraph_fallback_{reason}")
-
-    def _dispatch_piecewise_cudagraph(
-        self, num_tokens: int, capacity: int, stage_name: str
-    ) -> tuple[CUDAGraphMode, BatchDescriptor]:
-        del capacity
-        self.performance_stats.add_counter(f"{stage_name}_cudagraph_eager")
-        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
-
-    def _prepare_piecewise_model_inputs(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        slot_mapping_workspace: torch.Tensor,
-        stage_name: str,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        CUDAGraphMode,
-        BatchDescriptor,
-    ]:
-        num_tokens = input_ids.shape[0]
-        if positions.shape != (num_tokens,):
-            raise ValueError("Model positions must match the input token count")
-        if slot_mapping.shape != (num_tokens,):
-            raise ValueError("Slot mapping must match the input token count")
-
-        cudagraph_mode, batch_descriptor = self._dispatch_piecewise_cudagraph(
-            num_tokens, slot_mapping_workspace.shape[0], stage_name
-        )
-        if cudagraph_mode == CUDAGraphMode.NONE:
-            return (
-                input_ids,
-                positions,
-                slot_mapping,
-                cudagraph_mode,
-                batch_descriptor,
-            )
-
-        padded_tokens = batch_descriptor.num_tokens
-        graph_input_ids = self._graph_input_ids[:padded_tokens]
-        graph_positions = self._graph_positions[:padded_tokens]
-        graph_slot_mapping = slot_mapping_workspace[:padded_tokens]
-
-        graph_input_ids[:num_tokens].copy_(input_ids)
-        graph_positions[:num_tokens].copy_(positions)
-        graph_slot_mapping[:num_tokens].copy_(slot_mapping)
-        if padded_tokens > num_tokens:
-            graph_input_ids[num_tokens:].zero_()
-            graph_positions[num_tokens:].zero_()
-            graph_slot_mapping[num_tokens:].fill_(PADDING_SLOT_ID)
-
-        return (
-            graph_input_ids,
-            graph_positions,
-            graph_slot_mapping,
-            cudagraph_mode,
-            batch_descriptor,
-        )
-
     def _run_model_step(
         self,
         batch_size: int,
@@ -477,21 +382,9 @@ class RetroSpecModelMixin:
                 input_ids[:batch_size],
                 torch.zeros_like(input_ids[:batch_size]),
             )
-            (
-                model_input_ids,
-                model_positions,
-                forward_slot_mapping,
-                cudagraph_mode,
-                batch_descriptor,
-            ) = self._prepare_piecewise_model_inputs(
-                input_ids=safe_input_ids,
-                positions=clamped_positions,
-                slot_mapping=slot_mapping,
-                slot_mapping_workspace=self._slot_mapping,
-                stage_name="draft",
-            )
+            self.performance_stats.add_counter("draft_cudagraph_eager")
             per_layer_slot_mapping = {
-                layer_name: forward_slot_mapping for layer_name in self.attn_layer_names
+                layer_name: slot_mapping for layer_name in self.attn_layer_names
             }
 
         with (
@@ -499,19 +392,16 @@ class RetroSpecModelMixin:
             set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=batch_descriptor.num_tokens,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=(
-                    batch_descriptor if cudagraph_mode != CUDAGraphMode.NONE else None
-                ),
+                num_tokens=batch_size,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=None,
                 slot_mapping=per_layer_slot_mapping,
             ),
         ):
             hidden_states = self._run_pipeline_stage_model(
-                model_input_ids,
-                model_positions,
-                batch_descriptor.num_tokens,
-                cudagraph_mode,
+                safe_input_ids,
+                clamped_positions,
+                batch_size,
                 "draft",
             )
 
