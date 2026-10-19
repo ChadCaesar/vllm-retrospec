@@ -27,7 +27,10 @@ class RetroSpecDraftMixin:
             common_attn_metadata=common_attn_metadata,
             sampling_metadata=sampling_metadata,
             attention_mode=RetroSpecAttentionMode.DRAFT,
-            compute_margin=(self.policy.draft_margin_threshold is not None),
+            compute_margin=(
+                self.policy.draft_margin_threshold is not None
+                or self.token_metrics_tracer.enabled
+            ),
         )
 
     def _begin_draft_round(

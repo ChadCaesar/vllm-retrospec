@@ -204,7 +204,7 @@ class SpeculativeConfig:
 
     retrospec_draft_margin_threshold: float | None = Field(default=None, ge=0)
     """Stop the current draft block when the top-1/top-2 logit margin is
-    below this value."""
+    below this value. Zero is equivalent to disabling this threshold."""
     retrospec_sparse_margin_threshold: float | None = Field(default=None, ge=0)
     """Trigger expanded verification when the sparse-verification logit margin is
     below this value."""
@@ -225,6 +225,13 @@ class SpeculativeConfig:
     """Emit request-level RetroSpec stage-transition diagnostics. This option
     synchronizes compact decision tensors to CPU and must remain disabled
     during performance measurements."""
+
+    retrospec_trace_token_metrics: bool = False
+    """Trace the draft margin and globally averaged hit attention of accepted
+    proposal tokens and the first token mismatching target verification.
+    Diagnostic only: computes both signals without enabling either threshold,
+    synchronizes to CPU, and supports synchronous greedy decoding with
+    pipeline parallel size one."""
 
     retrospec_stats_interval_seconds: float = Field(default=0.0, ge=0)
     """Interval for worker-side RetroSpec performance logs. Zero disables all

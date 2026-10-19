@@ -3018,6 +3018,7 @@ class GPUModelRunner(
                     spec_decode_metadata.num_draft_tokens,
                     valid_sampled_counts,
                     req_ids_output_copy,
+                    sampled_token_ids=valid_sampled_token_ids,
                 )
 
         # Cache the sampled tokens in the model runner, so that the scheduler

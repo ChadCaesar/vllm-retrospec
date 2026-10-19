@@ -599,6 +599,15 @@ class RetroSpecVerificationMixin:
             sparse.token_ids,
             expected_token_ids,
         )
+        if self.token_metrics_tracer.enabled:
+            self.token_metrics_tracer.record_replacements(
+                request_ids,
+                sparse.request_indices,
+                sparse.token_indices,
+                expected_token_ids,
+                corrected_token_ids,
+                "sparse_correction",
+            )
         self._draft_token_ids[sparse.request_indices, sparse.token_indices] = (
             corrected_token_ids
         )
@@ -782,6 +791,17 @@ class RetroSpecVerificationMixin:
                 expanded_index_update=expanded_index_update,
                 verified_counts=verified_counts,
             )
+            if self.token_metrics_tracer.enabled:
+                self.token_metrics_tracer.record_replacements(
+                    request_ids,
+                    expanded.request_indices,
+                    expanded.token_indices,
+                    self._draft_token_ids[
+                        expanded.request_indices, expanded.token_indices
+                    ],
+                    expanded.token_ids,
+                    "expanded_correction",
+                )
             self._draft_token_ids[expanded.request_indices, expanded.token_indices] = (
                 expanded.token_ids
             )

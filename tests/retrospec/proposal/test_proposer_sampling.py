@@ -101,6 +101,41 @@ def test_sparse_bonus_pairs_append_only_with_capacity_and_budget():
     assert processed_sampling.numel() == 0
 
 
+@pytest.mark.parametrize(
+    "config_name", ["retrospec_draft_margin_threshold", "retrospec_hit_attn_threshold"]
+)
+@pytest.mark.parametrize("threshold", [None, 0.0, 0.1, 1.0])
+def test_draft_gate_threshold_does_not_disable_sparse_bonus(config_name, threshold):
+    proposer = RetroSpecProposer(
+        make_vllm_config(**{config_name: threshold}),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    proposer._sparse_bonus_enabled = True
+    initialize_verification(
+        proposer,
+        torch.tensor([[10, 20, -1, -1]], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+    )
+    starts = proposer.state.pending_counts.clone()
+    active = proposer.state.active_mask.clone()
+    requests, steps = proposer._build_verification_pairs(
+        1, starts, proposer.state.draft_counts, active
+    )
+
+    _, _, bonus_requests = proposer._append_sparse_bonus_pairs(
+        1,
+        requests,
+        steps,
+        starts,
+        proposer.state.draft_counts,
+        active,
+        make_sampling_metadata(all_greedy=True),
+    )
+
+    assert bonus_requests.tolist() == [0]
+
+
 def test_sparse_bonus_is_discarded_for_request_with_verification_boundary(monkeypatch):
     proposer = RetroSpecProposer(make_vllm_config(), torch.device("cpu"), make_runner())
     proposer._sparse_bonus_enabled = True

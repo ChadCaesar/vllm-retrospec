@@ -98,7 +98,14 @@ class RetroSpecDecisionPolicy:
         self.max_draft_tokens = config.retrospec_max_draft_tokens
         self.pending_limit = config.num_speculative_tokens
 
-        self.draft_margin_threshold = config.retrospec_draft_margin_threshold
+        # The top-1/top-2 logit margin is non-negative, so a zero threshold
+        # cannot trigger a draft transition. Treat it as disabled to avoid
+        # unnecessary margin computation.
+        self.draft_margin_threshold = (
+            None
+            if config.retrospec_draft_margin_threshold == 0
+            else config.retrospec_draft_margin_threshold
+        )
         self.sparse_margin_threshold = config.retrospec_sparse_margin_threshold
         self.expanded_margin_threshold = config.retrospec_expanded_margin_threshold
 

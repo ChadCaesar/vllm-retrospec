@@ -27,6 +27,7 @@ from .pipeline import (
 )
 from .prefill import resolve_retrospec_layer_model
 from .state import RetroSpecBatchState, RetroSpecIndexUpdateState, RetroSpecStage
+from .token_metrics_trace import RetroSpecTokenMetricsTracer
 from .transition_trace import RetroSpecTransitionTracer
 
 if TYPE_CHECKING:
@@ -120,6 +121,14 @@ class RetroSpecProposer(
         self.transition_tracer = RetroSpecTransitionTracer(
             config.retrospec_trace_transitions
         )
+        self.token_metrics_tracer = RetroSpecTokenMetricsTracer(
+            config.retrospec_trace_token_metrics
+        )
+        if (
+            self.token_metrics_tracer.enabled
+            and getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) != 1
+        ):
+            raise NotImplementedError("Token-metric tracing requires PP=1")
         self.state = RetroSpecBatchState(self.max_batch_size, device)
         self.sparse_attention = RetroSpecSparseAttention(vllm_config, device)
         self.performance_stats = self.sparse_attention.performance_stats
@@ -487,6 +496,10 @@ class RetroSpecProposer(
 
         self.positions[:batch_size].copy_(seq_lens)
         self.proposal_start_positions[:batch_size].copy_(seq_lens)
+        if self.token_metrics_tracer.enabled:
+            self.token_metrics_tracer.begin(
+                request_ids, self.proposal_start_positions[:batch_size]
+            )
 
         no_draft_space = self.positions[:batch_size] >= self.max_model_len - 1
         self.state.finish_requests(no_draft_space)
@@ -521,6 +534,15 @@ class RetroSpecProposer(
                         draft_stage_mask,
                         sampling_metadata,
                     )
+                    if self.token_metrics_tracer.enabled:
+                        self.token_metrics_tracer.record_draft(
+                            request_ids,
+                            token_index,
+                            draft_stage_mask,
+                            sampled_token_ids,
+                            draft_margin,
+                            hit_attn,
+                        )
 
                     output_column = self._draft_token_ids[:batch_size, token_index]
                     output_column.copy_(
@@ -695,6 +717,13 @@ class RetroSpecProposer(
                         verification.bonus_token_ids,
                         existing_tokens.squeeze(1),
                     )
+                    if self.token_metrics_tracer.enabled:
+                        self.token_metrics_tracer.record_bonus(
+                            request_ids,
+                            bonus_ready,
+                            bonus_steps.squeeze(1),
+                            bonus_tokens,
+                        )
                     self._draft_token_ids[:batch_size].scatter_(
                         1, bonus_steps, bonus_tokens.unsqueeze(1)
                     )
@@ -740,6 +769,7 @@ class RetroSpecProposer(
             token_ids[:pending_count]
             for token_ids, pending_count in zip(pending_token_ids, pending_counts_cpu)
         ]
+        self.token_metrics_tracer.submit(request_ids, result)
         if self.performance_stats.enabled:
             elapsed_seconds = perf_counter() - proposal_started_at
             first_request_count = 0

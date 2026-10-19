@@ -9,6 +9,7 @@ import torch
 class RetroSpecFeedbackMixin:
     def remove_requests(self, request_ids: Collection[str]) -> None:
         request_ids = tuple(request_ids)
+        self.token_metrics_tracer.remove_requests(request_ids)
         self.index_update_state.remove_requests(request_ids)
         self.sparse_attention.remove_requests(request_ids)
         for request_id in request_ids:
@@ -78,6 +79,7 @@ class RetroSpecFeedbackMixin:
         proposed_counts: Sequence[int],
         valid_sampled_token_counts: Sequence[int],
         request_ids: Sequence[str] | None = None,
+        sampled_token_ids: Sequence[Sequence[int]] | None = None,
     ) -> None:
         """Count outcomes using the proposal consumed by this target pass.
 
@@ -89,6 +91,13 @@ class RetroSpecFeedbackMixin:
             raise ValueError("Proposal and sampled-token counts must have equal length")
         if request_ids is not None and len(request_ids) != len(proposed_counts):
             raise ValueError("Request IDs and proposal counts must have equal length")
+        if request_ids is not None:
+            self.token_metrics_tracer.record_outcomes(
+                request_ids,
+                proposed_counts,
+                valid_sampled_token_counts,
+                sampled_token_ids,
+            )
 
         rounds = proposed = accepted = fully_accepted = 0
         for row, (proposed_count, valid_count) in enumerate(

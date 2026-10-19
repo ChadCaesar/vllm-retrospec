@@ -90,6 +90,7 @@ class RetroSpecSparseAttention:
         self.tensor_parallel_size = getattr(parallel_config, "tensor_parallel_size", 1)
         self.reduce_draft_attention_mass = (
             config.retrospec_hit_attn_threshold is not None
+            or config.retrospec_trace_token_metrics
         )
         self.reduce_sparse_attention_mass = (
             config.retrospec_retrieval_attn_threshold is not None

@@ -417,11 +417,16 @@ def test_verify_only_processes_current_logical_draft_interval(monkeypatch):
     assert verification.require_full.tolist() == [True]
 
 
+@pytest.mark.parametrize("draft_margin_threshold", [None, 0.0, 1.0])
 def test_sparse_bonus_seeds_next_round_without_committing_early(
     monkeypatch,
+    draft_margin_threshold,
 ):
     proposer = RetroSpecProposer(
-        make_vllm_config(retrospec_max_draft_tokens=2),
+        make_vllm_config(
+            retrospec_max_draft_tokens=2,
+            retrospec_draft_margin_threshold=draft_margin_threshold,
+        ),
         torch.device("cpu"),
         make_runner(),
     )
@@ -444,7 +449,7 @@ def test_sparse_bonus_seeds_next_round_without_committing_early(
         )
         return (
             torch.tensor([draft_index + 1], dtype=torch.int32),
-            None,
+            torch.tensor([2.0]) if draft_margin_threshold else None,
             torch.ones(batch_size),
         )
 
@@ -493,6 +498,77 @@ def test_sparse_bonus_seeds_next_round_without_committing_early(
     assert draft_calls == [(0, 7, 2), (1, 1, 3), (3, 99, 5)]
     assert verified_rounds == [(0, 2, [1, 2, -1, -1]), (2, 2, [1, 2, 99, 4])]
     assert result == [[1, 2, 99, 4]]
+
+
+def test_hit_attention_stops_real_draft_after_sparse_bonus(monkeypatch):
+    proposer = RetroSpecProposer(
+        make_vllm_config(
+            retrospec_max_draft_tokens=3,
+            retrospec_hit_attn_threshold=0.5,
+        ),
+        torch.device("cpu"),
+        make_runner(),
+    )
+    draft_calls = []
+    verified_rounds = []
+
+    def fake_run_draft_step(
+        batch_size,
+        draft_index,
+        common_attn_metadata,
+        active_mask,
+        sampling_metadata,
+    ):
+        draft_calls.append(
+            (draft_index, int(proposer.input_ids[0]), int(proposer.positions[0]))
+        )
+        return (
+            torch.tensor([draft_index + 1], dtype=torch.int32),
+            None,
+            torch.tensor([0.25]),
+        )
+
+    def fake_verify(
+        batch_size,
+        request_ids,
+        proposal_round,
+        round_start_counts,
+        common_attn_metadata,
+        sampling_metadata,
+    ):
+        verified_rounds.append(
+            (int(round_start_counts[0]), int(proposer.state.draft_counts[0]))
+        )
+        if proposal_round == 1:
+            return RetroSpecVerificationResult(
+                verified_counts=torch.tensor([1], dtype=torch.int32),
+                require_full=torch.tensor([False]),
+                bonus_mask=torch.tensor([True]),
+                bonus_token_ids=torch.tensor([99], dtype=torch.int32),
+            )
+        return RetroSpecVerificationResult(
+            verified_counts=torch.tensor([2], dtype=torch.int32),
+            require_full=torch.tensor([True]),
+        )
+
+    monkeypatch.setattr(
+        proposer.sparse_attention,
+        "proposal_context",
+        lambda _request_ids, _context_lens=None: nullcontext(),
+    )
+    monkeypatch.setattr(proposer, "_run_draft_step", fake_run_draft_step)
+    monkeypatch.setattr(proposer, "_verify_draft_tokens", fake_verify)
+
+    result = run_proposal(
+        proposer,
+        torch.tensor([7], dtype=torch.int32),
+        make_sampling_metadata(all_greedy=True),
+        make_common_metadata([2]),
+    )
+
+    assert draft_calls == [(0, 7, 2), (2, 99, 4)]
+    assert verified_rounds == [(0, 1), (1, 2)]
+    assert result == [[1, 99, 3]]
 
 
 def test_propose_accumulates_multiple_draft_rounds(monkeypatch):

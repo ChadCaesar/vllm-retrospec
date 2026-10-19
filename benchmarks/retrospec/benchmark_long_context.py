@@ -78,6 +78,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--num-speculative-tokens", type=int, default=64)
     parser.add_argument("--min-draft-tokens", type=int, default=1)
+    parser.add_argument("--draft-margin-threshold", type=float)
+    parser.add_argument("--hit-attn-threshold", type=float)
     parser.add_argument(
         "--max-draft-tokens",
         type=int,
@@ -108,6 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--native", action="store_true")
     parser.add_argument("--sync-attention-gates", action="store_true")
     parser.add_argument("--trace-transitions", action="store_true")
+    parser.add_argument("--trace-token-metrics", action="store_true")
     return parser.parse_args()
 
 
@@ -119,6 +122,36 @@ def load_sample(args: argparse.Namespace) -> dict[str, Any]:
         return samples[args.sample_index]
     except IndexError as exc:
         raise ValueError(f"Sample index {args.sample_index} is outside {path}") from exc
+
+
+def shorten_prompt_preserving_question(
+    prompt: str, max_chars: int, answer: str | None = None
+) -> str:
+    """Shorten a NIAH prompt while retaining its question and answer evidence."""
+    if max_chars <= 0:
+        raise ValueError("prompt chars must be positive")
+    question_start = prompt.rfind("\nQuestion:")
+    if question_start < 0:
+        return prompt[:max_chars]
+    question = prompt[question_start:]
+    if len(question) > max_chars:
+        raise ValueError("prompt chars must fit the final question")
+    if answer:
+        answer_start = prompt.find(answer, 0, question_start)
+        intro_end = prompt.find("\n") + 1
+        separator = "\n...\n"
+        passage_chars = max_chars - intro_end - len(separator) - len(question)
+        if intro_end > 0 and answer_start >= intro_end and passage_chars >= len(answer):
+            passage_start = max(intro_end, answer_start - passage_chars // 2)
+            passage_end = min(question_start, passage_start + passage_chars)
+            passage_start = max(intro_end, passage_end - passage_chars)
+            return (
+                prompt[:intro_end]
+                + separator
+                + prompt[passage_start:passage_end]
+                + question
+            )
+    return prompt[: max_chars - len(question)] + question
 
 
 def build_speculative_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -137,6 +170,7 @@ def build_speculative_config(args: argparse.Namespace) -> dict[str, Any]:
         "retrospec_min_draft_tokens": args.min_draft_tokens,
         "retrospec_max_draft_tokens": args.max_draft_tokens,
         "retrospec_trace_transitions": args.trace_transitions,
+        "retrospec_trace_token_metrics": getattr(args, "trace_token_metrics", False),
         "retrospec_stats_interval_seconds": (
             args.stats_interval if args.profile else 0.0
         ),
@@ -152,6 +186,12 @@ def build_speculative_config(args: argparse.Namespace) -> dict[str, Any]:
                 "retrospec_expanded_attn_threshold": 0.0,
             }
         )
+    draft_margin_threshold = getattr(args, "draft_margin_threshold", None)
+    if draft_margin_threshold is not None:
+        config["retrospec_draft_margin_threshold"] = draft_margin_threshold
+    hit_attn_threshold = getattr(args, "hit_attn_threshold", None)
+    if hit_attn_threshold is not None:
+        config["retrospec_hit_attn_threshold"] = hit_attn_threshold
     return config
 
 
@@ -225,6 +265,7 @@ def main() -> None:
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "num_speculative_tokens": args.num_speculative_tokens,
             "max_draft_tokens": args.max_draft_tokens,
+            "draft_margin_threshold": args.draft_margin_threshold,
             "draft_rank_dtype": args.draft_rank_dtype,
             "max_gpu_index_memory": args.max_gpu_index_memory,
             "requested_context_len": args.context_len,

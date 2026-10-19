@@ -8,6 +8,7 @@ from unittest.mock import Mock
 from benchmarks.retrospec.benchmark_long_context import (
     build_speculative_config,
     parse_args,
+    shorten_prompt_preserving_question,
     shutdown_llm,
 )
 from benchmarks.retrospec.summarize_long_context import summarize
@@ -33,6 +34,68 @@ def test_benchmark_uses_default_draft_limit(monkeypatch, tmp_path):
     assert args.retrieval_ratio == 0.050
     assert args.draft_rank_dtype == "native"
     assert args.prefill_tile_size == 32768
+    assert args.draft_margin_threshold is None
+    assert args.hit_attn_threshold is None
+
+
+def test_benchmark_passes_draft_margin_threshold(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "benchmark_long_context.py",
+            "--model",
+            "model",
+            "--dataset-dir",
+            str(tmp_path),
+            "--context-len",
+            "30000",
+            "--draft-margin-threshold",
+            "2.0",
+        ],
+    )
+
+    config = build_speculative_config(parse_args())
+
+    assert config["retrospec_draft_margin_threshold"] == 2.0
+
+
+def test_benchmark_passes_hit_attn_without_draft_margin(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "benchmark_long_context.py",
+            "--model",
+            "model",
+            "--dataset-dir",
+            str(tmp_path),
+            "--context-len",
+            "30000",
+            "--hit-attn-threshold",
+            "0.5",
+        ],
+    )
+
+    config = build_speculative_config(parse_args())
+
+    assert config["retrospec_hit_attn_threshold"] == 0.5
+    assert "retrospec_draft_margin_threshold" not in config
+
+
+def test_short_prompt_keeps_final_question():
+    prompt = (
+        "Read this context.\n"
+        + "context " * 50
+        + "The number is 2387512. "
+        + "context " * 50
+        + "\nQuestion: What is the number? Answer:"
+    )
+
+    shortened = shorten_prompt_preserving_question(prompt, 80, "2387512")
+
+    assert len(shortened) == 80
+    assert shortened.startswith("Read this context.\n")
+    assert "2387512" in shortened
+    assert shortened.endswith("\nQuestion: What is the number? Answer:")
 
 
 def test_benchmark_profile_controls_observation_interval():

@@ -122,11 +122,11 @@ class RetroSpecSamplingMixin:
         """Append one unverified next-token query per eligible request."""
         empty_requests = self._verification_bonus_requests[:0]
         num_pairs = request_indices.numel()
+        # Bonus tokens come from sparse verification. Draft margin and hit
+        # attention apply to subsequent draft forwards, not this query.
         if (
             not self._sparse_bonus_enabled
             or self.policy.max_draft_tokens <= 1
-            or self.policy.draft_margin_threshold is not None
-            or self.policy.hit_attn_threshold is not None
             or not self._can_use_raw_greedy_verification_sampling(sampling_metadata)
             or num_pairs >= self.max_parallel_tokens
         ):

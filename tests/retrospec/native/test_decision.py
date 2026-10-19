@@ -74,6 +74,15 @@ def test_draft_without_threshold_or_limit_stays_in_draft():
     ]
 
 
+def test_zero_draft_margin_threshold_is_disabled():
+    policy = make_policy(retrospec_draft_margin_threshold=0.0)
+
+    assert policy.draft_margin_threshold is None
+    decision = evaluate(policy, draft_counts=[2])
+    assert decision.stop_draft.tolist() == [False]
+    assert decision.reasons.tolist() == [0]
+
+
 def test_max_draft_tokens_transitions_to_sparse_verify():
     decision = evaluate(
         make_policy(),
