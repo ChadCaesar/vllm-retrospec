@@ -496,7 +496,15 @@ class RetroSpecVerificationMixin:
             with self.performance_stats.cuda_timer(f"{stage_name}_end_step"):
                 local_attention_stats = self.sparse_attention.end_step_statistics()
                 attention_mass = self.pipeline_protocol.reduce_attention_mass(
-                    local_attention_stats
+                    local_attention_stats,
+                    reduce_across_pp=(
+                        self.transition_tracer.enabled
+                        or (
+                            self.policy.retrieval_attn_threshold is not None
+                            if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY
+                            else self.policy.expanded_attn_threshold is not None
+                        )
+                    ),
                 )
         except BaseException:
             self.sparse_attention.abort_step()

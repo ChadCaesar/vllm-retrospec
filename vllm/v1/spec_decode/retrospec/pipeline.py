@@ -576,7 +576,12 @@ class RetroSpecPipelineProtocol:
 
         return RetroSpecPipelineModelOutput(output_token_ids, output_margin)
 
-    def reduce_attention_mass(self, stats: RetroSpecAttentionMassStats) -> torch.Tensor:
+    def reduce_attention_mass(
+        self,
+        stats: RetroSpecAttentionMassStats,
+        *,
+        reduce_across_pp: bool = True,
+    ) -> torch.Tensor:
         if stats.value_sum.device != self.device:
             raise ValueError("Attention-mass statistics are on the wrong device")
 
@@ -586,6 +591,10 @@ class RetroSpecPipelineProtocol:
                 "Attention-mass batch size "
                 f"{batch_size} exceeds {self.max_parallel_tokens}"
             )
+
+        if not reduce_across_pp:
+            # The caller needs no global attention mass for its policy or trace.
+            return stats.mean()
 
         reduction = self._attention_reduce[: batch_size + 1]
         reduction[:batch_size].copy_(stats.value_sum)

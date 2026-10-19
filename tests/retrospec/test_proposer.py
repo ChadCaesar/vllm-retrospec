@@ -1030,9 +1030,22 @@ def test_propose_rolls_back_rejected_tokens_before_drafting(monkeypatch):
     assert result == [[1, 2]]
 
 
-def test_run_draft_step_preserves_attention_seq_lens_dtype(monkeypatch):
+@pytest.mark.parametrize(
+    ("hit_threshold", "trace_enabled", "expect_reduce"),
+    [
+        (None, False, False),
+        (0.5, False, True),
+        (None, True, True),
+    ],
+)
+def test_run_draft_step_preserves_attention_seq_lens_dtype(
+    monkeypatch, hit_threshold, trace_enabled, expect_reduce
+):
     proposer = RetroSpecProposer(
-        make_vllm_config(),
+        make_vllm_config(
+            retrospec_hit_attn_threshold=hit_threshold,
+            retrospec_trace_transitions=trace_enabled,
+        ),
         torch.device("cpu"),
         make_runner(),
     )
@@ -1079,6 +1092,10 @@ def test_run_draft_step_preserves_attention_seq_lens_dtype(monkeypatch):
     )
 
     initialize_single_pipeline_stage(proposer)
+    reduce_attention_mass = Mock(wraps=proposer.pipeline_protocol.reduce_attention_mass)
+    monkeypatch.setattr(
+        proposer.pipeline_protocol, "reduce_attention_mass", reduce_attention_mass
+    )
     proposer._run_draft_step(
         batch_size=1,
         draft_index=0,
@@ -1089,6 +1106,7 @@ def test_run_draft_step_preserves_attention_seq_lens_dtype(monkeypatch):
 
     proposer.sparse_attention.begin_step.assert_called_once()
     proposer.sparse_attention.end_step_statistics.assert_called_once_with()
+    assert reduce_attention_mass.call_args.kwargs == {"reduce_across_pp": expect_reduce}
 
 
 def test_model_step_sanitizes_input_ids_for_inactive_rows(monkeypatch):
@@ -2453,19 +2471,41 @@ def test_propose_handles_different_round_offsets_in_one_buffer(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("attention_mode", "expect_margin"),
+    (
+        "attention_mode",
+        "expect_margin",
+        "attention_threshold",
+        "trace_enabled",
+        "expect_reduce",
+    ),
     [
-        (RetroSpecAttentionMode.SPARSE_VERIFY, True),
-        (RetroSpecAttentionMode.EXPANDED_VERIFY, False),
+        (RetroSpecAttentionMode.SPARSE_VERIFY, True, None, False, False),
+        (RetroSpecAttentionMode.SPARSE_VERIFY, True, 0.5, False, True),
+        (RetroSpecAttentionMode.SPARSE_VERIFY, True, None, True, True),
+        (RetroSpecAttentionMode.EXPANDED_VERIFY, False, None, False, False),
+        (RetroSpecAttentionMode.EXPANDED_VERIFY, False, 0.5, False, True),
+        (RetroSpecAttentionMode.EXPANDED_VERIFY, False, None, True, True),
     ],
 )
 def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     monkeypatch,
     attention_mode,
     expect_margin,
+    attention_threshold,
+    trace_enabled,
+    expect_reduce,
 ):
+    attention_threshold_name = (
+        "retrospec_retrieval_attn_threshold"
+        if attention_mode == RetroSpecAttentionMode.SPARSE_VERIFY
+        else "retrospec_expanded_attn_threshold"
+    )
     proposer = RetroSpecProposer(
-        make_vllm_config(retrospec_sparse_margin_threshold=0.5),
+        make_vllm_config(
+            retrospec_sparse_margin_threshold=0.5,
+            retrospec_trace_transitions=trace_enabled,
+            **{attention_threshold_name: attention_threshold},
+        ),
         torch.device("cpu"),
         make_runner(),
     )
@@ -2524,6 +2564,10 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     )
 
     initialize_single_pipeline_stage(proposer)
+    reduce_attention_mass = Mock(wraps=proposer.pipeline_protocol.reduce_attention_mass)
+    monkeypatch.setattr(
+        proposer.pipeline_protocol, "reduce_attention_mass", reduce_attention_mass
+    )
     result = proposer._run_parallel_verification(
         batch_size=2,
         request_indices=torch.tensor([1, 0, 1], dtype=torch.int64),
@@ -2550,6 +2594,7 @@ def test_parallel_verification_flattens_tokens_and_preserves_sampling_rows(
     assert torch.equal(begin_args[1], torch.tensor([1, 0, 1], dtype=torch.int64))
     assert torch.equal(begin_args[2], torch.tensor([0, 1, 1], dtype=torch.int64))
     proposer.sparse_attention.end_step_statistics.assert_called_once_with()
+    assert reduce_attention_mass.call_args.kwargs == {"reduce_across_pp": expect_reduce}
 
 
 def test_parallel_verification_replays_padded_piecewise_graph(monkeypatch):

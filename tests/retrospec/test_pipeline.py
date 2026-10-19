@@ -272,6 +272,24 @@ def test_attention_mass_reduction_weights_pipeline_stages_by_layer_count():
     torch.testing.assert_close(reduced_input, torch.tensor([1.0, 4.0, 2.0]))
 
 
+def test_attention_mass_skips_pipeline_reduction_when_unused():
+    protocol = make_protocol()
+    pp_group = make_pp_group(rank=0, world_size=2, is_last_rank=False)
+    stats = RetroSpecAttentionMassStats(
+        value_sum=torch.tensor([1.0, 4.0]),
+        layer_count=2,
+    )
+
+    with patch(
+        "vllm.v1.spec_decode.retrospec.pipeline.get_pp_group",
+        return_value=pp_group,
+    ):
+        attention_mass = protocol.reduce_attention_mass(stats, reduce_across_pp=False)
+
+    torch.testing.assert_close(attention_mass, torch.tensor([0.5, 2.0]))
+    pp_group.all_reduce.assert_not_called()
+
+
 def test_final_pipeline_stage_packs_fixed_control_workspace():
     protocol = make_protocol()
     pp_group = make_pp_group(rank=1, world_size=2, is_last_rank=True)

@@ -373,7 +373,11 @@ class RetroSpecDraftMixin:
         with self.performance_stats.cuda_timer("draft_end_step"):
             local_attention_stats = self.sparse_attention.end_step_statistics()
             attention_mass = self.pipeline_protocol.reduce_attention_mass(
-                local_attention_stats
+                local_attention_stats,
+                reduce_across_pp=(
+                    self.policy.hit_attn_threshold is not None
+                    or self.transition_tracer.enabled
+                ),
             )
 
         stage = self._require_pipeline_stage()
