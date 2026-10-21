@@ -26,6 +26,12 @@ _GPU_INDEX_REQUEST_SCALAR_BYTES = 44
 _GPU_INDEX_ADMISSION_SAFETY_FACTOR = 1.10
 
 
+def _proposal_capacity(config) -> int:
+    return getattr(
+        config, "retrospec_proposal_token_capacity", config.num_speculative_tokens
+    )
+
+
 @dataclass(frozen=True)
 class RetroSpecGPUIndexFootprint:
     cluster_capacity: int
@@ -69,7 +75,7 @@ def get_retrospec_native_working_set_tokens(
     if long_prefill_threshold > 0:
         max_prefill_chunk = min(max_prefill_chunk, long_prefill_threshold)
 
-    num_recent_blocks = cdiv(config.num_speculative_tokens, block_size) + 1
+    num_recent_blocks = cdiv(_proposal_capacity(config), block_size) + 1
 
     max_unindexed_segment_tokens = max(
         config.retrospec_index_segment_size,
@@ -83,7 +89,7 @@ def get_retrospec_native_working_set_tokens(
         block_size
         + max_unindexed_segment_tokens
         + num_recent_blocks * block_size
-        + config.num_speculative_tokens
+        + _proposal_capacity(config)
     )
     per_request_steady_tokens = min(per_request_steady_tokens, max_model_len)
 
@@ -144,7 +150,7 @@ def _get_indexed_token_capacity_for_length(
     assert config.num_speculative_tokens is not None
 
     context_len = min(context_len, vllm_config.model_config.max_model_len)
-    num_recent_blocks = cdiv(config.num_speculative_tokens, block_size) + 1
+    num_recent_blocks = cdiv(_proposal_capacity(config), block_size) + 1
 
     full_block_count = context_len // block_size
     stable_end_block = max(full_block_count - num_recent_blocks, 1)
@@ -284,7 +290,7 @@ def get_retrospec_exact_attention_source_token_capacity(
         max_model_len=vllm_config.model_config.max_model_len,
         prefill_segment_size=config.retrospec_index_segment_size,
         generation_update_interval=config.retrospec_index_update_interval,
-        num_speculative_tokens=config.num_speculative_tokens,
+        num_speculative_tokens=_proposal_capacity(config),
         block_size=block_size,
     )
     return exact_attention_source_token_capacity(
@@ -420,7 +426,7 @@ def build_retrospec_long_context_capacity(
     query_dtype_bytes = get_dtype_size(attention_specs[0].dtype)
     max_parallel_queries = exact_attention_query_capacity(
         scheduler_config.max_num_seqs,
-        config.num_speculative_tokens,
+        _proposal_capacity(config),
     )
     max_exact_partitions = get_retrospec_exact_attention_partition_capacity(
         vllm_config, block_size
@@ -516,12 +522,12 @@ def build_retrospec_long_context_capacity(
 
     # Selection history retains only compact token/cluster descriptors. Summary
     # K/V is gathered from the resident arena into one reusable layer workspace.
-    num_plan_rows = planning_requests * config.num_speculative_tokens
+    num_plan_rows = planning_requests * _proposal_capacity(config)
     primary_exact_width = exact_attention_primary_token_capacity(
         max_model_len=vllm_config.model_config.max_model_len,
         prefill_segment_size=prefill_segment_size,
         generation_update_interval=generation_update_interval,
-        num_speculative_tokens=config.num_speculative_tokens,
+        num_speculative_tokens=_proposal_capacity(config),
         block_size=block_size,
     )
     max_prefetch_clusters = max(max_retrieval_clusters, max_warmup_clusters)
@@ -536,7 +542,7 @@ def build_retrospec_long_context_capacity(
         ) * 4
         per_head_row_bytes = primary_exact_width * (8 + 1) + row_cluster_index_bytes
         miss_command_bytes = (
-            config.num_speculative_tokens
+            _proposal_capacity(config)
             * planning_requests
             * spec.num_kv_heads
             * max_prefetch_clusters
@@ -548,7 +554,7 @@ def build_retrospec_long_context_capacity(
             + num_plan_rows * spec.num_kv_heads * per_head_row_bytes
             + num_plan_rows * (4 + 4)
             + miss_command_bytes
-            + config.num_speculative_tokens * 4
+            + _proposal_capacity(config) * 4
         )
 
     draft_selection_scratch_bytes = 0
@@ -579,7 +585,7 @@ def build_retrospec_long_context_capacity(
 
     verification_record_capacity = (
         planning_requests
-        * config.num_speculative_tokens
+        * _proposal_capacity(config)
         * max_kv_heads
         * max_expanded_clusters
     )

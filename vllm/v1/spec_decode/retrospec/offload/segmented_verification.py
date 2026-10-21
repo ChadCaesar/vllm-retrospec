@@ -589,7 +589,8 @@ class RetroSpecSegmentVerificationMixin:
             candidate_counts,
             plan_valid_rows,
             capture_request_descriptors,
-            emit_misses=self.replay_mode == "ready_selected",
+            emit_misses=self.replay_mode == "ready_selected"
+            or getattr(self, "draft_prefetch", False),
         )
 
         if self.replay_mode == "ready_selected":
@@ -672,6 +673,32 @@ class RetroSpecSegmentVerificationMixin:
             resolved_clusters=resolved_clusters,
             exact_token_counts=exact_token_counts,
             attention_mass=resolved_clusters.attention_mass,
+            prefetch_miss_cluster_ids=(
+                output_workspace.draft_prefetch_miss_cluster_ids
+                if getattr(self, "draft_prefetch", False)
+                else None
+            ),
+            prefetch_miss_positions=(
+                output_workspace.draft_prefetch_miss_positions
+                if getattr(self, "draft_prefetch", False)
+                else None
+            ),
+            prefetch_miss_count=(
+                output_workspace.draft_prefetch_miss_count
+                if getattr(self, "draft_prefetch", False)
+                else None
+            ),
+            prefetch_num_groups=(
+                output_workspace.draft_exact_cluster_handles.shape[0]
+                * output_workspace.draft_exact_cluster_handles.shape[1]
+                if getattr(self, "draft_prefetch", False)
+                else 0
+            ),
+            prefetch_num_ranks=(
+                output_workspace.draft_exact_cluster_handles.shape[2]
+                if getattr(self, "draft_prefetch", False)
+                else 0
+            ),
         )
 
     def configure_sparse_prefetch_wave(self, max_layers: int) -> None:

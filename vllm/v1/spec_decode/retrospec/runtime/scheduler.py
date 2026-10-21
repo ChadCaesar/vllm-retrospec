@@ -120,7 +120,7 @@ class RetroSpecSchedulerAdmissionMixin:
         if not self._can_admit_retrospec_gpu_index(request):
             return False
 
-        num_recent_blocks = cdiv(self.num_spec_tokens, self.block_size) + 1
+        num_recent_blocks = cdiv(self.num_lookahead_tokens, self.block_size) + 1
         return self.kv_cache_manager.can_allocate_retrospec_prefill_slots(
             request,
             prompt_num_tokens=request.num_prompt_tokens,

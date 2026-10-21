@@ -3636,6 +3636,16 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
+        if getattr(getattr(self, "drafter", None), "cpu_coordinator", None) is not None:
+            cpu_proposal_output = self._maybe_run_retrospec_cpu_proposal_only(
+                scheduler_output, spec_decode_common_attn_metadata
+            )
+            if cpu_proposal_output is not None:
+                return cpu_proposal_output
+            # A target forward consumes any carried candidate snapshot.
+            self.drafter.cpu_coordinator.deferred_window = None
+            self.drafter.cpu_coordinator.deferred_plans = None
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -3994,7 +4004,13 @@ class GPUModelRunner(
         kv_cache_retirements: list[KVCacheRetirement] = []
         retrospec_draft_token_ids: DraftTokenIds | None = None
         retrospec_drafter = getattr(self, "drafter", None)
+        retrospec_cpu_committed_counts: dict[str, int] = {}
         if isinstance(retrospec_drafter, RetroSpecProposer):
+            cpu_coordinator = getattr(retrospec_drafter, "cpu_coordinator", None)
+            if cpu_coordinator is not None:
+                retrospec_cpu_committed_counts = self._append_retrospec_cpu_outputs(
+                    valid_sampled_token_ids
+                )
             kv_cache_retirements = retrospec_drafter.take_kv_cache_retirements(
                 tuple(scheduler_output.num_scheduled_tokens)
             )
@@ -4037,6 +4053,7 @@ class GPUModelRunner(
                     )
                 ),
                 retrospec_draft_token_ids=retrospec_draft_token_ids,
+                retrospec_cpu_committed_counts=retrospec_cpu_committed_counts,
             )
 
         if not self.use_async_scheduling:
@@ -5013,6 +5030,13 @@ class GPUModelRunner(
             assert cudagraph_capture_descriptor.num_tokens == num_tokens_unpadded, (
                 "The forced CUDA Graph descriptor must match the dummy token count"
             )
+            assert (
+                cudagraph_capture_descriptor
+                in (self.cudagraph_dispatcher.cudagraph_keys[cudagraph_runtime_mode])
+            ), "The forced CUDA Graph descriptor must be registered"
+            # Proposal namespaces can register larger piecewise graphs than
+            # the target's rounded speculative-decode capture limit.
+            _cudagraph_mode = cudagraph_runtime_mode
             batch_desc = cudagraph_capture_descriptor
 
         if cudagraph_runtime_mode is None:

@@ -112,6 +112,75 @@ def test_retrospec_reserves_speculative_lookahead_tokens():
     assert scheduler.num_lookahead_tokens == 64
 
 
+@pytest.mark.parametrize("cpu_count", [0, 2])
+@pytest.mark.parametrize("carried_drafts", [[], [10, 11]])
+def test_retrospec_cpu_proposal_only_preserves_computed_watermark(
+    cpu_count, carried_drafts
+):
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=32,
+        max_model_len=64,
+        speculative_config=SpeculativeConfig(
+            method="retrospec",
+            num_speculative_tokens=4,
+            retrospec_max_draft_tokens=4,
+            retrospec_cpu_verify=True,
+        ),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    request = create_requests(num_requests=1, num_tokens=8, max_tokens=24)[0]
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    scheduler.update_from_output(first, make_model_runner_output(first))
+    assert scheduler.num_lookahead_tokens == 8
+    old_computed = request.num_computed_tokens
+    if carried_drafts:
+        scheduler.update_draft_token_ids(
+            DraftTokenIds([request.request_id], [carried_drafts])
+        )
+    second = scheduler.schedule()
+    output = make_model_runner_output(second)
+    output.sampled_token_ids = [[11] * cpu_count]
+    output.retrospec_cpu_committed_counts = {request.request_id: cpu_count}
+    output.retrospec_computed_token_counts = {
+        request.request_id: old_computed + cpu_count
+    }
+    scheduler.update_from_output(second, output)
+    assert request.num_computed_tokens == old_computed + cpu_count
+    assert request.num_computed_tokens == request.num_tokens - 1
+
+
+def test_retrospec_cpu_outputs_do_not_count_as_gpu_draft_acceptance():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=32,
+        max_model_len=64,
+        speculative_config=SpeculativeConfig(
+            method="retrospec",
+            num_speculative_tokens=4,
+            retrospec_max_draft_tokens=4,
+            retrospec_cpu_verify=True,
+        ),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    request = create_requests(num_requests=1, num_tokens=8, max_tokens=24)[0]
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    scheduler.update_from_output(first, make_model_runner_output(first))
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [[10, 11, 12]])
+    )
+    second = scheduler.schedule()
+    output = make_model_runner_output(second)
+    # One accepted GPU draft, its full-target bonus, then two CPU tokens.
+    output.sampled_token_ids = [[10, 20, 21, 22]]
+    output.retrospec_cpu_committed_counts = {request.request_id: 2}
+    scheduler.update_from_output(second, output)
+    assert request.num_computed_tokens == 12
+    assert request.num_computed_tokens == request.num_tokens - 1
+
+
 def test_retrospec_scheduler_change_does_not_affect_ngram():
     scheduler = create_scheduler(
         num_speculative_tokens=4,

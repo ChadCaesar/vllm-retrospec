@@ -31,6 +31,7 @@ from .pipeline import (
     RetroSpecPipelineStage,
 )
 from .prefill import resolve_retrospec_layer_model
+from .runtime.proposer_cpu import RetroSpecCPUProposalMixin
 from .runtime.proposer_draft import RetroSpecDraftMixin
 from .runtime.proposer_types import (
     RetroSpecParallelVerificationOutput as RetroSpecParallelVerificationOutput,
@@ -46,7 +47,9 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
-class RetroSpecProposer(RetroSpecDraftMixin, RetroSpecVerificationMixin):
+class RetroSpecProposer(
+    RetroSpecCPUProposalMixin, RetroSpecDraftMixin, RetroSpecVerificationMixin
+):
     _CUDAGRAPH_NAMESPACE = "retrospec_proposal"
 
     def __init__(
@@ -85,7 +88,10 @@ class RetroSpecProposer(RetroSpecDraftMixin, RetroSpecVerificationMixin):
 
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
-        self.num_speculative_tokens = config.num_speculative_tokens
+        self.num_speculative_tokens = getattr(
+            config, "retrospec_proposal_token_capacity", config.num_speculative_tokens
+        )
+        self.cpu_coordinator = None
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
         self.pipeline_protocol = RetroSpecPipelineProtocol(
@@ -281,6 +287,11 @@ class RetroSpecProposer(RetroSpecDraftMixin, RetroSpecVerificationMixin):
 
     def remove_requests(self, request_ids: Collection[str]) -> None:
         request_ids = tuple(request_ids)
+        if (
+            getattr(self, "cpu_coordinator", None) is not None
+            and self.cpu_coordinator.request_id in request_ids
+        ):
+            self.cpu_coordinator.release()
         self.index_update_state.remove_requests(request_ids)
         self.sparse_attention.remove_requests(request_ids)
 
@@ -442,6 +453,8 @@ class RetroSpecProposer(RetroSpecDraftMixin, RetroSpecVerificationMixin):
     def close(self) -> None:
         if self._closed:
             return
+        if getattr(self, "cpu_coordinator", None) is not None:
+            self.cpu_coordinator.close()
         self.sparse_attention.uninstall()
         self._closed = True
 
@@ -462,6 +475,27 @@ class RetroSpecProposer(RetroSpecDraftMixin, RetroSpecVerificationMixin):
         self.pipeline_stage = self.pipeline_protocol.describe_stage(
             layer_model, self.attn_layer_names
         )
+        self.cpu_attention_layers = attention_layers
+        parallel = self.vllm_config.parallel_config
+        model_config = self.vllm_config.model_config
+        from vllm.distributed import get_tp_group
+
+        if (
+            getattr(self.speculative_config, "retrospec_cpu_verify", False)
+            and parallel.pipeline_parallel_size == 1
+            and parallel.tensor_parallel_size in (1, 2)
+            and parallel.data_parallel_size == 1
+            and not getattr(get_tp_group().device_communicator, "internode", False)
+            and model_config.dtype == torch.bfloat16
+            and model_config.quantization is None
+            and self.vllm_config.cache_config.cache_dtype in ("auto", "bfloat16")
+            and self.vllm_config.kv_transfer_config is None
+            and model_config.hf_config.model_type in ("llama", "qwen2")
+            and not getattr(model_config.hf_config, "use_sliding_window", False)
+        ):
+            from .cpu_coordinator import RetroSpecCPUCoordinator
+
+            self.cpu_coordinator = RetroSpecCPUCoordinator(self)
 
     def _require_pipeline_stage(self) -> RetroSpecPipelineStage:
         if self.pipeline_stage is None:
@@ -721,6 +755,33 @@ class RetroSpecProposer(RetroSpecDraftMixin, RetroSpecVerificationMixin):
         self.input_ids[:batch_size].copy_(next_token_ids)
         self.proposal_input_ids[:batch_size].copy_(next_token_ids)
 
+        cpu_supported = self._cpu_request_supported(request_ids, sampling_metadata)
+        if (
+            not cpu_supported
+            and getattr(self, "cpu_coordinator", None) is not None
+            and self.cpu_coordinator.request_id is not None
+        ):
+            # Re-entry after a GPU-only interval needs a fresh full KV image;
+            # its older native delta may already have moved to cluster pages.
+            self.cpu_coordinator.release()
+        if cpu_supported and bool(self.state.active_mask[0].item()):
+            result = self._propose_with_cpu(
+                request_ids,
+                committed_positions,
+                common_attn_metadata,
+                sampling_metadata,
+                remaining_generation_budget=max(
+                    0,
+                    remaining_generation_tokens[0]
+                    - int(valid_sampled_tokens_count[0].item()),
+                ),
+            )
+            self._record_proposal_timing(
+                request_ids, [len(tokens) for tokens in result], proposal_started_at
+            )
+            self.performance_stats.maybe_log()
+            return result
+
         proposal_round = 0
         with self.sparse_attention.proposal_context(request_ids, committed_positions):
             while True:
@@ -936,23 +997,29 @@ class RetroSpecProposer(RetroSpecDraftMixin, RetroSpecVerificationMixin):
             token_ids[:pending_count]
             for token_ids, pending_count in zip(pending_token_ids, pending_counts_cpu)
         ]
-        if self.performance_stats.enabled:
-            elapsed_seconds = perf_counter() - proposal_started_at
-            first_request_count = 0
-            for request_id, pending_count in zip(request_ids, pending_counts_cpu):
-                if pending_count > 0:
-                    self._last_proposed_counts[request_id] = pending_count
-                    self._last_committed_proposal_counts.pop(request_id, None)
-                    if request_id not in self._seen_proposal_request_ids:
-                        self._seen_proposal_request_ids.add(request_id)
-                        first_request_count += 1
-            if first_request_count:
-                self.performance_stats.add_counter(
-                    "first_proposal_requests", first_request_count
-                )
-                self.performance_stats.record_cpu_time(
-                    "first_proposal_batch_wall", elapsed_seconds
-                )
-            self.performance_stats.record_cpu_time("proposal_wall", elapsed_seconds)
+        self._record_proposal_timing(
+            request_ids, pending_counts_cpu, proposal_started_at
+        )
         self.performance_stats.maybe_log()
         return result
+
+    def _record_proposal_timing(self, request_ids, pending_counts, started_at):
+        if not self.performance_stats.enabled:
+            return
+        elapsed_seconds = perf_counter() - started_at
+        first_request_count = 0
+        for request_id, pending_count in zip(request_ids, pending_counts):
+            if pending_count > 0:
+                self._last_proposed_counts[request_id] = pending_count
+                self._last_committed_proposal_counts.pop(request_id, None)
+                if request_id not in self._seen_proposal_request_ids:
+                    self._seen_proposal_request_ids.add(request_id)
+                    first_request_count += 1
+        if first_request_count:
+            self.performance_stats.add_counter(
+                "first_proposal_requests", first_request_count
+            )
+            self.performance_stats.record_cpu_time(
+                "first_proposal_batch_wall", elapsed_seconds
+            )
+        self.performance_stats.record_cpu_time("proposal_wall", elapsed_seconds)

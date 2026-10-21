@@ -243,7 +243,11 @@ class Scheduler(
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
             if self.is_retrospec:
-                self.num_lookahead_tokens = self.num_spec_tokens
+                self.num_lookahead_tokens = getattr(
+                    speculative_config,
+                    "retrospec_proposal_token_capacity",
+                    self.num_spec_tokens,
+                )
                 self.retrospec_blocks_per_cluster = (
                     speculative_config.retrospec_blocks_per_cluster
                 )
@@ -855,7 +859,9 @@ class Scheduler(
                 )
 
                 if is_layer_major_prefill:
-                    num_recent_blocks = cdiv(self.num_spec_tokens, self.block_size) + 1
+                    num_recent_blocks = (
+                        cdiv(self.num_lookahead_tokens, self.block_size) + 1
+                    )
                     allocation = self.kv_cache_manager.allocate_retrospec_prefill_slots(
                         request,
                         prompt_num_tokens=request.num_prompt_tokens,
@@ -1533,13 +1539,27 @@ class Scheduler(
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            cpu_committed = getattr(
+                model_runner_output, "retrospec_cpu_committed_counts", {}
+            ).get(req_id, 0)
+            if not 0 <= cpu_committed <= len(generated_token_ids):
+                raise RuntimeError("Invalid RetroSpec CPU committed-token count")
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
-            if scheduled_spec_token_ids and generated_token_ids:
+            computed_override = getattr(
+                model_runner_output, "retrospec_computed_token_counts", {}
+            ).get(req_id)
+            if (
+                scheduled_spec_token_ids
+                and generated_token_ids
+                and computed_override is None
+            ):
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
+                num_accepted = len(generated_token_ids) - 1 - cpu_committed
+                if not 0 <= num_accepted <= num_draft_tokens:
+                    raise RuntimeError("Invalid speculative accepted-token count")
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
@@ -1559,6 +1579,16 @@ class Scheduler(
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+
+            request.num_computed_tokens += cpu_committed
+            if computed_override is not None:
+                if (
+                    not self.is_retrospec
+                    or cpu_committed != len(generated_token_ids)
+                    or computed_override != request.num_tokens + cpu_committed - 1
+                ):
+                    raise RuntimeError("Invalid RetroSpec computed-token override")
+                request.num_computed_tokens = computed_override
 
             stopped = False
             new_logprobs = None

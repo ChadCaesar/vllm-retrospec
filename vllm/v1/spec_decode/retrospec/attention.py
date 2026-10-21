@@ -127,7 +127,9 @@ class RetroSpecSparseAttention(RetroSpecAttentionExecutionMixin):
         )
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.block_size = block_size
-        self.num_speculative_tokens = config.num_speculative_tokens
+        self.num_speculative_tokens = getattr(
+            config, "retrospec_proposal_token_capacity", config.num_speculative_tokens
+        )
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
         self.max_verification_tokens = exact_attention_query_capacity(
             self.max_batch_size, self.num_speculative_tokens
@@ -163,7 +165,7 @@ class RetroSpecSparseAttention(RetroSpecAttentionExecutionMixin):
 
         self.index = RetroSpecSegmentedTokenIndex(
             block_size=block_size,
-            num_speculative_tokens=config.num_speculative_tokens,
+            num_speculative_tokens=self.num_speculative_tokens,
             retrieval_ratio=config.retrospec_retrieval_ratio,
             estimation_ratio=config.retrospec_estimation_ratio,
             prefill_segment_size_tokens=config.retrospec_index_segment_size,
@@ -195,6 +197,8 @@ class RetroSpecSparseAttention(RetroSpecAttentionExecutionMixin):
                 self.performance_stats if self.performance_stats.enabled else None
             ),
         )
+        self.index.draft_prefetch = getattr(config, "retrospec_draft_prefetch", False)
+        self._resident_prefetch_wave = []
 
         exact_partition_capacity = get_retrospec_exact_attention_partition_capacity(
             vllm_config, block_size
@@ -879,6 +883,12 @@ class RetroSpecSparseAttention(RetroSpecAttentionExecutionMixin):
         attention_mass_sum = self.attention_mass_sum[: self.batch_size]
         attention_mass_sum = self._synchronize_attention_mass_sum(attention_mass_sum)
 
+        wave = getattr(self, "_resident_prefetch_wave", None)
+        if self.mode == RetroSpecAttentionMode.DRAFT and wave:
+            records = tuple(wave)
+            wave.clear()
+            self.index.submit_sparse_verification_prefetch_wave(records)
+
         if self.parallel_request_indices is not None:
             self.index.end_indexed_verification_transaction()
 
@@ -901,6 +911,9 @@ class RetroSpecSparseAttention(RetroSpecAttentionExecutionMixin):
         try:
             self.index.end_indexed_verification_transaction()
         finally:
+            wave = getattr(self, "_resident_prefetch_wave", None)
+            if wave is not None:
+                wave.clear()
             self.mode = RetroSpecAttentionMode.PASSTHROUGH
             self.step_active = False
             self.step_index = -1
@@ -1302,5 +1315,14 @@ class RetroSpecSparseAttention(RetroSpecAttentionExecutionMixin):
 
         self.attention_mass_sum[: self.batch_size].add_(selection.attention_mass)
         self.attention_mass_layer_count += 1
+
+        if self.mode == RetroSpecAttentionMode.DRAFT and getattr(
+            self.index, "draft_prefetch", False
+        ):
+            record = self.index.build_sparse_verification_prefetch(
+                selection, self.active_mask
+            )
+            if record is not None:
+                self._resident_prefetch_wave.append(record)
 
         return output

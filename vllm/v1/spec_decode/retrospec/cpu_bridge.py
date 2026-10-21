@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Full KV handoff between the native paged cache and the CPU target."""
+
+import torch
+
+
+class RetroSpecCPUKVBridge:
+    def __init__(self, proposer):
+        self.proposer = proposer
+        self.layers = proposer.cpu_attention_layers
+        self.pending_uploads = []
+        self.upload_stream = torch.cuda.Stream(device=proposer.device)
+
+    def _head_slice(self, layer, tensor):
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        heads = layer.impl.num_kv_heads
+        total = tensor.shape[2]
+        start = group.rank_in_group * heads if total >= group.world_size else 0
+        return slice(start, start + heads)
+
+    @staticmethod
+    def _native_rows(cache, block_table, start: int, end: int):
+        positions = torch.arange(start, end, device=cache.device)
+        block_size = cache.shape[1]
+        blocks = block_table[0].index_select(0, positions // block_size).long()
+        if (blocks < 0).any():
+            raise RuntimeError("CPU verifier requested retired native KV")
+        return blocks, positions % block_size
+
+    def export_gpu(
+        self, storage, metadata, request_id: str, start: int, end: int, initial: bool
+    ):
+        index = self.proposer.sparse_attention.index
+        index.flush_staged_updates()
+        destination = storage.kv if initial else storage.journal
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        if destination.shape[2] < group.world_size and group.rank_in_group != 0:
+            # Replicated KV heads have one writer in the shared CPU mapping.
+            return
+        for layer_index, (name, layer) in enumerate(self.layers.items()):
+            keys, values = layer.kv_cache[0].unbind(0)
+            target = destination[:, layer_index, self._head_slice(layer, destination)]
+            native_start = start
+            if initial:
+                record = index._indices.get(name, {}).get(request_id)
+                indexed_end = self.proposer.block_size
+                if record is not None:
+                    for segment in record.segments:
+                        pages = segment.cluster_blocks.page_metadata
+                        packed_k, packed_v, mask = index.cluster_store.gather_pages(
+                            name,
+                            pages.page_ids.unsqueeze(0),
+                            pages.page_token_counts.unsqueeze(0),
+                        )
+                        for head in range(keys.shape[2]):
+                            for kind, packed in enumerate((packed_k, packed_v)):
+                                target[
+                                    kind,
+                                    head,
+                                    segment.indexed_start : segment.indexed_end,
+                                ].copy_(
+                                    packed[0, head][mask[0, head]],
+                                )
+                        indexed_end = segment.indexed_end
+                # Historical post-RoPE KV can be permuted per head: every
+                # subsequent CPU query attends to the complete past, unmasked.
+                sink_end = min(end, self.proposer.block_size)
+                if sink_end:
+                    blocks, offsets = self._native_rows(
+                        keys, metadata.block_table_tensor, 0, sink_end
+                    )
+                    target[0, :, :sink_end].copy_(
+                        keys[blocks, offsets].transpose(0, 1).cpu()
+                    )
+                    target[1, :, :sink_end].copy_(
+                        values[blocks, offsets].transpose(0, 1).cpu()
+                    )
+                native_start = min(max(indexed_end, sink_end), end)
+            if native_start < end:
+                blocks, offsets = self._native_rows(
+                    keys, metadata.block_table_tensor, native_start, end
+                )
+                target[0, :, native_start:end].copy_(
+                    keys[blocks, offsets].transpose(0, 1).cpu()
+                )
+                target[1, :, native_start:end].copy_(
+                    values[blocks, offsets].transpose(0, 1).cpu()
+                )
+
+    def stage_cpu(self, storage, metadata, start: int, end: int, background: bool):
+        if end <= start:
+            return
+        # Staging copies into separate tensors may overlap draft. Publication
+        # into native KV happens only on the next safe model boundary.
+        current = torch.cuda.current_stream(self.proposer.device)
+        self.upload_stream.wait_stream(current)
+        for layer_index, layer in enumerate(self.layers.values()):
+            target = layer.kv_cache[0]
+            source = storage.kv[
+                :, layer_index, self._head_slice(layer, storage.kv), start:end
+            ]
+            pinned = source.contiguous().pin_memory()
+            with torch.cuda.stream(self.upload_stream):
+                staged = pinned.to(self.proposer.device, non_blocking=True)
+                event = torch.cuda.Event()
+                event.record(self.upload_stream)
+            self.pending_uploads.append(
+                (target, metadata.block_table_tensor, start, end, pinned, staged, event)
+            )
+        if not background:
+            self.publish(wait=True)
+
+    def publish(self, wait: bool):
+        remaining = []
+        for target, table, start, end, pinned, staged, event in self.pending_uploads:
+            if not wait and not event.query():
+                remaining.append((target, table, start, end, pinned, staged, event))
+                continue
+            stream = torch.cuda.current_stream(self.proposer.device)
+            stream.wait_event(event)
+            keys, values = target.unbind(0)
+            blocks, offsets = self._native_rows(keys, table, start, end)
+            keys[blocks, offsets] = staged[0].transpose(0, 1)
+            values[blocks, offsets] = staged[1].transpose(0, 1)
+            staged.record_stream(stream)
+        self.pending_uploads = remaining
+
+    def close(self):
+        self.publish(wait=True)
+        torch.cuda.current_stream(self.proposer.device).synchronize()

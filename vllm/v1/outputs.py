@@ -223,6 +223,11 @@ class ModelRunnerOutput:
 
     # RetroSpec proposal generated from this exact target batch.
     retrospec_draft_token_ids: "DraftTokenIds | None" = None
+    # Already committed by the independent CPU full target, appended after the
+    # ordinary GPU sampler output. Excluded from GPU acceptance statistics.
+    retrospec_cpu_committed_counts: dict[str, int] = field(default_factory=dict)
+    # Proposal-only batches skip the scheduled target forward entirely.
+    retrospec_computed_token_counts: dict[str, int] = field(default_factory=dict)
 
 
 # ModelRunnerOutput wrapper for async scheduling.

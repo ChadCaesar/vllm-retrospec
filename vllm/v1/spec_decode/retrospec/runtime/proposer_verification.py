@@ -797,6 +797,7 @@ class RetroSpecVerificationMixin:
         round_start_counts: torch.Tensor,
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
+        confirmed_counts: torch.Tensor | None = None,
     ) -> RetroSpecVerificationResult:
         with self.performance_stats.cpu_timer("draft_prefetch_backpressure"):
             self.sparse_attention.flush_sparse_verification_prefetch()
@@ -840,17 +841,23 @@ class RetroSpecVerificationMixin:
             sparse.request_indices, sparse.token_indices
         ].clone()
         sparse_token_changed = sparse.token_ids != expected_token_ids
-        candidate_pending_counts = (sparse.token_indices + 1).to(draft_counts.dtype)
+        absolute_candidate_counts = (sparse.token_indices + 1).to(draft_counts.dtype)
+        candidate_pending_counts = absolute_candidate_counts
+        if confirmed_counts is not None:
+            candidate_pending_counts = (
+                candidate_pending_counts
+                - confirmed_counts.index_select(0, sparse.request_indices)
+            )
         candidate_positions = (
             self.proposal_start_positions.index_select(0, sparse.request_indices)
-            + candidate_pending_counts
+            + absolute_candidate_counts
         )
         pair_generation_token_budgets = self._proposal_token_budgets.gpu.index_select(
             0,
             sparse.request_indices,
         )
         generation_limit_reached = (candidate_positions >= self.max_model_len - 1) | (
-            candidate_pending_counts >= pair_generation_token_budgets
+            absolute_candidate_counts >= pair_generation_token_budgets
         )
         next_update_positions = (
             self.index_update_state.next_update_positions.index_select(
@@ -938,6 +945,11 @@ class RetroSpecVerificationMixin:
             out=require_full,
         )
         require_full.logical_and_(boundary_request_mask)
+        full_reasons = None
+        if confirmed_counts is not None:
+            full_reasons = sparse_decision.reasons.index_select(
+                0, safe_boundary_indices
+            ).masked_fill_(~boundary_request_mask, 0)
 
         run_expanded = self._verification_run_expanded[:batch_size]
         torch.index_select(
@@ -1026,6 +1038,12 @@ class RetroSpecVerificationMixin:
                 self.proposal_start_positions.index_select(0, expanded.request_indices)
                 + expanded_pending_counts
             )
+            expanded_absolute_counts = expanded_pending_counts
+            if confirmed_counts is not None:
+                expanded_pending_counts = (
+                    expanded_pending_counts
+                    - confirmed_counts.index_select(0, expanded.request_indices)
+                )
             expanded_generation_token_budgets = (
                 self._proposal_token_budgets.gpu.index_select(
                     0,
@@ -1034,7 +1052,7 @@ class RetroSpecVerificationMixin:
             )
             expanded_generation_limit = (
                 expanded_positions >= self.max_model_len - 1
-            ) | (expanded_pending_counts >= expanded_generation_token_budgets)
+            ) | (expanded_absolute_counts >= expanded_generation_token_budgets)
             expanded_index_update = expanded_positions >= (
                 self.index_update_state.next_update_positions.index_select(
                     0, expanded.request_indices
@@ -1084,6 +1102,10 @@ class RetroSpecVerificationMixin:
                 expanded.request_indices,
                 expanded_decision.require_full,
             )
+            if full_reasons is not None:
+                full_reasons.index_copy_(
+                    0, expanded.request_indices, expanded_decision.reasons
+                )
             self.performance_stats.add_gpu_histogram(
                 "expanded_to_full_prefix",
                 verified_counts,
@@ -1094,4 +1116,4 @@ class RetroSpecVerificationMixin:
         self.state.set_stage(verification_active, RetroSpecStage.DRAFT)
         self.state.set_stage(require_full, RetroSpecStage.FULL_VERIFY)
 
-        return RetroSpecVerificationResult(verified_counts, require_full)
+        return RetroSpecVerificationResult(verified_counts, require_full, full_reasons)

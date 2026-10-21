@@ -96,6 +96,54 @@ def test_capture_cudagraphs_forces_registered_descriptor(monkeypatch):
     assert call.kwargs["is_graph_capturing"] is True
 
 
+def test_cpu_deferred_candidates_resume_without_a_target_forward():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device, runner.max_model_len = torch.device("cpu"), 64
+    runner.input_batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["r"],
+        sampling_metadata=object(),
+        num_tokens_no_spec=np.array([11]),
+        token_ids_cpu=np.zeros((1, 64), dtype=np.int32),
+        is_token_ids=np.zeros((1, 64), dtype=np.bool_),
+    )
+    runner.requests = {
+        "r": SimpleNamespace(
+            num_computed_tokens=10,
+            num_prompt_tokens=8,
+            get_token_id=lambda position: 9,
+            output_token_ids=[1, 2, 9],
+        )
+    }
+    cpu = SimpleNamespace(
+        request_id="r",
+        authoritative_length=10,
+        deferred_window=("r", 10, [12, 13], 1),
+        committed_tokens={"r": [14]},
+    )
+    runner.drafter = SimpleNamespace(
+        cpu_coordinator=cpu,
+        _cpu_request_supported=lambda *args: True,
+        propose=Mock(return_value=[[15]]),
+        take_kv_cache_retirements=Mock(return_value=[]),
+        performance_stats=Mock(),
+    )
+    runner._copy_draft_token_ids_to_cpu = Mock()
+    runner._apply_retrospec_kv_retirements = Mock()
+    metadata = SimpleNamespace(seq_lens=torch.tensor([13]), replace=Mock())
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={"r": [12, 13]},
+        total_num_scheduled_tokens=3,
+        retrospec_generation_token_budgets={"r": 12},
+    )
+    output = runner._maybe_run_retrospec_cpu_proposal_only(scheduler_output, metadata)
+    assert output.sampled_token_ids == [[14]]
+    assert output.retrospec_computed_token_counts == {"r": 11}
+    assert runner.requests["r"].output_token_ids == [1, 2, 9, 14]
+    assert metadata.replace.call_args.kwargs["seq_lens"].tolist() == [10]
+    assert runner.drafter.propose.call_args.kwargs["next_token_ids"].tolist() == [9]
+
+
 def make_retrospec_proposal_runner(
     partial_prefill_mask: list[bool],
 ) -> tuple[GPUModelRunner, RetroSpecProposer]:

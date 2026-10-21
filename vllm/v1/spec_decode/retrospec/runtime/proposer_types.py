@@ -10,6 +10,7 @@ import torch
 class RetroSpecVerificationResult:
     verified_counts: torch.Tensor
     require_full: torch.Tensor
+    full_reasons: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)

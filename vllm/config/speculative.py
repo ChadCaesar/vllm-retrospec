@@ -250,6 +250,14 @@ class SpeculativeConfig:
     """Emit request-level RetroSpec stage-transition diagnostics. This option
     synchronizes compact decision tensors to CPU and must remain disabled
     during performance measurements."""
+    retrospec_cpu_verify: bool = False
+    """Run an independent full target model on CPU alongside RetroSpec drafts."""
+    retrospec_cpu_threads: int = Field(default=16, gt=0)
+    """Intra-op threads reserved for the independent CPU verifier."""
+    retrospec_cpu_kv_background_upload: bool = False
+    """Stage authoritative CPU KV asynchronously between GPU token boundaries."""
+    retrospec_draft_prefetch: bool = False
+    """Prefetch historical resident pages during drafting (experimental)."""
 
     retrospec_replay_mode: Literal[
         "off", "trace", "freeze_resident", "ready_selected"
@@ -272,6 +280,13 @@ class SpeculativeConfig:
     retrospec_stats_cuda_sample_interval: int = Field(default=8, gt=0)
     """Record one out of every N detailed CUDA timing samples. Coarse timers
     are always recorded while RetroSpec statistics are enabled."""
+
+    @property
+    def retrospec_proposal_token_capacity(self) -> int:
+        """Candidate storage includes room released by CPU confirmations."""
+        return (self.num_speculative_tokens or 0) * (
+            2 if self.retrospec_cpu_verify else 1
+        )
 
     def compute_hash(self) -> str:
         """
@@ -303,6 +318,8 @@ class SpeculativeConfig:
                     self.retrospec_max_draft_tokens,
                     self.retrospec_index_update_interval,
                     self.num_speculative_tokens,
+                    self.retrospec_cpu_verify,
+                    self.retrospec_draft_prefetch,
                 ]
             )
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
