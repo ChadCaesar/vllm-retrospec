@@ -5,6 +5,7 @@ from time import perf_counter
 
 from vllm.distributed import get_tp_group
 
+from .cpu_affinity import RetroSpecCPUAffinity
 from .cpu_bridge import RetroSpecCPUKVBridge
 from .cpu_worker import RetroSpecCPUStorage, RetroSpecCPUWorker
 
@@ -15,16 +16,26 @@ class RetroSpecCPUCoordinator:
         self.group = get_tp_group()
         model_config = proposer.vllm_config.model_config
         self.config = model_config.hf_config
-        self.worker = (
-            RetroSpecCPUWorker(
-                model_config.model,
-                model_config.revision,
-                proposer.speculative_config.retrospec_cpu_threads,
-                self.config,
-            )
-            if self.group.rank_in_group == 0
-            else None
+        self.affinity = RetroSpecCPUAffinity.create(
+            self.group,
+            proposer.speculative_config.retrospec_cpu_threads,
+            proposer.speculative_config.retrospec_cpu_numa_binding,
         )
+        try:
+            self.worker = (
+                RetroSpecCPUWorker(
+                    model_config.model,
+                    model_config.revision,
+                    proposer.speculative_config.retrospec_cpu_threads,
+                    self.config,
+                    cpu_affinity=self.affinity.cpu_cpus,
+                )
+                if self.group.rank_in_group == 0
+                else None
+            )
+        except BaseException:
+            self.affinity.close()
+            raise
         self.bridge = RetroSpecCPUKVBridge(proposer)
         self.storage = None
         # One retained mapping, bounded by max_model_len. It is quarantined
@@ -256,5 +267,9 @@ class RetroSpecCPUCoordinator:
                     self._pending_release = None
                     self.request_id = None
                     self.deferred_window = self.deferred_plans = None
-                    if self.worker is not None:
-                        self.worker.close()
+                    try:
+                        if self.worker is not None:
+                            self.worker.close()
+                    finally:
+                        if getattr(self, "affinity", None) is not None:
+                            self.affinity.close()

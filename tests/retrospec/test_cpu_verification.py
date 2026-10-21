@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import time
+import weakref
 from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
@@ -32,6 +34,20 @@ from vllm.v1.spec_decode.retrospec.decision import (
 )
 from vllm.v1.spec_decode.retrospec.runtime.proposer_cpu import RetroSpecCPUProposalMixin
 from vllm.v1.spec_decode.retrospec.state import RetroSpecBatchState
+
+
+def test_cpu_storage_unlinks_paths_before_releasing_large_mappings():
+    storage = RetroSpecCPUStorage((2, 1, 1, 8, 1))
+    directory = Path(storage.directory)
+    paths_present_at_release = []
+    for tensor in (storage.kv, storage.journal):
+        weakref.finalize(
+            tensor, lambda: paths_present_at_release.append(directory.exists())
+        )
+    del tensor
+    storage.close()
+    assert paths_present_at_release == [False, False]
+    assert not directory.exists()
 
 
 @pytest.mark.parametrize("indexed", [False, True])
@@ -789,7 +805,8 @@ def test_cpu_partial_forward_can_be_cancelled_and_resumed(tmp_path, control):
         torch.set_num_threads(previous_threads)
 
 
-def test_cpu_process_reuses_gpu_kv_delta_without_reforward(tmp_path):
+@pytest.mark.parametrize("bind_cpu", [False, True])
+def test_cpu_process_reuses_gpu_kv_delta_without_reforward(tmp_path, bind_cpu):
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(2)
     worker = storage = None
@@ -819,12 +836,21 @@ def test_cpu_process_reuses_gpu_kv_delta_without_reforward(tmp_path):
                 storage.kv[0, i, :, :5].copy_(layer.keys[0, :, :5])
                 storage.kv[1, i, :, :5].copy_(layer.values[0, :, :5])
             seed = int(output.logits[0, -1].argmax())
-            worker = RetroSpecCPUWorker(str(model_path), None, 2)
+            parent_affinity = set(os.sched_getaffinity(0))
+            parent_environment = dict(os.environ)
+            cpus = tuple(sorted(parent_affinity)[:2]) if bind_cpu else None
+            worker = RetroSpecCPUWorker(str(model_path), None, 2, cpu_affinity=cpus)
             worker.send(("initialize", 1, 1, storage.paths, shape, 5, seed, 9, ()))
             messages = _wait_messages(
                 worker, lambda values: sum(value[0] == "token" for value in values) == 4
             )
             actual = [value[4] for value in messages if value[0] == "token"]
+            assert not Path(worker.socket_directory).exists()
+            assert set(os.sched_getaffinity(0)) == parent_affinity
+            assert dict(os.environ) == parent_environment
+            if bind_cpu:
+                for task in Path(f"/proc/{worker.process.pid}/task").iterdir():
+                    assert set(os.sched_getaffinity(int(task.name))) <= set(cpus)
             expected = []
             for position in range(5, 9):
                 output = model(

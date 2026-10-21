@@ -254,6 +254,11 @@ class SpeculativeConfig:
     """Run an independent full target model on CPU alongside RetroSpec drafts."""
     retrospec_cpu_threads: int = Field(default=16, gt=0)
     """Intra-op threads reserved for the independent CPU verifier."""
+    retrospec_cpu_numa_binding: bool = True
+    """Place CPU verification and GPU launch threads on separate NUMA nodes
+    when the allowed CPU sets have sufficient physical cores. Explicit OpenMP
+    placement and separately pinned helper threads are preserved. Disable to
+    retain the caller's CPU affinity."""
     retrospec_cpu_kv_background_upload: bool = False
     """Stage authoritative CPU KV asynchronously between GPU token boundaries."""
     retrospec_draft_prefetch: bool = False

@@ -3,6 +3,8 @@
 
 """A process-isolated CPU target with coordinator-owned file-backed KV."""
 
+from __future__ import annotations
+
 import atexit
 import json
 import math
@@ -16,8 +18,10 @@ from collections import deque
 from contextlib import suppress
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
 
 class _CPUForwardInterrupted(Exception):
@@ -25,6 +29,8 @@ class _CPUForwardInterrupted(Exception):
 
 
 def map_cpu_kv(path: str, shape: tuple[int, ...]) -> torch.Tensor:
+    import torch
+
     return torch.from_file(
         path,
         shared=True,
@@ -34,10 +40,20 @@ def map_cpu_kv(path: str, shape: tuple[int, ...]) -> torch.Tensor:
 
 
 def _cpu_target_main(
-    connection, model_path: str, revision: str | None, threads: int, config_path=None
+    connection,
+    model_path: str,
+    revision: str | None,
+    threads: int,
+    config_path=None,
+    cpu_affinity: tuple[int, ...] | None = None,
 ):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     try:
+        # Apply before importing Torch so native helper threads and model
+        # allocations inherit the CPU verifier's NUMA placement.
+        if cpu_affinity is not None:
+            os.sched_setaffinity(0, cpu_affinity)
+        import torch
         from transformers import AutoConfig, AutoModelForCausalLM
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
@@ -54,6 +70,9 @@ def _cpu_target_main(
         )
         if config_path:
             config.update(json.loads(Path(config_path).read_text()))
+            Path(config_path).unlink()
+            with suppress(OSError):
+                Path(config_path).parent.rmdir()
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
@@ -178,7 +197,12 @@ class RetroSpecCPUWorker:
     """Only TP rank zero owns this process; no CUDA tensors cross the pipe."""
 
     def __init__(
-        self, model_path: str, revision: str | None, threads: int, config=None
+        self,
+        model_path: str,
+        revision: str | None,
+        threads: int,
+        config=None,
+        cpu_affinity: tuple[int, ...] | None = None,
     ):
         # vLLM GPU workers can themselves be daemon processes, which cannot
         # create multiprocessing children. A fresh interpreter also keeps all
@@ -191,6 +215,14 @@ class RetroSpecCPUWorker:
         listener = Listener(address, family="AF_UNIX")
         listener._listener._socket.settimeout(1)
         environment = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+        if cpu_affinity is not None:
+            # The GPU executor normally exports OMP_NUM_THREADS=1. Configure
+            # the independent interpreter before its OpenMP runtime starts.
+            environment.update(
+                OMP_NUM_THREADS=str(threads),
+                OMP_PLACES=",".join(f"{{{cpu}}}" for cpu in cpu_affinity),
+                OMP_PROC_BIND="close",
+            )
         self.process = subprocess.Popen(
             [
                 sys.executable,
@@ -200,6 +232,7 @@ class RetroSpecCPUWorker:
                 revision or "",
                 str(threads),
                 str(self.config_path) if config is not None else "",
+                ",".join(map(str, cpu_affinity)) if cpu_affinity is not None else "",
             ],
             env=environment,
         )
@@ -221,6 +254,11 @@ class RetroSpecCPUWorker:
                         ) from None
         finally:
             listener.close()
+        # The connected socket stays usable after its listener path is
+        # unlinked. The child removes its config after reading it; whichever
+        # side removes the last startup file also removes this directory.
+        with suppress(OSError):
+            Path(self.socket_directory).rmdir()
         self.ready = False
         self.messages = deque()
         self.started_at = time.monotonic()
@@ -333,11 +371,14 @@ class RetroSpecCPUWorker:
         self.connection.close()
         Path(self.socket_directory, "control").unlink(missing_ok=True)
         self.config_path.unlink(missing_ok=True)
-        Path(self.socket_directory).rmdir()
+        with suppress(FileNotFoundError):
+            Path(self.socket_directory).rmdir()
 
 
 class RetroSpecCPUStorage:
     def __init__(self, shape: tuple[int, ...], directory: str | None = None):
+        import torch
+
         self.owner = directory is None
         self.directory = directory or tempfile.mkdtemp(prefix="retrospec-cpu-kv-")
         self.shape = shape
@@ -367,11 +408,17 @@ class RetroSpecCPUStorage:
         )
 
     def close(self):
-        self.kv = self.journal = None
-        if self.owner:
-            for path in self.paths:
-                Path(path).unlink(missing_ok=True)
-            Path(self.directory).rmdir()
+        try:
+            if self.owner:
+                # Keep the mappings alive until every path is removed.
+                # Otherwise unlinking the last reference to a large KV file
+                # can evict gigabytes of page cache before the journal and
+                # directory are removed, exceeding the executor's exit grace.
+                for path in self.paths:
+                    Path(path).unlink(missing_ok=True)
+                Path(self.directory).rmdir()
+        finally:
+            self.kv = self.journal = None
 
 
 if __name__ == "__main__":
@@ -382,4 +429,5 @@ if __name__ == "__main__":
         sys.argv[3] or None,
         int(sys.argv[4]),
         sys.argv[5] or None,
+        tuple(map(int, sys.argv[6].split(","))) if sys.argv[6] else None,
     )
