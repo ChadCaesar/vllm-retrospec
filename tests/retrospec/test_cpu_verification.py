@@ -4,6 +4,7 @@
 import time
 from collections import deque
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -329,11 +330,12 @@ def test_cpu_can_advance_beyond_gpu_draft():
         window.confirm(14, 3)
 
 
-def test_cpu_mapping_covers_later_proposal_rounds():
+def _make_cpu_coordinator():
     cpu = RetroSpecCPUCoordinator.__new__(RetroSpecCPUCoordinator)
     cpu.proposer = SimpleNamespace(
         max_model_len=64,
         runner=SimpleNamespace(requests={"r": SimpleNamespace(num_prompt_tokens=8)}),
+        performance_stats=Mock(),
     )
     cpu.config = LlamaConfig(
         num_hidden_layers=2,
@@ -347,8 +349,14 @@ def test_cpu_mapping_covers_later_proposal_rounds():
     cpu.bridge = Mock()
     cpu.worker = Mock()
     cpu.storage = cpu.request_id = None
+    cpu._pooled_storage = cpu._pending_release = None
     cpu.session = cpu.epoch = cpu.authoritative_length = 0
     cpu.committed_tokens = {}
+    return cpu
+
+
+def test_cpu_mapping_covers_later_proposal_rounds():
+    cpu = _make_cpu_coordinator()
     params = SimpleNamespace(max_tokens=24, ignore_eos=True, stop_token_ids=[])
     try:
         cpu.begin("r", 8, 10, 4, None, params)
@@ -360,6 +368,213 @@ def test_cpu_mapping_covers_later_proposal_rounds():
         assert cpu.worker.send.call_args.args[0] == ("resume", 1, 2, 10, 14, 11, 18)
     finally:
         cpu.close()
+
+
+def test_cpu_mapping_reuse_fences_old_session_and_preserves_capacity():
+    cpu = _make_cpu_coordinator()
+    params = SimpleNamespace(max_tokens=24, ignore_eos=True, stop_token_ids=[])
+    try:
+        cpu.begin("r", 8, 10, 4, None, params)
+        storage = cpu.storage
+        pointer = storage.kv.data_ptr()
+        storage.kv.fill_(-17)
+        paths = storage.paths
+        cpu.release()
+        assert cpu.storage is None
+        assert cpu._pooled_storage is storage
+        assert cpu._pending_release == (1, 2)
+        cpu.worker.send.assert_called_with(("release", 1, 2))
+        assert all(Path(path).exists() for path in paths)
+
+        order = []
+
+        def acknowledged(session, epoch):
+            assert (session, epoch) == (1, 2)
+            assert cpu.bridge.export_gpu.call_count == 1
+            assert (storage.kv == -17).all()
+            order.append("released")
+
+        def exported(*args):
+            assert order == ["released"]
+            order.append("exported")
+
+        cpu.worker.wait_for_release.side_effect = acknowledged
+        cpu.bridge.export_gpu.side_effect = exported
+        cpu.proposer.runner.requests["short"] = SimpleNamespace(num_prompt_tokens=4)
+        params.max_tokens = 12
+        cpu.begin("short", 4, 20, 4, None, params)
+        assert order == ["released", "exported"]
+        assert cpu.storage is storage
+        assert storage.kv.data_ptr() == pointer
+        assert storage.shape[-2] == 32
+        assert (storage.kv == -17).all()  # No clearing or remapping on reuse.
+        assert cpu._pending_release is None
+        assert cpu._pooled_storage is None
+        assert cpu.worker.send.call_args.args[0] == (
+            "initialize",
+            2,
+            3,
+            paths,
+            storage.shape,
+            4,
+            20,
+            8,
+            (),
+        )
+
+        cpu.release()
+        cpu.worker.wait_for_release.side_effect = None
+        cpu.bridge.export_gpu.side_effect = None
+        cpu.proposer.runner.requests["long"] = SimpleNamespace(num_prompt_tokens=60)
+        params.max_tokens = 24
+        cpu.begin("long", 60, 30, 4, None, params)
+        cpu.worker.wait_for_release.assert_called_with(2, 4)
+        assert cpu.storage.shape[-2] == cpu.proposer.max_model_len
+        assert cpu.storage.paths != paths
+        assert not any(Path(path).exists() for path in paths)
+        paths = cpu.storage.paths
+        cpu.release()
+    finally:
+        cpu.close()
+    assert not any(Path(path).exists() for path in paths)
+
+
+def test_cpu_pool_is_unlinked_before_waiting_for_process_teardown():
+    cpu = _make_cpu_coordinator()
+    storage = RetroSpecCPUStorage((2, 2, 2, 32, 16))
+    cpu._pooled_storage = storage
+    paths = storage.paths
+    order = []
+
+    def requested():
+        assert all(Path(path).exists() for path in paths)
+        order.append("close_requested")
+
+    def joined():
+        assert not any(Path(path).exists() for path in paths)
+        order.append("joined")
+
+    cpu.worker.request_close.side_effect = requested
+    cpu.worker.close.side_effect = joined
+    cpu.close()
+    assert order == ["close_requested", "joined"]
+    assert cpu._pooled_storage is None
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_cpu_reuse_failure_keeps_mapping_quarantined_on_every_rank(rank):
+    cpu = _make_cpu_coordinator()
+    storage = RetroSpecCPUStorage((2, 2, 2, 32, 16))
+    cpu._pooled_storage = storage
+    cpu._pending_release = (1, 2)
+    storage.kv.fill_(-17)
+    cpu.group.rank_in_group = rank
+    if rank == 0:
+        cpu.worker.wait_for_release.side_effect = RuntimeError("release timed out")
+    else:
+        cpu.worker = None
+        cpu.group.broadcast_object = lambda value, src: (
+            "release timed out",
+            None,
+            None,
+            False,
+        )
+    try:
+        with pytest.raises(RuntimeError, match="release timed out"):
+            cpu._acquire_storage((2, 2, 2, 16, 16))
+        assert cpu.storage is None
+        assert cpu._pooled_storage is storage
+        assert cpu._pending_release == (1, 2)
+        assert (storage.kv == -17).all()
+        cpu.bridge.export_gpu.assert_not_called()
+    finally:
+        cpu.close()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_cpu_reuse_preserves_tp_mappings(rank):
+    cpu = _make_cpu_coordinator()
+    owner = RetroSpecCPUStorage((2, 2, 2, 32, 16))
+    cpu.group.rank_in_group = rank
+    cpu._pooled_storage = (
+        owner if rank == 0 else RetroSpecCPUStorage(owner.shape, owner.directory)
+    )
+    storage = cpu._pooled_storage
+    pointer = storage.kv.data_ptr()
+    cpu._pending_release = (1, 2)
+    cpu.group.broadcast_object = lambda value, src: (
+        None,
+        owner.directory,
+        owner.shape,
+        True,
+    )
+    try:
+        cpu._acquire_storage((2, 2, 2, 16, 16))
+        assert cpu.storage is storage
+        assert cpu.storage.kv.data_ptr() == pointer
+        assert cpu.storage.shape == owner.shape
+    finally:
+        cpu.close()
+        if rank != 0:
+            owner.close()
+
+
+@pytest.mark.parametrize("shape", [(2, 2, 3, 16, 16), (2, 2, 2, 16, 8)])
+def test_cpu_pool_rejects_incompatible_layout(shape):
+    storage = RetroSpecCPUStorage((2, 2, 2, 32, 16))
+    try:
+        assert storage.can_reuse((2, 2, 2, 16, 16))
+        assert not storage.can_reuse((2, 2, 2, 33, 16))
+        assert not storage.can_reuse(shape)
+    finally:
+        storage.close()
+
+
+def _make_protocol_worker(connection):
+    worker = RetroSpecCPUWorker.__new__(RetroSpecCPUWorker)
+    worker.connection = connection
+    worker.process = Mock(pid=123)
+    worker.process.poll.return_value = None
+    worker.closed, worker.ready, worker.awaiting_progress = False, True, True
+    worker.messages = deque()
+    worker.released = None
+    worker.started_at = worker.last_progress = time.monotonic()
+    worker.last_command = ("release", 1, 4, 0)
+    return worker
+
+
+def test_cpu_release_wait_requires_matching_session_and_epoch():
+    class Connection:
+        messages = deque([("token", 1, 3, 11, 7), ("released", 1, 3)])
+        waits = 0
+
+        def poll(self, timeout=0):
+            if timeout:
+                self.waits += 1
+                assert worker.released != (1, 4)
+                self.messages.append(
+                    ("released", 2, 4) if self.waits == 1 else ("released", 1, 4)
+                )
+            return bool(self.messages)
+
+        def recv(self):
+            return self.messages.popleft()
+
+    connection = Connection()
+    worker = _make_protocol_worker(connection)
+    worker.wait_for_release(1, 4, timeout=1)
+    assert connection.waits == 2
+    assert worker.released == (1, 4)
+    assert not worker.awaiting_progress
+    assert not worker.messages
+
+
+def test_cpu_release_wait_times_out_without_fence():
+    connection = Mock()
+    connection.poll.return_value = False
+    worker = _make_protocol_worker(connection)
+    with pytest.raises(RuntimeError, match="did not release KV.*session=1, epoch=4"):
+        worker.wait_for_release(1, 4, timeout=0)
 
 
 def test_cpu_freeze_invalidates_inflight_result_without_waiting():
@@ -492,7 +707,8 @@ def _wait_messages(worker, predicate, timeout=60):
     raise AssertionError(f"CPU worker made no expected progress: {messages}")
 
 
-def test_cpu_partial_forward_can_be_cancelled_and_resumed(tmp_path):
+@pytest.mark.parametrize("control", ["pause", "release"])
+def test_cpu_partial_forward_can_be_cancelled_and_resumed(tmp_path, control):
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(2)
     worker = storage = None
@@ -531,15 +747,30 @@ def test_cpu_partial_forward_can_be_cancelled_and_resumed(tmp_path):
                 worker.poll()
                 assert time.monotonic() < deadline, "CPU did not enter its first layer"
                 time.sleep(0.0001)
-            worker.send(("pause", 2))
+            worker.send((control, 1, 2) if control == "release" else ("pause", 2))
+            acknowledged = "released" if control == "release" else "paused"
             messages = _wait_messages(
-                worker, lambda values: any(value[0] == "paused" for value in values)
+                worker, lambda values: any(value[0] == acknowledged for value in values)
             )
             assert any(value[0] == "interrupted" for value in messages)
             assert not any(value[0] == "token" for value in messages)
             assert torch.equal(storage.kv[..., :5, :], prefix)
 
-            worker.send(("resume", 1, 3, 5, 5, seed, 6))
+            if control == "release":
+                # The fence remains valid even when a poll already drained it.
+                worker.wait_for_release(1, 2, timeout=1)
+                storage.kv.fill_(-17)
+                cache = make_cache(config, 16)
+                output = model(
+                    torch.tensor([[6, 7, 8]]), past_key_values=cache, use_cache=True
+                )
+                seed = int(output.logits[0, -1].argmax())
+                for i, layer in enumerate(cache.layers):
+                    storage.kv[0, i, :, :3].copy_(layer.keys[0, :, :3])
+                    storage.kv[1, i, :, :3].copy_(layer.values[0, :, :3])
+                worker.send(("initialize", 2, 3, storage.paths, shape, 3, seed, 4, ()))
+            else:
+                worker.send(("resume", 1, 3, 5, 5, seed, 6))
             messages = _wait_messages(
                 worker, lambda values: any(value[0] == "token" for value in values)
             )
@@ -548,6 +779,8 @@ def test_cpu_partial_forward_can_be_cancelled_and_resumed(tmp_path):
             )
             token = next(value[4] for value in messages if value[0] == "token")
             assert token == int(output.logits[0, -1].argmax())
+            if control == "release":
+                assert (storage.kv[..., 5:, :] == -17).all()
     finally:
         if worker is not None:
             worker.close()

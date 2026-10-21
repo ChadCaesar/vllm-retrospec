@@ -65,7 +65,7 @@ def _cpu_target_main(
         if any(parameter.device.type != "cpu" for parameter in model.parameters()):
             raise RuntimeError("CPU verifier loaded a parameter on a non-CPU device")
         connection.send(("ready",))
-        cache = storage = journal = None
+        cache = storage = journal = output = None
         session = epoch = 0
         token = position = limit = 0
         running = False
@@ -99,6 +99,15 @@ def _cpu_target_main(
                         running = False
                         connection.send(("paused", session, epoch))
                         continue
+                    if operation == "release":
+                        _, session, epoch = command
+                        running = False
+                        # All CPU kernels are synchronous. Reaching this point
+                        # after a layer-boundary interruption fences every old
+                        # KV access, including partially written token rows.
+                        cache = storage = journal = output = None
+                        connection.send(("released", session, epoch))
+                        continue
                     if operation == "initialize":
                         _, session, epoch, paths, shape, position, token, limit, eos = (
                             command
@@ -116,8 +125,8 @@ def _cpu_target_main(
                         storage[..., start:position, :].copy_(
                             journal[..., start:position, :]
                         )
-                        for layer in cache.layers:
-                            layer.length = position
+                        for index in range(len(cache.layers)):
+                            cache.layers[index].length = position
                     else:
                         raise RuntimeError(f"Unknown CPU verifier command: {operation}")
                     running = position < limit
@@ -135,8 +144,8 @@ def _cpu_target_main(
                         logits_to_keep=1,
                     )
                 except _CPUForwardInterrupted:
-                    for layer in cache.layers:
-                        layer.length = position
+                    for index in range(len(cache.layers)):
+                        cache.layers[index].length = position
                     connection.send(("interrupted", session, epoch, position))
                     continue
                 logits = output.logits[0, -1]
@@ -218,7 +227,9 @@ class RetroSpecCPUWorker:
         self.last_progress = self.started_at
         self.awaiting_progress = False
         self.last_command = None
+        self.released = None
         self.closed = False
+        self.close_requested = False
         atexit.register(self.close)
 
     def poll(self):
@@ -235,11 +246,15 @@ class RetroSpecCPUWorker:
                 self.ready = True
             else:
                 self.messages.append(message)
+            if message[0] == "released":
+                self.released = message[1:3]
             self.last_progress = time.monotonic()
             if self.last_command is not None:
                 operation, session, epoch, limit = self.last_command
                 if message[0] == "paused" and operation == "pause":
                     self.awaiting_progress = message[2] != epoch
+                elif message[0] == "released" and operation == "release":
+                    self.awaiting_progress = message[1:3] != (session, epoch)
                 elif (
                     message[0] == "token"
                     and message[1:3] == (session, epoch)
@@ -268,20 +283,48 @@ class RetroSpecCPUWorker:
         if not self.awaiting_progress:
             self.last_progress = time.monotonic()
         if command[0] in ("initialize", "resume"):
+            self.released = None
             self.last_command = (command[0], command[1], command[2], command[-2])
             if command[0] == "resume":
                 self.last_command = (command[0], command[1], command[2], command[-1])
             self.awaiting_progress = True
         elif command[0] == "pause":
             self.last_command = ("pause", None, command[1], 0)
+        elif command[0] == "release":
+            self.released = None
+            self.last_command = ("release", command[1], command[2], 0)
+            self.awaiting_progress = True
+
+    def wait_for_release(self, session: int, epoch: int, timeout: float = 300):
+        """Drain old results and fence a previously submitted release."""
+        deadline = time.monotonic() + timeout
+        while True:
+            self.poll()
+            if self.released == (session, epoch):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "CPU verifier did not release KV within "
+                    f"{timeout}s: pid={self.process.pid}, "
+                    f"session={session}, epoch={epoch}"
+                )
+            self.connection.poll(min(0.1, remaining))
+
+    def request_close(self):
+        if self.closed or self.close_requested:
+            return
+        self.close_requested = True
+        if self.process.poll() is None:
+            with suppress(OSError, EOFError):
+                self.connection.send(("close",))
 
     def close(self):
         if self.closed:
             return
+        self.request_close()
         self.closed = True
         if self.process.poll() is None:
-            with suppress(OSError, EOFError):
-                self.connection.send(("close",))
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -314,6 +357,14 @@ class RetroSpecCPUStorage:
                     stream.truncate(size)
         self.kv = map_cpu_kv(self.paths[0], shape)
         self.journal = map_cpu_kv(self.paths[1], shape)
+
+    def can_reuse(self, shape: tuple[int, ...]) -> bool:
+        return (
+            self.kv is not None
+            and self.shape[:-2] == shape[:-2]
+            and self.shape[-1] == shape[-1]
+            and self.shape[-2] >= shape[-2]
+        )
 
     def close(self):
         self.kv = self.journal = None

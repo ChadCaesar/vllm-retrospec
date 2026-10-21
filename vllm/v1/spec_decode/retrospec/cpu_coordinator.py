@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from time import perf_counter
+
 from vllm.distributed import get_tp_group
 
 from .cpu_bridge import RetroSpecCPUKVBridge
@@ -25,6 +27,10 @@ class RetroSpecCPUCoordinator:
         )
         self.bridge = RetroSpecCPUKVBridge(proposer)
         self.storage = None
+        # One retained mapping, bounded by max_model_len. It is quarantined
+        # until the worker acknowledges the matching release session/epoch.
+        self._pooled_storage = None
+        self._pending_release = None
         self.request_id = None
         self.session = 0
         self.epoch = 0
@@ -38,6 +44,49 @@ class RetroSpecCPUCoordinator:
 
     def _control(self, value):
         return self.group.broadcast_object(value, src=0)
+
+    def _acquire_storage(self, shape):
+        description = None
+        if self.group.rank_in_group == 0:
+            try:
+                if self._pending_release is not None:
+                    started = perf_counter()
+                    self.worker.wait_for_release(*self._pending_release)
+                    self.proposer.performance_stats.record_cpu_time(
+                        "cpu_kv_release_wait_wall", perf_counter() - started
+                    )
+                storage = self._pooled_storage
+                reused = storage is not None and storage.can_reuse(shape)
+                if not reused:
+                    if storage is not None:
+                        storage.close()
+                        self._pooled_storage = None
+                    storage = RetroSpecCPUStorage(shape)
+                    self._pooled_storage = storage
+                description = (None, storage.directory, storage.shape, reused)
+            except Exception as exc:
+                description = (str(exc), None, None, False)
+        error, directory, actual_shape, reused = self._control(description)
+        if error is not None:
+            raise RuntimeError(error)
+        # No TP rank may overwrite the mapping before this broadcast confirms
+        # the CPU fence. Keep the allocated capacity/strides for shorter inputs.
+        self._pending_release = None
+        storage = self._pooled_storage
+        if self.group.rank_in_group != 0 and (
+            storage is None or storage.directory != directory
+        ):
+            if storage is not None:
+                storage.close()
+            self._pooled_storage = RetroSpecCPUStorage(tuple(actual_shape), directory)
+        self.storage = self._pooled_storage
+        self._pooled_storage = None
+        self.proposer.performance_stats.add_counter(
+            "cpu_kv_buffer_reuses" if reused else "cpu_kv_buffer_allocations"
+        )
+        self.proposer.performance_stats.observe_peak(
+            "cpu_kv_buffer_capacity_tokens", self.storage.shape[-2]
+        )
 
     def begin(self, request_id, base_position, seed, budget, metadata, sampling_params):
         initial = (
@@ -65,13 +114,7 @@ class RetroSpecCPUCoordinator:
                 getattr(self.config, "head_dim", None)
                 or self.config.hidden_size // self.config.num_attention_heads,
             )
-            if self.group.rank_in_group == 0:
-                self.storage = RetroSpecCPUStorage(shape)
-            directory, shape = self._control(
-                (self.storage.directory, shape) if self.storage is not None else None
-            )
-            if self.group.rank_in_group != 0:
-                self.storage = RetroSpecCPUStorage(tuple(shape), directory)
+            self._acquire_storage(shape)
             self.stop_ids = set(sampling_params.stop_token_ids or [])
             if not sampling_params.ignore_eos:
                 self.stop_ids.update(sampling_params._all_stop_token_ids)
@@ -182,19 +225,36 @@ class RetroSpecCPUCoordinator:
         self.deferred_plans = None
         if self.storage is not None:
             self.epoch += 1
-            storage = self.storage
+            if self.worker is not None:
+                self.worker.send(("release", self.session, self.epoch))
+            self._pending_release = (self.session, self.epoch)
+            # Drain GPU publications before retaining this rank's mapping.
+            # CPU acknowledgement can overlap the next request's prefill.
+            self.bridge.close()
+            self._pooled_storage = self.storage
             self.storage = None
-            try:
-                if self.worker is not None:
-                    self.worker.send(("pause", self.epoch))
-            finally:
-                self.bridge.close()
-                storage.close()
         self.request_id = None
 
     def close(self):
         try:
-            self.release()
-        finally:
             if self.worker is not None:
-                self.worker.close()
+                self.worker.request_close()
+        finally:
+            try:
+                self.bridge.close()
+            finally:
+                try:
+                    # Unlink before waiting for model teardown: the executor
+                    # may terminate this GPU process after its shutdown grace.
+                    # Existing CPU mappings stay valid until the child exits;
+                    # shutdown never reuses or truncates their backing files.
+                    for storage in (self.storage, self._pooled_storage):
+                        if storage is not None:
+                            storage.close()
+                finally:
+                    self.storage = self._pooled_storage = None
+                    self._pending_release = None
+                    self.request_id = None
+                    self.deferred_window = self.deferred_plans = None
+                    if self.worker is not None:
+                        self.worker.close()
