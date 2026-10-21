@@ -11,6 +11,8 @@ from time import perf_counter
 
 import torch
 
+from vllm import _custom_ops as ops
+
 from ..performance import RetroSpecPerformanceStats
 from .cluster_identity import RetroSpecClusterGroup
 from .cluster_identity import RetroSpecClusterIdentity as RetroSpecClusterIdentity
@@ -1286,6 +1288,37 @@ class RetroSpecClusterPageStore(
             pool.free(block_table.page_metadata.page_ids)
             self._free_cluster_ids(layer_name, block_table.cluster_ids)
             self._resize_resident_cache(layer_name, pool)
+
+    def gather_full_verification_into(
+        self,
+        layer_name: str,
+        descriptors: Sequence[RetroSpecFullVerificationDescriptor],
+        token_offsets: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+    ) -> None:
+        """Copy valid ranges into CPU outputs, leaving gaps untouched.
+
+        The caller keeps the described pages allocated until this returns.
+        """
+        with self._resident_state_lock:
+            pool = self._layer_pools.get(layer_name)
+            if pool is None:
+                raise RuntimeError(
+                    f"No RetroSpec page pool exists for layer {layer_name!r}"
+                )
+            source = pool.snapshot_full_verification_sources()
+
+        ops.retrospec_gather_compact_kv(
+            source.key_slabs,
+            source.value_slabs,
+            tuple(descriptor.range_table for descriptor in descriptors),
+            token_offsets,
+            0,
+            key_output,
+            value_output,
+            self.full_verify_gather_workers,
+        )
 
     def gather_pages(
         self,

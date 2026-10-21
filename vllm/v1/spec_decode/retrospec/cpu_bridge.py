@@ -50,24 +50,33 @@ class RetroSpecCPUKVBridge:
             if initial:
                 record = index._indices.get(name, {}).get(request_id)
                 indexed_end = self.proposer.block_size
-                if record is not None:
-                    for segment in record.segments:
-                        pages = segment.cluster_blocks.page_metadata
-                        packed_k, packed_v, mask = index.cluster_store.gather_pages(
-                            name,
-                            pages.page_ids.unsqueeze(0),
-                            pages.page_token_counts.unsqueeze(0),
-                        )
-                        for head in range(keys.shape[2]):
-                            for kind, packed in enumerate((packed_k, packed_v)):
-                                target[
-                                    kind,
-                                    head,
-                                    segment.indexed_start : segment.indexed_end,
-                                ].copy_(
-                                    packed[0, head][mask[0, head]],
-                                )
-                        indexed_end = segment.indexed_end
+                if record is not None and record.segments:
+                    descriptor = record.full_verification_descriptor
+                    indexed_end = record.indexed_end
+                    indexed_tokens = indexed_end - self.proposer.block_size
+                    heads, capacity, head_size = target.shape[1:]
+                    if (
+                        descriptor is None
+                        or descriptor.num_kv_heads != heads
+                        or indexed_tokens <= 0
+                        or indexed_end > min(end, capacity)
+                        or descriptor.head_token_counts != (indexed_tokens,) * heads
+                    ):
+                        raise RuntimeError("CPU verifier received an invalid KV prefix")
+                    # Flatten complete head slots so the native gather can write
+                    # straight into the shared mapping. Per-head offsets skip
+                    # sink rows and leave native tails and future slots intact.
+                    token_offsets = (
+                        torch.arange(heads, dtype=torch.int64, device="cpu") * capacity
+                        + self.proposer.block_size
+                    ).unsqueeze(0)
+                    index.cluster_store.gather_full_verification_into(
+                        name,
+                        (descriptor,),
+                        token_offsets,
+                        target[0].view(-1, head_size),
+                        target[1].view(-1, head_size),
+                    )
                 # Historical post-RoPE KV can be permuted per head: every
                 # subsequent CPU query attends to the complete past, unmasked.
                 sink_end = min(end, self.proposer.block_size)

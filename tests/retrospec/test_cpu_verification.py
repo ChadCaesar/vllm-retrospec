@@ -11,7 +11,13 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, LlamaConfig, Qwen2Config
 
+from tests.retrospec.offload.cluster_store_helpers import (
+    make_cluster_data,
+    store_cluster_data,
+)
 from vllm.config import SpeculativeConfig
+from vllm.v1.spec_decode.retrospec.cluster_store import RetroSpecClusterPageStore
+from vllm.v1.spec_decode.retrospec.cpu_bridge import RetroSpecCPUKVBridge
 from vllm.v1.spec_decode.retrospec.cpu_coordinator import RetroSpecCPUCoordinator
 from vllm.v1.spec_decode.retrospec.cpu_model import attach_cache, make_cache
 from vllm.v1.spec_decode.retrospec.cpu_state import RetroSpecCPUWindow
@@ -25,6 +31,134 @@ from vllm.v1.spec_decode.retrospec.decision import (
 )
 from vllm.v1.spec_decode.retrospec.runtime.proposer_cpu import RetroSpecCPUProposalMixin
 from vllm.v1.spec_decode.retrospec.state import RetroSpecBatchState
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+@pytest.mark.parametrize(
+    "rank,world_size,total_heads",
+    [(0, 1, 2), (0, 2, 4), (1, 2, 4), (0, 2, 1), (1, 2, 1)],
+)
+def test_cpu_export_gathers_directly_into_shared_head_slots(
+    monkeypatch, indexed, rank, world_size, total_heads
+):
+    group = SimpleNamespace(rank_in_group=rank, world_size=world_size)
+    monkeypatch.setattr("vllm.distributed.get_tp_group", lambda: group)
+    heads = max(1, total_heads // world_size)
+    store = RetroSpecClusterPageStore(page_size=2)
+    index = SimpleNamespace(
+        cluster_store=store, _indices={}, flush_staged_updates=Mock()
+    )
+    layers = {}
+    end = 15 if indexed else 7
+    table = torch.tensor([[3, -1, -1, -1, -1, -1, 1, 0]])
+    if not indexed:
+        table = torch.tensor([[3, 2, 1, 0]])
+    storage = RetroSpecCPUStorage((2, 2, total_heads, 20, 1))
+    try:
+        storage.kv.fill_(-999)
+        storage.journal.fill_(-777)
+        expected = storage.kv.clone()
+        expected_journal = storage.journal.clone()
+        writer = total_heads >= world_size or rank == 0
+        head_start = rank * heads if total_heads >= world_size else 0
+        head_slice = slice(head_start, head_start + heads)
+        for layer_index in range(2):
+            name = f"layer{layer_index}"
+            native = torch.arange(2 * 4 * 2 * heads).view(2, 4, 2, heads, 1)
+            native = native.to(torch.bfloat16) + layer_index * 1000
+            layers[name] = SimpleNamespace(
+                impl=SimpleNamespace(num_kv_heads=heads), kv_cache=[native]
+            )
+            if indexed:
+                descriptor = None
+                segments = []
+                for segment_index in range(2):
+                    keys, values, assignments, counts = make_cluster_data()
+                    keys = keys[:heads].to(torch.bfloat16) + segment_index * 200
+                    values = values[:heads].to(torch.bfloat16) + segment_index * 200
+                    blocks = store_cluster_data(
+                        store,
+                        name,
+                        keys,
+                        values,
+                        assignments[:heads],
+                        counts[:heads],
+                        cluster_start=segment_index * 2,
+                    )
+                    current = blocks.full_verification_descriptor
+                    descriptor = (
+                        current if descriptor is None else descriptor.append(current)
+                    )
+                    segments.append(SimpleNamespace(cluster_blocks=blocks))
+                    pages = blocks.page_metadata
+                    old_keys, old_values, mask = store.gather_pages(
+                        name,
+                        pages.page_ids.unsqueeze(0),
+                        pages.page_token_counts.unsqueeze(0),
+                    )
+                    if writer:
+                        for kind, packed in enumerate((old_keys, old_values)):
+                            for head in range(heads):
+                                start = 2 + segment_index * 5
+                                expected[
+                                    kind,
+                                    layer_index,
+                                    head_start + head,
+                                    start : start + 5,
+                                ] = packed[0, head][mask[0, head]]
+                index._indices[name] = {
+                    "r": SimpleNamespace(
+                        segments=segments,
+                        indexed_end=12,
+                        full_verification_descriptor=descriptor,
+                    )
+                }
+            if writer:
+                positions = (
+                    list(range(2)) + list(range(12, end))
+                    if indexed
+                    else list(range(end))
+                )
+                for position in positions:
+                    expected[:, layer_index, head_slice, position] = native[
+                        :, table[0, position // 2], position % 2
+                    ]
+                expected_journal[:, layer_index, head_slice, end - 1] = native[
+                    :, table[0, (end - 1) // 2], (end - 1) % 2
+                ]
+        # A retired historical native block must never be read. The old
+        # padded gather is only the reference, never the export path.
+        store.gather_pages = Mock(side_effect=AssertionError("padded gather"))
+        store.gather_full_verification_into = Mock(
+            wraps=store.gather_full_verification_into
+        )
+        bridge = RetroSpecCPUKVBridge.__new__(RetroSpecCPUKVBridge)
+        bridge.proposer = SimpleNamespace(
+            sparse_attention=SimpleNamespace(index=index), block_size=2
+        )
+        bridge.layers = layers
+        metadata = SimpleNamespace(block_table_tensor=table)
+        bridge.export_gpu(storage, metadata, "r", 0, end, True)
+        torch.testing.assert_close(
+            storage.kv.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+        )
+        assert (storage.journal == -777).all()
+        assert store.gather_full_verification_into.call_count == (
+            2 if indexed and writer else 0
+        )
+        bridge.export_gpu(storage, metadata, "r", end - 1, end, False)
+        torch.testing.assert_close(
+            storage.kv.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            storage.journal.view(torch.int16),
+            expected_journal.view(torch.int16),
+            rtol=0,
+            atol=0,
+        )
+    finally:
+        storage.close()
+        store.close()
 
 
 @pytest.mark.parametrize("quality_trigger", [False, True])
