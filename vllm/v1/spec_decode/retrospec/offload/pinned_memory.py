@@ -7,6 +7,8 @@ from threading import Lock
 
 import torch
 
+from ..numa import RetroSpecHostPlacement
+
 
 class RetroSpecPinnedMemoryManager:
     """Account for all reusable RetroSpec pinned CPU allocations."""
@@ -20,6 +22,7 @@ class RetroSpecPinnedMemoryManager:
         self._allocated_bytes = 0
         self._allocations: dict[int, int] = {}
         self._lock = Lock()
+        self.host_placement = RetroSpecHostPlacement()
 
     @property
     def allocated_bytes(self) -> int:
@@ -43,8 +46,9 @@ class RetroSpecPinnedMemoryManager:
         shape: Sequence[int],
         dtype: torch.dtype,
         label: str,
+        placement: RetroSpecHostPlacement | None = None,
     ) -> torch.Tensor:
-        return self.replace(None, shape, dtype, label)
+        return self.replace(None, shape, dtype, label, placement)
 
     def replace(
         self,
@@ -52,6 +56,7 @@ class RetroSpecPinnedMemoryManager:
         shape: Sequence[int],
         dtype: torch.dtype,
         label: str,
+        placement: RetroSpecHostPlacement | None = None,
     ) -> torch.Tensor:
         shape = tuple(shape)
         if not self.enabled:
@@ -71,7 +76,10 @@ class RetroSpecPinnedMemoryManager:
                     "the clustering/verification working set"
                 )
 
-            replacement = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+            with (placement or self.host_placement).bind():
+                replacement = torch.empty(
+                    shape, dtype=dtype, device="cpu", pin_memory=True
+                )
             if current is not None:
                 self._allocations.pop(id(current), None)
             self._allocations[id(replacement)] = required_bytes

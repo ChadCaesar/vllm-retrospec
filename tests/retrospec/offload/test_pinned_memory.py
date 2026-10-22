@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import pytest
 import torch
 
+from vllm.v1.spec_decode.retrospec.numa import RetroSpecHostPlacement
 from vllm.v1.spec_decode.retrospec.pinned_memory import (
     RetroSpecPinnedMemoryManager,
 )
@@ -20,6 +23,31 @@ def test_disabled_pinned_manager_returns_pageable_storage_without_accounting():
     assert manager.allocated_bytes == 0
     assert manager.available_bytes == 16
     manager.release(storage)
+    manager.assert_empty()
+
+
+def test_bulk_placement_does_not_move_later_control_allocations(monkeypatch):
+    from vllm.v1.spec_decode.retrospec import numa
+
+    monkeypatch.setattr(numa, "_numa_library", lambda: None)
+    allowed = os.sched_getaffinity(0)
+    observed = []
+    allocate = torch.empty
+
+    def empty(*args, **kwargs):
+        observed.append(os.sched_getaffinity(0))
+        kwargs.pop("pin_memory", None)
+        return allocate(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty)
+    manager = RetroSpecPinnedMemoryManager(enabled=True, max_bytes=32)
+    placement = RetroSpecHostPlacement((min(allowed),))
+    bulk = manager.empty((4,), torch.float32, "h2d", placement=placement)
+    control = manager.empty((4,), torch.float32, "control")
+    assert observed == [{min(allowed)}, allowed]
+    assert os.sched_getaffinity(0) == allowed
+    manager.release(bulk)
+    manager.release(control)
     manager.assert_empty()
 
 

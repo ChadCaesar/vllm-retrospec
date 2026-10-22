@@ -12,6 +12,7 @@ import torch
 
 from vllm import _custom_ops as ops
 
+from ..numa import RetroSpecHostPlacement
 from ..performance import RetroSpecPerformanceStats
 from .cluster_store_support import (
     RetroSpecFullVerificationDescriptor,
@@ -50,6 +51,7 @@ class _FullVerificationTransferBuffer:
         pinned_memory: RetroSpecPinnedMemoryManager,
         gather_workers: int,
         performance_stats: RetroSpecPerformanceStats | None = None,
+        host_placement: RetroSpecHostPlacement | None = None,
     ) -> None:
         if page_size <= 0:
             raise ValueError("page_size must be positive")
@@ -70,6 +72,7 @@ class _FullVerificationTransferBuffer:
         self._pinned_memory = pinned_memory
         self.pin_memory = pinned_memory.enabled
         self.gather_workers = gather_workers
+        self.host_placement = host_placement or RetroSpecHostPlacement()
 
         self._gpu_arenas = [
             _FullVerificationGPUArena(),
@@ -87,6 +90,7 @@ class _FullVerificationTransferBuffer:
         self._gather_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix=f"retrospec-full-verify-{device.index}",
+            initializer=self.host_placement.initialize_worker,
         )
         self._closed = False
 
@@ -189,11 +193,17 @@ class _FullVerificationTransferBuffer:
             try:
                 for _ in range(self._RESIDENT_PREFETCH_RING_SIZE):
                     key_pages = self._pinned_memory.empty(
-                        shape, dtype, "full-verification-h2d-keys"
+                        shape,
+                        dtype,
+                        "full-verification-h2d-keys",
+                        placement=self.host_placement,
                     )
                     try:
                         value_pages = self._pinned_memory.empty(
-                            shape, dtype, "full-verification-h2d-values"
+                            shape,
+                            dtype,
+                            "full-verification-h2d-values",
+                            placement=self.host_placement,
                         )
                     except BaseException:
                         self._pinned_memory.release(key_pages)

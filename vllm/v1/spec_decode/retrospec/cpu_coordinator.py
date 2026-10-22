@@ -8,6 +8,7 @@ from vllm.distributed import get_tp_group
 from .cpu_affinity import RetroSpecCPUAffinity
 from .cpu_bridge import RetroSpecCPUKVBridge
 from .cpu_worker import RetroSpecCPUStorage, RetroSpecCPUWorker
+from .numa import RetroSpecHostPlacement
 
 
 class RetroSpecCPUCoordinator:
@@ -36,7 +37,28 @@ class RetroSpecCPUCoordinator:
         except BaseException:
             self.affinity.close()
             raise
+        store = proposer.sparse_attention.index.cluster_store
+        placement = self.affinity.transfer_placement(
+            proposer.device.index,
+            max(store.full_verify_gather_workers, store.cpu_page_build_workers),
+        )
+        store.host_placement.cpus = placement.cpus
+        store.host_placement.node = placement.node
+        self.affinity.reserve_transfer_cores(self.group, placement.cpus)
+        # Small admission jobs exchange the GIL with the launch thread on
+        # every layer. Keep control work and pageable backing on the launch
+        # side. Full gather/staging use separately selected transfer cores;
+        # avoid the verifier's memory controller even for a locally attached GPU.
+        store.resident_host_placement.cpus = tuple(sorted(self.affinity.gpu_allowed))
         self.bridge = RetroSpecCPUKVBridge(proposer)
+        # These small uploads run on the launch thread. Place their buffers
+        # with the transfer buffers without migrating the launch thread.
+        self.bridge.upload_placement = RetroSpecHostPlacement(
+            node=store.host_placement.node
+        )
+        self.bridge.export_placement = RetroSpecHostPlacement(
+            store.host_placement.cpus, self.affinity.cpu_node
+        )
         self.storage = None
         # One retained mapping, bounded by max_model_len. It is quarantined
         # until the worker acknowledges the matching release session/epoch.
@@ -74,6 +96,8 @@ class RetroSpecCPUCoordinator:
                         self._pooled_storage = None
                     storage = RetroSpecCPUStorage(shape)
                     self._pooled_storage = storage
+                    self.bridge.export_placement.bind_memory(storage.kv)
+                    self.bridge.export_placement.bind_memory(storage.journal)
                 description = (None, storage.directory, storage.shape, reused)
             except Exception as exc:
                 description = (str(exc), None, None, False)

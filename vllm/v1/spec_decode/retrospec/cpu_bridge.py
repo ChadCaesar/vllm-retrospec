@@ -5,6 +5,8 @@
 
 import torch
 
+from .numa import RetroSpecHostPlacement
+
 
 class RetroSpecCPUKVBridge:
     def __init__(self, proposer):
@@ -12,6 +14,8 @@ class RetroSpecCPUKVBridge:
         self.layers = proposer.cpu_attention_layers
         self.pending_uploads = []
         self.upload_stream = torch.cuda.Stream(device=proposer.device)
+        self.export_placement = RetroSpecHostPlacement()
+        self.upload_placement = RetroSpecHostPlacement()
 
     def _head_slice(self, layer, tensor):
         from vllm.distributed import get_tp_group
@@ -32,6 +36,12 @@ class RetroSpecCPUKVBridge:
         return blocks, positions % block_size
 
     def export_gpu(
+        self, storage, metadata, request_id: str, start: int, end: int, initial: bool
+    ):
+        with self.export_placement.bind():
+            self._export_gpu(storage, metadata, request_id, start, end, initial)
+
+    def _export_gpu(
         self, storage, metadata, request_id: str, start: int, end: int, initial: bool
     ):
         index = self.proposer.sparse_attention.index
@@ -103,6 +113,10 @@ class RetroSpecCPUKVBridge:
                 )
 
     def stage_cpu(self, storage, metadata, start: int, end: int, background: bool):
+        with self.upload_placement.bind():
+            self._stage_cpu(storage, metadata, start, end, background)
+
+    def _stage_cpu(self, storage, metadata, start: int, end: int, background: bool):
         if end <= start:
             return
         # Staging copies into separate tensors may overlap draft. Publication

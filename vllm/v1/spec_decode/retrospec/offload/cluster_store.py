@@ -13,6 +13,7 @@ import torch
 
 from vllm import _custom_ops as ops
 
+from ..numa import RetroSpecHostPlacement
 from ..performance import RetroSpecPerformanceStats
 from .cluster_identity import RetroSpecClusterGroup
 from .cluster_identity import RetroSpecClusterIdentity as RetroSpecClusterIdentity
@@ -121,6 +122,8 @@ class RetroSpecClusterPageStore(
 
         self.page_size = page_size
         self._pinned_memory = pinned_memory
+        self.host_placement = RetroSpecHostPlacement()
+        self.resident_host_placement = RetroSpecHostPlacement()
         self.pin_memory = pinned_memory.enabled
         self.cache_ratio = cache_ratio
         self.cpu_page_initial_slab_bytes = cpu_page_initial_slab_bytes
@@ -201,7 +204,9 @@ class RetroSpecClusterPageStore(
             torch.device, torch.cuda.Event
         ] = {}
         self._resident_prefetch_lock = Lock()
-        self._resident_prefetch_executor = _ResidentPrefetchPriorityExecutor()
+        self._resident_prefetch_executor = _ResidentPrefetchPriorityExecutor(
+            self.resident_host_placement
+        )
         self._resident_prefetch_next_sequence = 1
         self._resident_prefetch_latest: dict[str, tuple[int, int]] = {}
         self._verification_miss_slots: dict[

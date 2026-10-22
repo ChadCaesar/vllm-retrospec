@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from ..numa import RetroSpecHostPlacement
 from .cluster_identity import (
     RetroSpecClusterGroup,
     RetroSpecClusterIdentity,
@@ -165,7 +166,8 @@ class _DeferredResidentPrefetchWave:
 class _ResidentPrefetchPriorityExecutor:
     """One fixed worker that lets fresh DRAFT work overtake queued hints."""
 
-    def __init__(self) -> None:
+    def __init__(self, host_placement: RetroSpecHostPlacement | None = None) -> None:
+        self._host_placement = host_placement
         self._queue = PriorityQueue()
         self._lock = Lock()
         self._next_sequence = 0
@@ -190,6 +192,7 @@ class _ResidentPrefetchPriorityExecutor:
         return future
 
     def _run(self) -> None:
+        initialized = False
         while True:
             _, _, function, args, future = self._queue.get()
             try:
@@ -199,6 +202,12 @@ class _ResidentPrefetchPriorityExecutor:
                 if not future.set_running_or_notify_cancel():
                     continue
                 try:
+                    # The store is configured after model loading. Apply its
+                    # placement on the first job, without moving this Python
+                    # worker across NUMA nodes for every small admission.
+                    if not initialized and self._host_placement is not None:
+                        self._host_placement.initialize_worker()
+                        initialized = True
                     function(*args)
                 except BaseException as error:
                     future.set_exception(error)

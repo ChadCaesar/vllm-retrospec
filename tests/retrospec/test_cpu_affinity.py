@@ -28,13 +28,14 @@ def topology(tmp_path, monkeypatch):
     for tid in masks:
         (tasks / str(tid)).mkdir()
     monkeypatch.setattr(cpu_affinity, "Path", path)
+    monkeypatch.setattr(cpu_affinity, "get_native_id", lambda: 11)
     monkeypatch.setattr(
         cpu_affinity.os, "sched_getaffinity", lambda tid: masks[tid or 11].copy()
     )
     monkeypatch.setattr(
         cpu_affinity.os,
         "sched_setaffinity",
-        lambda tid, mask: masks.update({tid: set(mask)}),
+        lambda tid, mask: masks.update({tid or 11: set(mask)}),
     )
     for key in ("GOMP_CPU_AFFINITY", "OMP_PLACES", "OMP_PROC_BIND"):
         monkeypatch.delenv(key, raising=False)
@@ -166,3 +167,71 @@ def test_numa_binding_can_be_disabled(topology):
     affinity = cpu_affinity.RetroSpecCPUAffinity.create(group(), 3, False)
     assert affinity.cpu_cpus is None
     assert masks[11] == set(range(16))
+
+
+def test_transfer_workers_use_local_cores_without_verifier_siblings(
+    topology, monkeypatch
+):
+    from vllm.v1.spec_decode.retrospec import numa
+
+    monkeypatch.setattr(numa, "gpu_numa_node", lambda index: index)
+    affinity = cpu_affinity.RetroSpecCPUAffinity.create(group(), 3, True)
+    transfer = affinity.transfer_placement(1, 4)
+    # Avoid the verifier's memory controller even for its locally attached GPU.
+    assert transfer.node == 0
+    assert transfer.cpus == (6, 4, 2, 0)
+    other = affinity.transfer_placement(0, 2)
+    assert other.node == 0
+    assert other.cpus == (6, 4)
+    affinity.close()
+
+
+def test_launch_reservation_excludes_copy_siblings_and_restores_new_threads(topology):
+    path, masks = topology
+    affinity = cpu_affinity.RetroSpecCPUAffinity.create(group(), 3, True)
+    affinity.reserve_transfer_cores(group(), (4, 6))
+    assert masks[11] == {0, 2, 8, 10}
+    assert affinity.gpu_allowed == masks[11]
+    (path("/proc/self/task") / "14").mkdir()
+    masks[14] = masks[11].copy()
+    affinity.close()
+    assert masks[11] == masks[14] == set(range(16))
+
+
+def test_launch_reservation_keeps_a_minimum_launch_partition(topology):
+    _, masks = topology
+    affinity = cpu_affinity.RetroSpecCPUAffinity.create(group(), 3, True)
+    before = masks[11].copy()
+    affinity.reserve_transfer_cores(group(), (0, 2, 4))
+    assert masks[11] == before
+    affinity.close()
+
+
+@pytest.mark.parametrize("failure_stage", ["prepare", "apply"])
+def test_peer_launch_reservation_failure_keeps_original_masks(
+    topology, monkeypatch, failure_stage
+):
+    import torch.distributed as dist
+
+    _, masks = topology
+    affinity = cpu_affinity.RetroSpecCPUAffinity.create(group(), 3, True)
+    before = {tid: mask.copy() for tid, mask in masks.items()}
+    checks = 0
+
+    def gather(values, value, group):
+        nonlocal checks
+        peer = value
+        if isinstance(value, bool):
+            checks += 1
+            if checks == (1 if failure_stage == "prepare" else 2):
+                peer = False
+        values[:] = [value, peer]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    tp = group()
+    tp.world_size = 2
+    tp.cpu_group = object()
+    affinity.reserve_transfer_cores(tp, (4, 6))
+    assert masks == before
+    assert affinity.gpu_allowed == before[11]
+    affinity.close()

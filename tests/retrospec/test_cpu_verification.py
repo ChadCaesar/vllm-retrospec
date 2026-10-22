@@ -32,6 +32,7 @@ from vllm.v1.spec_decode.retrospec.decision import (
     RetroSpecDecisionPolicy,
     RetroSpecReason,
 )
+from vllm.v1.spec_decode.retrospec.numa import RetroSpecHostPlacement
 from vllm.v1.spec_decode.retrospec.runtime.proposer_cpu import RetroSpecCPUProposalMixin
 from vllm.v1.spec_decode.retrospec.state import RetroSpecBatchState
 
@@ -48,6 +49,49 @@ def test_cpu_storage_unlinks_paths_before_releasing_large_mappings():
     storage.close()
     assert paths_present_at_release == [False, False]
     assert not directory.exists()
+
+
+@pytest.mark.parametrize("fail_at", [None, 1, 2])
+def test_cpu_storage_memfd_and_file_fallback_share_data(monkeypatch, fail_at):
+    original = os.memfd_create
+    descriptors = []
+
+    def allocate(*args):
+        if len(descriptors) + 1 == fail_at:
+            raise OSError("memfd unavailable")
+        fd = original(*args)
+        descriptors.append(fd)
+        return fd
+
+    monkeypatch.setattr(os, "memfd_create", allocate)
+    owner = RetroSpecCPUStorage((2, 1, 1, 8, 1))
+    peer = RetroSpecCPUStorage(owner.shape, owner.directory)
+    try:
+        assert owner.backing == peer.backing == ("memfd" if fail_at is None else "file")
+        owner.kv.fill_(7)
+        peer.journal.fill_(11)
+        assert (peer.kv == 7).all()
+        assert (owner.journal == 11).all()
+    finally:
+        peer.close()
+        owner.close()
+    for fd in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+def test_cpu_storage_uses_files_when_shared_ram_budget_is_insufficient(monkeypatch):
+    import psutil
+
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(available=0))
+    allocate = Mock(side_effect=AssertionError("RAM budget was ignored"))
+    monkeypatch.setattr(os, "memfd_create", allocate)
+    storage = RetroSpecCPUStorage((2, 1, 1, 8, 1))
+    try:
+        assert storage.backing == "file"
+        assert not allocate.called
+    finally:
+        storage.close()
 
 
 @pytest.mark.parametrize("indexed", [False, True])
@@ -150,6 +194,7 @@ def test_cpu_export_gathers_directly_into_shared_head_slots(
             wraps=store.gather_full_verification_into
         )
         bridge = RetroSpecCPUKVBridge.__new__(RetroSpecCPUKVBridge)
+        bridge.export_placement = RetroSpecHostPlacement()
         bridge.proposer = SimpleNamespace(
             sparse_attention=SimpleNamespace(index=index), block_size=2
         )

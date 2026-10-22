@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Keep full CPU inference off the GPU workers' NUMA nodes when possible."""
+"""Separate CPU verification, launch work, and host KV transfers."""
 
 import os
 from contextlib import suppress
 from pathlib import Path
+from threading import get_native_id
 
 from vllm.logger import init_logger
 
@@ -58,10 +59,13 @@ class RetroSpecCPUAffinity:
         self.bound_masks: dict[int, set[int]] = {}
         self.original_allowed: set[int] = set()
         self.gpu_allowed: set[int] = set()
+        self.cpu_node: int | None = None
+        self.rank = 0
 
     @classmethod
     def create(cls, group, threads: int, enabled: bool):
         affinity = cls()
+        affinity.rank = group.rank_in_group
         if not enabled:
             return affinity
 
@@ -135,6 +139,7 @@ class RetroSpecCPUAffinity:
             )
             return affinity
         affinity.cpu_cpus = cpu_cpus
+        affinity.cpu_node = node
         logger.info(
             "RetroSpec CPU verifier: NUMA node %s, CPUs %s; GPU launch CPUs %s",
             node,
@@ -142,6 +147,102 @@ class RetroSpecCPUAffinity:
             sorted(gpu_allowed),
         )
         return affinity
+
+    def transfer_placement(self, device_index: int, workers: int):
+        from .numa import RetroSpecHostPlacement, gpu_numa_node
+
+        if self.cpu_cpus is None:
+            return RetroSpecHostPlacement()
+        node = gpu_numa_node(device_index)
+        if node is None:
+            return RetroSpecHostPlacement()
+        try:
+            if node == self.cpu_node:
+                # The CPU target streams weights and full KV from this node.
+                # Its memory controller is not free bandwidth for PCIe staging.
+                # Keep that traffic on the launch side even for a remote GPU.
+                for path in sorted(Path("/sys/devices/system/node").glob("node[0-9]*")):
+                    cpus = _parse_cpu_list((path / "cpulist").read_text())
+                    if cpus & self.gpu_allowed:
+                        node = int(path.name[4:])
+                        break
+            local = _parse_cpu_list(
+                Path(f"/sys/devices/system/node/node{node}/cpulist").read_text()
+            )
+
+            # Exclude every SMT sibling of a verifier core. Transfer workers
+            # may use the remaining physical cores on the same NUMA node.
+            def core(cpu):
+                path = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+                return (
+                    (path / "physical_package_id").read_text().strip(),
+                    (path / "core_id").read_text().strip(),
+                )
+
+            reserved = {core(cpu) for cpu in self.cpu_cpus}
+            physical = {}
+            for cpu in sorted(local & self.original_allowed, reverse=True):
+                identity = core(cpu)
+                if identity not in reserved:
+                    physical[identity] = cpu
+            available = list(physical.values())
+            offset = self.rank * workers % len(available) if available else 0
+            available = available[offset:] + available[:offset]
+            cpus = tuple(available[:workers])
+        except (OSError, ValueError):
+            return RetroSpecHostPlacement()
+        if not cpus:
+            return RetroSpecHostPlacement()
+        logger.info("RetroSpec gather/H2D: NUMA node %s, CPUs %s", node, list(cpus))
+        return RetroSpecHostPlacement(cpus, node)
+
+    def reserve_transfer_cores(self, group, cpus: tuple[int, ...]):
+        """Keep the launch thread off every rank's copy cores and SMT siblings."""
+        if self.cpu_cpus is None:
+            return
+
+        def gather(value):
+            if group.world_size == 1:
+                return [value]
+            import torch.distributed as dist
+
+            values = [None] * group.world_size
+            dist.all_gather_object(values, value, group=group.cpu_group)
+            return values
+
+        copies = set().union(*map(set, gather(cpus)))
+        original = set()
+        remaining = set()
+        prepared = True
+        try:
+            original = set(os.sched_getaffinity(0))
+
+            def core(cpu):
+                path = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+                return (
+                    (path / "physical_package_id").read_text().strip(),
+                    (path / "core_id").read_text().strip(),
+                )
+
+            reserved = {core(cpu) for cpu in copies}
+            remaining = {cpu for cpu in self.gpu_allowed if core(cpu) not in reserved}
+            prepared = len({core(cpu) for cpu in remaining}) >= 2
+        except (OSError, ValueError):
+            prepared = False
+        if not all(gather(prepared)):
+            return
+        applied = True
+        try:
+            os.sched_setaffinity(0, remaining)
+        except OSError:
+            applied = False
+        if not all(gather(applied)):
+            if applied:
+                os.sched_setaffinity(0, original)
+            return
+        self.gpu_allowed = remaining
+        self.bound_masks[get_native_id()] = remaining
+        logger.info("RetroSpec GPU launch/control CPUs: %s", sorted(remaining))
 
     def close(self):
         if not self.original_masks:
@@ -160,3 +261,4 @@ class RetroSpecCPUAffinity:
         self.original_masks.clear()
         self.bound_masks.clear()
         self.cpu_cpus = None
+        self.cpu_node = None

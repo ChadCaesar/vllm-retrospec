@@ -59,6 +59,7 @@ class RetroSpecClusterPrefetchMixin:
                 pinned_memory=self._pinned_memory,
                 gather_workers=self.full_verify_gather_workers,
                 performance_stats=self.performance_stats,
+                host_placement=self.host_placement,
             )
             self._full_verification_buffers[device] = buffer
 
@@ -511,7 +512,9 @@ class RetroSpecClusterPrefetchMixin:
                 _PREFETCH_SOURCE_PRIORITY[record.source] for record in records
             )
             future = self._resident_prefetch_executor.submit(
-                priority, self._finish_resident_prefetch_wave, staged
+                priority,
+                self._finish_resident_prefetch_wave,
+                staged,
             )
             ownership_transferred = True
 

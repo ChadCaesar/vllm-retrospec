@@ -377,6 +377,7 @@ class RetroSpecCPUWorker:
 
 class RetroSpecCPUStorage:
     def __init__(self, shape: tuple[int, ...], directory: str | None = None):
+        import psutil
         import torch
 
         self.owner = directory is None
@@ -385,19 +386,52 @@ class RetroSpecCPUStorage:
         self.paths = tuple(
             str(Path(self.directory) / name) for name in ("kv", "gpu-journal")
         )
-        if self.owner:
-            size = math.prod(shape) * torch.bfloat16.itemsize
-            if (
-                size
-                > os.statvfs(self.directory).f_bavail
-                * os.statvfs(self.directory).f_frsize
-            ):
-                raise RuntimeError("Insufficient temporary storage for CPU verifier KV")
-            for path in self.paths:
-                with open(path, "wb") as stream:
-                    stream.truncate(size)
-        self.kv = map_cpu_kv(self.paths[0], shape)
-        self.journal = map_cpu_kv(self.paths[1], shape)
+        self._fds: list[int] = []
+        self.kv = self.journal = None
+        try:
+            if self.owner:
+                size = math.prod(shape) * torch.bfloat16.itemsize
+                # Linux memfd is shared RAM without filesystem writeback or a
+                # small /dev/shm mount quota. Pages are allocated on first touch;
+                # the sparse journal and unused capacity are never pre-cleared.
+                # Symlinks keep the existing same-host TP/CPU attachment API.
+                if (
+                    hasattr(os, "memfd_create")
+                    and Path("/proc/self/fd").is_dir()
+                    and 2 * size <= psutil.virtual_memory().available * 0.8
+                ):
+                    try:
+                        for name in ("kv", "gpu-journal"):
+                            fd = os.memfd_create(
+                                f"retrospec-cpu-{name}", os.MFD_CLOEXEC
+                            )
+                            self._fds.append(fd)
+                            os.ftruncate(fd, size)
+                    except OSError:
+                        for fd in self._fds:
+                            os.close(fd)
+                        self._fds.clear()
+                if self._fds:
+                    for path, fd in zip(self.paths, self._fds):
+                        os.symlink(f"/proc/{os.getpid()}/fd/{fd}", path)
+                else:
+                    space = os.statvfs(self.directory)
+                    if size > space.f_bavail * space.f_frsize:
+                        raise RuntimeError(
+                            "Insufficient temporary storage for CPU verifier KV"
+                        )
+                    for path in self.paths:
+                        with open(path, "wb") as stream:
+                            stream.truncate(size)
+            self.kv = map_cpu_kv(self.paths[0], shape)
+            self.journal = map_cpu_kv(self.paths[1], shape)
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def backing(self) -> str:
+        return "memfd" if Path(self.paths[0]).is_symlink() else "file"
 
     def can_reuse(self, shape: tuple[int, ...]) -> bool:
         return (
@@ -418,6 +452,9 @@ class RetroSpecCPUStorage:
                     Path(path).unlink(missing_ok=True)
                 Path(self.directory).rmdir()
         finally:
+            for fd in self._fds:
+                os.close(fd)
+            self._fds.clear()
             self.kv = self.journal = None
 
 

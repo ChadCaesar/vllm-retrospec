@@ -413,6 +413,7 @@ class RetroSpecSegmentBuildMixin:
             self._cluster_build_executor = ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="retrospec-cluster-page",
+                initializer=self.cluster_store.resident_host_placement.initialize_worker,
             )
 
         return self._cluster_build_executor
