@@ -48,6 +48,11 @@ class RetroSpecCPUProposalMixin:
     def _cpu_request_supported(self, request_ids, sampling_metadata):
         if getattr(self, "cpu_coordinator", None) is None or len(request_ids) != 1:
             return False
+        return self._cpu_risk_request_supported(request_ids, sampling_metadata)
+
+    def _cpu_risk_request_supported(self, request_ids, sampling_metadata):
+        if len(request_ids) != 1:
+            return False
         if not self._can_use_raw_greedy_verification_sampling(sampling_metadata):
             return False
         request = self.runner.requests[request_ids[0]]

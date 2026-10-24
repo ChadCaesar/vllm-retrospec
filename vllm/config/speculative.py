@@ -252,6 +252,12 @@ class SpeculativeConfig:
     during performance measurements."""
     retrospec_cpu_verify: bool = False
     """Run an independent full target model on CPU alongside RetroSpec drafts."""
+    retrospec_cpu_risk_check: bool = False
+    """Check low-margin draft positions on CPU and request GPU full verification
+    on disagreement. Mutually exclusive with continuous CPU verification."""
+    retrospec_cpu_risk_margin_threshold: float = Field(default=0.5, ge=0)
+    """Queue draft tokens whose raw top-1/top-2 logit margin is strictly lower
+    than this threshold. Independent of GPU stage-transition thresholds."""
     retrospec_cpu_threads: int = Field(default=16, gt=0)
     """Intra-op threads reserved for the independent CPU verifier."""
     retrospec_cpu_numa_binding: bool = True
@@ -324,6 +330,7 @@ class SpeculativeConfig:
                     self.retrospec_index_update_interval,
                     self.num_speculative_tokens,
                     self.retrospec_cpu_verify,
+                    self.retrospec_cpu_risk_check,
                     self.retrospec_draft_prefetch,
                 ]
             )
@@ -716,6 +723,10 @@ class SpeculativeConfig:
             )
 
     def _validate_retrospec(self) -> None:
+        if self.retrospec_cpu_verify and self.retrospec_cpu_risk_check:
+            raise ValueError("RetroSpec CPU continuous and risk modes are exclusive")
+        if self.retrospec_cpu_risk_check and self.retrospec_cpu_kv_background_upload:
+            raise ValueError("CPU risk checks cannot upload authoritative KV")
         if self.retrospec_retrieval_ratio + self.retrospec_estimation_ratio > 1:
             raise ValueError(
                 "The sum of retrospec_retrieval_ratio and "

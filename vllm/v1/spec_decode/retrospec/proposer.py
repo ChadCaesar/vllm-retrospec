@@ -92,6 +92,7 @@ class RetroSpecProposer(
             config, "retrospec_proposal_token_capacity", config.num_speculative_tokens
         )
         self.cpu_coordinator = None
+        self.cpu_risk_coordinator = None
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
         self.pipeline_protocol = RetroSpecPipelineProtocol(
@@ -287,6 +288,9 @@ class RetroSpecProposer(
 
     def remove_requests(self, request_ids: Collection[str]) -> None:
         request_ids = tuple(request_ids)
+        risk = getattr(self, "cpu_risk_coordinator", None)
+        if risk is not None and risk.request_id in request_ids:
+            risk.release()
         if (
             getattr(self, "cpu_coordinator", None) is not None
             and self.cpu_coordinator.request_id in request_ids
@@ -360,6 +364,10 @@ class RetroSpecProposer(
         context_lens: Sequence[int],
         query_lens: Sequence[int],
     ):
+        risk = getattr(self, "cpu_risk_coordinator", None)
+        if risk is not None and risk.request_id in request_ids:
+            risk.finish_round()
+            risk.invalidate_kv(context_lens[request_ids.index(risk.request_id)])
         return self.sparse_attention.full_verification_context(
             request_ids,
             context_lens,
@@ -455,6 +463,8 @@ class RetroSpecProposer(
             return
         if getattr(self, "cpu_coordinator", None) is not None:
             self.cpu_coordinator.close()
+        if getattr(self, "cpu_risk_coordinator", None) is not None:
+            self.cpu_risk_coordinator.close()
         self.sparse_attention.uninstall()
         self._closed = True
 
@@ -480,9 +490,14 @@ class RetroSpecProposer(
         model_config = self.vllm_config.model_config
         from vllm.distributed import get_tp_group
 
-        if (
-            getattr(self.speculative_config, "retrospec_cpu_verify", False)
-            and parallel.pipeline_parallel_size == 1
+        cpu_enabled = getattr(self.speculative_config, "retrospec_cpu_verify", False)
+        risk_enabled = getattr(
+            self.speculative_config, "retrospec_cpu_risk_check", False
+        )
+        if not (cpu_enabled or risk_enabled):
+            return
+        supported = (
+            parallel.pipeline_parallel_size == 1
             and parallel.tensor_parallel_size in (1, 2)
             and parallel.data_parallel_size == 1
             and not getattr(get_tp_group().device_communicator, "internode", False)
@@ -492,7 +507,16 @@ class RetroSpecProposer(
             and self.vllm_config.kv_transfer_config is None
             and model_config.hf_config.model_type in ("llama", "qwen2")
             and not getattr(model_config.hf_config, "use_sliding_window", False)
-        ):
+        )
+        if risk_enabled and not supported:
+            raise ValueError(
+                "CPU risk checks require local TP=1/2, PP=DP=1, BF16 Llama/Qwen2"
+            )
+        if risk_enabled:
+            from .cpu_risk import RetroSpecCPURiskCoordinator
+
+            self.cpu_risk_coordinator = RetroSpecCPURiskCoordinator(self)
+        elif cpu_enabled and supported:
             from .cpu_coordinator import RetroSpecCPUCoordinator
 
             self.cpu_coordinator = RetroSpecCPUCoordinator(self)
@@ -783,6 +807,17 @@ class RetroSpecProposer(
             return result
 
         proposal_round = 0
+        risk = getattr(self, "cpu_risk_coordinator", None)
+        if risk is not None:
+            if not self._cpu_risk_request_supported(request_ids, sampling_metadata):
+                raise ValueError(
+                    "CPU risk checks require one unconstrained greedy request"
+                )
+            risk.begin_round(
+                request_ids[0],
+                int(self.proposal_start_positions[0].item()),
+                int(self.proposal_input_ids[0].item()),
+            )
         with self.sparse_attention.proposal_context(request_ids, committed_positions):
             while True:
                 proposal_round += 1
@@ -883,6 +918,26 @@ class RetroSpecProposer(
 
                     self.positions[:batch_size].add_(emitted_counts)
 
+                    if risk is not None:
+                        values = (
+                            torch.stack(
+                                (
+                                    sampled_token_ids[0].float(),
+                                    draft_margin[0],
+                                )
+                            )
+                            .cpu()
+                            .tolist()
+                        )
+                        if risk.draft(
+                            token_index, int(values[0]), values[1], common_attn_metadata
+                        ):
+                            self.state.set_pending_counts(projected_pending_counts)
+                            self.state.set_stage(
+                                self.state.active_mask, RetroSpecStage.FULL_VERIFY
+                            )
+                            break
+
                     # Sampled IDs are meaningful only for rows that ran this
                     # step and remain in the draft stage.
                     continue_draft_mask = draft_stage_mask & (
@@ -902,6 +957,17 @@ class RetroSpecProposer(
                         round_start_counts,
                     )
 
+                if risk is not None:
+                    if risk.pump(common_attn_metadata):
+                        self.performance_stats.add_counter("cpu_risk_early_full")
+                        self.state.set_pending_counts(
+                            round_start_counts + self.state.draft_counts
+                        )
+                        self.state.set_stage(
+                            self.state.active_mask, RetroSpecStage.FULL_VERIFY
+                        )
+                        break
+                    risk.invalidate_kv(risk.base + int(round_start_counts[0].item()))
                 verification = self._verify_draft_tokens(
                     batch_size,
                     request_ids,
@@ -922,6 +988,17 @@ class RetroSpecProposer(
                     self.state.pending_counts,
                 )
                 self.state.set_pending_counts(updated_pending_counts)
+                if risk is not None:
+                    count = int(updated_pending_counts[0].item())
+                    risk.update_candidates(
+                        self._draft_token_ids[0, :count].cpu().tolist()
+                    )
+                    if risk.pump(common_attn_metadata):
+                        self.performance_stats.add_counter("cpu_risk_early_full")
+                        self.state.set_stage(
+                            self.state.active_mask, RetroSpecStage.FULL_VERIFY
+                        )
+                        break
 
                 # Verification can stop early. Roll positions back so a later
                 # draft round overwrites KV slots belonging to discarded tokens.
@@ -977,6 +1054,8 @@ class RetroSpecProposer(
                     )
                 )
 
+        if risk is not None:
+            risk.finish_round()
         self.performance_stats.add_gpu_counter(
             "proposed_tokens",
             self.state.pending_counts,

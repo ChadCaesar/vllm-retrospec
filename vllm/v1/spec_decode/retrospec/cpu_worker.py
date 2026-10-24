@@ -127,7 +127,14 @@ def _cpu_target_main(
                         cache = storage = journal = output = None
                         connection.send(("released", session, epoch))
                         continue
-                    if operation == "initialize":
+                    if operation == "check":
+                        _, session, epoch, paths, shape, position, token = command
+                        storage = map_cpu_kv(paths[0], shape)
+                        journal = None
+                        cache = attach_cache(model.config, storage, position)
+                        limit = position + 1
+                        eos_ids = set()
+                    elif operation == "initialize":
                         _, session, epoch, paths, shape, position, token, limit, eos = (
                             command
                         )
@@ -165,7 +172,15 @@ def _cpu_target_main(
                 except _CPUForwardInterrupted:
                     for index in range(len(cache.layers)):
                         cache.layers[index].length = position
-                    connection.send(("interrupted", session, epoch, position))
+                    connection.send(
+                        (
+                            "interrupted",
+                            session,
+                            epoch,
+                            position,
+                            time.monotonic() - started,
+                        )
+                    )
                     continue
                 logits = output.logits[0, -1]
                 if not torch.isfinite(logits).all():
@@ -320,7 +335,11 @@ class RetroSpecCPUWorker:
         self.connection.send(command)
         if not self.awaiting_progress:
             self.last_progress = time.monotonic()
-        if command[0] in ("initialize", "resume"):
+        if command[0] == "check":
+            self.released = None
+            self.last_command = ("check", command[1], command[2], command[-2] + 1)
+            self.awaiting_progress = True
+        elif command[0] in ("initialize", "resume"):
             self.released = None
             self.last_command = (command[0], command[1], command[2], command[-2])
             if command[0] == "resume":

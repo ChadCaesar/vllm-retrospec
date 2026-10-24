@@ -116,6 +116,67 @@ class RetroSpecCPUKVBridge:
         with self.upload_placement.bind():
             self._stage_cpu(storage, metadata, start, end, background)
 
+    def export_risk(self, storage, metadata, request_id: str, start: int, end: int):
+        """Refresh a GPU-origin mirror, including deltas retired to CPU pages.
+
+        Each indexed segment may permute its rows per head. Rebuild an entire
+        intersecting segment, rather than splice packed rows into logical rows.
+        All these rows precede the query, so the per-head order is immaterial.
+        The caller fences CPU readers before invoking this method.
+        """
+        from vllm.distributed import get_tp_group
+
+        with self.export_placement.bind():
+            index = self.proposer.sparse_attention.index
+            index.flush_staged_updates()
+            group = get_tp_group()
+            if storage.shape[2] < group.world_size and group.rank_in_group != 0:
+                return
+            for layer_index, (name, layer) in enumerate(self.layers.items()):
+                keys, values = layer.kv_cache[0].unbind(0)
+                target = storage.kv[:, layer_index, self._head_slice(layer, storage.kv)]
+                record = index._indices.get(name, {}).get(request_id)
+                segments = () if record is None else record.segments
+                native_ranges = []
+                cursor = start
+                for segment in segments:
+                    lo, hi = segment.indexed_start, segment.indexed_end
+                    if hi <= start or lo >= end:
+                        continue
+                    if hi > end:
+                        raise RuntimeError(
+                            "CPU risk query intersects an indexed segment"
+                        )
+                    if cursor < lo:
+                        native_ranges.append((cursor, lo))
+                    descriptor = segment.cluster_blocks.full_verification_descriptor
+                    heads, capacity, dimension = target.shape[1:]
+                    if descriptor.head_token_counts != (hi - lo,) * heads:
+                        raise RuntimeError("Invalid CPU risk segment coverage")
+                    offsets = (
+                        torch.arange(heads, dtype=torch.int64) * capacity + lo
+                    ).unsqueeze(0)
+                    index.cluster_store.gather_full_verification_into(
+                        name,
+                        (descriptor,),
+                        offsets,
+                        target[0].view(-1, dimension),
+                        target[1].view(-1, dimension),
+                    )
+                    cursor = hi
+                if cursor < end:
+                    native_ranges.append((cursor, end))
+                for lo, hi in native_ranges:
+                    blocks, offsets = self._native_rows(
+                        keys, metadata.block_table_tensor, lo, hi
+                    )
+                    target[0, :, lo:hi].copy_(
+                        keys[blocks, offsets].transpose(0, 1).cpu()
+                    )
+                    target[1, :, lo:hi].copy_(
+                        values[blocks, offsets].transpose(0, 1).cpu()
+                    )
+
     def _stage_cpu(self, storage, metadata, start: int, end: int, background: bool):
         if end <= start:
             return
