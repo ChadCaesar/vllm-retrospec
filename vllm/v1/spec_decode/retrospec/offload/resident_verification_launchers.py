@@ -7,6 +7,7 @@ from vllm.triton_utils import triton
 
 from .resident_verification_kernel_impl import (
     _map_compact_verification_miss_indices_kernel,
+    _reset_compact_verification_pages_kernel,
     _reset_verification_miss_hash_kernel,
     _resolve_compact_verification_pages_vector_kernel,
     _scatter_compact_staging_page_ids_kernel,
@@ -177,6 +178,22 @@ def resolve_compact_verification_pages(
         output_miss_counts.zero_()
         return
 
+    # Clearing is independent of cluster resolution and uses a small fixed tile.
+    # The resolver only overwrites the compact prefix, so tails must still reset.
+    _reset_compact_verification_pages_kernel[
+        (triton.cdiv(output_resident_page_ids.numel(), reset_block_size),)
+    ](
+        output_resident_page_ids,
+        output_staging_page_ids,
+        output_page_token_counts,
+        output_resident_page_ids.numel(),
+        BLOCK_SIZE=reset_block_size,
+    )
+
+    # Bound the cluster/page product while retaining parallelism for short
+    # page lists. Only these power-of-two tile sizes specialize the resolver.
+    block_pages = triton.next_power_of_2(max_pages)
+    block_clusters = max(1, min(64, 4096 // block_pages))
     _resolve_compact_verification_pages_vector_kernel[(num_queries * num_kv_heads,)](
         selected_cluster_indices,
         plan_valid_rows,
@@ -226,9 +243,8 @@ def resolve_compact_verification_pages(
         ARENA_PAGE_CAPACITY=arena_page_ids.shape[1],
         TABLE_CAPACITY=table_handles.numel(),
         MISS_TABLE_CAPACITY=miss_table_capacity,
-        BLOCK_CLUSTERS=triton.next_power_of_2(num_clusters),
-        BLOCK_PAGES=triton.next_power_of_2(max_pages),
-        BLOCK_OUTPUT_PAGES=triton.next_power_of_2(page_capacity),
+        BLOCK_CLUSTERS=block_clusters,
+        BLOCK_PAGES=block_pages,
     )
 
     mapping_block_size = 256
