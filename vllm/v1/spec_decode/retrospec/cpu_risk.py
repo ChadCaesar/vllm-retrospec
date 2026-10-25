@@ -7,6 +7,9 @@ from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
 
+import torch
+import torch.distributed as dist
+
 from .cpu_coordinator import RetroSpecCPUCoordinator
 
 
@@ -15,6 +18,21 @@ class RiskTask:
     index: int
     token: int
     queued_at: float
+
+
+@dataclass
+class _RiskPreparation:
+    task: RiskTask
+    session: int
+    epoch: int
+    start: int
+    position: int
+    initial: bool
+    started: float
+    kv: object
+    valid_length: int
+    obsolete: bool = False
+    completed: bool = False
 
 
 class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
@@ -28,6 +46,7 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
         self.mirror_length = 0
         self.alert = False
         self.ready = False
+        self.preparing = None
 
     @property
     def stats(self):
@@ -58,6 +77,8 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
 
     def invalidate_kv(self, start):
         self.mirror_length = min(self.mirror_length, start)
+        if self.preparing is not None and self.preparing.position > start:
+            self._invalidate_preparation(start)
         if self.active is not None and self.base + self.active[0].index > start:
             # Retain the head task for retry if its candidate prefix survives.
             self._cancel_active()
@@ -77,6 +98,8 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
             )
             if self.active is not None and self.active[0].index >= common:
                 self._cancel_active()
+            if self.preparing is not None and self.preparing.task.index >= common:
+                self._invalidate_preparation(self.base + common)
         self.tokens = list(tokens)
 
     def draft(
@@ -144,6 +167,10 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
             self._cancel_active(completed=True)
         if self.alert or self.active is not None or self._pending_release is not None:
             return self.alert
+        if self.preparing is not None:
+            self._poll_preparation(allow_start, kv_rewrite_start)
+            if self.preparing is not None or self.active is not None:
+                return self.alert
         if self.queue and self.ready:
             task = self.queue[0]
             if not allow_start:
@@ -188,21 +215,167 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
             "cpu_risk_queue_wait", perf_counter() - task.queued_at
         )
         start = min(self.mirror_length, position)
-        with self.stats.cpu_timer("cpu_risk_kv_export"):
-            self.bridge.export_risk(
+        self.epoch += 1
+        preparation = None
+        error = None
+        try:
+            preparation = self.bridge.prepare_risk(
                 self.storage, metadata, self.request_id, start, position
             )
-            self.group.barrier()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        try:
+            self._preparation_error(error)
+        except BaseException:
+            if preparation is not None:
+                preparation.cancel()
+            raise
+        self.preparing = _RiskPreparation(
+            task,
+            self.session,
+            self.epoch,
+            start,
+            position,
+            initial,
+            started,
+            preparation,
+            position,
+        )
         self.stats.record_cpu_time(
-            "cpu_risk_initial_prepare" if initial else "cpu_risk_delta_prepare",
+            "cpu_risk_prepare_submit_wall",
             perf_counter() - started,
         )
-        self.stats.add_counter("cpu_risk_kv_refresh_tokens", position - start)
+        self.stats.add_counter("cpu_risk_prepare_submitted")
+
+    def _preparation_error(self, error):
+        """Coordinate local capture failures; no collectives run in workers."""
+        failed = torch.tensor([int(error is not None)], dtype=torch.int32)
+        if self.group.world_size > 1:
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=self.group.cpu_group)
+        if failed.item():
+            errors = [error]
+            if self.group.world_size > 1:
+                errors = [None] * self.group.world_size
+                dist.all_gather_object(errors, error, group=self.group.cpu_group)
+            raise RuntimeError(
+                "CPU KV preparation failed: " + next(e for e in errors if e)
+            )
+
+    def _cancel_preparation(self):
+        preparation = self.preparing
+        if preparation is not None and not preparation.kv.cancelled.is_set():
+            preparation.kv.cancel()
+            self.stats.add_counter("cpu_risk_prepare_cancelled")
+
+    def _invalidate_preparation(self, start):
+        preparation = self.preparing
+        preparation.valid_length = min(preparation.valid_length, start)
+        preparation.obsolete = True
+        preparation.kv.fence_sources()
+        # Finish the stable historical prefix rather than repeatedly restart a
+        # long initial gather at every sparse boundary. No CPU reader or new
+        # writer is admitted until this future ends; only the tail is retried.
+        self.stats.add_counter("cpu_risk_prepare_tail_invalidated")
+
+    def _poll_preparation(self, allow_start, kv_rewrite_start):
+        preparation = self.preparing
+        kv = preparation.kv
+        done = kv.future.done()
+        error = None
+        if done:
+            try:
+                kv.future.result()
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+        snapshot_valid = kv.valid()
+        if not snapshot_valid:
+            self.mirror_length = 0
+        valid = (
+            not kv.cancelled.is_set()
+            and preparation.session == self.session
+            and preparation.epoch == self.epoch
+            and snapshot_valid
+        )
+        obsolete = (
+            preparation.obsolete
+            or not self.queue
+            or self.queue[0] is not preparation.task
+        )
+        # Poll all ranks, rather than wait at an export barrier. A ready rank
+        # cannot expose the shared buffer until every writer has completed.
+        status = torch.tensor(
+            [
+                not done,
+                error is not None,
+                not valid,
+                obsolete,
+                not snapshot_valid,
+                -preparation.valid_length,
+            ],
+            dtype=torch.int64,
+        )
+        with self.stats.cpu_timer("cpu_risk_prepare_poll_wall"):
+            if self.group.world_size > 1:
+                dist.all_reduce(
+                    status, op=dist.ReduceOp.MAX, group=self.group.cpu_group
+                )
+        pending, failed, invalid, obsolete, version_changed, negative_length = (
+            status.tolist()
+        )
+        if version_changed:
+            self.mirror_length = 0
+        if failed:
+            self._cancel_preparation()
+            self._preparation_error(error)
+        if invalid:
+            self._cancel_preparation()
+        if pending:
+            return
+        if obsolete:
+            # All ranks finished writing a snapshot whose immutable prefix is
+            # still useful. Refresh only the invalidated suffix on the retry.
+            self.mirror_length = -negative_length
+            if not preparation.completed:
+                self.stats.add_counter(
+                    "cpu_risk_kv_refresh_tokens",
+                    max(0, self.mirror_length - preparation.start),
+                )
+                self.stats.record_cpu_time(
+                    "cpu_risk_initial_prepare"
+                    if preparation.initial
+                    else "cpu_risk_delta_prepare",
+                    perf_counter() - preparation.started,
+                )
+            self.preparing = None
+            self.stats.add_counter("cpu_risk_prepare_prefix_reused")
+            return
+        if invalid:
+            self.preparing = None
+            self.stats.add_counter("cpu_risk_prepare_discarded")
+            return
+        if not preparation.completed:
+            preparation.completed = True
+            self.mirror_length = preparation.position
+            self.stats.add_counter("cpu_risk_prepare_ready")
+            self.stats.add_counter(
+                "cpu_risk_kv_refresh_tokens", preparation.position - preparation.start
+            )
+            self.stats.record_cpu_time(
+                "cpu_risk_initial_prepare"
+                if preparation.initial
+                else "cpu_risk_delta_prepare",
+                perf_counter() - preparation.started,
+            )
+        if not allow_start or (
+            kv_rewrite_start is not None and preparation.position > kv_rewrite_start
+        ):
+            return
+        self.preparing = None
         # The worker writes the input row at position. It is outside this
         # exclusive valid prefix and will be restored before a later query.
-        self.mirror_length = position
-        self.epoch += 1
-        self.active = (task, self.session, self.epoch)
+        task = preparation.task
+        position = preparation.position
+        self.active = (task, preparation.session, preparation.epoch)
         token = self.seed if task.index == 0 else self.tokens[task.index - 1]
         if self.worker is not None:
             self.worker.send(
@@ -222,6 +395,14 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
         self.stats.add_counter("cpu_risk_full_covered", len(self.queue))
         self.queue.clear()
         self._cancel_active()
+        self._cancel_preparation()
+
+    def close(self):
+        self._cancel_preparation()
+        try:
+            super().close()
+        finally:
+            self.preparing = None
 
     def release(self):
         self.finish_round()

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from threading import RLock
+
 import torch
 
 from vllm import _custom_ops as ops
@@ -12,6 +14,27 @@ from .cluster_store_support import (
     _CPUPageSlab,
     _FullVerificationSourceSnapshot,
 )
+
+
+class _FullVerificationPageLease:
+    """Prevent retired pages from being recycled while a snapshot is read."""
+
+    def __init__(self, pool, source):
+        self._pool = pool
+        self.source = source
+
+    def release(self):
+        pool = self._pool
+        if pool is None:
+            return
+        with pool._allocation_lock:
+            if self._pool is None:
+                return
+            self._pool = None
+            pool._snapshot_readers -= 1
+            if not pool._snapshot_readers:
+                pool._return_pages(pool._retired_page_ids)
+                pool._retired_page_ids.clear()
 
 
 class _LayerClusterPagePool:
@@ -61,6 +84,9 @@ class _LayerClusterPagePool:
         # request release are control-plane operations.
         self._free_page_ids: list[int] = []
         self._allocated_page_ids: set[int] = set()
+        self._allocation_lock = RLock()
+        self._snapshot_readers = 0
+        self._retired_page_ids: set[int] = set()
 
     @classmethod
     def encode_page_id(cls, slab_id: int, page_offset: int) -> int:
@@ -133,6 +159,15 @@ class _LayerClusterPagePool:
             value_slabs=tuple(slab.value_pages for slab in self._slabs),
         )
 
+    def lease_full_verification_sources(self) -> _FullVerificationPageLease:
+        # A bounded background reader pins the pool's current pages as a group.
+        # New allocations remain available; frees retire ownership immediately
+        # but delay reuse and slab trimming until the last reader exits.
+        with self._allocation_lock:
+            source = self.snapshot_full_verification_sources()
+            self._snapshot_readers += 1
+            return _FullVerificationPageLease(self, source)
+
     def build_cluster_pages(
         self,
         allocated_page_ids: torch.Tensor,
@@ -167,6 +202,10 @@ class _LayerClusterPagePool:
         return page_ids, page_token_counts, descriptor
 
     def allocate(self, num_pages: int) -> torch.Tensor:
+        with self._allocation_lock:
+            return self._allocate(num_pages)
+
+    def _allocate(self, num_pages: int) -> torch.Tensor:
         if num_pages < 0:
             raise ValueError("num_pages must be non-negative")
         if num_pages == 0:
@@ -199,6 +238,10 @@ class _LayerClusterPagePool:
         )
 
     def free(self, page_ids: torch.Tensor) -> None:
+        with self._allocation_lock:
+            self._free(page_ids)
+
+    def _free(self, page_ids: torch.Tensor) -> None:
         if page_ids.numel() == 0:
             return
 
@@ -214,9 +257,16 @@ class _LayerClusterPagePool:
             if page_id not in self._allocated_page_ids:
                 raise RuntimeError(f"RetroSpec cluster page {page_id} is not allocated")
 
-        for page_id in sorted(unique_page_ids, reverse=True):
-            slab_id, _ = self.decode_page_id(page_id)
+        for page_id in unique_page_ids:
             self._allocated_page_ids.remove(page_id)
+        if self._snapshot_readers:
+            self._retired_page_ids.update(unique_page_ids)
+        else:
+            self._return_pages(unique_page_ids)
+
+    def _return_pages(self, page_ids) -> None:
+        for page_id in sorted(page_ids, reverse=True):
+            slab_id, _ = self.decode_page_id(page_id)
             self._slab_allocated_page_counts[slab_id] -= 1
             self._free_page_ids.append(page_id)
 

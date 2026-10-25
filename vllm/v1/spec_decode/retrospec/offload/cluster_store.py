@@ -1325,6 +1325,16 @@ class RetroSpecClusterPageStore(
             self.full_verify_gather_workers,
         )
 
+    def lease_full_verification_sources(self, layer_name: str):
+        """Capture CPU slabs and fence page reuse without holding a gather lock."""
+        with self._resident_state_lock:
+            pool = self._layer_pools.get(layer_name)
+            if pool is None:
+                raise RuntimeError(
+                    f"No RetroSpec page pool exists for layer {layer_name!r}"
+                )
+            return pool.lease_full_verification_sources()
+
     def gather_pages(
         self,
         layer_name: str,

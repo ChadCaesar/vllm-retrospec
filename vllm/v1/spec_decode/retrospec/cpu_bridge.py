@@ -16,6 +16,7 @@ class RetroSpecCPUKVBridge:
         self.upload_stream = torch.cuda.Stream(device=proposer.device)
         self.export_placement = RetroSpecHostPlacement()
         self.upload_placement = RetroSpecHostPlacement()
+        self._risk_preparer = None
 
     def _head_slice(self, layer, tensor):
         from vllm.distributed import get_tp_group
@@ -177,6 +178,13 @@ class RetroSpecCPUKVBridge:
                         values[blocks, offsets].transpose(0, 1).cpu()
                     )
 
+    def prepare_risk(self, storage, metadata, request_id: str, start: int, end: int):
+        from .cpu_prepare import RetroSpecCPUKVPreparer
+
+        if self._risk_preparer is None:
+            self._risk_preparer = RetroSpecCPUKVPreparer(self)
+        return self._risk_preparer.submit(storage, metadata, request_id, start, end)
+
     def _stage_cpu(self, storage, metadata, start: int, end: int, background: bool):
         if end <= start:
             return
@@ -216,5 +224,8 @@ class RetroSpecCPUKVBridge:
         self.pending_uploads = remaining
 
     def close(self):
+        if self._risk_preparer is not None:
+            self._risk_preparer.close()
+            self._risk_preparer = None
         self.publish(wait=True)
         torch.cuda.current_stream(self.proposer.device).synchronize()
