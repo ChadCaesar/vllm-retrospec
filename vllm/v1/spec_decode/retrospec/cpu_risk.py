@@ -79,7 +79,16 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
                 self._cancel_active()
         self.tokens = list(tokens)
 
-    def draft(self, index, token, margin, metadata):
+    def draft(
+        self,
+        index,
+        token,
+        margin,
+        metadata,
+        *,
+        allow_start=True,
+        kv_rewrite_start=None,
+    ):
         if index != len(self.tokens):
             raise RuntimeError("CPU risk candidate positions are not contiguous")
         self.tokens.append(token)
@@ -90,9 +99,11 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
             self.queue.append(RiskTask(index, token, perf_counter()))
             self.stats.add_counter("cpu_risk_enqueued")
             self.stats.observe_peak("cpu_risk_queue_depth", len(self.queue))
-        return self.pump(metadata)
+        return self.pump(
+            metadata, allow_start=allow_start, kv_rewrite_start=kv_rewrite_start
+        )
 
-    def pump(self, metadata):
+    def pump(self, metadata, *, allow_start=True, kv_rewrite_start=None):
         payload = None
         if self.worker is not None:
             try:
@@ -134,7 +145,18 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
         if self.alert or self.active is not None or self._pending_release is not None:
             return self.alert
         if self.queue and self.ready:
-            self._start(self.queue[0], metadata)
+            task = self.queue[0]
+            if not allow_start:
+                self.stats.add_counter("cpu_risk_dispatch_deferred_boundary")
+            elif (
+                kv_rewrite_start is not None
+                and self.base + task.index > kv_rewrite_start
+            ):
+                # Keep FIFO ownership. Older checks whose past ends at or
+                # before the rewrite can still overlap this sparse verify.
+                self.stats.add_counter("cpu_risk_dispatch_deferred_kv")
+            else:
+                self._start(task, metadata)
         elif self.queue and not self.ready:
             self.stats.add_counter("cpu_risk_not_ready_polls")
         return self.alert

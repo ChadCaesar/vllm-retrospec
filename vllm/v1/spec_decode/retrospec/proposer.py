@@ -24,7 +24,7 @@ from vllm.v1.spec_decode.utils import (
 from vllm.v1.utils import CpuGpuBuffer
 
 from .attention import RetroSpecSparseAttention
-from .decision import RetroSpecDecisionPolicy, RetroSpecMetrics
+from .decision import RetroSpecDecisionPolicy, RetroSpecMetrics, RetroSpecReason
 from .pipeline import (
     RetroSpecPipelineControlState,
     RetroSpecPipelineProtocol,
@@ -818,6 +818,11 @@ class RetroSpecProposer(
                 int(self.proposal_start_positions[0].item()),
                 int(self.proposal_input_ids[0].item()),
             )
+            risk_full_reasons = int(
+                RetroSpecReason.PENDING_LIMIT
+                | RetroSpecReason.GENERATION_LIMIT
+                | RetroSpecReason.INDEX_UPDATE
+            )
         with self.sparse_attention.proposal_context(request_ids, committed_positions):
             while True:
                 proposal_round += 1
@@ -831,6 +836,17 @@ class RetroSpecProposer(
                 )
                 if token_index >= self.num_speculative_tokens:
                     break
+                if risk is not None:
+                    risk_round_start = token_index
+                    risk_hard_boundary = False
+                    # The next draft round is runnable. Resume deferred FIFO
+                    # work here, after sparse corrections/full decisions.
+                    if risk.pump(common_attn_metadata):
+                        self.performance_stats.add_counter("cpu_risk_early_full")
+                        self.state.set_stage(
+                            self.state.active_mask, RetroSpecStage.FULL_VERIFY
+                        )
+                        break
                 if self.sparse_attention.selection_provenance_enabled:
                     self.sparse_attention.set_proposal_round(proposal_round)
 
@@ -924,13 +940,23 @@ class RetroSpecProposer(
                                 (
                                     sampled_token_ids[0].float(),
                                     draft_margin[0],
+                                    draft_to_sparse[0],
+                                    decision.reasons[0] & risk_full_reasons,
                                 )
                             )
                             .cpu()
                             .tolist()
                         )
+                        risk_hard_boundary = bool(values[3])
                         if risk.draft(
-                            token_index, int(values[0]), values[1], common_attn_metadata
+                            token_index,
+                            int(values[0]),
+                            values[1],
+                            common_attn_metadata,
+                            allow_start=not risk_hard_boundary,
+                            kv_rewrite_start=(
+                                risk.base + risk_round_start if values[2] else None
+                            ),
                         ):
                             self.state.set_pending_counts(projected_pending_counts)
                             self.state.set_stage(
@@ -958,7 +984,11 @@ class RetroSpecProposer(
                     )
 
                 if risk is not None:
-                    if risk.pump(common_attn_metadata):
+                    if risk.pump(
+                        common_attn_metadata,
+                        allow_start=not risk_hard_boundary,
+                        kv_rewrite_start=risk.base + risk_round_start,
+                    ):
                         self.performance_stats.add_counter("cpu_risk_early_full")
                         self.state.set_pending_counts(
                             round_start_counts + self.state.draft_counts
@@ -993,7 +1023,9 @@ class RetroSpecProposer(
                     risk.update_candidates(
                         self._draft_token_ids[0, :count].cpu().tolist()
                     )
-                    if risk.pump(common_attn_metadata):
+                    # Poll results now, but dispatch only after the next
+                    # runnable draft round proves full will not take over.
+                    if risk.pump(common_attn_metadata, allow_start=False):
                         self.performance_stats.add_counter("cpu_risk_early_full")
                         self.state.set_stage(
                             self.state.active_mask, RetroSpecStage.FULL_VERIFY

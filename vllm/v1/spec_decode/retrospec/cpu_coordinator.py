@@ -92,6 +92,9 @@ class RetroSpecCPUCoordinator:
                 reused = storage is not None and storage.can_reuse(shape)
                 if not reused:
                     if storage is not None:
+                        # A retained worker mapping would otherwise keep the
+                        # old RAM backing alive during the new pool's export.
+                        self.worker.discard_mappings(self.session, self.epoch)
                         storage.close()
                         self._pooled_storage = None
                     storage = RetroSpecCPUStorage(shape)

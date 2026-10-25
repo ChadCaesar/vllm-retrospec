@@ -39,6 +39,41 @@ def map_cpu_kv(path: str, shape: tuple[int, ...]) -> torch.Tensor:
     ).view(shape)
 
 
+class _CPUWorkerMappings:
+    """Keep one KV/journal pair mapped while released sessions are idle."""
+
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        self.kv = self.journal = None
+        self._kv_key = self._journal_key = None
+
+    @staticmethod
+    def _key(path, shape):
+        # Follow memfd symlinks: a pathname or producer fd can be reused for a
+        # different backing. Layout changes also require fresh tensor views.
+        stat = os.stat(path)
+        return stat.st_dev, stat.st_ino, stat.st_size, tuple(shape)
+
+    def attach(self, paths, shape, *, with_journal):
+        key = self._key(paths[0], shape)
+        if key != self._kv_key:
+            # Drop the old pair before mapping another backing to stay bounded.
+            self.clear()
+            self.kv = map_cpu_kv(paths[0], shape)
+            self._kv_key = key
+        if with_journal:
+            key = self._key(paths[1], shape)
+            if key != self._journal_key:
+                self.journal = None
+                self.journal = map_cpu_kv(paths[1], shape)
+                self._journal_key = key
+        else:
+            self.journal = self._journal_key = None
+        return self.kv, self.journal
+
+
 def _cpu_target_main(
     connection,
     model_path: str,
@@ -84,6 +119,7 @@ def _cpu_target_main(
         if any(parameter.device.type != "cpu" for parameter in model.parameters()):
             raise RuntimeError("CPU verifier loaded a parameter on a non-CPU device")
         connection.send(("ready",))
+        mappings = _CPUWorkerMappings()
         cache = storage = journal = output = None
         session = epoch = 0
         token = position = limit = 0
@@ -119,18 +155,23 @@ def _cpu_target_main(
                         connection.send(("paused", session, epoch))
                         continue
                     if operation == "release":
-                        _, session, epoch = command
+                        _, session, epoch = command[:3]
                         running = False
                         # All CPU kernels are synchronous. Reaching this point
                         # after a layer-boundary interruption fences every old
                         # KV access, including partially written token rows.
                         cache = storage = journal = output = None
+                        # Retaining an idle mapping does not access its pages.
+                        # The producer still needs this ACK before overwriting.
+                        if len(command) > 3 and command[3]:
+                            mappings.clear()
                         connection.send(("released", session, epoch))
                         continue
                     if operation == "check":
                         _, session, epoch, paths, shape, position, token = command
-                        storage = map_cpu_kv(paths[0], shape)
-                        journal = None
+                        storage, journal = mappings.attach(
+                            paths, shape, with_journal=False
+                        )
                         cache = attach_cache(model.config, storage, position)
                         limit = position + 1
                         eos_ids = set()
@@ -138,8 +179,9 @@ def _cpu_target_main(
                         _, session, epoch, paths, shape, position, token, limit, eos = (
                             command
                         )
-                        storage = map_cpu_kv(paths[0], shape)
-                        journal = map_cpu_kv(paths[1], shape)
+                        storage, journal = mappings.attach(
+                            paths, shape, with_journal=True
+                        )
                         cache = attach_cache(model.config, storage, position)
                         eos_ids = set(eos)
                     elif operation == "resume":
@@ -367,6 +409,11 @@ class RetroSpecCPUWorker:
                     f"session={session}, epoch={epoch}"
                 )
             self.connection.poll(min(0.1, remaining))
+
+    def discard_mappings(self, session: int, epoch: int):
+        """Release cached mappings before the producer replaces a KV pool."""
+        self.send(("release", session, epoch, True))
+        self.wait_for_release(session, epoch)
 
     def request_close(self):
         if self.closed or self.close_requested:
