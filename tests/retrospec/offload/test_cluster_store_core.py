@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -443,6 +443,34 @@ def test_cluster_store_reuses_block_metadata_when_freeing(monkeypatch):
     metadata_lookup.assert_not_called()
     assert store.num_allocated_pages("layer") == 0
     assert store.num_allocated_clusters("layer") == 0
+
+
+def test_free_waits_for_admission_readers_before_recycling_ids(monkeypatch):
+    store = RetroSpecClusterPageStore(page_size=2)
+    table = store_cluster_data(store, "layer", *make_cluster_data())
+    reader = Future()
+    store._verification_admission_futures.append(reader)
+    wait_started = threading.Event()
+    original_wait = store.wait_for_verification_admissions
+
+    def wait_for_reader():
+        wait_started.set()
+        original_wait()
+
+    monkeypatch.setattr(store, "wait_for_verification_admissions", wait_for_reader)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        freeing = workers.submit(store.free, "layer", table)
+        try:
+            assert wait_started.wait(timeout=5)
+            assert not freeing.done()
+            assert store.num_allocated_pages("layer") > 0
+            assert store.num_allocated_clusters("layer") > 0
+        finally:
+            reader.set_result(None)
+        freeing.result(timeout=5)
+    assert store.num_allocated_pages("layer") == 0
+    assert store.num_allocated_clusters("layer") == 0
+    store.close()
 
 
 def test_cluster_store_uses_gpu_generated_offsets_without_sorting_tokens():

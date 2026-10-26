@@ -1272,9 +1272,13 @@ class RetroSpecClusterPrefetchMixin:
             raise RuntimeError("Resident replay is already active")
 
         self.synchronize_resident_prefetches(layer_names)
-        self._resident_admission_frozen = True
+        with self._resident_state_lock:
+            if self._resident_admission_frozen:
+                raise RuntimeError("Resident replay is already active")
+            self._resident_admission_frozen = True
 
     def end_resident_replay(self) -> None:
-        if not self._resident_admission_frozen:
-            raise RuntimeError("Resident replay is not active")
-        self._resident_admission_frozen = False
+        with self._resident_state_lock:
+            if not self._resident_admission_frozen:
+                raise RuntimeError("Resident replay is not active")
+            self._resident_admission_frozen = False

@@ -4,7 +4,9 @@
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+# Sequence lengths change on every proposal. Keep exact boundaries at runtime;
+# only tile sizes and model layouts need separate compiled attention kernels.
+@triton.jit(do_not_specialize=["MAX_PRIMARY_TOKENS", "MAX_PAGE_SLOTS"])
 def _multi_source_exact_partition_kernel(
     query,
     request_indices,
@@ -61,8 +63,8 @@ def _multi_source_exact_partition_kernel(
     source_partition_offset,
     NUM_KV_HEADS: tl.constexpr,
     QUERIES_PER_KV_HEAD: tl.constexpr,
-    MAX_PRIMARY_TOKENS: tl.constexpr,
-    MAX_PAGE_SLOTS: tl.constexpr,
+    MAX_PRIMARY_TOKENS,
+    MAX_PAGE_SLOTS,
     PAGE_SIZE: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -266,7 +268,7 @@ def _multi_source_exact_partition_kernel(
     tl.store(partial_sum + stats_offset, running_sum)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_PRIMARY_TOKENS"])
 def _ranked_draft_attention_partition_kernel(
     query,
     key_cache,
@@ -322,7 +324,7 @@ def _ranked_draft_attention_partition_kernel(
     source_partition_offset,
     NUM_KV_HEADS: tl.constexpr,
     QUERIES_PER_KV_HEAD: tl.constexpr,
-    MAX_PRIMARY_TOKENS: tl.constexpr,
+    MAX_PRIMARY_TOKENS,
     RETRIEVAL_WIDTH: tl.constexpr,
     ESTIMATION_WIDTH: tl.constexpr,
     MAX_PAGES: tl.constexpr,
@@ -977,7 +979,7 @@ def _reduce_proposal_partitions_kernel(
     tl.store(output + output_offsets, normalized_output, mask=dimension_mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_CLUSTER_TOKENS"])
 def _parallel_cluster_prefix_kernel(
     query,
     query_start_loc,
@@ -1007,7 +1009,7 @@ def _parallel_cluster_prefix_kernel(
     scale,
     NUM_KV_HEADS: tl.constexpr,
     QUERIES_PER_KV_HEAD: tl.constexpr,
-    MAX_CLUSTER_TOKENS: tl.constexpr,
+    MAX_CLUSTER_TOKENS,
     HEAD_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -1111,7 +1113,7 @@ def _parallel_cluster_prefix_kernel(
     tl.store(partial_sum + stats_offsets, running_sum, mask=query_valid)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_PRIMARY_TOKENS", "MAX_QUERY_LEN"])
 def _parallel_native_suffix_kernel(
     query,
     local_keys,
@@ -1154,8 +1156,8 @@ def _parallel_native_suffix_kernel(
     scale,
     NUM_KV_HEADS: tl.constexpr,
     QUERIES_PER_KV_HEAD: tl.constexpr,
-    MAX_PRIMARY_TOKENS: tl.constexpr,
-    MAX_QUERY_LEN: tl.constexpr,
+    MAX_PRIMARY_TOKENS,
+    MAX_QUERY_LEN,
     PAGE_SIZE: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,

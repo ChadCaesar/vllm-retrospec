@@ -1276,6 +1276,9 @@ class RetroSpecClusterPageStore(
         layer_name: str,
         block_table: RetroSpecClusterBlockTable,
     ) -> None:
+        # Admission descriptor preparation and epoch reads run without the
+        # state lock. Fence those readers before releasing their cluster IDs.
+        self.wait_for_verification_admissions()
         self.wait_for_resident_prefetches((layer_name,))
 
         with self._resident_state_lock:
@@ -1561,29 +1564,78 @@ class RetroSpecClusterPageStore(
             return
 
         with self._resident_state_lock:
+            if self._resident_admission_frozen:
+                return
             pool, resident_cache = self._get_or_create_resident_cache(
                 admission.layer_name
             )
             cluster_groups = self._get_cluster_groups(
                 admission.layer_name, admission.cluster_ids_cpu
             )
-            with resident_cache.mutation_guard():
-                resident_cache.admit_staged(
-                    cluster_ids=admission.cluster_ids_cpu,
-                    page_ids=admission.logical_page_ids_cpu,
-                    cluster_groups=cluster_groups,
-                    allocated_cluster_ids=self._get_allocated_cluster_ids(
-                        admission.layer_name
-                    ),
-                    allocated_page_ids=pool.allocated_page_ids,
-                    staging_page_ids=admission.staging_page_ids_cpu,
-                    staging_key_pages=admission.staging_key_pages,
-                    staging_value_pages=admission.staging_value_pages,
-                    cluster_ids_cpu=admission.cluster_ids_cpu,
-                    page_ids_cpu=admission.logical_page_ids_cpu,
-                    reuse_ready_event=admission.staging_ready_event,
-                    lookup_after_admit=False,
-                )
+
+        stats = self.performance_stats
+        measure = stats is not None and stats.enabled
+        started = perf_counter() if measure else 0.0
+        # These descriptors and staged pages belong to the admission ticket.
+        # Parsing them does not access resident ownership or GPU slots.
+        prepared = resident_cache.prepare_staged_admission(
+            cluster_ids=admission.cluster_ids_cpu,
+            page_ids=admission.logical_page_ids_cpu,
+            cluster_groups=cluster_groups,
+            staging_page_ids=admission.staging_page_ids_cpu,
+            staging_key_pages=admission.staging_key_pages,
+            staging_value_pages=admission.staging_value_pages,
+            cluster_ids_cpu=admission.cluster_ids_cpu,
+            page_ids_cpu=admission.logical_page_ids_cpu,
+        )
+        if measure:
+            stats.record_cpu_time(
+                "verification_resident_prepare_wall", perf_counter() - started
+            )
+
+        stream = torch.cuda.current_stream(pool.metadata_device)
+        with self._resident_state_lock, resident_cache.mutation_guard():
+            if self._resident_admission_frozen:
+                return
+            capture = resident_cache.capture_prepared_admission_lru(
+                prepared=prepared,
+                allocated_cluster_ids=self._get_allocated_cluster_ids(
+                    admission.layer_name
+                ),
+                allocated_page_ids=pool.allocated_page_ids,
+                stream=stream,
+            )
+
+        started = perf_counter() if measure else 0.0
+        # A GPU epoch read can wait for outstanding kernels. Keep both resident
+        # locks available while waiting; the revision is checked at commit.
+        resolved_lru = (
+            None if capture is None else resident_cache.resolve_lru_capture(capture)
+        )
+        if measure:
+            stats.record_cpu_time(
+                "verification_resident_lru_resolve_wall", perf_counter() - started
+            )
+
+        started = perf_counter() if measure else 0.0
+        with self._resident_state_lock, resident_cache.mutation_guard():
+            if self._resident_admission_frozen:
+                return
+            resident_cache.admit_prepared_staged(
+                prepared=prepared,
+                allocated_cluster_ids=self._get_allocated_cluster_ids(
+                    admission.layer_name
+                ),
+                allocated_page_ids=pool.allocated_page_ids,
+                reuse_ready_event=admission.staging_ready_event,
+                mutation_stream=stream,
+                lookup_after_admit=False,
+                resolved_lru=resolved_lru,
+            )
+        if measure:
+            stats.record_cpu_time(
+                "verification_resident_commit_wall", perf_counter() - started
+            )
 
     def submit_verification_miss_admission(
         self,

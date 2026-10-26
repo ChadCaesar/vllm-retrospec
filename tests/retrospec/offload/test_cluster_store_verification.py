@@ -29,7 +29,10 @@ from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
     not torch.cuda.is_available(),
     reason="CUDA is required for GPU-native verification resolution",
 )
-def test_gpu_verification_resolution_deduplicates_miss_pages_before_h2d():
+@pytest.mark.parametrize("freeze_phase", [None, "prepare", "resolve"])
+def test_gpu_verification_resolution_deduplicates_miss_pages_before_h2d(
+    monkeypatch, freeze_phase
+):
     device = torch.device("cuda", torch.cuda.current_device())
     stats = RetroSpecPerformanceStats(device=device, log_interval_seconds=60.0)
     store = RetroSpecClusterPageStore(
@@ -123,9 +126,67 @@ def test_gpu_verification_resolution_deduplicates_miss_pages_before_h2d():
         reference.read_lease.release()
     if resolved.read_lease is not None:
         resolved.read_lease.release()
+
+    cache = store._resident_caches["layer"]
+    original_prepare = cache.prepare_staged_admission
+    original_capture = cache.capture_prepared_admission_lru
+    original_resolve = cache.resolve_lru_capture
+    original_commit = cache.admit_prepared_staged
+    phases = []
+
+    def prepare_without_lookup_lock(*args, **kwargs):
+        # Simulate a draft lookup while CPU admission descriptors are parsed.
+        acquired = cache.mutation_guard().acquire(blocking=False)
+        assert acquired
+        cache.mutation_guard().release()
+        phases.append("prepare")
+        prepared = original_prepare(*args, **kwargs)
+        if freeze_phase == "prepare":
+            store.begin_resident_replay(("layer",))
+        return prepared
+
+    def capture_with_lookup_lock(*args, **kwargs):
+        assert cache.mutation_guard().locked()
+        phases.append("capture")
+        capture = original_capture(*args, **kwargs)
+        # Exercise the GPU epoch read even if this small fixture has free slots.
+        return capture or cache._capture_group_lru_from_gpu(
+            cache._group_states.keys(), kwargs["stream"]
+        )
+
+    def resolve_without_lookup_lock(capture):
+        acquired = cache.mutation_guard().acquire(blocking=False)
+        assert acquired
+        cache.mutation_guard().release()
+        assert not store._resident_state_lock._is_owned()
+        phases.append("resolve")
+        resolved = original_resolve(capture)
+        if freeze_phase == "resolve":
+            store.begin_resident_replay(("layer",))
+        return resolved
+
+    def commit_with_lookup_lock(*args, **kwargs):
+        assert cache.mutation_guard().locked()
+        phases.append("commit")
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(cache, "prepare_staged_admission", prepare_without_lookup_lock)
+    monkeypatch.setattr(
+        cache, "capture_prepared_admission_lru", capture_with_lookup_lock
+    )
+    monkeypatch.setattr(cache, "resolve_lru_capture", resolve_without_lookup_lock)
+    monkeypatch.setattr(cache, "admit_prepared_staged", commit_with_lookup_lock)
     store.admit_verification_misses(resolved.miss_admission)
+    expected_phases = ["prepare", "capture", "resolve", "commit"]
+    if freeze_phase == "prepare":
+        expected_phases = expected_phases[:1]
+    elif freeze_phase == "resolve":
+        expected_phases = expected_phases[:3]
+    assert phases == expected_phases
     store.synchronize_resident_prefetches(("layer",))
-    assert store.num_resident_pages("layer") == 3
+    assert store.num_resident_pages("layer") == (3 if freeze_phase is None else 0)
+    if freeze_phase is not None:
+        store.end_resident_replay()
     assert stats._cpu_counters["verification_unique_miss_clusters"] == 4
     assert stats._cpu_counters["verification_duplicate_miss_clusters"] == 4
     assert stats._cpu_counters["verification_miss_pages"] == 6

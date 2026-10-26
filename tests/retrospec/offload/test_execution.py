@@ -568,7 +568,10 @@ def test_fused_proposal_attention_matches_multi_source_reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_ranked_draft_attention_reads_resident_buckets_and_summary_misses(dtype):
+@pytest.mark.parametrize("primary_padding", [0, 1, 63])
+def test_ranked_draft_attention_reads_resident_buckets_and_summary_misses(
+    dtype, primary_padding
+):
     device = torch.device("cuda")
     torch.manual_seed(120)
     page_size = 4
@@ -589,6 +592,8 @@ def test_ranked_draft_attention_reads_resident_buckets_and_summary_misses(dtype)
         [[[True, False], [True, True]], [[True, True], [False, True]]],
         device=device,
     )
+    primary_indices = torch.nn.functional.pad(primary_indices, (0, primary_padding))
+    primary_mask = torch.nn.functional.pad(primary_mask, (0, primary_padding))
     cluster_keys = torch.randn(num_kv_heads, 6, head_size, dtype=dtype, device=device)
     cluster_values = torch.randn_like(cluster_keys)
     cluster_counts = torch.tensor(
@@ -1320,3 +1325,74 @@ def test_parallel_full_verification_matches_compact_causal_reference():
     merged_lse = torch.logaddexp(cluster_lse, native_lse)
     torch.testing.assert_close(output, expected, atol=4e-2, rtol=4e-2)
     torch.testing.assert_close(merged_lse, expected_lse, atol=6e-3, rtol=6e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("primary_length", "query_length"),
+    [(0, 1), (1, 17), (31, 3), (32, 33), (33, 8), (65, 17)],
+)
+def test_parallel_native_attention_preserves_exact_runtime_boundaries(
+    dtype, primary_length, query_length
+):
+    torch.manual_seed(29)
+    device = torch.device("cuda")
+    query_lengths = (query_length, max(1, query_length - 2))
+    starts = (0, query_lengths[0], sum(query_lengths))
+    query = torch.randn(starts[-1], 4, 128, device=device, dtype=dtype)
+    local_keys = torch.randn(starts[-1], 2, 128, device=device, dtype=dtype)
+    local_values = torch.randn_like(local_keys)
+    key_cache = torch.randn(8, 16, 2, 128, device=device, dtype=dtype)
+    value_cache = torch.randn_like(key_cache)
+    indices = torch.randint(0, 128, (2, 2, primary_length), device=device)
+    mask = torch.rand(2, 2, primary_length, device=device) > 0.3
+    source = RetroSpecFullVerificationKVSource(
+        primary=RetroSpecExactPrimaryKVSource(
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=torch.arange(8, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(2, -1),
+            token_indices=indices,
+            token_mask=mask,
+        )
+    )
+    workspace = RetroSpecExactAttentionWorkspace(16, starts[-1], 8)
+    _, _, output, lse = workspace.run_parallel_full_verification(
+        source,
+        query,
+        local_keys,
+        local_values,
+        0.125,
+        torch.tensor(starts, device=device, dtype=torch.int32),
+        query_length,
+    )
+    expected = torch.empty_like(output)
+    expected_lse = torch.empty_like(lse)
+    for request, length in enumerate(query_lengths):
+        lo, hi = starts[request : request + 2]
+        for head in range(4):
+            kv_head = head // 2
+            selected = indices[request, kv_head][mask[request, kv_head]]
+            keys = torch.cat(
+                (
+                    key_cache[selected // 16, selected % 16, kv_head],
+                    local_keys[lo:hi, kv_head],
+                )
+            ).float()
+            values = torch.cat(
+                (
+                    value_cache[selected // 16, selected % 16, kv_head],
+                    local_values[lo:hi, kv_head],
+                )
+            ).float()
+            scores = query[lo:hi, head].float() @ keys.T * 0.125
+            causal = torch.arange(keys.shape[0], device=device)[None, :] < (
+                selected.numel() + torch.arange(length, device=device)[:, None] + 1
+            )
+            scores.masked_fill_(~causal, -torch.inf)
+            expected[lo:hi, head] = (scores.softmax(-1) @ values).to(dtype)
+            expected_lse[head, lo:hi] = scores.logsumexp(-1)
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=3e-3)
+    torch.testing.assert_close(lse, expected_lse, rtol=1e-4, atol=1e-4)
