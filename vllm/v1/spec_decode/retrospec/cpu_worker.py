@@ -124,13 +124,21 @@ def _cpu_target_main(
         session = epoch = 0
         token = position = limit = 0
         running = False
+        predicting = False
         pending_command = None
         eos_ids: set[int] = set()
 
         def check_control(_module, _inputs):
-            nonlocal pending_command
-            if connection.poll():
-                pending_command = connection.recv()
+            nonlocal pending_command, limit
+            while connection.poll():
+                command = connection.recv()
+                # Raising the lookahead limit must not interrupt an expensive
+                # forward that is already using the same cache and input.
+                if command[0] == "extend":
+                    if predicting and command[1:3] == (session, epoch):
+                        limit = max(limit, command[3])
+                    continue
+                pending_command = command
                 raise _CPUForwardInterrupted
 
         # Stop at a decoder-layer boundary instead of reading the remaining
@@ -167,6 +175,15 @@ def _cpu_target_main(
                             mappings.clear()
                         connection.send(("released", session, epoch))
                         continue
+                    if operation == "extend":
+                        if (
+                            predicting
+                            and cache is not None
+                            and command[1:3] == (session, epoch)
+                        ):
+                            limit = max(limit, command[3])
+                            running = position < limit and token not in eos_ids
+                        continue
                     if operation == "check":
                         _, session, epoch, paths, shape, position, token = command
                         storage, journal = mappings.attach(
@@ -175,15 +192,17 @@ def _cpu_target_main(
                         cache = attach_cache(model.config, storage, position)
                         limit = position + 1
                         eos_ids = set()
-                    elif operation == "initialize":
+                        predicting = False
+                    elif operation in ("initialize", "predict"):
                         _, session, epoch, paths, shape, position, token, limit, eos = (
                             command
                         )
                         storage, journal = mappings.attach(
-                            paths, shape, with_journal=True
+                            paths, shape, with_journal=operation == "initialize"
                         )
                         cache = attach_cache(model.config, storage, position)
                         eos_ids = set(eos)
+                        predicting = operation == "predict"
                     elif operation == "resume":
                         _, session, epoch, start, position, token, limit = command
                         if cache is None or cache.get_seq_length() < start:
@@ -229,16 +248,18 @@ def _cpu_target_main(
                     raise RuntimeError("CPU verifier produced non-finite logits")
                 token = int(logits.argmax().item())
                 position += 1
-                connection.send(
-                    (
-                        "token",
-                        session,
-                        epoch,
-                        position,
-                        token,
-                        time.monotonic() - started,
-                    )
+                finished = time.monotonic()
+                message = (
+                    "token",
+                    session,
+                    epoch,
+                    position,
+                    token,
+                    finished - started,
                 )
+                if predicting:
+                    message += (started, finished)
+                connection.send(message)
                 running = position < limit and token not in eos_ids
     except (EOFError, ConnectionError):
         return
@@ -353,7 +374,13 @@ class RetroSpecCPUWorker:
                 elif (
                     message[0] == "token"
                     and message[1:3] == (session, epoch)
-                    and message[3] >= limit
+                    and (
+                        message[3] >= limit
+                        or (
+                            operation == "predict"
+                            and message[4] in self.prediction_stop_ids
+                        )
+                    )
                 ):
                     self.awaiting_progress = False
         if self.process.poll() is not None and not self.closed:
@@ -381,11 +408,16 @@ class RetroSpecCPUWorker:
             self.released = None
             self.last_command = ("check", command[1], command[2], command[-2] + 1)
             self.awaiting_progress = True
-        elif command[0] in ("initialize", "resume"):
+        elif command[0] in ("initialize", "resume", "predict"):
             self.released = None
             self.last_command = (command[0], command[1], command[2], command[-2])
             if command[0] == "resume":
                 self.last_command = (command[0], command[1], command[2], command[-1])
+            self.awaiting_progress = True
+            if command[0] == "predict":
+                self.prediction_stop_ids = set(command[-1])
+        elif command[0] == "extend":
+            self.last_command = ("predict", command[1], command[2], command[3])
             self.awaiting_progress = True
         elif command[0] == "pause":
             self.last_command = ("pause", None, command[1], 0)

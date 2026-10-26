@@ -334,7 +334,7 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
         if obsolete:
             # All ranks finished writing a snapshot whose immutable prefix is
             # still useful. Refresh only the invalidated suffix on the retry.
-            self.mirror_length = -negative_length
+            self.mirror_length = 0 if invalid else -negative_length
             if not preparation.completed:
                 self.stats.add_counter(
                     "cpu_risk_kv_refresh_tokens",
@@ -371,6 +371,9 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
         ):
             return
         self.preparing = None
+        self._dispatch_preparation(preparation)
+
+    def _dispatch_preparation(self, preparation):
         # The worker writes the input row at position. It is outside this
         # exclusive valid prefix and will be restored before a later query.
         task = preparation.task

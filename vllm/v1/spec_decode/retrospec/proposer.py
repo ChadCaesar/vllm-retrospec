@@ -93,6 +93,7 @@ class RetroSpecProposer(
         )
         self.cpu_coordinator = None
         self.cpu_risk_coordinator = None
+        self.cpu_shadow_coordinator = None
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_parallel_tokens = self.max_batch_size * self.num_speculative_tokens
         self.pipeline_protocol = RetroSpecPipelineProtocol(
@@ -291,6 +292,9 @@ class RetroSpecProposer(
         risk = getattr(self, "cpu_risk_coordinator", None)
         if risk is not None and risk.request_id in request_ids:
             risk.release()
+        shadow = getattr(self, "cpu_shadow_coordinator", None)
+        if shadow is not None and shadow.request_id in request_ids:
+            shadow.release()
         if (
             getattr(self, "cpu_coordinator", None) is not None
             and self.cpu_coordinator.request_id in request_ids
@@ -368,6 +372,10 @@ class RetroSpecProposer(
         if risk is not None and risk.request_id in request_ids:
             risk.finish_round()
             risk.invalidate_kv(context_lens[request_ids.index(risk.request_id)])
+        shadow = getattr(self, "cpu_shadow_coordinator", None)
+        if shadow is not None and shadow.request_id in request_ids:
+            shadow.finish_round()
+            shadow.invalidate_kv(context_lens[request_ids.index(shadow.request_id)])
         return self.sparse_attention.full_verification_context(
             request_ids,
             context_lens,
@@ -465,6 +473,8 @@ class RetroSpecProposer(
             self.cpu_coordinator.close()
         if getattr(self, "cpu_risk_coordinator", None) is not None:
             self.cpu_risk_coordinator.close()
+        if getattr(self, "cpu_shadow_coordinator", None) is not None:
+            self.cpu_shadow_coordinator.close()
         self.sparse_attention.uninstall()
         self._closed = True
 
@@ -494,7 +504,10 @@ class RetroSpecProposer(
         risk_enabled = getattr(
             self.speculative_config, "retrospec_cpu_risk_check", False
         )
-        if not (cpu_enabled or risk_enabled):
+        shadow_enabled = getattr(
+            self.speculative_config, "retrospec_cpu_shadow_check", False
+        )
+        if not (cpu_enabled or risk_enabled or shadow_enabled):
             return
         supported = (
             parallel.pipeline_parallel_size == 1
@@ -508,11 +521,15 @@ class RetroSpecProposer(
             and model_config.hf_config.model_type in ("llama", "qwen2")
             and not getattr(model_config.hf_config, "use_sliding_window", False)
         )
-        if risk_enabled and not supported:
+        if (risk_enabled or shadow_enabled) and not supported:
             raise ValueError(
-                "CPU risk checks require local TP=1/2, PP=DP=1, BF16 Llama/Qwen2"
+                "CPU risk/shadow checks require local TP=1/2, PP=DP=1, BF16 Llama/Qwen2"
             )
-        if risk_enabled:
+        if shadow_enabled:
+            from .cpu_shadow import RetroSpecCPUShadowCoordinator
+
+            self.cpu_shadow_coordinator = RetroSpecCPUShadowCoordinator(self)
+        elif risk_enabled:
             from .cpu_risk import RetroSpecCPURiskCoordinator
 
             self.cpu_risk_coordinator = RetroSpecCPURiskCoordinator(self)
@@ -807,6 +824,18 @@ class RetroSpecProposer(
             return result
 
         proposal_round = 0
+        shadow = getattr(self, "cpu_shadow_coordinator", None)
+        if shadow is not None:
+            if not self._cpu_risk_request_supported(request_ids, sampling_metadata):
+                raise ValueError(
+                    "CPU shadow checks require one unconstrained greedy request"
+                )
+            shadow.begin_round(
+                request_ids[0],
+                int(self.proposal_start_positions[0].item()),
+                int(self.proposal_input_ids[0].item()),
+                int(proposal_token_budgets[0].item()),
+            )
         risk = getattr(self, "cpu_risk_coordinator", None)
         if risk is not None:
             if not self._cpu_risk_request_supported(request_ids, sampling_metadata):
@@ -818,6 +847,7 @@ class RetroSpecProposer(
                 int(self.proposal_start_positions[0].item()),
                 int(self.proposal_input_ids[0].item()),
             )
+        if risk is not None or shadow is not None:
             risk_full_reasons = int(
                 RetroSpecReason.PENDING_LIMIT
                 | RetroSpecReason.GENERATION_LIMIT
@@ -835,6 +865,9 @@ class RetroSpecProposer(
                     round_start_counts,
                 )
                 if token_index >= self.num_speculative_tokens:
+                    break
+                if shadow is not None and shadow.pump(common_attn_metadata):
+                    self._apply_cpu_shadow_correction(shadow)
                     break
                 if risk is not None:
                     risk_round_start = token_index
@@ -934,12 +967,14 @@ class RetroSpecProposer(
 
                     self.positions[:batch_size].add_(emitted_counts)
 
-                    if risk is not None:
+                    if risk is not None or shadow is not None:
                         values = (
                             torch.stack(
                                 (
                                     sampled_token_ids[0].float(),
-                                    draft_margin[0],
+                                    draft_margin[0]
+                                    if draft_margin is not None
+                                    else draft_to_sparse[0],
                                     draft_to_sparse[0],
                                     decision.reasons[0] & risk_full_reasons,
                                 )
@@ -948,7 +983,16 @@ class RetroSpecProposer(
                             .tolist()
                         )
                         risk_hard_boundary = bool(values[3])
-                        if risk.draft(
+                        if shadow is not None:
+                            if shadow.draft(
+                                token_index,
+                                int(values[0]),
+                                values[1] if draft_margin is not None else None,
+                                common_attn_metadata,
+                                allow_start=not risk_hard_boundary,
+                            ):
+                                break
+                        elif risk.draft(
                             token_index,
                             int(values[0]),
                             values[1],
@@ -983,6 +1027,13 @@ class RetroSpecProposer(
                         round_start_counts,
                     )
 
+                if shadow is not None:
+                    if shadow.pump(common_attn_metadata, allow_start=False):
+                        self._apply_cpu_shadow_correction(shadow)
+                        break
+                    shadow.invalidate_kv(
+                        shadow.base + int(round_start_counts[0].item())
+                    )
                 if risk is not None:
                     if risk.pump(
                         common_attn_metadata,
@@ -1018,6 +1069,14 @@ class RetroSpecProposer(
                     self.state.pending_counts,
                 )
                 self.state.set_pending_counts(updated_pending_counts)
+                if shadow is not None:
+                    count = int(updated_pending_counts[0].item())
+                    shadow.update_candidates(
+                        self._draft_token_ids[0, :count].cpu().tolist()
+                    )
+                    if shadow.pump(common_attn_metadata, allow_start=False):
+                        self._apply_cpu_shadow_correction(shadow)
+                        break
                 if risk is not None:
                     count = int(updated_pending_counts[0].item())
                     risk.update_candidates(
@@ -1088,6 +1147,8 @@ class RetroSpecProposer(
 
         if risk is not None:
             risk.finish_round()
+        if shadow is not None:
+            shadow.finish_round()
         self.performance_stats.add_gpu_counter(
             "proposed_tokens",
             self.state.pending_counts,
@@ -1113,6 +1174,23 @@ class RetroSpecProposer(
         )
         self.performance_stats.maybe_log()
         return result
+
+    def _apply_cpu_shadow_correction(self, shadow):
+        # CPU can lag several sparse rounds. Set the complete pending prefix
+        # directly, never reconstruct it from the current round's draft count.
+        if shadow.correction is None:
+            raise RuntimeError("CPU shadow requested full without a correction")
+        index, token = shadow.correction
+        count = index + 1
+        if not 0 < count <= len(shadow.tokens):
+            raise RuntimeError("CPU shadow correction is outside the candidate prefix")
+        self._draft_token_ids[0, index] = token
+        self._draft_token_ids[0, count:].fill_(-1)
+        self.state.set_pending_counts(torch.full_like(self.state.pending_counts, count))
+        self.state.draft_counts.zero_()
+        self.positions[0] = self.proposal_start_positions[0] + count
+        self.state.set_stage(self.state.active_mask, RetroSpecStage.FULL_VERIFY)
+        self.performance_stats.add_counter("cpu_shadow_early_full")
 
     def _record_proposal_timing(self, request_ids, pending_counts, started_at):
         if not self.performance_stats.enabled:

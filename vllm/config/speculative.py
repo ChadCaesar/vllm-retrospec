@@ -255,6 +255,10 @@ class SpeculativeConfig:
     retrospec_cpu_risk_check: bool = False
     """Check low-margin draft positions on CPU and request GPU full verification
     on disagreement. Mutually exclusive with continuous CPU verification."""
+    retrospec_cpu_shadow_check: bool = False
+    """Predict continuously on CPU from GPU KV snapshots. Correct the first
+    disagreeing candidate and request GPU full verification. CPU predictions
+    are not committed outputs. Exclusive with the other CPU modes."""
     retrospec_cpu_risk_margin_threshold: float = Field(default=0.5, ge=0)
     """Queue draft tokens whose raw top-1/top-2 logit margin is strictly lower
     than this threshold. Independent of GPU stage-transition thresholds."""
@@ -331,6 +335,7 @@ class SpeculativeConfig:
                     self.num_speculative_tokens,
                     self.retrospec_cpu_verify,
                     self.retrospec_cpu_risk_check,
+                    self.retrospec_cpu_shadow_check,
                     self.retrospec_draft_prefetch,
                 ]
             )
@@ -723,10 +728,23 @@ class SpeculativeConfig:
             )
 
     def _validate_retrospec(self) -> None:
-        if self.retrospec_cpu_verify and self.retrospec_cpu_risk_check:
-            raise ValueError("RetroSpec CPU continuous and risk modes are exclusive")
-        if self.retrospec_cpu_risk_check and self.retrospec_cpu_kv_background_upload:
-            raise ValueError("CPU risk checks cannot upload authoritative KV")
+        if (
+            sum(
+                (
+                    self.retrospec_cpu_verify,
+                    self.retrospec_cpu_risk_check,
+                    self.retrospec_cpu_shadow_check,
+                )
+            )
+            > 1
+        ):
+            raise ValueError(
+                "RetroSpec CPU continuous, risk and shadow modes are exclusive"
+            )
+        if (
+            self.retrospec_cpu_risk_check or self.retrospec_cpu_shadow_check
+        ) and self.retrospec_cpu_kv_background_upload:
+            raise ValueError("CPU risk/shadow checks cannot upload authoritative KV")
         if self.retrospec_retrieval_ratio + self.retrospec_estimation_ratio > 1:
             raise ValueError(
                 "The sum of retrospec_retrieval_ratio and "
