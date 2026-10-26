@@ -22,6 +22,13 @@ class _LayerSnapshot:
     native: list = field(default_factory=list)
 
 
+@dataclass
+class _NativeBatch:
+    data: torch.Tensor
+    valid: torch.Tensor
+    ready: torch.cuda.Event
+
+
 class RetroSpecCPUKVPreparation:
     def __init__(self, index, request_id, captured):
         self.index = index
@@ -30,6 +37,7 @@ class RetroSpecCPUKVPreparation:
         self.revisions = []
         self.layers = []
         self.leases = []
+        self.native_batch = None
         self.cancelled = Event()
         self.future = None
 
@@ -61,6 +69,7 @@ class RetroSpecCPUKVPreparation:
 class RetroSpecCPUKVPreparer:
     # One reusable pinned window, independent of context length and layer count.
     _NATIVE_CHUNK_TOKENS = 1024
+    _NATIVE_BATCH_BYTES = 8 * 1024 * 1024
 
     def __init__(self, bridge):
         self.bridge = bridge
@@ -74,6 +83,8 @@ class RetroSpecCPUKVPreparer:
         store = bridge.proposer.sparse_attention.index.cluster_store
         self.gather_workers = store.full_verify_gather_workers
         self.pinned = None
+        self.native_pinned = None
+        self.native_valid = None
 
     def submit(self, storage, metadata, request_id, start, end):
         index = self.bridge.proposer.sparse_attention.index
@@ -156,6 +167,7 @@ class RetroSpecCPUKVPreparer:
                         values.record_stream(self.stream)
                     metadata.block_table_tensor.record_stream(self.stream)
                 captured.record(self.stream)
+                preparation.native_batch = self._batch_native(preparation)
             preparation.future = self.executor.submit(self._run, preparation)
             return preparation
         except BaseException:
@@ -164,11 +176,61 @@ class RetroSpecCPUKVPreparer:
             preparation.release_pages()
             raise
 
+    def _batch_native(self, preparation):
+        parts = []
+        elements = 0
+        for layer in preparation.layers:
+            for lo, hi, data, valid in layer.native:
+                elements += data.numel()
+                if (
+                    hi - lo > self._NATIVE_CHUNK_TOKENS
+                    or elements * data.element_size() > self._NATIVE_BATCH_BYTES
+                ):
+                    return None
+                parts.append((layer, lo, hi, data, valid))
+        if not parts:
+            return None
+        # The private GPU snapshots have already fenced their native sources.
+        # Queue the small tails together on the independent stream, so the
+        # background gather need not enter CUDA or synchronize once per layer
+        # while the launch thread is submitting draft kernels.
+        with self.bridge.upload_placement.bind():
+            if self.native_pinned is None or self.native_pinned.numel() < elements:
+                self.native_pinned = torch.empty(
+                    elements, dtype=parts[0][3].dtype, device="cpu", pin_memory=True
+                )
+            if self.native_valid is None or self.native_valid.numel() < len(parts):
+                self.native_valid = torch.empty(
+                    len(parts), dtype=torch.bool, device="cpu", pin_memory=True
+                )
+        data = self.native_pinned[:elements]
+        valid = self.native_valid[: len(parts)]
+        data.copy_(torch.cat([part[3].view(-1) for part in parts]), non_blocking=True)
+        valid.copy_(torch.stack([part[4] for part in parts]), non_blocking=True)
+        ready = torch.cuda.Event()
+        ready.record(self.stream)
+        stats = self.bridge.proposer.performance_stats
+        stats.add_counter("cpu_risk_native_batches")
+        stats.add_counter("cpu_risk_native_batch_parts", len(parts))
+        stats.observe_peak(
+            "cpu_risk_native_batch_bytes", elements * data.element_size()
+        )
+        return _NativeBatch(data, valid, ready)
+
     def _run(self, preparation):
         stats = self.bridge.proposer.performance_stats
         started = perf_counter()
         try:
             with torch.inference_mode(), torch.cuda.device(self.device):
+                batch = preparation.native_batch
+                if batch is not None:
+                    if preparation.cancelled.is_set():
+                        return
+                    with stats.cpu_timer("cpu_risk_native_d2h_wall"):
+                        batch.ready.synchronize()
+                    if not batch.valid.all().item():
+                        raise RuntimeError("CPU verifier requested retired native KV")
+                offset = 0
                 for layer in preparation.layers:
                     if preparation.cancelled.is_set():
                         return
@@ -191,6 +253,14 @@ class RetroSpecCPUKVPreparer:
                     for lo, hi, data, valid in layer.native:
                         if preparation.cancelled.is_set():
                             return
+                        if batch is not None:
+                            count = data.numel()
+                            with stats.cpu_timer("cpu_risk_native_d2h_wall"):
+                                layer.target[:, :, lo:hi].copy_(
+                                    batch.data[offset : offset + count].view(data.shape)
+                                )
+                            offset += count
+                            continue
                         with torch.cuda.stream(self.stream):
                             if not valid.item():
                                 raise RuntimeError(
@@ -232,3 +302,5 @@ class RetroSpecCPUKVPreparer:
         self.executor.shutdown(wait=True)
         self.stream.synchronize()
         self.pinned = None
+        self.native_pinned = None
+        self.native_valid = None

@@ -239,7 +239,12 @@ class RetroSpecCPUShadowCoordinator(RetroSpecCPURiskCoordinator):
             )
             if message[3] == self.limit:
                 self.stats.add_counter("cpu_shadow_limit_hits")
-        self._validate_snapshot()
+        # All ranks share this progress through the worker-message broadcast.
+        # With no prediction to compare, there is no snapshot result to consume.
+        # Sparse boundaries still validate unconditionally in update_candidates;
+        # otherwise fence every newly comparable prediction before using it.
+        if self.checked < min(self.next_result, len(self.tokens)):
+            self._validate_snapshot()
         self._compare()
         if self.retired:
             # Cancellation fences the GPU sources immediately, but the old

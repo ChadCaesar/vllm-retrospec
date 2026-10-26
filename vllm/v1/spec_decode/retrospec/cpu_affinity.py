@@ -106,6 +106,15 @@ class RetroSpecCPUAffinity:
         gpu_allowed = allowed - reserved
         prepared = True
         try:
+
+            def core(cpu):
+                topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+                return (
+                    (topology / "physical_package_id").read_text().strip(),
+                    (topology / "core_id").read_text().strip(),
+                )
+
+            verifier_cores = {core(cpu) for cpu in cpu_cpus}
             for task in Path("/proc/self/task").iterdir():
                 tid = int(task.name)
                 try:
@@ -113,10 +122,18 @@ class RetroSpecCPUAffinity:
                 except ProcessLookupError:
                     continue
                 affinity.original_masks[tid] = mask
-                # CUDA/NCCL can pin helper threads to their GPU's NUMA node.
-                # Preserve these existing bindings while moving the launch
-                # thread and other freely scheduled worker threads.
-                affinity.bound_masks[tid] = mask & gpu_allowed or mask
+                # CUDA/NCCL can pin helpers to the verifier's NUMA node.
+                # Retain their locality, using free physical cores on that
+                # node rather than competing with the verifier or its SMT
+                # siblings. Keep an exclusive binding if it has no alternative.
+                launch_mask = mask & gpu_allowed
+                if not launch_mask:
+                    # A helper's mask can be wider than the launch thread's:
+                    # inspect its own CPUs to include every SMT sibling.
+                    launch_mask = {
+                        cpu for cpu in mask if core(cpu) not in verifier_cores
+                    }
+                affinity.bound_masks[tid] = launch_mask or mask
         except OSError:
             prepared = False
         if not all(gather(prepared)):
