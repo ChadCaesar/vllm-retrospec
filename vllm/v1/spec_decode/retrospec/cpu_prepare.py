@@ -98,6 +98,7 @@ class RetroSpecCPUKVPreparer:
         self.stream.wait_event(source_ready)
         try:
             with torch.cuda.stream(self.stream):
+                native_sources = []
                 if storage.shape[2] >= group.world_size or group.rank_in_group == 0:
                     for layer_index, (name, layer) in enumerate(
                         self.bridge.layers.items()
@@ -144,30 +145,13 @@ class RetroSpecCPUKVPreparer:
                             native_ranges.append((cursor, end))
                         keys, values = layer.kv_cache[0].unbind(0)
                         for lo, hi in native_ranges:
-                            positions = torch.arange(lo, hi, device=self.device)
-                            blocks = (
-                                metadata.block_table_tensor[0]
-                                .index_select(0, positions // keys.shape[1])
-                                .long()
-                            )
-                            valid = ((blocks >= 0) & (blocks < keys.shape[0])).all()
-                            safe_blocks = blocks.clamp(0, keys.shape[0] - 1)
-                            offsets = positions % keys.shape[1]
-                            # Only the unindexed tail/sink is copied on device.
-                            # Private tensors let sparse overwrite native rows
-                            # while D2H and the CPU page gather are still running.
-                            data = torch.stack(
-                                (
-                                    keys[safe_blocks, offsets].transpose(0, 1),
-                                    values[safe_blocks, offsets].transpose(0, 1),
-                                )
-                            )
-                            snapshot.native.append((lo, hi, data, valid))
+                            native_sources.append((snapshot, lo, hi, keys, values))
                         keys.record_stream(self.stream)
                         values.record_stream(self.stream)
                     metadata.block_table_tensor.record_stream(self.stream)
+                packed = self._capture_native(native_sources, metadata)
                 captured.record(self.stream)
-                preparation.native_batch = self._batch_native(preparation)
+                preparation.native_batch = self._batch_native(preparation, packed)
             preparation.future = self.executor.submit(self._run, preparation)
             return preparation
         except BaseException:
@@ -176,7 +160,87 @@ class RetroSpecCPUKVPreparer:
             preparation.release_pages()
             raise
 
-    def _batch_native(self, preparation):
+    def _capture_native(self, sources, metadata):
+        elements = 0
+        fast = bool(sources)
+        for _, lo, hi, keys, _ in sources:
+            elements += 2 * keys.shape[2] * (hi - lo) * keys.shape[3]
+            fast &= (
+                0 < hi - lo <= self._NATIVE_CHUNK_TOKENS
+                and keys.dtype == sources[0][3].dtype
+                and elements * keys.element_size() <= self._NATIVE_BATCH_BYTES
+            )
+        if fast:
+            from vllm.triton_utils import triton
+
+            from .cpu_kv_kernels import _capture_native_kv_kernel
+
+            # One capture launch writes all layers directly into the D2H
+            # payload. No per-layer arange/index/reduction/stack launches, and
+            # no second GPU packing pass. Pointer/stride metadata is private
+            # to this snapshot; source lifetimes retain their original fence.
+            data = torch.empty(elements, dtype=sources[0][3].dtype, device=self.device)
+            valid = torch.empty(len(sources), dtype=torch.bool, device=self.device)
+            rows = []
+            offset = largest = 0
+            for part, (layer, lo, hi, keys, values) in enumerate(sources):
+                shape = (2, keys.shape[2], hi - lo, keys.shape[3])
+                count = shape[1] * shape[2] * shape[3]
+                rows.append(
+                    (
+                        keys.data_ptr(),
+                        values.data_ptr(),
+                        *keys.stride(),
+                        *values.stride(),
+                        lo,
+                        hi - lo,
+                        keys.shape[2],
+                        keys.shape[3],
+                        offset,
+                        keys.shape[0],
+                        keys.shape[1],
+                    )
+                )
+                layer.native.append(
+                    (lo, hi, data[offset : offset + 2 * count].view(shape), valid[part])
+                )
+                largest = max(largest, count)
+                offset += 2 * count
+            with self.bridge.upload_placement.bind():
+                plan = torch.tensor(rows, dtype=torch.int64, pin_memory=True)
+            plan = plan.to(self.device, non_blocking=True)
+            table = metadata.block_table_tensor[0]
+            _capture_native_kv_kernel[(len(rows), triton.cdiv(largest, 1024))](
+                plan,
+                table,
+                data,
+                valid,
+                table.numel(),
+                table.stride(0),
+                BLOCK=1024,
+                MAX_TOKENS=self._NATIVE_CHUNK_TOKENS,
+            )
+            return data, valid
+        for layer, lo, hi, keys, values in sources:
+            positions = torch.arange(lo, hi, device=self.device)
+            blocks = (
+                metadata.block_table_tensor[0]
+                .index_select(0, positions // keys.shape[1])
+                .long()
+            )
+            valid = ((blocks >= 0) & (blocks < keys.shape[0])).all()
+            safe_blocks = blocks.clamp(0, keys.shape[0] - 1)
+            offsets = positions % keys.shape[1]
+            data = torch.stack(
+                (
+                    keys[safe_blocks, offsets].transpose(0, 1),
+                    values[safe_blocks, offsets].transpose(0, 1),
+                )
+            )
+            layer.native.append((lo, hi, data, valid))
+        return None
+
+    def _batch_native(self, preparation, packed=None):
         parts = []
         elements = 0
         for layer in preparation.layers:
@@ -205,8 +269,13 @@ class RetroSpecCPUKVPreparer:
                 )
         data = self.native_pinned[:elements]
         valid = self.native_valid[: len(parts)]
-        data.copy_(torch.cat([part[3].view(-1) for part in parts]), non_blocking=True)
-        valid.copy_(torch.stack([part[4] for part in parts]), non_blocking=True)
+        if packed is None:
+            packed = (
+                torch.cat([part[3].view(-1) for part in parts]),
+                torch.stack([part[4] for part in parts]),
+            )
+        data.copy_(packed[0], non_blocking=True)
+        valid.copy_(packed[1], non_blocking=True)
         ready = torch.cuda.Event()
         ready.record(self.stream)
         stats = self.bridge.proposer.performance_stats
