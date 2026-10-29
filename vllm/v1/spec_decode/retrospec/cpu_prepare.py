@@ -17,6 +17,7 @@ from vllm.distributed import get_tp_group
 @dataclass
 class _LayerSnapshot:
     target: torch.Tensor
+    origin: int = 0
     source: object = None
     gathers: list = field(default_factory=list)
     native: list = field(default_factory=list)
@@ -42,13 +43,10 @@ class RetroSpecCPUKVPreparation:
         self.future = None
 
     def valid(self):
-        for name, record, revision in self.revisions:
-            current = self.index._indices.get(name, {}).get(self.request_id)
-            if current is not record or (
-                current is not None and current.revision != revision
-            ):
-                return False
-        return True
+        # Descriptors/pages and native payloads belong to this capture, not to
+        # the latest mutable index revision. Leases fence the old sources until
+        # the background writer ends; afterwards only the private CPU copy is read.
+        return not self.cancelled.is_set()
 
     def fence_sources(self):
         # This event was recorded before returning to the proposer. A sparse,
@@ -86,7 +84,7 @@ class RetroSpecCPUKVPreparer:
         self.native_pinned = None
         self.native_valid = None
 
-    def submit(self, storage, metadata, request_id, start, end):
+    def submit(self, storage, metadata, request_id, start, end, *, native_only=False):
         index = self.bridge.proposer.sparse_attention.index
         if index.has_staged_updates:
             raise RuntimeError("CPU risk snapshot requires a published KV index")
@@ -106,13 +104,18 @@ class RetroSpecCPUKVPreparer:
                         target = storage.kv[
                             :, layer_index, self.bridge._head_slice(layer, storage.kv)
                         ]
-                        snapshot = _LayerSnapshot(target)
+                        origin = getattr(storage, "offset", 0)
+                        if not origin <= start <= end <= origin + target.shape[-2]:
+                            raise RuntimeError("CPU risk tail capacity exceeded")
+                        snapshot = _LayerSnapshot(target, origin)
                         preparation.layers.append(snapshot)
                         record = index._indices.get(name, {}).get(request_id)
                         preparation.revisions.append(
                             (name, record, None if record is None else record.revision)
                         )
-                        segments = () if record is None else record.segments
+                        segments = (
+                            () if native_only or record is None else record.segments
+                        )
                         cursor = start
                         native_ranges = []
                         for segment in segments:
@@ -133,7 +136,7 @@ class RetroSpecCPUKVPreparer:
                                 != (hi - lo,) * target.shape[1]
                             ):
                                 raise RuntimeError("Invalid CPU risk segment coverage")
-                            snapshot.gathers.append((descriptor, lo))
+                            snapshot.gathers.append((descriptor, lo - origin))
                             cursor = hi
                         if snapshot.gathers:
                             lease = index.cluster_store.lease_full_verification_sources(
@@ -202,7 +205,12 @@ class RetroSpecCPUKVPreparer:
                     )
                 )
                 layer.native.append(
-                    (lo, hi, data[offset : offset + 2 * count].view(shape), valid[part])
+                    (
+                        lo - layer.origin,
+                        hi - layer.origin,
+                        data[offset : offset + 2 * count].view(shape),
+                        valid[part],
+                    )
                 )
                 largest = max(largest, count)
                 offset += 2 * count
@@ -237,7 +245,7 @@ class RetroSpecCPUKVPreparer:
                     values[safe_blocks, offsets].transpose(0, 1),
                 )
             )
-            layer.native.append((lo, hi, data, valid))
+            layer.native.append((lo - layer.origin, hi - layer.origin, data, valid))
         return None
 
     def _batch_native(self, preparation, packed=None):

@@ -133,6 +133,9 @@ class RetroSpecCPUProposalMixin:
         )
         defer_window = False
         stopped = seed in cpu.stop_ids
+        risk = cpu if hasattr(cpu, "start_window") else None
+        if risk is not None:
+            risk.start_window(window, seed, metadata)
 
         def materialize():
             self._draft_token_ids[0].fill_(-1)
@@ -159,8 +162,8 @@ class RetroSpecCPUProposalMixin:
                     break
                 if changed:
                     materialize()
-                if self.speculative_config.retrospec_cpu_kv_background_upload:
-                    cpu.synchronize(metadata, background=True)
+                if changed or getattr(cpu, "needs_publication", False):
+                    cpu.synchronize(metadata, background=False)
 
                 end_position = base + window.draft_end
                 terminal_draft = (
@@ -196,9 +199,17 @@ class RetroSpecCPUProposalMixin:
                     or hard_boundary
                     or window.sparse_pending >= self.policy.max_draft_tokens
                 )
+                if risk is not None and risk.pump(
+                    metadata, allow_start=not hard_boundary
+                ):
+                    self.performance_stats.add_counter("cpu_risk_early_full")
+                    require_full = True
+                    break
                 if should_verify:
                     cpu.synchronize(metadata, background=False)
                     start = max(window.confirmed, window.sparse)
+                    if risk is not None:
+                        risk.invalidate_kv(base + start)
                     snapshot_version = window.version
                     snapshot_end = window.draft_end
                     materialize()
@@ -223,10 +234,19 @@ class RetroSpecCPUProposalMixin:
                     verified_tokens = (
                         self._draft_token_ids[0, start : start + count].cpu().tolist()
                     )
-                    cpu.poll(window)
+                    if risk is not None:
+                        cpu.poll(window, accept_risk=False)
+                    else:
+                        cpu.poll(window)
                     applied = window.apply_sparse(
                         snapshot_version, start, verified_tokens
                     )
+                    if risk is not None:
+                        risk.update_candidates(window)
+                        # Accept only the risk results held across this sparse
+                        # update. A second TP poll could introduce new CPU
+                        # corrections after the snapshot's validity decision.
+                        cpu.poll(window, read_worker=False)
                     force_sparse = False
                     if not applied:
                         self.performance_stats.add_counter("cpu_stale_verifications")
@@ -247,6 +267,9 @@ class RetroSpecCPUProposalMixin:
                     require_full |= (
                         window.full_pending > 0 and window.tokens[-1] in cpu.stop_ids
                     )
+                    if risk is not None and risk.alert:
+                        require_full = True
+                        self.performance_stats.add_counter("cpu_risk_early_full")
                     self.performance_stats.add_gpu_counter("verified_tokens", count)
                     if require_full:
                         break
@@ -269,7 +292,13 @@ class RetroSpecCPUProposalMixin:
                     active,
                     sampling_metadata,
                 )
-                token = int(sampled[0].item())
+                if risk is None:
+                    token = int(sampled[0].item())
+                else:
+                    token_value, risk_margin = (
+                        torch.stack((sampled[0].float(), margin[0])).cpu().tolist()
+                    )
+                    token = int(token_value)
                 window.tokens.append(token)
                 self._draft_token_ids[0, slot] = token
                 self.performance_stats.add_gpu_counter("draft_tokens", 1)
@@ -289,11 +318,16 @@ class RetroSpecCPUProposalMixin:
                     RetroSpecReason.DRAFT_MARGIN | RetroSpecReason.HIT_ATTN
                 )
                 force_sparse = bool(int(decision.reasons[0].item()) & quality_reasons)
+                if risk is not None:
+                    risk.draft(window, risk_margin)
                 if window.confirmed:
                     self.performance_stats.add_counter("cpu_sliding_draft_tokens")
 
         # Freeze the last already committed prefix without waiting for CPU work.
-        cpu.freeze(window, metadata)
+        if risk is None:
+            cpu.freeze(window, metadata)
+        else:
+            cpu.freeze(window, metadata, carry=defer_window)
         if stopped:
             window.tokens[window.confirmed :] = []
         committed_length = base + window.confirmed

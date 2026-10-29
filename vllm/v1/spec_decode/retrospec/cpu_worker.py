@@ -48,6 +48,15 @@ class _CPUWorkerMappings:
     def clear(self):
         self.kv = self.journal = None
         self._kv_key = self._journal_key = None
+        self.aux = {}
+
+    def attach_aux(self, name, path, shape):
+        key = self._key(path, shape)
+        previous = self.aux.get(name)
+        if previous is None or previous[0] != key:
+            previous = (key, map_cpu_kv(path, shape))
+            self.aux[name] = previous
+        return previous[1]
 
     @staticmethod
     def _key(path, shape):
@@ -64,10 +73,15 @@ class _CPUWorkerMappings:
             self.kv = map_cpu_kv(paths[0], shape)
             self._kv_key = key
         if with_journal:
-            key = self._key(paths[1], shape)
+            journal_shape = list(shape)
+            journal_shape[-2] = os.stat(paths[1]).st_size // (
+                2 * math.prod(shape[:-2]) * shape[-1]
+            )
+            journal_shape = tuple(journal_shape)
+            key = self._key(paths[1], journal_shape)
             if key != self._journal_key:
                 self.journal = None
-                self.journal = map_cpu_kv(paths[1], shape)
+                self.journal = map_cpu_kv(paths[1], journal_shape)
                 self._journal_key = key
         else:
             self.journal = self._journal_key = None
@@ -124,20 +138,16 @@ def _cpu_target_main(
         session = epoch = 0
         token = position = limit = 0
         running = False
-        predicting = False
+        saved = None
+        saved_tail = None
+        saved_origin = 0
         pending_command = None
         eos_ids: set[int] = set()
 
         def check_control(_module, _inputs):
-            nonlocal pending_command, limit
+            nonlocal pending_command
             while connection.poll():
                 command = connection.recv()
-                # Raising the lookahead limit must not interrupt an expensive
-                # forward that is already using the same cache and input.
-                if command[0] == "extend":
-                    if predicting and command[1:3] == (session, epoch):
-                        limit = max(limit, command[3])
-                    continue
                 pending_command = command
                 raise _CPUForwardInterrupted
 
@@ -162,29 +172,101 @@ def _cpu_target_main(
                         running = False
                         connection.send(("paused", session, epoch))
                         continue
+                    if operation == "suspend":
+                        checkpoint_started = time.monotonic()
+                        _, nonce, path, shape, saved_origin = command
+                        if saved is not None:
+                            raise RuntimeError("CPU continuous task already suspended")
+                        saved_tail = mappings.attach_aux("continuous", path, shape)
+                        count = position - saved_origin
+                        if not 0 <= count <= saved_tail.shape[-2]:
+                            raise RuntimeError("CPU continuous tail capacity exceeded")
+                        saved_tail[..., :count, :].copy_(
+                            storage[..., saved_origin:position, :]
+                        )
+                        saved = (
+                            cache,
+                            storage,
+                            journal,
+                            session,
+                            epoch,
+                            token,
+                            position,
+                            limit,
+                            eos_ids,
+                        )
+                        running = False
+                        connection.send(
+                            (
+                                "suspended",
+                                session,
+                                epoch,
+                                nonce,
+                                position,
+                                time.monotonic() - checkpoint_started,
+                            )
+                        )
+                        continue
+                    if operation == "restore":
+                        restore_started = time.monotonic()
+                        if saved is None:
+                            raise RuntimeError("CPU continuous checkpoint is missing")
+                        (
+                            cache,
+                            storage,
+                            journal,
+                            session,
+                            epoch,
+                            token,
+                            position,
+                            limit,
+                            eos_ids,
+                        ) = saved
+                        storage[..., saved_origin:position, :].copy_(
+                            saved_tail[..., : position - saved_origin, :]
+                        )
+                        saved = saved_tail = None
+                        running = (
+                            command[1] and position < limit and token not in eos_ids
+                        )
+                        connection.send(
+                            (
+                                "restored",
+                                session,
+                                epoch,
+                                time.monotonic() - restore_started,
+                            )
+                        )
+                        continue
                     if operation == "release":
                         _, session, epoch = command[:3]
                         running = False
                         # All CPU kernels are synchronous. Reaching this point
                         # after a layer-boundary interruption fences every old
                         # KV access, including partially written token rows.
-                        cache = storage = journal = output = None
+                        cache = storage = journal = output = saved = saved_tail = None
                         # Retaining an idle mapping does not access its pages.
                         # The producer still needs this ACK before overwriting.
                         if len(command) > 3 and command[3]:
                             mappings.clear()
                         connection.send(("released", session, epoch))
                         continue
-                    if operation == "extend":
-                        if (
-                            predicting
-                            and cache is not None
-                            and command[1:3] == (session, epoch)
-                        ):
-                            limit = max(limit, command[3])
-                            running = position < limit and token not in eos_ids
-                        continue
-                    if operation == "check":
+                    if operation == "check_shared":
+                        (_, session, epoch, path, shape, origin, position, token) = (
+                            command
+                        )
+                        if saved is None:
+                            raise RuntimeError("CPU risk check requires a checkpoint")
+                        storage = saved[1]
+                        tail = mappings.attach_aux("risk", path, shape)
+                        storage[..., origin:position, :].copy_(
+                            tail[..., : position - origin, :]
+                        )
+                        journal = None
+                        cache = attach_cache(model.config, storage, position)
+                        limit = position + 1
+                        eos_ids = set()
+                    elif operation == "check":
                         _, session, epoch, paths, shape, position, token = command
                         storage, journal = mappings.attach(
                             paths, shape, with_journal=False
@@ -192,25 +274,28 @@ def _cpu_target_main(
                         cache = attach_cache(model.config, storage, position)
                         limit = position + 1
                         eos_ids = set()
-                        predicting = False
-                    elif operation in ("initialize", "predict"):
+                    elif operation == "initialize":
                         _, session, epoch, paths, shape, position, token, limit, eos = (
                             command
                         )
                         storage, journal = mappings.attach(
-                            paths, shape, with_journal=operation == "initialize"
+                            paths, shape, with_journal=True
                         )
                         cache = attach_cache(model.config, storage, position)
                         eos_ids = set(eos)
-                        predicting = operation == "predict"
                     elif operation == "resume":
-                        _, session, epoch, start, position, token, limit = command
+                        _, session, epoch, start, position, token, limit = command[:7]
+                        journal_origin = command[7] if len(command) > 7 else 0
                         if cache is None or cache.get_seq_length() < start:
                             raise RuntimeError(
                                 "CPU verifier missed an authoritative KV prefix"
                             )
                         storage[..., start:position, :].copy_(
-                            journal[..., start:position, :]
+                            journal[
+                                ...,
+                                start - journal_origin : position - journal_origin,
+                                :,
+                            ]
                         )
                         for index in range(len(cache.layers)):
                             cache.layers[index].length = position
@@ -257,8 +342,6 @@ def _cpu_target_main(
                     token,
                     finished - started,
                 )
-                if predicting:
-                    message += (started, finished)
                 connection.send(message)
                 running = position < limit and token not in eos_ids
     except (EOFError, ConnectionError):
@@ -344,6 +427,7 @@ class RetroSpecCPUWorker:
         self.awaiting_progress = False
         self.last_command = None
         self.released = None
+        self.paused = None
         self.closed = False
         self.close_requested = False
         atexit.register(self.close)
@@ -364,23 +448,21 @@ class RetroSpecCPUWorker:
                 self.messages.append(message)
             if message[0] == "released":
                 self.released = message[1:3]
+            elif message[0] == "paused":
+                self.paused = message[1:3]
             self.last_progress = time.monotonic()
             if self.last_command is not None:
                 operation, session, epoch, limit = self.last_command
                 if message[0] == "paused" and operation == "pause":
                     self.awaiting_progress = message[2] != epoch
+                elif message[0] == "suspended" and operation == "suspend":
+                    self.awaiting_progress = message[3] != epoch
                 elif message[0] == "released" and operation == "release":
                     self.awaiting_progress = message[1:3] != (session, epoch)
                 elif (
                     message[0] == "token"
                     and message[1:3] == (session, epoch)
-                    and (
-                        message[3] >= limit
-                        or (
-                            operation == "predict"
-                            and message[4] in self.prediction_stop_ids
-                        )
-                    )
+                    and (message[3] >= limit)
                 ):
                     self.awaiting_progress = False
         if self.process.poll() is not None and not self.closed:
@@ -404,21 +486,22 @@ class RetroSpecCPUWorker:
         self.connection.send(command)
         if not self.awaiting_progress:
             self.last_progress = time.monotonic()
-        if command[0] == "check":
+        if command[0] in ("check", "check_shared"):
             self.released = None
             self.last_command = ("check", command[1], command[2], command[-2] + 1)
             self.awaiting_progress = True
-        elif command[0] in ("initialize", "resume", "predict"):
+        elif command[0] in ("initialize", "resume"):
             self.released = None
             self.last_command = (command[0], command[1], command[2], command[-2])
             if command[0] == "resume":
-                self.last_command = (command[0], command[1], command[2], command[-1])
+                self.last_command = (command[0], command[1], command[2], command[6])
             self.awaiting_progress = True
-            if command[0] == "predict":
-                self.prediction_stop_ids = set(command[-1])
-        elif command[0] == "extend":
-            self.last_command = ("predict", command[1], command[2], command[3])
+        elif command[0] == "suspend":
+            self.last_command = ("suspend", None, command[1], 0)
             self.awaiting_progress = True
+        elif command[0] == "restore":
+            self.last_command = None
+            self.awaiting_progress = False
         elif command[0] == "pause":
             self.last_command = ("pause", None, command[1], 0)
         elif command[0] == "release":
@@ -439,6 +522,20 @@ class RetroSpecCPUWorker:
                     "CPU verifier did not release KV within "
                     f"{timeout}s: pid={self.process.pid}, "
                     f"session={session}, epoch={epoch}"
+                )
+            self.connection.poll(min(0.1, remaining))
+
+    def wait_for_pause(self, session: int, epoch: int, timeout: float = 300):
+        """Fence the old reader before reusing the bounded GPU journal."""
+        deadline = time.monotonic() + timeout
+        while True:
+            self.poll()
+            if self.paused == (session, epoch):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"CPU verifier did not pause: session={session}, epoch={epoch}"
                 )
             self.connection.poll(min(0.1, remaining))
 
@@ -474,7 +571,13 @@ class RetroSpecCPUWorker:
 
 
 class RetroSpecCPUStorage:
-    def __init__(self, shape: tuple[int, ...], directory: str | None = None):
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        directory: str | None = None,
+        *,
+        journal_tokens: int | None = None,
+    ):
         import psutil
         import torch
 
@@ -484,11 +587,26 @@ class RetroSpecCPUStorage:
         self.paths = tuple(
             str(Path(self.directory) / name) for name in ("kv", "gpu-journal")
         )
+        if not self.owner:
+            journal_tokens = (
+                os.stat(self.paths[1]).st_size
+                // (2 * math.prod(shape[:-2]) * shape[-1])
+                if Path(self.paths[1]).exists()
+                else 0
+            )
+        journal_shape = (
+            *shape[:-2],
+            journal_tokens if journal_tokens is not None else shape[-2],
+            shape[-1],
+        )
+        self.journal_offset = 0
         self._fds: list[int] = []
         self.kv = self.journal = None
         try:
             if self.owner:
-                size = math.prod(shape) * torch.bfloat16.itemsize
+                sizes = [math.prod(shape) * torch.bfloat16.itemsize]
+                if journal_shape[-2]:
+                    sizes.append(math.prod(journal_shape) * torch.bfloat16.itemsize)
                 # Linux memfd is shared RAM without filesystem writeback or a
                 # small /dev/shm mount quota. Pages are allocated on first touch;
                 # the sparse journal and unused capacity are never pre-cleared.
@@ -496,10 +614,10 @@ class RetroSpecCPUStorage:
                 if (
                     hasattr(os, "memfd_create")
                     and Path("/proc/self/fd").is_dir()
-                    and 2 * size <= psutil.virtual_memory().available * 0.8
+                    and sum(sizes) <= psutil.virtual_memory().available * 0.8
                 ):
                     try:
-                        for name in ("kv", "gpu-journal"):
+                        for name, size in zip(("kv", "gpu-journal"), sizes):
                             fd = os.memfd_create(
                                 f"retrospec-cpu-{name}", os.MFD_CLOEXEC
                             )
@@ -514,15 +632,16 @@ class RetroSpecCPUStorage:
                         os.symlink(f"/proc/{os.getpid()}/fd/{fd}", path)
                 else:
                     space = os.statvfs(self.directory)
-                    if size > space.f_bavail * space.f_frsize:
+                    if sum(sizes) > space.f_bavail * space.f_frsize:
                         raise RuntimeError(
                             "Insufficient temporary storage for CPU verifier KV"
                         )
-                    for path in self.paths:
+                    for path, size in zip(self.paths, sizes):
                         with open(path, "wb") as stream:
                             stream.truncate(size)
             self.kv = map_cpu_kv(self.paths[0], shape)
-            self.journal = map_cpu_kv(self.paths[1], shape)
+            if journal_shape[-2]:
+                self.journal = map_cpu_kv(self.paths[1], journal_shape)
         except BaseException:
             self.close()
             raise

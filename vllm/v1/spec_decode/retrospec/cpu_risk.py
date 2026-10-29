@@ -47,6 +47,7 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
         self.alert = False
         self.ready = False
         self.preparing = None
+        self._mirror_dirty = None
 
     @property
     def stats(self):
@@ -77,12 +78,11 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
 
     def invalidate_kv(self, start):
         self.mirror_length = min(self.mirror_length, start)
-        if self.preparing is not None and self.preparing.position > start:
-            self._invalidate_preparation(start)
-        if self.active is not None and self.base + self.active[0].index > start:
-            # Retain the head task for retry if its candidate prefix survives.
-            self._cancel_active()
-            self.stats.add_counter("cpu_risk_retries")
+        self._mirror_dirty = (
+            start if self._mirror_dirty is None else min(self._mirror_dirty, start)
+        )
+        if self.preparing is not None:
+            self.preparing.kv.fence_sources()
 
     def update_candidates(self, tokens):
         common = 0
@@ -175,13 +175,6 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
             task = self.queue[0]
             if not allow_start:
                 self.stats.add_counter("cpu_risk_dispatch_deferred_boundary")
-            elif (
-                kv_rewrite_start is not None
-                and self.base + task.index > kv_rewrite_start
-            ):
-                # Keep FIFO ownership. Older checks whose past ends at or
-                # before the rewrite can still overlap this sparse verify.
-                self.stats.add_counter("cpu_risk_dispatch_deferred_kv")
             else:
                 self._start(task, metadata)
         elif self.queue and not self.ready:
@@ -215,6 +208,7 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
             "cpu_risk_queue_wait", perf_counter() - task.queued_at
         )
         start = min(self.mirror_length, position)
+        self._mirror_dirty = None
         self.epoch += 1
         preparation = None
         error = None
@@ -335,6 +329,8 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
             # All ranks finished writing a snapshot whose immutable prefix is
             # still useful. Refresh only the invalidated suffix on the retry.
             self.mirror_length = 0 if invalid else -negative_length
+            if self._mirror_dirty is not None:
+                self.mirror_length = min(self.mirror_length, self._mirror_dirty)
             if not preparation.completed:
                 self.stats.add_counter(
                     "cpu_risk_kv_refresh_tokens",
@@ -355,7 +351,12 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
             return
         if not preparation.completed:
             preparation.completed = True
-            self.mirror_length = preparation.position
+            self.mirror_length = min(
+                preparation.position,
+                self._mirror_dirty
+                if self._mirror_dirty is not None
+                else preparation.position,
+            )
             self.stats.add_counter("cpu_risk_prepare_ready")
             self.stats.add_counter(
                 "cpu_risk_kv_refresh_tokens", preparation.position - preparation.start
@@ -366,9 +367,7 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
                 else "cpu_risk_delta_prepare",
                 perf_counter() - preparation.started,
             )
-        if not allow_start or (
-            kv_rewrite_start is not None and preparation.position > kv_rewrite_start
-        ):
+        if not allow_start:
             return
         self.preparing = None
         self._dispatch_preparation(preparation)

@@ -48,6 +48,9 @@ class RetroSpecCPUKVBridge:
         index = self.proposer.sparse_attention.index
         index.flush_staged_updates()
         destination = storage.kv if initial else storage.journal
+        origin = 0 if initial else getattr(storage, "journal_offset", 0)
+        if end - origin > destination.shape[-2]:
+            raise RuntimeError("CPU KV journal capacity exceeded")
         from vllm.distributed import get_tp_group
 
         group = get_tp_group()
@@ -106,10 +109,10 @@ class RetroSpecCPUKVBridge:
                 blocks, offsets = self._native_rows(
                     keys, metadata.block_table_tensor, native_start, end
                 )
-                target[0, :, native_start:end].copy_(
+                target[0, :, native_start - origin : end - origin].copy_(
                     keys[blocks, offsets].transpose(0, 1).cpu()
                 )
-                target[1, :, native_start:end].copy_(
+                target[1, :, native_start - origin : end - origin].copy_(
                     values[blocks, offsets].transpose(0, 1).cpu()
                 )
 
@@ -178,12 +181,23 @@ class RetroSpecCPUKVBridge:
                         values[blocks, offsets].transpose(0, 1).cpu()
                     )
 
-    def prepare_risk(self, storage, metadata, request_id: str, start: int, end: int):
+    def prepare_risk(
+        self,
+        storage,
+        metadata,
+        request_id: str,
+        start: int,
+        end: int,
+        *,
+        native_only=False,
+    ):
         from .cpu_prepare import RetroSpecCPUKVPreparer
 
         if self._risk_preparer is None:
             self._risk_preparer = RetroSpecCPUKVPreparer(self)
-        return self._risk_preparer.submit(storage, metadata, request_id, start, end)
+        return self._risk_preparer.submit(
+            storage, metadata, request_id, start, end, native_only=native_only
+        )
 
     def _stage_cpu(self, storage, metadata, start: int, end: int, background: bool):
         if end <= start:
@@ -195,7 +209,11 @@ class RetroSpecCPUKVBridge:
         for layer_index, layer in enumerate(self.layers.values()):
             target = layer.kv_cache[0]
             source = storage.kv[
-                :, layer_index, self._head_slice(layer, storage.kv), start:end
+                :,
+                layer_index,
+                self._head_slice(layer, storage.kv),
+                start - getattr(storage, "offset", 0) : end
+                - getattr(storage, "offset", 0),
             ]
             pinned = source.contiguous().pin_memory()
             with torch.cuda.stream(self.upload_stream):

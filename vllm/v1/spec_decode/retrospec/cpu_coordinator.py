@@ -64,6 +64,7 @@ class RetroSpecCPUCoordinator:
         # until the worker acknowledges the matching release session/epoch.
         self._pooled_storage = None
         self._pending_release = None
+        self._pending_pause = None
         self.request_id = None
         self.session = 0
         self.epoch = 0
@@ -97,10 +98,19 @@ class RetroSpecCPUCoordinator:
                         self.worker.discard_mappings(self.session, self.epoch)
                         storage.close()
                         self._pooled_storage = None
-                    storage = RetroSpecCPUStorage(shape)
+                    config = getattr(self.proposer, "speculative_config", None)
+                    journal_tokens = None
+                    if config is not None:
+                        journal_tokens = (
+                            min(shape[-2], self.proposer.num_speculative_tokens + 1)
+                            if config.retrospec_cpu_verify
+                            else 0
+                        )
+                    storage = RetroSpecCPUStorage(shape, journal_tokens=journal_tokens)
                     self._pooled_storage = storage
                     self.bridge.export_placement.bind_memory(storage.kv)
-                    self.bridge.export_placement.bind_memory(storage.journal)
+                    if storage.journal is not None:
+                        self.bridge.export_placement.bind_memory(storage.journal)
                 description = (None, storage.directory, storage.shape, reused)
             except Exception as exc:
                 description = (str(exc), None, None, False)
@@ -127,6 +137,7 @@ class RetroSpecCPUCoordinator:
         )
 
     def begin(self, request_id, base_position, seed, budget, metadata, sampling_params):
+        self._pause_fenced = False
         initial = (
             self.storage is None
             or self.request_id != request_id
@@ -156,7 +167,29 @@ class RetroSpecCPUCoordinator:
             self.stop_ids = set(sampling_params.stop_token_ids or [])
             if not sampling_params.ignore_eos:
                 self.stop_ids.update(sampling_params._all_stop_token_ids)
+        elif getattr(self, "_pending_pause", None) is not None:
+            error = None
+            if self.worker is not None:
+                started = perf_counter()
+                try:
+                    self.worker.wait_for_pause(*self._pending_pause)
+                except Exception as exc:
+                    error = str(exc)
+                self.proposer.performance_stats.record_cpu_time(
+                    "cpu_kv_pause_wait_wall", perf_counter() - started
+                )
+            error = self._control(error)
+            if error is not None:
+                raise RuntimeError(error)
+            self._pending_pause = None
+            self._pause_fenced = True
         self.epoch += 1
+        self.storage.journal_offset = (
+            self.authoritative_length
+            if self.storage.journal is not None
+            and self.storage.journal.shape[-2] < self.storage.shape[-2]
+            else 0
+        )
         self.bridge.export_gpu(
             self.storage,
             metadata,
@@ -167,6 +200,7 @@ class RetroSpecCPUCoordinator:
         )
         self.group.barrier()
         self.authoritative_length = self.staged_length = base_position
+        self.needs_publication = False
         self.committed_tokens[request_id] = []
         if self.worker is not None:
             if initial:
@@ -178,7 +212,10 @@ class RetroSpecCPUCoordinator:
                     self.storage.shape,
                     base_position,
                     seed,
-                    base_position + budget,
+                    base_position
+                    + min(
+                        budget, getattr(self.proposer, "num_speculative_tokens", budget)
+                    ),
                     tuple(self.stop_ids),
                 )
             else:
@@ -189,12 +226,17 @@ class RetroSpecCPUCoordinator:
                     self._resume_start,
                     base_position,
                     seed,
-                    base_position + budget,
+                    base_position
+                    + min(
+                        budget, getattr(self.proposer, "num_speculative_tokens", budget)
+                    ),
                 )
+                if self.storage.journal_offset:
+                    command += (self.storage.journal_offset,)
             self.worker.send(command)
         self._resume_start = base_position
 
-    def poll(self, window):
+    def _poll_messages(self):
         payload = None
         if self.worker is not None:
             try:
@@ -204,6 +246,13 @@ class RetroSpecCPUCoordinator:
         error, messages = self._control(payload)
         if error:
             raise RuntimeError(error)
+        return messages
+
+    def poll(self, window):
+        return self._consume_continuous(window, self._poll_messages())
+
+    def _consume_continuous(self, window, messages, expected_epoch=None):
+        expected_epoch = self.epoch if expected_epoch is None else expected_epoch
         changed = False
         for message in messages:
             if message[0] == "interrupted":
@@ -215,7 +264,7 @@ class RetroSpecCPUCoordinator:
                 self.proposer.performance_stats.record_cpu_time(
                     "cpu_full_forward", message[5]
                 )
-            if session != self.session or epoch != self.epoch:
+            if session != self.session or epoch != expected_epoch:
                 self.proposer.performance_stats.add_counter("cpu_stale_results")
                 continue
             if position > window.base_position + self.proposer.num_speculative_tokens:
@@ -228,6 +277,9 @@ class RetroSpecCPUCoordinator:
                 )
             corrected = window.confirm(position, token)
             changed |= corrected
+            self.needs_publication = (
+                getattr(self, "needs_publication", False) or corrected
+            )
             self.authoritative_length = window.base_position + window.confirmed
             self._resume_start = self.authoritative_length
             self.proposer.performance_stats.add_counter("cpu_confirmed_tokens")
@@ -248,17 +300,21 @@ class RetroSpecCPUCoordinator:
             )
             self.staged_length = self.authoritative_length
         self.bridge.publish(wait=not background)
+        if not background:
+            self.needs_publication = False
 
     def freeze(self, window, metadata):
         # Do not wait for an in-flight CPU forward; its old-epoch result is stale.
         self.epoch += 1
         if self.worker is not None:
             self.worker.send(("pause", self.epoch))
+        self._pending_pause = (self.session, self.epoch)
         self.synchronize(metadata, background=False)
         self.committed_tokens[self.request_id] = window.tokens[: window.confirmed]
         self._resume_start = self.authoritative_length
 
     def release(self):
+        self._pending_pause = None
         self.deferred_window = None
         self.deferred_plans = None
         if self.storage is not None:

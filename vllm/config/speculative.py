@@ -254,11 +254,9 @@ class SpeculativeConfig:
     """Run an independent full target model on CPU alongside RetroSpec drafts."""
     retrospec_cpu_risk_check: bool = False
     """Check low-margin draft positions on CPU and request GPU full verification
-    on disagreement. Mutually exclusive with continuous CPU verification."""
+    on disagreement. May preempt continuous CPU verification in a shared worker."""
     retrospec_cpu_shadow_check: bool = False
-    """Predict continuously on CPU from GPU KV snapshots. Correct the first
-    disagreeing candidate and request GPU full verification. CPU predictions
-    are not committed outputs. Exclusive with the other CPU modes."""
+    """Removed mode. True produces an explicit migration error."""
     retrospec_cpu_risk_margin_threshold: float = Field(default=0.5, ge=0)
     """Queue draft tokens whose raw top-1/top-2 logit margin is strictly lower
     than this threshold. Independent of GPU stage-transition thresholds."""
@@ -270,7 +268,8 @@ class SpeculativeConfig:
     placement and separately pinned helper threads are preserved. Disable to
     retain the caller's CPU affinity."""
     retrospec_cpu_kv_background_upload: bool = False
-    """Stage authoritative CPU KV asynchronously between GPU token boundaries."""
+    """Deprecated. Uploads now batch at sparse boundaries and publish immediately
+    for CPU corrections or missing GPU KV rows, independently of this setting."""
     retrospec_draft_prefetch: bool = False
     """Prefetch historical resident pages during drafting (experimental)."""
 
@@ -335,7 +334,6 @@ class SpeculativeConfig:
                     self.num_speculative_tokens,
                     self.retrospec_cpu_verify,
                     self.retrospec_cpu_risk_check,
-                    self.retrospec_cpu_shadow_check,
                     self.retrospec_draft_prefetch,
                 ]
             )
@@ -728,23 +726,17 @@ class SpeculativeConfig:
             )
 
     def _validate_retrospec(self) -> None:
-        if (
-            sum(
-                (
-                    self.retrospec_cpu_verify,
-                    self.retrospec_cpu_risk_check,
-                    self.retrospec_cpu_shadow_check,
-                )
-            )
-            > 1
-        ):
+        if self.retrospec_cpu_shadow_check:
             raise ValueError(
-                "RetroSpec CPU continuous, risk and shadow modes are exclusive"
+                "CPU shadow mode has been removed. Use retrospec_cpu_verify "
+                "and/or retrospec_cpu_risk_check instead."
             )
-        if (
-            self.retrospec_cpu_risk_check or self.retrospec_cpu_shadow_check
-        ) and self.retrospec_cpu_kv_background_upload:
-            raise ValueError("CPU risk/shadow checks cannot upload authoritative KV")
+        if self.retrospec_cpu_kv_background_upload:
+            logger.warning_once(
+                "retrospec_cpu_kv_background_upload is deprecated and ignored; "
+                "matching CPU KV uploads batch at sparse boundaries, while "
+                "corrections publish before GPU draft resumes."
+            )
         if self.retrospec_retrieval_ratio + self.retrospec_estimation_ratio > 1:
             raise ValueError(
                 "The sum of retrospec_retrieval_ratio and "

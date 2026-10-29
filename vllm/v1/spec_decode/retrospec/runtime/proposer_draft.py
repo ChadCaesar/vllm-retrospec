@@ -437,9 +437,10 @@ class RetroSpecDraftMixin:
             compute_margin=(
                 self.policy.draft_margin_threshold is not None
                 or getattr(self, "cpu_risk_coordinator", None) is not None
-                or (
-                    getattr(self, "cpu_shadow_coordinator", None) is not None
-                    and self.performance_stats.enabled
+                or getattr(
+                    getattr(self, "speculative_config", None),
+                    "retrospec_cpu_risk_check",
+                    False,
                 )
             ),
         )
