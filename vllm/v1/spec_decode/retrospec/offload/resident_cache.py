@@ -440,7 +440,7 @@ class RetroSpecResidentClusterCache:
         page_counts: list[int] = []
         page_slots: list[list[int]] = []
         hit_gate_ready: list[bool] = []
-        new_entry_indices: list[int] = []
+        access_epochs: list[int] = []
 
         for cluster_id, slots, group in entries:
             if len(slots) > self._handle_table_max_pages:
@@ -451,6 +451,7 @@ class RetroSpecResidentClusterCache:
                 )
 
             bucket = self._handle_to_bucket.get(cluster_id)
+            is_new = bucket is None
             if bucket is None:
                 bucket = self._find_handle_bucket(cluster_id)
                 if bucket is None:
@@ -458,7 +459,6 @@ class RetroSpecResidentClusterCache:
                     continue
                 self._handle_to_bucket[cluster_id] = bucket
                 self._bucket_handles[bucket] = cluster_id
-                new_entry_indices.append(len(bucket_ids))
 
             padded_slots = list(slots)
             padded_slots.extend(
@@ -469,46 +469,20 @@ class RetroSpecResidentClusterCache:
             page_counts.append(len(slots))
             page_slots.append(padded_slots)
             hit_gate_ready.append(self._is_group_hit_gate_ready(group))
+            access_epochs.append(self._next_access_epoch if is_new else -1)
 
         if not cluster_ids:
             return 0
 
         with torch.cuda.stream(stream):
-            bucket_ids_gpu = torch.tensor(
-                bucket_ids, dtype=torch.int32, device=self.device
+            self._submit_handle_updates(
+                bucket_ids,
+                cluster_ids,
+                page_counts,
+                page_slots,
+                hit_gate_ready,
+                access_epochs,
             )
-            update_resident_handles(
-                bucket_ids=bucket_ids_gpu,
-                cluster_handles=torch.tensor(
-                    cluster_ids, dtype=torch.int64, device=self.device
-                ),
-                page_counts=torch.tensor(
-                    page_counts, dtype=torch.int32, device=self.device
-                ),
-                page_slots=torch.tensor(
-                    page_slots, dtype=torch.int32, device=self.device
-                ),
-                hit_gate_ready=torch.tensor(
-                    hit_gate_ready, dtype=torch.bool, device=self.device
-                ),
-                table_handles=self._handle_table_handles,
-                table_versions=self._handle_table_versions,
-                table_page_counts=self._handle_table_page_counts,
-                table_page_slots=self._handle_table_page_slots,
-                table_hit_gate_ready=self._handle_table_hit_gate_ready,
-            )
-            if new_entry_indices:
-                new_bucket_ids = bucket_ids_gpu.index_select(
-                    0,
-                    torch.tensor(
-                        new_entry_indices,
-                        dtype=torch.int64,
-                        device=self.device,
-                    ),
-                )
-                self._handle_table_last_access_epochs.index_fill_(
-                    0, new_bucket_ids.to(torch.int64), self._next_access_epoch
-                )
             if self._binding_publisher is not None:
                 self._binding_publisher(
                     tuple(cluster_ids),
@@ -517,6 +491,48 @@ class RetroSpecResidentClusterCache:
                 )
 
         return len(cluster_ids)
+
+    def _submit_handle_updates(
+        self,
+        bucket_ids: list[int],
+        cluster_ids: list[int],
+        page_counts: list[int],
+        page_slots: list[list[int]],
+        hit_gate_ready: list[bool],
+        access_epochs: list[int],
+    ) -> None:
+        """Upload one immutable command batch on the caller's update stream.
+
+        Synchronous CPU-to-CUDA tensor constructors would wait for the preceding
+        KV copies while holding the reader/mutation lock. Pack the fields into
+        one pinned allocation and enqueue a single nonblocking transfer instead.
+        PyTorch's pinned allocator records the copy event before recycling this
+        allocation; the host commands are never changed after submission.
+        """
+        num_entries = len(bucket_ids)
+        values = bucket_ids + cluster_ids + page_counts + hit_gate_ready + access_epochs
+        values.extend(slot for slots in page_slots for slot in slots)
+        commands_cpu = torch.tensor(
+            values, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        commands = commands_cpu.to(device=self.device, non_blocking=True)
+        buckets, handles, counts, gates, epochs, slots = commands.split(
+            [num_entries] * 5 + [num_entries * self._handle_table_max_pages]
+        )
+        update_resident_handles(
+            bucket_ids=buckets,
+            cluster_handles=handles,
+            page_counts=counts,
+            page_slots=slots.view(num_entries, self._handle_table_max_pages),
+            hit_gate_ready=gates,
+            table_handles=self._handle_table_handles,
+            table_versions=self._handle_table_versions,
+            table_page_counts=self._handle_table_page_counts,
+            table_page_slots=self._handle_table_page_slots,
+            table_hit_gate_ready=self._handle_table_hit_gate_ready,
+            entry_access_epochs=epochs,
+            table_last_access_epochs=self._handle_table_last_access_epochs,
+        )
 
     def _erase_handle_entries(
         self,
@@ -541,34 +557,13 @@ class RetroSpecResidentClusterCache:
 
         num_entries = len(bucket_ids)
         with torch.cuda.stream(stream):
-            bucket_ids_gpu = torch.tensor(
-                bucket_ids, dtype=torch.int32, device=self.device
-            )
-            update_resident_handles(
-                bucket_ids=bucket_ids_gpu,
-                cluster_handles=torch.full(
-                    (num_entries,), -2, dtype=torch.int64, device=self.device
-                ),
-                page_counts=torch.zeros(
-                    num_entries, dtype=torch.int32, device=self.device
-                ),
-                page_slots=torch.full(
-                    (num_entries, self._handle_table_max_pages),
-                    -1,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                hit_gate_ready=torch.zeros(
-                    num_entries, dtype=torch.bool, device=self.device
-                ),
-                table_handles=self._handle_table_handles,
-                table_versions=self._handle_table_versions,
-                table_page_counts=self._handle_table_page_counts,
-                table_page_slots=self._handle_table_page_slots,
-                table_hit_gate_ready=self._handle_table_hit_gate_ready,
-            )
-            self._handle_table_last_access_epochs.index_fill_(
-                0, bucket_ids_gpu.to(torch.int64), 0
+            self._submit_handle_updates(
+                bucket_ids,
+                [-2] * num_entries,
+                [0] * num_entries,
+                [[-1] * self._handle_table_max_pages] * num_entries,
+                [False] * num_entries,
+                [0] * num_entries,
             )
             if self._binding_publisher is not None:
                 self._binding_publisher(
@@ -992,6 +987,12 @@ class RetroSpecResidentClusterCache:
         stream: torch.cuda.Stream,
     ) -> RetroSpecResidentLruCapture:
         """Capture the epoch allocation guarded by a structural revision."""
+        if self._pending_copy_batches:
+            # Publication is asynchronous on the copy stream. A revision check
+            # cannot detect an epoch initialization still queued there. Order
+            # the snapshot after that publication without waiting on the CPU;
+            # resolve_lru_capture performs the D2H wait outside the locks.
+            stream.wait_event(self._pending_copy_batches[-1].ready_event)
         return RetroSpecResidentLruCapture(
             structure_revision=self._structure_revision,
             groups=tuple(groups),

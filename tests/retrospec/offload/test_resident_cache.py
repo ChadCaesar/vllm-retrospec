@@ -1971,6 +1971,72 @@ def test_handle_table_write_rejects_entry_wider_than_table():
         )
 
 
+def test_handle_commands_do_not_wait_for_copy_stream_and_retain_pinned_sources():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=4, group_targets={group: 4})
+    cache._ensure_handle_table(2)
+    stream = cache._copy_stream
+    entries = ((7, (0, 1), group), (8, (2,), group))
+    # Warm both batch sizes, including first-use JIT and pinned allocations,
+    # before testing whether submission waits for preceding GPU work.
+    cache._write_handle_entries(entries, stream)
+    cache._erase_handle_entries((8,), stream)
+    cache._write_handle_entries(entries, stream)
+    stream.synchronize()
+    bucket7 = cache._handle_to_bucket[7]
+    cache._handle_table_last_access_epochs[bucket7] = 41
+    torch.cuda.synchronize()
+
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(500_000_000)
+    cache._next_access_epoch = 99
+    cache._write_handle_entries(entries, stream)
+    cache._erase_handle_entries((8,), stream)
+    done = torch.cuda.Event()
+    done.record(stream)
+    assert not done.query(), "Handle submission waited for preceding GPU work"
+
+    # Both command tensors have gone out of scope. Reusing their host allocation
+    # before the delayed H2D completed would corrupt handles, slots or epochs.
+    for count in (14, 7):
+        for _ in range(32):
+            torch.empty(count, dtype=torch.int64, pin_memory=True).fill_(-999)
+    done.synchronize()
+    assert cache._handle_table_handles[bucket7].item() == 7
+    assert cache._handle_table_page_slots[bucket7].cpu().tolist() == [0, 1]
+    assert cache._handle_table_last_access_epochs[bucket7].item() == 41
+    tombstone = cache._bucket_handles.index(-2)
+    assert cache._handle_table_handles[tombstone].item() == -2
+    assert cache._handle_table_last_access_epochs[tombstone].item() == 0
+
+
+def test_lru_capture_waits_for_pending_handle_epoch_publication():
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=2, group_targets={group: 2})
+    cache._ensure_handle_table(1)
+    stream = torch.cuda.current_stream(cache.device)
+    entries = ((8, (0,), group),)
+    # Warm the one-entry command before introducing a cross-stream delay.
+    cache._write_handle_entries(entries, stream)
+    cache._erase_handle_entries((8,), stream)
+    stream.synchronize()
+    cache._next_access_epoch = 55
+    with torch.cuda.stream(cache._copy_stream):
+        torch.cuda._sleep(500_000_000)
+    cache._write_handle_entries(entries, cache._copy_stream)
+    source = torch.empty(0)
+    cache._record_copy_batch((8,), source, source)
+    bucket = cache._handle_to_bucket[8]
+
+    with cache.mutation_guard():
+        capture = cache._capture_group_lru_from_gpu((group,), stream)
+    # The CPU wait belongs outside the mutation guard. A structural revision
+    # alone cannot detect an epoch initialization still queued on another stream.
+    resolved = cache.resolve_lru_capture(capture)
+    cache.synchronize_pending_copies()
+    assert resolved.epochs[bucket] == 55
+
+
 def test_handle_table_rebuild_hashes_sparse_monotonic_handles():
     group = RetroSpecClusterGroup("request", 0)
     cache = make_cache(capacity=65, group_targets={group: 65})

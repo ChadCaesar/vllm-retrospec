@@ -173,6 +173,39 @@ def test_resident_binding_publication_survives_request_slot_reuse():
     manager.deactivate()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_resident_binding_commands_remain_valid_after_async_submission():
+    manager = make_manager(max_resident_requests=1)
+    segment = make_resident_segment(manager, request_id="request", device="cuda")
+    manager.publish_resident_segments([segment])
+    stream = torch.cuda.Stream()
+
+    def publish(bucket):
+        manager.publish_resident_table_bindings(
+            "layer",
+            [RetroSpecResidentTableBinding("request", 0, 0, 0, bucket)],
+            stream,
+        )
+
+    publish(3)
+    stream.synchronize()
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(500_000_000)
+    publish(5)
+    done = torch.cuda.Event()
+    done.record(stream)
+    assert not done.query(), "Binding submission waited for preceding GPU work"
+    for _ in range(32):
+        torch.empty((1, 6), dtype=torch.int64, pin_memory=True).fill_(-999)
+    done.synchronize()
+
+    manager.activate(["request"])
+    view = manager.get_active_view("layer", ["request"], torch.device("cuda"))
+    assert view.arena is not None
+    assert view.arena.resident_table_buckets[0, 0].item() == 5
+    manager.deactivate()
+
+
 def test_active_view_omits_arena_when_layer_has_no_requested_resident_index():
     manager = make_manager()
     manager.publish_resident_segments(

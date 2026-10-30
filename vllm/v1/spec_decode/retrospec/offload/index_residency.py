@@ -901,10 +901,15 @@ class RetroSpecGPUIndexResidencyManager:
 
             device = arena.cluster_ids.device
             with torch.cuda.device(device), torch.cuda.stream(stream):
+                # Avoid waiting for earlier stream work under the arena lock.
+                # The pinned allocator defers source reuse until H2D completion.
                 publish_resident_table_bindings(
                     binding_commands=torch.tensor(
-                        binding_commands, dtype=torch.int64, device=device
-                    ),
+                        binding_commands,
+                        dtype=torch.int64,
+                        device="cpu",
+                        pin_memory=True,
+                    ).to(device=device, non_blocking=True),
                     arena_cluster_ids=arena.cluster_ids,
                     arena_resident_table_buckets=arena.resident_table_buckets,
                     arena_cluster_offsets=arena.cluster_offsets,

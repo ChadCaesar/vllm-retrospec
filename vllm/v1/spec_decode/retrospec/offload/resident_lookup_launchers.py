@@ -243,7 +243,14 @@ def update_resident_handles(
     table_page_counts: torch.Tensor,
     table_page_slots: torch.Tensor,
     table_hit_gate_ready: torch.Tensor,
+    *,
+    entry_access_epochs: torch.Tensor | None = None,
+    table_last_access_epochs: torch.Tensor | None = None,
 ) -> None:
+    if (entry_access_epochs is None) != (table_last_access_epochs is None):
+        raise ValueError(
+            "Resident access epoch inputs and table must be supplied together"
+        )
     if cluster_handles.numel() == 0:
         return
 
@@ -258,12 +265,15 @@ def update_resident_handles(
         table_page_counts,
         table_page_slots,
         table_hit_gate_ready,
+        entry_access_epochs,
+        table_last_access_epochs,
         cluster_handles.numel(),
         page_slots.stride(0),
         page_slots.stride(1),
         table_page_slots.stride(0),
         table_page_slots.stride(1),
         MAX_PAGES=table_page_slots.shape[1],
+        UPDATE_ACCESS_EPOCHS=entry_access_epochs is not None,
     )
 
 

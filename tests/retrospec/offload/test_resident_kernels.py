@@ -27,6 +27,29 @@ def _resident_bucket(cluster_handle: int, capacity: int = 8) -> int:
     return _resident_handle_hash(cluster_handle) & (capacity - 1)
 
 
+def test_handle_update_initializes_preserves_and_clears_access_epochs():
+    table = _make_table()
+    table[5].fill_(23)
+    device = table[0].device
+    update_resident_handles(
+        bucket_ids=torch.tensor([0, 1, 2], device=device),
+        cluster_handles=torch.tensor([7, 8, -2], device=device),
+        page_counts=torch.tensor([1, 2, 0], device=device),
+        page_slots=torch.tensor([[4, -1], [5, 6], [-1, -1]], device=device),
+        hit_gate_ready=torch.tensor([True, False, False], device=device),
+        table_handles=table[0],
+        table_versions=table[1],
+        table_page_counts=table[2],
+        table_page_slots=table[3],
+        table_hit_gate_ready=table[4],
+        entry_access_epochs=torch.tensor([37, -1, 0], device=device),
+        table_last_access_epochs=table[5],
+    )
+    assert table[5].cpu().tolist() == [37, 23, 0, 23, 23, 23, 23, 23]
+    assert table[1][:3].cpu().tolist() == [2, 2, 2]
+    assert table[0][:3].cpu().tolist() == [7, 8, -2]
+
+
 def _make_table(
     capacity: int = 8,
     max_pages: int = 2,

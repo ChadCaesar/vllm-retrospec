@@ -263,12 +263,15 @@ def _update_resident_handles_kernel(
     table_page_counts,
     table_page_slots,
     table_hit_gate_ready,
+    entry_access_epochs,
+    table_last_access_epochs,
     num_updates,
     input_page_stride_0,
     input_page_stride_1,
     table_page_stride_0,
     table_page_stride_1,
     MAX_PAGES: tl.constexpr,
+    UPDATE_ACCESS_EPOCHS: tl.constexpr,
 ):
     update_index = tl.program_id(0)
     valid = update_index < num_updates
@@ -300,6 +303,10 @@ def _update_resident_handles_kernel(
     tl.store(table_page_counts + bucket, page_count, mask=valid)
     tl.store(table_hit_gate_ready + bucket, gate_ready, mask=valid)
     tl.store(table_handles + bucket, handle, mask=valid)
+    if UPDATE_ACCESS_EPOCHS:
+        # A gate-only republish must preserve the reader's access record.
+        epoch = tl.load(entry_access_epochs + update_index, mask=valid, other=-1)
+        tl.store(table_last_access_epochs + bucket, epoch, mask=valid & (epoch >= 0))
     tl.atomic_add(version_ptr, 1, mask=valid, sem="release")
 
 
