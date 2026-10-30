@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -35,6 +36,60 @@ void validate_cpu_contiguous(const torch::Tensor& tensor, at::ScalarType dtype,
 }
 
 }  // namespace
+
+std::tuple<std::vector<int64_t>, std::vector<std::vector<int64_t>>,
+           std::vector<std::vector<int64_t>>>
+retrospec_parse_cluster_pages(const torch::Tensor& cluster_ids,
+                              const torch::Tensor& page_ids) {
+  validate_cpu_contiguous(cluster_ids, at::kLong, "Cluster IDs");
+  validate_cpu_contiguous(page_ids, at::kLong, "Cluster page IDs");
+  TORCH_CHECK_VALUE(cluster_ids.dim() == 1 && page_ids.dim() == 2 &&
+                        page_ids.size(0) == cluster_ids.numel(),
+                    "Flattened cluster and page-table shapes do not match");
+
+  const auto* ids = cluster_ids.data_ptr<int64_t>();
+  const auto* pages = page_ids.data_ptr<int64_t>();
+  const int64_t rows = cluster_ids.numel();
+  const int64_t width = page_ids.size(1);
+  std::vector<int64_t> parsed_ids;
+  std::vector<std::vector<int64_t>> parsed_pages(rows), positions(rows);
+  parsed_ids.reserve(rows);
+  std::unordered_map<int64_t, int64_t> cluster_rows, page_owners;
+
+  // The dispatcher releases the Python GIL while validating and compacting
+  // padded descriptors. Only the compact valid pages are boxed on return.
+  for (int64_t row = 0; row < rows; ++row) {
+    const int64_t id = ids[row];
+    TORCH_CHECK_VALUE(id >= -1, "Cluster IDs must be at least -1");
+    parsed_ids.push_back(id);
+    std::unordered_set<int64_t> row_pages;
+    for (int64_t column = 0; column < width; ++column) {
+      const int64_t page = pages[row * width + column];
+      TORCH_CHECK_VALUE(page >= -1, "Cluster page IDs must be at least -1");
+      if (page == -1) continue;
+      TORCH_CHECK_VALUE(
+          row_pages.insert(page).second,
+          "A cluster cannot reference the same logical page twice");
+      TORCH_CHECK_VALUE(id >= 0,
+                        "A padded cluster ID cannot reference logical pages");
+      auto owner = page_owners.emplace(page, id);
+      TORCH_CHECK_VALUE(owner.second || owner.first->second == id,
+                        "A logical page cannot belong to multiple clusters");
+      parsed_pages[row].push_back(page);
+      positions[row].push_back(column);
+    }
+    if (id < 0) continue;
+    TORCH_CHECK_VALUE(
+        !parsed_pages[row].empty(),
+        "A valid cluster ID must reference at least one logical page");
+    auto previous = cluster_rows.emplace(id, row);
+    TORCH_CHECK_VALUE(
+        previous.second ||
+            parsed_pages[previous.first->second] == parsed_pages[row],
+        "One cluster ID cannot reference different logical pages");
+  }
+  return {std::move(parsed_ids), std::move(parsed_pages), std::move(positions)};
+}
 
 std::tuple<std::vector<torch::Tensor>, std::vector<torch::Tensor>,
            std::vector<torch::Tensor>, std::vector<torch::Tensor>,

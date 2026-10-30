@@ -9,6 +9,8 @@ from time import perf_counter
 
 import torch
 
+from vllm import _custom_ops as ops
+
 from ..performance import RetroSpecPerformanceStats
 from .cluster_identity import RetroSpecClusterGroup
 from .resident_cache_admission import _ResidentAdmissionMixin
@@ -1301,90 +1303,36 @@ class RetroSpecResidentClusterCache:
         if page_ids_cpu.shape != page_ids.shape:
             raise ValueError("CPU page IDs do not match the selection shape")
 
-        if torch.any(cluster_ids_cpu < -1).item():
-            raise ValueError("Cluster IDs must be at least -1")
-        if torch.any(page_ids_cpu < -1).item():
-            raise ValueError("Cluster page IDs must be at least -1")
-
         flat_cluster_ids = cluster_ids_cpu.reshape(-1)
         flat_page_ids = page_ids_cpu.reshape(
             flat_cluster_ids.numel(),
             page_ids_cpu.shape[-1],
         )
+        raw_ids, page_rows, position_rows = ops.retrospec_parse_cluster_pages(
+            flat_cluster_ids.contiguous(), flat_page_ids.contiguous()
+        )
+        parsed_cluster_ids = [
+            None if cluster_id < 0 else cluster_id for cluster_id in raw_ids
+        ]
+        parsed_cluster_pages = [tuple(row) for row in page_rows]
+        valid_positions = [tuple(row) for row in position_rows]
 
-        parsed_cluster_ids: list[_ClusterId | None] = []
-        parsed_cluster_pages: list[_LogicalPages] = []
-        valid_positions: list[tuple[int, ...]] = []
-
-        requested_cluster_pages: dict[_ClusterId, _LogicalPages] = {}
-        requested_page_owners: dict[int, _ClusterId] = {}
-
-        for raw_cluster_id, row in zip(
-            flat_cluster_ids.tolist(),
-            flat_page_ids.tolist(),
-        ):
-            positions = tuple(
-                index for index, page_id in enumerate(row) if page_id >= 0
-            )
-            logical_pages = tuple(row[index] for index in positions)
-
-            if len(logical_pages) != len(set(logical_pages)):
-                raise ValueError(
-                    "A cluster cannot reference the same logical page twice"
-                )
-
-            if raw_cluster_id < 0:
-                if logical_pages:
-                    raise ValueError(
-                        "A padded cluster ID cannot reference logical pages"
-                    )
-
-                parsed_cluster_ids.append(None)
-                parsed_cluster_pages.append(())
-                valid_positions.append(())
-                continue
-
-            cluster_id = int(raw_cluster_id)
-
-            if (
-                allocated_cluster_ids is not None
-                and cluster_id not in allocated_cluster_ids
-            ):
-                raise RuntimeError(
-                    f"Cluster selection references unallocated cluster {cluster_id}"
-                )
-            if not logical_pages:
-                raise ValueError(
-                    "A valid cluster ID must reference at least one logical page"
-                )
-
-            previous_pages = requested_cluster_pages.get(cluster_id)
-            if previous_pages is not None and previous_pages != logical_pages:
-                raise ValueError(
-                    "One cluster ID cannot reference different logical pages"
-                )
-            requested_cluster_pages[cluster_id] = logical_pages
-
-            for logical_page_id in logical_pages:
-                if (
-                    allocated_page_ids is not None
-                    and logical_page_id not in allocated_page_ids
-                ):
+        # Allocation ownership is live Python state. Validate it at the caller's
+        # existing lock boundary; the native parser only reads immutable input.
+        if allocated_cluster_ids is not None:
+            for cluster_id in raw_ids:
+                if cluster_id >= 0 and cluster_id not in allocated_cluster_ids:
                     raise RuntimeError(
-                        "Cluster page table references an unallocated "
-                        f"logical page {logical_page_id}"
+                        f"Cluster selection references unallocated cluster {cluster_id}"
                     )
-
-                previous_owner = requested_page_owners.get(logical_page_id)
-                if previous_owner is not None and previous_owner != cluster_id:
-                    raise ValueError(
-                        "A logical page cannot belong to multiple clusters"
-                    )
-                requested_page_owners[logical_page_id] = cluster_id
-
-            parsed_cluster_ids.append(cluster_id)
-            parsed_cluster_pages.append(logical_pages)
-            valid_positions.append(positions)
+        if allocated_page_ids is not None:
+            for row in parsed_cluster_pages:
+                for page_id in row:
+                    if page_id not in allocated_page_ids:
+                        raise RuntimeError(
+                            "Cluster page table references an unallocated "
+                            f"logical page {page_id}"
+                        )
 
         return (
             cluster_ids_cpu,

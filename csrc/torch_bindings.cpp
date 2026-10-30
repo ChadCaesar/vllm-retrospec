@@ -63,6 +63,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("retrospec_plan_prefetch_admissions", torch::kCPU,
            &retrospec_plan_prefetch_admissions);
 
+  ops.def("retrospec_parse_cluster_pages(Tensor cluster_ids, Tensor page_ids) "
+          "-> (int[], int[][], int[][])");
+  ops.impl("retrospec_parse_cluster_pages", torch::kCPU,
+           &retrospec_parse_cluster_pages);
+
   ops.def(
       "retrospec_gather_cluster_pages("
       "Tensor[] key_slabs, Tensor[] value_slabs, Tensor page_ids, "

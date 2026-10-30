@@ -205,6 +205,23 @@ class RetroSpecCPUProposalMixin:
                     self.performance_stats.add_counter("cpu_risk_early_full")
                     require_full = True
                     break
+                if (
+                    should_verify
+                    and not force_sparse
+                    and window.full_pending >= self.policy.pending_limit
+                    and 2 * window.sparse_pending < self.policy.max_draft_tokens
+                ):
+                    # A CPU confirmation during sparse can release only one or
+                    # two slots. Refilling those slots must not create a chain
+                    # of tiny sparse calls at the full boundary. Full verify
+                    # can consume this unverified tail directly; quality
+                    # triggers still take the sparse/expanded path below.
+                    self.performance_stats.add_counter("cpu_small_tail_full_handoffs")
+                    self.performance_stats.add_counter(
+                        "cpu_small_tail_full_tokens", window.sparse_pending
+                    )
+                    require_full = True
+                    break
                 if should_verify:
                     cpu.synchronize(metadata, background=False)
                     start = max(window.confirmed, window.sparse)

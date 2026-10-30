@@ -223,7 +223,7 @@ def test_cpu_export_gathers_directly_into_shared_head_slots(
         store.close()
 
 
-@pytest.mark.parametrize("quality_trigger", [False, True])
+@pytest.mark.parametrize("quality_trigger", [None, 7, 19])
 @pytest.mark.parametrize("cpu_during_verification", [False, True])
 @pytest.mark.parametrize("execution_slice", [False, True])
 def test_cpu_refills_only_length_triggered_verification(
@@ -257,7 +257,7 @@ def test_cpu_refills_only_length_triggered_verification(
 
     class Proposer(RetroSpecCPUProposalMixin):
         def _run_draft_step(self, batch, slot, metadata, active, sampling):
-            margin = 0.0 if slot == 7 and quality_trigger else 1.0
+            margin = 0.0 if slot == quality_trigger else 1.0
             return torch.tensor([slot + 1]), torch.tensor([margin]), torch.ones(1)
 
         def _verify_draft_tokens(
@@ -273,15 +273,16 @@ def test_cpu_refills_only_length_triggered_verification(
             start = int(starts[0])
             count = int(self.state.draft_counts[0])
             self.ranges.append((start + 1, start + count))
+            quality = quality_trigger is not None and start + count > quality_trigger
             return SimpleNamespace(
                 verified_counts=torch.tensor([count]),
                 require_full=torch.tensor(
-                    [quality_trigger or start + count - int(confirmed_counts[0]) >= 16]
+                    [quality or start + count - int(confirmed_counts[0]) >= 16]
                 ),
                 full_reasons=torch.tensor(
                     [
                         int(RetroSpecReason.EXPANDED_MARGIN)
-                        if quality_trigger
+                        if quality
                         else int(RetroSpecReason.PENDING_LIMIT)
                     ]
                 ),
@@ -294,7 +295,7 @@ def test_cpu_refills_only_length_triggered_verification(
         method="retrospec",
         num_speculative_tokens=16,
         retrospec_max_draft_tokens=8,
-        retrospec_draft_margin_threshold=0.5 if quality_trigger else None,
+        retrospec_draft_margin_threshold=0.5 if quality_trigger is not None else None,
     )
     proposer.policy = RetroSpecDecisionPolicy(proposer.speculative_config)
     proposer.num_speculative_tokens = 32
@@ -323,7 +324,7 @@ def test_cpu_refills_only_length_triggered_verification(
     result = proposer._propose_with_cpu(
         ["r"], [100], None, None, remaining_generation_budget=24
     )
-    if quality_trigger:
+    if quality_trigger == 7:
         assert proposer.cpu_coordinator.committed == [1, 2]
         assert proposer.ranges == [(3, 8)]
         assert result == [list(range(3, 9))]
@@ -339,8 +340,14 @@ def test_cpu_refills_only_length_triggered_verification(
         )
     elif cpu_during_verification:
         assert proposer.cpu_coordinator.committed == [1, 2, 3, 4]
-        assert proposer.ranges == [(3, 10), (11, 18), (19, 20)]
+        assert proposer.ranges == [(3, 10), (11, 18)] + (
+            [(19, 20)] if quality_trigger == 19 else []
+        )
         assert result == [list(range(5, 21))]
+        if quality_trigger is None:
+            proposer.performance_stats.add_counter.assert_any_call(
+                "cpu_small_tail_full_handoffs"
+            )
     else:
         assert proposer.cpu_coordinator.committed == [1, 2]
         assert proposer.ranges == [(3, 10), (11, 18)]

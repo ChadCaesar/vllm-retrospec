@@ -154,7 +154,7 @@ class _ResidentAdmissionMixin:
         flat_source_page_ids = source_page_ids_cpu.reshape(
             len(parsed_cluster_ids),
             source_page_ids_cpu.shape[-1],
-        )
+        ).tolist()
         cluster_page_map: dict[_ClusterId, _LogicalPages] = {}
         cluster_source_ids: dict[_ClusterId, tuple[int, ...]] = {}
 
@@ -169,9 +169,7 @@ class _ResidentAdmissionMixin:
                 continue
 
             cluster_page_map[cluster_id] = logical_pages
-            current_source_ids = tuple(
-                int(source_row[position]) for position in positions
-            )
+            current_source_ids = tuple(source_row[position] for position in positions)
             previous_source_ids = cluster_source_ids.get(cluster_id)
 
             # A duplicated cluster may occur in more than one batch position.

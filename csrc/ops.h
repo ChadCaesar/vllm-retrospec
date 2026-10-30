@@ -221,6 +221,11 @@ retrospec_plan_prefetch_admissions(
     const std::vector<torch::Tensor>& resident_states,
     const std::vector<int64_t>& page_capacities);
 
+std::tuple<std::vector<int64_t>, std::vector<std::vector<int64_t>>,
+           std::vector<std::vector<int64_t>>>
+retrospec_parse_cluster_pages(const torch::Tensor& cluster_ids,
+                             const torch::Tensor& page_ids);
+
 void retrospec_gather_cluster_pages(
     const std::vector<torch::Tensor>& key_slabs,
     const std::vector<torch::Tensor>& value_slabs,

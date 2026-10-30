@@ -1361,6 +1361,44 @@ def test_prepared_staged_admission_revalidates_current_allocations():
     assert cache._cluster_to_pages[10] == (0, 1)
 
 
+def test_prepared_admission_keeps_sparse_positions_and_complete_duplicate_source():
+    cache = make_cache(capacity=3)
+    source_keys, source_values = make_backing_pages(num_pages=3)
+    cluster_ids = torch.tensor([10, 11, 10, -1])
+    logical_pages = torch.tensor([[0, -1, 1], [-1, 2, -1], [0, -1, 1], [-1, -1, -1]])
+    # The first duplicate has an incomplete mapping. The second occurrence
+    # supplies both source pages, including a hole between their positions.
+    source_ids = torch.tensor([[-1, -1, -1], [-1, 2, -1], [1, -1, 0], [-1, -1, -1]])
+    group = RetroSpecClusterGroup("prepared", 0)
+    prepared = cache.prepare_staged_admission(
+        cluster_ids,
+        logical_pages,
+        {10: group, 11: group},
+        source_ids,
+        source_keys,
+        source_values,
+    )
+    assert prepared.parsed_cluster_ids == (10, 11, 10, None)
+    assert prepared.valid_positions == ((0, 2), (1,), (0, 2), ())
+    assert prepared.requested_clusters == (10, 11)
+    assert prepared.cluster_page_map == {10: (0, 1), 11: (2,)}
+    assert prepared.cluster_source_ids == {10: (1, 0), 11: (2,)}
+    with cache.mutation_guard():
+        access = cache.admit_prepared_staged(
+            prepared,
+            {10, 11},
+            {0, 1, 2},
+        )
+    assert access.hit_cluster_mask.tolist() == [True, True, True, False]
+    cache.synchronize_pending_copies()
+    torch.testing.assert_close(
+        cache.key_pages[cache._cluster_to_slots[10][0]].cpu(), source_keys[1]
+    )
+    torch.testing.assert_close(
+        cache.key_pages[cache._cluster_to_slots[10][1]].cpu(), source_keys[0]
+    )
+
+
 def test_prepared_staged_admission_rejects_released_logical_page():
     cache = make_cache(capacity=2)
     source_keys, source_values = make_backing_pages(num_pages=2)

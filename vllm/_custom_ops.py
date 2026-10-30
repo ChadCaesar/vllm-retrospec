@@ -108,6 +108,13 @@ def retrospec_plan_prefetch_admissions(
     )
 
 
+def retrospec_parse_cluster_pages(
+    cluster_ids: torch.Tensor,
+    page_ids: torch.Tensor,
+) -> tuple[list[int], list[list[int]], list[list[int]]]:
+    return torch.ops._C.retrospec_parse_cluster_pages(cluster_ids, page_ids)
+
+
 def retrospec_gather_cluster_pages(
     key_slabs: tuple[torch.Tensor, ...],
     value_slabs: tuple[torch.Tensor, ...],
