@@ -853,12 +853,31 @@ class RetroSpecResidentClusterCache:
                     )
                 slot_ids.add(slot_id)
 
+        self._register_validated_clusters(entries)
+
+    def _register_validated_clusters(
+        self,
+        entries: Collection[
+            tuple[_ClusterId, RetroSpecClusterGroup, _LogicalPages, tuple[int, ...]]
+        ],
+    ) -> None:
+        """Install entries after descriptor, ownership and slot validation.
+
+        Prepared admissions validate immutable descriptors outside the guard,
+        then check live ownership and reserve disjoint free slots under it.
+        Generic callers go through _register_clusters instead.
+        """
+        cluster_ids = []
         for cluster_id, group, logical_pages, slots in entries:
+            cluster_ids.append(cluster_id)
             self._cluster_to_pages[cluster_id] = logical_pages
             self._cluster_to_slots[cluster_id] = slots
             self._cluster_to_group[cluster_id] = group
 
-            group_state = self._group_states.setdefault(group, _ResidentGroupState())
+            group_state = self._group_states.get(group)
+            if group_state is None:
+                group_state = _ResidentGroupState()
+                self._group_states[group] = group_state
             group_state.lru[cluster_id] = None
             group_state.num_pages += len(slots)
             for logical_page_id in logical_pages:

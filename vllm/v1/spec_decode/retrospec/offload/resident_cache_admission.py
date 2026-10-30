@@ -16,6 +16,7 @@ from .resident_cache_types import (
     RetroSpecResolvedResidentLru,
     _ClusterId,
     _LogicalPages,
+    _PreparedClusterStats,
 )
 
 
@@ -190,6 +191,19 @@ class _ResidentAdmissionMixin:
             for logical_pages in cluster_page_map.values()
             for page_id in logical_pages
         )
+        # Source rows and their bounds are immutable for this ticket. Compute
+        # them once here; capacity itself is read again at commit to catch a
+        # source tensor resized after preparation. Missing/out-of-range sources
+        # remain legal for resident or unselected clusters.
+        cluster_stats = tuple(
+            (
+                cluster_id,
+                len(cluster_page_map[cluster_id]),
+                min(cluster_source_ids[cluster_id]),
+                max(cluster_source_ids[cluster_id]),
+            )
+            for cluster_id in requested_clusters
+        )
 
         return RetroSpecPreparedResidentAdmission(
             cluster_ids=cluster_ids,
@@ -208,6 +222,7 @@ class _ResidentAdmissionMixin:
             cluster_source_ids=MappingProxyType(cluster_source_ids),
             referenced_cluster_ids=frozenset(cluster_page_map),
             referenced_page_ids=referenced_page_ids,
+            cluster_stats=cluster_stats,
         )
 
     @staticmethod
@@ -217,17 +232,19 @@ class _ResidentAdmissionMixin:
         allocated_page_ids: Collection[int],
     ) -> None:
         """Reject a descriptor whose request storage was released or reused."""
-        missing_cluster_ids = prepared.referenced_cluster_ids.difference(
-            allocated_cluster_ids
-        )
-        if missing_cluster_ids:
+        if not prepared.referenced_cluster_ids.issubset(allocated_cluster_ids):
+            missing_cluster_ids = prepared.referenced_cluster_ids.difference(
+                allocated_cluster_ids
+            )
             cluster_id = min(missing_cluster_ids)
             raise RuntimeError(
                 f"Prepared admission references unallocated cluster {cluster_id}"
             )
 
-        missing_page_ids = prepared.referenced_page_ids.difference(allocated_page_ids)
-        if missing_page_ids:
+        if not prepared.referenced_page_ids.issubset(allocated_page_ids):
+            missing_page_ids = prepared.referenced_page_ids.difference(
+                allocated_page_ids
+            )
             page_id = min(missing_page_ids)
             raise RuntimeError(
                 f"Prepared admission references unallocated logical page {page_id}"
@@ -269,42 +286,37 @@ class _ResidentAdmissionMixin:
     ) -> tuple[
         tuple[_ClusterId, ...],
         set[_ClusterId],
-        tuple[_ClusterId, ...],
+        tuple[_PreparedClusterStats, ...],
         int,
         dict[RetroSpecClusterGroup, int],
     ]:
         """Plan the priority prefix against the current resident state."""
         target_clusters: list[_ClusterId] = []
         target_page_count = 0
-        for cluster_id in prepared.requested_clusters:
-            cluster_page_count = len(prepared.cluster_page_map[cluster_id])
+        missing_targets: list[_PreparedClusterStats] = []
+        required_page_count = 0
+        incoming_group_pages: dict[RetroSpecClusterGroup, int] = {}
+        for cluster_stats in prepared.cluster_stats:
+            cluster_id, cluster_page_count, _, _ = cluster_stats
             if cluster_page_count > self._logical_capacity:
                 continue
             if target_page_count + cluster_page_count > self._logical_capacity:
                 break
             target_clusters.append(cluster_id)
             target_page_count += cluster_page_count
-
-        missing_targets = tuple(
-            cluster_id
-            for cluster_id in target_clusters
-            if cluster_id not in self._cluster_to_slots
-        )
-        required_page_count = sum(
-            len(prepared.cluster_page_map[cluster_id]) for cluster_id in missing_targets
-        )
-        incoming_group_pages: dict[RetroSpecClusterGroup, int] = {}
-        for cluster_id in missing_targets:
-            group = prepared.cluster_groups[cluster_id]
-            incoming_group_pages[group] = incoming_group_pages.get(group, 0) + len(
-                prepared.cluster_page_map[cluster_id]
-            )
+            if cluster_id not in self._cluster_to_slots:
+                missing_targets.append(cluster_stats)
+                required_page_count += cluster_page_count
+                group = prepared.cluster_groups[cluster_id]
+                incoming_group_pages[group] = (
+                    incoming_group_pages.get(group, 0) + cluster_page_count
+                )
 
         target_cluster_tuple = tuple(target_clusters)
         return (
             target_cluster_tuple,
             set(target_cluster_tuple),
-            missing_targets,
+            tuple(missing_targets),
             required_page_count,
             incoming_group_pages,
         )
@@ -381,23 +393,25 @@ class _ResidentAdmissionMixin:
         requested_clusters = prepared.requested_clusters
         cluster_page_map = prepared.cluster_page_map
         cluster_source_ids = prepared.cluster_source_ids
-
+        resident_pages_by_cluster = self._cluster_to_pages
+        resident_groups = self._cluster_to_group
+        page_owner = self._page_to_cluster.get
         for cluster_id in requested_clusters:
             logical_pages = cluster_page_map[cluster_id]
-            resident_pages = self._cluster_to_pages.get(cluster_id)
+            resident_pages = resident_pages_by_cluster.get(cluster_id)
 
             if resident_pages is not None:
                 if resident_pages != logical_pages:
                     raise RuntimeError(
                         "Cluster ID conflicts with an existing resident descriptor"
                     )
-                if self._cluster_to_group.get(cluster_id) != cluster_groups[cluster_id]:
+                if resident_groups.get(cluster_id) != cluster_groups[cluster_id]:
                     raise RuntimeError(
                         "Resident cluster group does not match requested ownership"
                     )
 
             for logical_page_id in logical_pages:
-                resident_owner = self._page_to_cluster.get(logical_page_id)
+                resident_owner = page_owner(logical_page_id)
                 if resident_owner is not None and resident_owner != cluster_id:
                     raise RuntimeError(
                         "Logical page ownership conflicts with an existing "
@@ -412,21 +426,15 @@ class _ResidentAdmissionMixin:
             incoming_group_pages,
         ) = self._plan_prepared_admission_targets(prepared)
 
-        # Validate every source before changing resident ownership.
-        for cluster_id in missing_targets:
-            logical_pages = cluster_page_map[cluster_id]
-            source_ids = cluster_source_ids.get(cluster_id)
-
-            if source_ids is None or len(source_ids) != len(logical_pages):
-                raise RuntimeError("Missing source-page mapping for resident admission")
-            if any(source_page_id < 0 for source_page_id in source_ids):
+        # Check live capacity once, using immutable bounds computed in prepare.
+        # Only selected missing clusters require a complete valid source row.
+        source_capacity = source_key_pages.shape[0]
+        for _, _, min_source_id, max_source_id in missing_targets:
+            if min_source_id < 0:
                 raise RuntimeError(
                     "A missing cluster does not have complete source pages"
                 )
-            if any(
-                source_page_id >= source_key_pages.shape[0]
-                for source_page_id in source_ids
-            ):
+            if max_source_id >= source_capacity:
                 raise RuntimeError("Source page ID exceeds source storage capacity")
 
         if mutation_stream is None:
@@ -521,19 +529,16 @@ class _ResidentAdmissionMixin:
             self._free_slots.difference_update(reserved_slots)
 
             slot_offset = 0
-            for cluster_id in missing_targets:
-                logical_pages = cluster_page_map[cluster_id]
-                cluster_page_count = len(logical_pages)
+            for cluster_id, cluster_page_count, _, _ in missing_targets:
                 slots = reserved_slots[slot_offset : slot_offset + cluster_page_count]
                 slot_offset += cluster_page_count
-                source_ids = cluster_source_ids[cluster_id]
-                source_page_ids.extend(source_ids)
+                source_page_ids.extend(cluster_source_ids[cluster_id])
                 destination_slots.extend(slots)
                 registration_entries.append(
                     (
                         cluster_id,
                         cluster_groups[cluster_id],
-                        logical_pages,
+                        cluster_page_map[cluster_id],
                         slots,
                     )
                 )
@@ -546,8 +551,12 @@ class _ResidentAdmissionMixin:
                     source_key_pages,
                     source_value_pages,
                 )
-                self._register_clusters(registration_entries)
-                copied_cluster_ids = tuple(missing_targets)
+                # Native parsing proved descriptor/page uniqueness. Live
+                # ownership was checked above under this same guard, and the
+                # sorted free-slot set supplies disjoint slots (also bounds-
+                # checked by the native copy). No Python revalidation is needed.
+                self._register_validated_clusters(registration_entries)
+                copied_cluster_ids = tuple(c[0] for c in missing_targets)
         except BaseException:
             if not copied_cluster_ids:
                 self._free_slots.update(reserved_slots)

@@ -435,14 +435,14 @@ def test_resident_admission_batches_page_copy_and_cluster_registration():
     backing_keys, backing_values = make_backing_pages(num_pages=3)
     page_ids = torch.tensor([[0], [1], [2]], dtype=torch.int64)
     cache._copy_pages_to_slots = Mock(wraps=cache._copy_pages_to_slots)
-    cache._register_clusters = Mock(wraps=cache._register_clusters)
+    cache._register_validated_clusters = Mock(wraps=cache._register_validated_clusters)
 
     access = cache.admit(page_ids, {0, 1, 2}, backing_keys, backing_values)
 
     cache._copy_pages_to_slots.assert_called_once()
     assert cache._copy_pages_to_slots.call_args.args[:2] == ([0, 1, 2], [0, 1, 2])
-    cache._register_clusters.assert_called_once()
-    assert len(cache._register_clusters.call_args.args[0]) == 3
+    cache._register_validated_clusters.assert_called_once()
+    assert len(cache._register_validated_clusters.call_args.args[0]) == 3
     assert len(cache._pending_copy_batches) == 1
     assert cache._pending_copy_batches[0].cluster_ids == (0, 1, 2)
     assert_cached_pages_match_backing(
@@ -1383,6 +1383,7 @@ def test_prepared_admission_keeps_sparse_positions_and_complete_duplicate_source
     assert prepared.requested_clusters == (10, 11)
     assert prepared.cluster_page_map == {10: (0, 1), 11: (2,)}
     assert prepared.cluster_source_ids == {10: (1, 0), 11: (2,)}
+    assert prepared.cluster_stats == ((10, 2, 0, 1), (11, 1, 2, 2))
     with cache.mutation_guard():
         access = cache.admit_prepared_staged(
             prepared,
@@ -1427,6 +1428,128 @@ def test_prepared_staged_admission_rejects_released_logical_page():
             lookup_after_admit=False,
         )
     assert cache.num_resident_pages == 0
+
+
+@pytest.mark.parametrize("bad_source", [-1, 2])
+def test_prepared_source_bounds_are_checked_only_for_selected_misses(bad_source):
+    group = RetroSpecClusterGroup("request", 0)
+    cache = make_cache(capacity=1, group_targets={group: 1})
+    keys, values = make_backing_pages(num_pages=2)
+    prepared = cache.prepare_staged_admission(
+        torch.tensor([10, 11]),
+        torch.tensor([[0], [1]]),
+        {10: group, 11: group},
+        torch.tensor([[0], [bad_source]]),
+        keys,
+        values,
+    )
+    with cache.mutation_guard():
+        cache.admit_prepared_staged(
+            prepared, {10, 11}, {0, 1}, lookup_after_admit=False
+        )
+    cache.synchronize_pending_copies()
+    assert set(cache._cluster_to_slots) == {10}
+
+    cache.resize(2, group_targets={group: 2})
+    error = "complete source pages" if bad_source < 0 else "source storage capacity"
+    with cache.mutation_guard(), pytest.raises(RuntimeError, match=error):
+        cache.admit_prepared_staged(
+            prepared, {10, 11}, {0, 1}, lookup_after_admit=False
+        )
+    assert set(cache._cluster_to_slots) == {10}
+
+
+def test_prepared_admission_rechecks_source_capacity_before_eviction():
+    cache = make_cache(capacity=1)
+    keys, values = make_backing_pages(num_pages=2)
+    cache.admit(torch.tensor([[0]]), {0, 1}, keys, values)
+    cache.synchronize_pending_copies()
+    group = cache._cluster_to_group[0]
+    prepared = cache.prepare_staged_admission(
+        torch.tensor([10]),
+        torch.tensor([[1]]),
+        {10: group},
+        torch.tensor([[1]]),
+        keys,
+        values,
+    )
+    keys.resize_(1, 2, 1)
+    values.resize_(1, 2, 1)
+    with cache.mutation_guard(), pytest.raises(RuntimeError, match="storage capacity"):
+        cache.admit_prepared_staged(prepared, {0, 10}, {0, 1}, lookup_after_admit=False)
+    assert set(cache._cluster_to_slots) == {0}
+    assert cache._page_to_cluster == {0: 0}
+
+
+@pytest.mark.parametrize("conflict", ["page", "descriptor", "group"])
+def test_prepared_admission_rechecks_ownership_after_intervening_admission(conflict):
+    group = RetroSpecClusterGroup("request", 0)
+    other_group = RetroSpecClusterGroup("other", 0)
+    cache = make_cache(capacity=2)
+    keys, values = make_backing_pages(num_pages=2)
+    prepared = cache.prepare_staged_admission(
+        torch.tensor([10]),
+        torch.tensor([[0]]),
+        {10: group},
+        torch.tensor([[0]]),
+        keys,
+        values,
+    )
+    cluster_id = 11 if conflict == "page" else 10
+    page_id = 1 if conflict == "descriptor" else 0
+    owner_group = other_group if conflict == "group" else group
+    RetroSpecResidentClusterCache.admit(
+        cache,
+        torch.tensor([cluster_id]),
+        torch.tensor([[page_id]]),
+        {cluster_id: owner_group},
+        {10, 11},
+        {0, 1},
+        keys,
+        values,
+    )
+    cache.synchronize_pending_copies()
+    before = dict(cache._cluster_to_slots)
+    with (
+        cache.mutation_guard(),
+        pytest.raises(RuntimeError, match="conflicts|ownership"),
+    ):
+        cache.admit_prepared_staged(
+            prepared, {10, 11}, {0, 1}, lookup_after_admit=False
+        )
+    assert cache._cluster_to_slots == before
+    assert cache._page_to_cluster == {page_id: cluster_id}
+
+
+def test_resident_clusters_do_not_require_valid_sources_on_repeated_admission():
+    cache = make_cache(capacity=1)
+    keys, values = make_backing_pages(num_pages=1)
+    cache.admit(torch.tensor([[0]]), {0}, keys, values)
+    cache.synchronize_pending_copies()
+    group = cache._cluster_to_group[0]
+    prepared = cache.prepare_staged_admission(
+        torch.tensor([0]),
+        torch.tensor([[0]]),
+        {0: group},
+        torch.tensor([[-1]]),
+        keys,
+        values,
+    )
+    with cache.mutation_guard():
+        cache.admit_prepared_staged(prepared, {0}, {0}, lookup_after_admit=False)
+    assert cache.num_resident_clusters == 1
+    assert not cache._pending_copy_batches
+
+
+@pytest.mark.parametrize("slots", [(2, 1), (0, 0)])
+def test_generic_registration_still_validates_slot_range_and_uniqueness(slots):
+    cache = make_cache(capacity=2)
+    group = RetroSpecClusterGroup("request", 0)
+    entries = ((10, group, (0,), (slots[0],)), (11, group, (1,), (slots[1],)))
+    with pytest.raises(RuntimeError, match="out of range|more than once"):
+        cache._register_clusters(entries)
+    assert not cache._cluster_to_slots
+    assert not cache._page_to_cluster
 
 
 def test_prepared_admission_skips_lru_capture_without_eviction():

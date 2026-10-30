@@ -54,6 +54,11 @@ class RetroSpecResidentPageAccess:
     read_lease: "RetroSpecResidentReadLease | None" = None
 
 
+# Cluster ID, logical page count, minimum and maximum chosen source page IDs.
+# Plain integer tuples avoid retaining a tracked descriptor object per cluster.
+_PreparedClusterStats = tuple[_ClusterId, int, int, int]
+
+
 @dataclass(frozen=True)
 class RetroSpecPreparedResidentAdmission:
     """Immutable CPU descriptors prepared before taking the mutation guard."""
@@ -74,6 +79,7 @@ class RetroSpecPreparedResidentAdmission:
     cluster_source_ids: Mapping[_ClusterId, tuple[int, ...]]
     referenced_cluster_ids: frozenset[_ClusterId]
     referenced_page_ids: frozenset[int]
+    cluster_stats: tuple[_PreparedClusterStats, ...]
 
 
 @dataclass(frozen=True)
