@@ -441,6 +441,8 @@ class RetroSpecResidentClusterCache:
         page_slots: list[list[int]] = []
         hit_gate_ready: list[bool] = []
         access_epochs: list[int] = []
+        new_cluster_ids: list[int] = []
+        new_bucket_ids: list[int] = []
 
         for cluster_id, slots, group in entries:
             if len(slots) > self._handle_table_max_pages:
@@ -459,6 +461,8 @@ class RetroSpecResidentClusterCache:
                     continue
                 self._handle_to_bucket[cluster_id] = bucket
                 self._bucket_handles[bucket] = cluster_id
+                new_cluster_ids.append(cluster_id)
+                new_bucket_ids.append(bucket)
 
             padded_slots = list(slots)
             padded_slots.extend(
@@ -483,10 +487,13 @@ class RetroSpecResidentClusterCache:
                 hit_gate_ready,
                 access_epochs,
             )
-            if self._binding_publisher is not None:
+            # Gate/epoch updates keep the same bucket. New index segments
+            # explicitly replay bindings; table rebuilds clear the bucket map
+            # and therefore include every live handle in this new-entry batch.
+            if self._binding_publisher is not None and new_cluster_ids:
                 self._binding_publisher(
-                    tuple(cluster_ids),
-                    tuple(bucket_ids),
+                    tuple(new_cluster_ids),
+                    tuple(new_bucket_ids),
                     stream,
                 )
 
@@ -1268,13 +1275,20 @@ class RetroSpecResidentClusterCache:
                 self._group_states.keys(),
                 current_stream,
             )
-        while self.num_resident_pages > capacity:
-            if not self._evict_oldest_unprotected(
+            # Use the same sequential group-local LRU choices, then publish
+            # their tombstones/bindings in one batch before reusing any slots.
+            victims = self._select_victim_clusters(
                 protected_clusters=set(),
                 incoming_group_pages={},
-                update_stream=current_stream,
+                required_page_count=0,
+            )
+            if (
+                self.num_resident_pages
+                - sum(len(self._cluster_to_slots[victim]) for victim in victims)
+                > capacity
             ):
                 raise RuntimeError("Resident cache cannot satisfy the reduced capacity")
+            self._evict_clusters(victims, update_stream=current_stream)
 
         self._publish_handle_delta((), previous_gate_ready, current_stream)
 

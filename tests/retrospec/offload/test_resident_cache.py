@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import OrderedDict
+from copy import copy
+from random import Random
 from unittest.mock import Mock
 
 import pytest
@@ -926,6 +929,126 @@ def test_resize_republishes_gate_changed_survivors_and_fast_returns():
     cache.resize(4, group_targets={group: 1})
     publish.assert_not_called()
     synchronize.assert_not_called()
+
+
+@pytest.mark.parametrize("seed,capacity", [(0, 0), (1, 1), (2, 7), (3, 17), (4, 29)])
+def test_resize_batches_publications_with_sequential_lru_choices(seed, capacity):
+    rng = Random(seed)
+    groups = [RetroSpecClusterGroup(f"request-{i // 2}", i % 2) for i in range(4)]
+    cluster_groups = {100 + i: groups[i % len(groups)] for i in range(24)}
+    page_rows = []
+    num_pages = 0
+    for _ in cluster_groups:
+        count = rng.randint(1, 3)
+        page_rows.append(list(range(num_pages, num_pages + count)) + [-1] * (3 - count))
+        num_pages += count
+    publisher = Mock()
+    cache = make_cache(num_pages, binding_publisher=publisher)
+    backing_keys, backing_values = make_backing_pages(num_pages=num_pages)
+    cache.admit(
+        torch.tensor(page_rows),
+        set(range(num_pages)),
+        backing_keys,
+        backing_values,
+        cluster_ids=torch.tensor(list(cluster_groups)),
+        cluster_groups=cluster_groups,
+        allocated_cluster_ids=set(cluster_groups),
+    )
+    cache.synchronize_pending_copies()
+    # GPU hits reorder each group's LRU, including ties retaining CPU order.
+    epochs = {cluster_id: rng.randrange(7) for cluster_id in cluster_groups}
+    buckets = dict(cache._handle_to_bucket)
+    for cluster_id, bucket in buckets.items():
+        cache._handle_table_last_access_epochs[bucket] = epochs[cluster_id]
+    targets = {group: capacity // len(groups) for group in groups}
+    oracle = copy(cache)
+    oracle._group_targets = targets
+    oracle._group_states = {
+        group: copy(state) for group, state in cache._group_states.items()
+    }
+    for state in oracle._group_states.values():
+        state.lru = OrderedDict.fromkeys(sorted(state.lru, key=epochs.__getitem__))
+
+    # Run the original one-victim selector against independent CPU state.
+    expected_victims = []
+    remaining_pages = num_pages
+    while remaining_pages > capacity:
+        victim = oracle._select_victim_cluster(set(), {})
+        assert victim is not None
+        expected_victims.append(victim)
+        state = oracle._group_states[cluster_groups[victim]]
+        count = len(cache._cluster_to_slots[victim])
+        del state.lru[victim]
+        state.num_pages -= count
+        remaining_pages -= count
+    expected_free_slots = cache._free_slots.union(
+        slot for victim in expected_victims for slot in cache._cluster_to_slots[victim]
+    )
+    publisher.reset_mock()
+    erase = Mock(wraps=cache._erase_handle_entries)
+    cache._erase_handle_entries = erase
+    before_revision = cache._structure_revision
+    cache.resize(capacity, group_targets=targets)
+    torch.cuda.synchronize()
+
+    erase.assert_called_once()
+    assert erase.call_args.args[0] == tuple(expected_victims)
+    publisher.assert_called_once_with(
+        tuple(expected_victims),
+        (-1,) * len(expected_victims),
+        torch.cuda.current_stream(),
+    )
+    assert cache._structure_revision > before_revision
+    assert cache.num_resident_pages == remaining_pages
+    assert cache.physical_capacity == num_pages
+    assert cache._free_slots == expected_free_slots
+    assert set(cache._cluster_to_slots) == set(cluster_groups).difference(
+        expected_victims
+    )
+    for group, state in oracle._group_states.items():
+        actual = cache._group_states.get(group)
+        assert (tuple(actual.lru) if actual else ()) == tuple(state.lru)
+        assert (actual.num_pages if actual else 0) == state.num_pages
+    for cluster_id, bucket in buckets.items():
+        if cluster_id in expected_victims:
+            assert cache._handle_table_handles[bucket].item() == -2
+            assert cache._handle_table_last_access_epochs[bucket].item() == 0
+            assert cache._handle_table_page_counts[bucket].item() == 0
+            assert not cache._handle_table_hit_gate_ready[bucket].item()
+        else:
+            assert cache._handle_table_handles[bucket].item() == cluster_id
+            assert (
+                cache._handle_table_last_access_epochs[bucket].item()
+                == epochs[cluster_id]
+            )
+            assert cache._handle_table_hit_gate_ready[
+                bucket
+            ].item() == cache._is_group_hit_gate_ready(cluster_groups[cluster_id])
+
+
+def test_gate_updates_publish_bindings_only_for_new_buckets():
+    group = RetroSpecClusterGroup("request", 0)
+    publisher = Mock()
+    cache = make_cache(3, group_targets={group: 3}, binding_publisher=publisher)
+    keys, values = make_backing_pages(num_pages=3)
+    for page_ids in (torch.tensor([[0], [1]]), torch.tensor([[2]])):
+        publisher.reset_mock()
+        cache.admit(page_ids, set(range(3)), keys, values)
+        cache.synchronize_pending_copies()
+        cluster_ids = tuple(page_ids.flatten().tolist())
+        publisher.assert_called_once_with(
+            cluster_ids,
+            tuple(cache._handle_to_bucket[cluster_id] for cluster_id in cluster_ids),
+            cache._copy_stream,
+        )
+    assert all(resident_handle_state(cache, cluster_id)[1] for cluster_id in range(3))
+
+    publisher.reset_mock()
+    cache.resize(4, group_targets={group: 4})
+    publisher.assert_not_called()
+    assert all(
+        not resident_handle_state(cache, cluster_id)[1] for cluster_id in range(3)
+    )
 
 
 def test_group_target_change_waits_for_pending_copies():

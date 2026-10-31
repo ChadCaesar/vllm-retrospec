@@ -4,12 +4,14 @@
 import pytest
 import torch
 
+from vllm.v1.spec_decode.retrospec.cluster_identity import RetroSpecClusterGroup
 from vllm.v1.spec_decode.retrospec.index_residency import (
     RetroSpecGPUIndexResidencyManager,
     RetroSpecResidentSegment,
     RetroSpecResidentTableBinding,
 )
 from vllm.v1.spec_decode.retrospec.performance import RetroSpecPerformanceStats
+from vllm.v1.spec_decode.retrospec.resident_cache import RetroSpecResidentClusterCache
 
 pytestmark = pytest.mark.cpu_test
 
@@ -204,6 +206,65 @@ def test_resident_binding_commands_remain_valid_after_async_submission():
     assert view.arena is not None
     assert view.arena.resident_table_buckets[0, 0].item() == 5
     manager.deactivate()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_batched_resize_bindings_survive_gate_updates_slot_reuse_and_rebuild():
+    manager = make_manager(max_resident_requests=1)
+    segment = make_resident_segment(manager, num_clusters=4, device="cuda")
+    manager.publish_resident_segments([segment])
+    group = RetroSpecClusterGroup("request", 0)
+    cache = RetroSpecResidentClusterCache(
+        page_size=2, head_size=1, dtype=torch.float32, device=torch.device("cuda")
+    )
+
+    def publish(cluster_ids, buckets, stream):
+        manager.publish_resident_table_bindings(
+            "layer",
+            [
+                RetroSpecResidentTableBinding("request", 0, cid, cid, bucket)
+                for cid, bucket in zip(cluster_ids, buckets, strict=True)
+            ],
+            stream,
+        )
+
+    def assert_bindings():
+        torch.cuda.synchronize()
+        manager.activate(["request"])
+        try:
+            view = manager.get_active_view("layer", ["request"], torch.device("cuda"))
+            assert view.arena is not None
+            assert view.arena.resident_table_buckets[0, :4].tolist() == [
+                cache._handle_to_bucket.get(cid, -1) for cid in range(4)
+            ]
+        finally:
+            manager.deactivate()
+
+    cache._binding_publisher = publish
+    cache.resize(4, group_targets={group: 4})
+    keys = torch.arange(8, dtype=torch.float32).view(4, 2, 1).pin_memory()
+    values = (keys + 1).pin_memory()
+    kwargs = dict(
+        cluster_ids=torch.arange(4),
+        page_ids=torch.arange(4).unsqueeze(-1),
+        cluster_groups={cid: group for cid in range(4)},
+        allocated_cluster_ids=set(range(4)),
+        allocated_page_ids=set(range(4)),
+        backing_key_pages=keys,
+        backing_value_pages=values,
+    )
+    cache.admit(**kwargs)
+    cache.synchronize_pending_copies()
+    assert_bindings()
+    cache.resize(2, group_targets={group: 2})
+    assert_bindings()
+    cache.resize(4, group_targets={group: 4})
+    assert_bindings()
+    cache.admit(**kwargs)
+    cache.synchronize_pending_copies()
+    assert_bindings()
+    cache._ensure_handle_table(cache._handle_table_max_pages + 1)
+    assert_bindings()
 
 
 def test_active_view_omits_arena_when_layer_has_no_requested_resident_index():
