@@ -13,6 +13,7 @@ from vllm import _custom_ops as ops
 
 from ..performance import RetroSpecPerformanceStats
 from .cluster_identity import RetroSpecClusterGroup
+from .command_buffers import get_command_buffer_pool
 from .resident_cache_admission import _ResidentAdmissionMixin
 from .resident_cache_lookup import _ResidentLookupMixin
 from .resident_cache_types import (
@@ -92,6 +93,7 @@ class RetroSpecResidentClusterCache:
         self.device = device
         self.performance_stats = performance_stats
         self._binding_publisher = binding_publisher
+        self._command_buffers = get_command_buffer_pool(device)
 
         self.key_pages = torch.empty(
             0,
@@ -512,34 +514,31 @@ class RetroSpecResidentClusterCache:
 
         Synchronous CPU-to-CUDA tensor constructors would wait for the preceding
         KV copies while holding the reader/mutation lock. Pack the fields into
-        one pinned allocation and enqueue a single nonblocking transfer instead.
-        PyTorch's pinned allocator records the copy event before recycling this
-        allocation; the host commands are never changed after submission.
+        one pinned batch and enqueue a single nonblocking transfer instead.
+        Large batches reuse command storage after their kernel completes,
+        without waiting for a busy slot. Small batches use the pinned allocator.
         """
         num_entries = len(bucket_ids)
         values = bucket_ids + cluster_ids + page_counts + hit_gate_ready + access_epochs
         values.extend(slot for slots in page_slots for slot in slots)
-        commands_cpu = torch.tensor(
-            values, dtype=torch.int64, device="cpu", pin_memory=True
-        )
-        commands = commands_cpu.to(device=self.device, non_blocking=True)
-        buckets, handles, counts, gates, epochs, slots = commands.split(
-            [num_entries] * 5 + [num_entries * self._handle_table_max_pages]
-        )
-        update_resident_handles(
-            bucket_ids=buckets,
-            cluster_handles=handles,
-            page_counts=counts,
-            page_slots=slots.view(num_entries, self._handle_table_max_pages),
-            hit_gate_ready=gates,
-            table_handles=self._handle_table_handles,
-            table_versions=self._handle_table_versions,
-            table_page_counts=self._handle_table_page_counts,
-            table_page_slots=self._handle_table_page_slots,
-            table_hit_gate_ready=self._handle_table_hit_gate_ready,
-            entry_access_epochs=epochs,
-            table_last_access_epochs=self._handle_table_last_access_epochs,
-        )
+        with self._command_buffers.stage_metadata(values, (len(values),)) as commands:
+            buckets, handles, counts, gates, epochs, slots = commands.split(
+                [num_entries] * 5 + [num_entries * self._handle_table_max_pages]
+            )
+            update_resident_handles(
+                bucket_ids=buckets,
+                cluster_handles=handles,
+                page_counts=counts,
+                page_slots=slots.view(num_entries, self._handle_table_max_pages),
+                hit_gate_ready=gates,
+                table_handles=self._handle_table_handles,
+                table_versions=self._handle_table_versions,
+                table_page_counts=self._handle_table_page_counts,
+                table_page_slots=self._handle_table_page_slots,
+                table_hit_gate_ready=self._handle_table_hit_gate_ready,
+                entry_access_epochs=epochs,
+                table_last_access_epochs=self._handle_table_last_access_epochs,
+            )
 
     def _erase_handle_entries(
         self,

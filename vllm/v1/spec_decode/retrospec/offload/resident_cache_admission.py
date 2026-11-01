@@ -6,8 +6,6 @@ from types import MappingProxyType
 
 import torch
 
-from vllm import _custom_ops as ops
-
 from .cluster_identity import RetroSpecClusterGroup
 from .resident_cache_types import (
     RetroSpecPreparedResidentAdmission,
@@ -18,6 +16,7 @@ from .resident_cache_types import (
     _LogicalPages,
     _PreparedClusterStats,
 )
+from .resident_copy import copy_resident_pages
 
 
 class _ResidentAdmissionMixin:
@@ -83,23 +82,26 @@ class _ResidentAdmissionMixin:
         if not source_page_ids:
             return
 
-        block_mapping = torch.tensor(
-            tuple(zip(source_page_ids, slots, strict=True)),
-            dtype=torch.int64,
-            device="cpu",
-        )
         block_size = self.page_size * self.head_size * source_key_pages.element_size()
         with torch.cuda.stream(self._copy_stream):
-            span_count = ops.copy_kv_blocks_coalesced(
+            span_count, batched = copy_resident_pages(
                 source_key_pages,
                 source_value_pages,
                 self.key_pages,
                 self.value_pages,
+                source_page_ids,
+                slots,
                 block_size,
-                block_mapping,
+                self._command_buffers,
             )
 
         stats = self.performance_stats
+        if stats is not None and stats.enabled and source_key_pages.is_cuda:
+            stats.add_counter(
+                "resident_d2d_batched_copies"
+                if batched
+                else "resident_d2d_memcpy_copies"
+            )
         if (
             stats is not None
             and stats.enabled

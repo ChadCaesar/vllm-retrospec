@@ -7,6 +7,7 @@ from threading import Lock, RLock
 import torch
 
 from ..performance import RetroSpecPerformanceStats
+from .command_buffers import RetroSpecCommandBufferPool, get_command_buffer_pool
 from .index_residency_types import (
     RetroSpecClusterSummary,
     RetroSpecResidentBatchView,
@@ -81,6 +82,7 @@ class RetroSpecGPUIndexResidencyManager:
         self._arena_lock = RLock()
         self._arena_ready_events: dict[str, torch.cuda.Event] = {}
         self._binding_update_events: dict[str, torch.cuda.Event] = {}
+        self._command_buffers: dict[torch.device, RetroSpecCommandBufferPool] = {}
 
     @property
     def active_request_ids(self) -> tuple[str, ...]:
@@ -900,22 +902,24 @@ class RetroSpecGPUIndexResidencyManager:
                 stream.wait_event(previous_update)
 
             device = arena.cluster_ids.device
+            commands = self._command_buffers.get(device)
+            if commands is None:
+                commands = get_command_buffer_pool(device)
+                self._command_buffers[device] = commands
             with torch.cuda.device(device), torch.cuda.stream(stream):
                 # Avoid waiting for earlier stream work under the arena lock.
-                # The pinned allocator defers source reuse until H2D completion.
-                publish_resident_table_bindings(
-                    binding_commands=torch.tensor(
-                        binding_commands,
-                        dtype=torch.int64,
-                        device="cpu",
-                        pin_memory=True,
-                    ).to(device=device, non_blocking=True),
-                    arena_cluster_ids=arena.cluster_ids,
-                    arena_resident_table_buckets=arena.resident_table_buckets,
-                    arena_cluster_offsets=arena.cluster_offsets,
-                    arena_num_clusters=arena.num_clusters,
-                    arena_generations=arena.generations,
-                )
+                # Command storage stays immutable until this kernel completes.
+                with commands.stage_metadata(
+                    binding_commands, (len(binding_commands), 6)
+                ) as batch:
+                    publish_resident_table_bindings(
+                        binding_commands=batch,
+                        arena_cluster_ids=arena.cluster_ids,
+                        arena_resident_table_buckets=arena.resident_table_buckets,
+                        arena_cluster_offsets=arena.cluster_offsets,
+                        arena_num_clusters=arena.num_clusters,
+                        arena_generations=arena.generations,
+                    )
                 update_event = torch.cuda.Event()
                 update_event.record(stream)
                 self._binding_update_events[layer_name] = update_event
@@ -1347,6 +1351,7 @@ class RetroSpecGPUIndexResidencyManager:
                         )
                     slot.release_storage()
             self._summary_slots.clear()
+        self._command_buffers.clear()
 
 
 # Preserve the original qualified path for serialized classes.
