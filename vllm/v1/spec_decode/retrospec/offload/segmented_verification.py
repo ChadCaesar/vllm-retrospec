@@ -439,6 +439,9 @@ class RetroSpecSegmentVerificationMixin:
         output_workspace: _SelectionStepWorkspace,
         candidate_counts: torch.Tensor,
     ) -> None:
+        if not self.selection_provenance.enabled:
+            return
+
         candidate_counts_i64 = plan.candidate_counts.to(torch.int64)
         retrieval_counts = torch.ceil(
             candidate_counts_i64.float() * self.retrieval_ratio

@@ -2,12 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 from vllm.v1.spec_decode.retrospec import selection_provenance
+from vllm.v1.spec_decode.retrospec.offload.segmented_selection import (
+    RetroSpecSegmentSelectionMixin,
+)
+from vllm.v1.spec_decode.retrospec.offload.segmented_verification import (
+    RetroSpecSegmentVerificationMixin,
+)
 from vllm.v1.spec_decode.retrospec.selection_provenance import (
     RetroSpecSelectionProvenanceTracer,
 )
@@ -47,6 +54,116 @@ def test_disabled_trace_returns_before_tensor_digest(monkeypatch):
 
     logger_info.assert_not_called()
     digest.assert_not_called()
+
+
+def test_disabled_draft_trace_skips_selection_preparation():
+    tracer = RetroSpecSelectionProvenanceTracer("off")
+    tracer.record_draft_selection = Mock(
+        side_effect=AssertionError("disabled trace prepared a record")
+    )
+    # No selection metadata is needed when tracing is disabled. Accessing the
+    # plan or workspace would fail, including before the tracer's own guard.
+    index = SimpleNamespace(selection_provenance=tracer)
+    RetroSpecSegmentVerificationMixin._trace_draft_selection(
+        index,
+        request_ids=(),
+        query=None,
+        active_mask=None,
+        proposal_round=0,
+        draft_step=0,
+        snapshot="used",
+        physical_source="resident",
+        index_revisions=(),
+        plan=None,
+        output_workspace=None,
+        candidate_counts=None,
+    )
+    tracer.record_draft_selection.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["trace", "freeze_resident", "ready_selected"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is required"
+            ),
+        ),
+    ],
+)
+def test_enabled_draft_trace_prepares_rank_intervals(monkeypatch, mode, device):
+    logger_info = Mock()
+    monkeypatch.setattr(selection_provenance.logger, "info", logger_info)
+    tracer = RetroSpecSelectionProvenanceTracer(mode)
+    record = Mock(wraps=tracer.record_draft_selection)
+    tracer.record_draft_selection = record
+    counts = torch.tensor([[5, 1], [3, 0]], dtype=torch.int32, device=device)
+    plan = SimpleNamespace(
+        layer_name="layer.0",
+        candidate_counts=counts,
+        ranked_cluster_indices=torch.tensor(
+            [[[7, 3, 9, 1, 8], [4, 6, 2, 0, 5]], [[5, 4, 3, 2, 1], [0, 1, 2, 3, 4]]],
+            dtype=torch.int32,
+            device=device,
+        ),
+        sparse_retrieval_width=2,
+        sparse_estimation_width=2,
+        request_slot_ids=torch.tensor([3, 5], device=device),
+        request_slot_generations=torch.tensor([9, 13], device=device),
+    )
+    workspace = SimpleNamespace(
+        draft_exact_cluster_handles=torch.zeros(
+            2, 2, 2, dtype=torch.int64, device=device
+        ),
+        draft_selected_cluster_counts=counts,
+        draft_hit_cluster_counts=counts,
+        draft_miss_cluster_counts=torch.zeros_like(counts),
+        draft_hit_gate_ready=torch.ones_like(counts, dtype=torch.bool),
+    )
+    index = SimpleNamespace(
+        selection_provenance=tracer,
+        retrieval_ratio=0.4,
+        estimation_ratio=0.4,
+        _slice_rank_range=RetroSpecSegmentSelectionMixin._slice_rank_range,
+    )
+    ranked_before = plan.ranked_cluster_indices.clone()
+    counts_before = counts.clone()
+    RetroSpecSegmentVerificationMixin._trace_draft_selection(
+        index,
+        request_ids=("active", "idle"),
+        query=torch.ones(2, 2, 4, device=device),
+        active_mask=torch.tensor([True, False], device=device),
+        proposal_round=4,
+        draft_step=2,
+        snapshot="used",
+        physical_source="resident",
+        index_revisions=(7, 11),
+        plan=plan,
+        output_workspace=workspace,
+        candidate_counts=counts,
+    )
+
+    record.assert_called_once()
+    prepared = record.call_args.kwargs
+    assert prepared["sparse_exact_cluster_indices"].tolist() == [
+        [[7, 3], [4, -1]],
+        [[5, 4], [-1, -1]],
+    ]
+    assert prepared["sparse_estimation_cluster_indices"].tolist() == [
+        [[9, 1], [-1, -1]],
+        [[3, -1], [-1, -1]],
+    ]
+    assert torch.equal(plan.ranked_cluster_indices, ranked_before)
+    assert torch.equal(counts, counts_before)
+    payload = extract_payload(logger_info)
+    assert payload["mode"] == mode
+    assert payload["proposal_round"] == 4
+    assert payload["draft_step"] == 2
+    assert [row["request_id"] for row in payload["records"]] == ["active"]
+    assert payload["records"][0]["index_revision"] == 7
 
 
 def test_index_segment_checksum_is_stable_and_order_sensitive(monkeypatch):
