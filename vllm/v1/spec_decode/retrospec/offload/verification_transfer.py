@@ -280,8 +280,23 @@ class _FullVerificationTransferBuffer:
         page_ids_cpu: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, _PinnedPageTransferSlot]:
         """Gather one bounded selection from pageable slabs into pinned CPU."""
-        self._ensure_cpu_slots(pool.dtype, pool.head_size)
         page_ids_cpu = page_ids_cpu.reshape(-1).contiguous()
+        # Acquire the ring slot inside the service, not before enqueueing. A
+        # queued page gather must not hold a slot needed by an active full job.
+        return self._gather_executor.submit(
+            self._gather_cpu_pages,
+            pool.snapshot_full_verification_sources(),
+            page_ids_cpu,
+        ).result()
+
+    def _gather_cpu_pages(
+        self,
+        source: _FullVerificationSourceSnapshot,
+        page_ids_cpu: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, _PinnedPageTransferSlot]:
+        # Both page and compact gathers reuse the dedicated transfer worker and
+        # its native copy service, independently of the GPU launch CPU pool.
+        self._ensure_cpu_slots(source.dtype, source.head_size)
         num_pages = page_ids_cpu.numel()
         if num_pages > self._cpu_slot_capacity:
             raise RuntimeError(
@@ -292,13 +307,12 @@ class _FullVerificationTransferBuffer:
         slot = self._acquire_cpu_slot()
         staged_keys = slot.key_pages[:num_pages]
         staged_values = slot.value_pages[:num_pages]
-        source = pool.snapshot_full_verification_sources()
         try:
             ops.retrospec_gather_cluster_pages(
                 source.key_slabs,
                 source.value_slabs,
                 page_ids_cpu,
-                pool.page_size,
+                self.page_size,
                 staged_keys,
                 staged_values,
                 self.gather_workers,

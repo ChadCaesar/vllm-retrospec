@@ -4,6 +4,7 @@
 from collections.abc import Sequence
 from time import perf_counter
 
+import numpy as np
 import torch
 
 from .cluster_store_support import (
@@ -265,13 +266,17 @@ class RetroSpecClusterVerificationMixin:
         page_counts = slot.unique_page_count_storage[:num_unique_misses].tolist()
         logical_page_ids = slot.unique_logical_page_id_storage[
             :num_unique_misses, :max_pages
-        ]
+        ].tolist()
 
         descriptors = self._cluster_block_descriptors.get(layer_name)
         if descriptors is None:
             raise RuntimeError(f"No cluster descriptors exist for {layer_name!r}")
         allocated_cluster_ids = self._get_allocated_cluster_ids(layer_name)
 
+        # Build all admission metadata in one pass. The returned arrays own their
+        # storage: the pinned D2H slot can be reused before admission finishes.
+        page_ids = np.full((num_unique_misses, max_pages), -1, dtype=np.int64)
+        staging_starts = np.empty(num_unique_misses, dtype=np.int64)
         unique_page_ids: list[int] = []
         for unique_index, cluster_id_value in enumerate(cluster_ids):
             cluster_id = int(cluster_id_value)
@@ -285,33 +290,30 @@ class RetroSpecClusterVerificationMixin:
                 raise RuntimeError(
                     "Verification descriptor exceeds the packed page-table width"
                 )
-            emitted_pages = tuple(
-                int(page_id)
-                for page_id in logical_page_ids[unique_index, :page_count].tolist()
-            )
+            emitted_pages = tuple(logical_page_ids[unique_index][:page_count])
             if descriptor.page_ids != emitted_pages:
                 raise RuntimeError(
                     f"Verification selected stale pages for cluster {cluster_id}"
                 )
-            slot.unique_staging_start_storage[unique_index] = len(unique_page_ids)
+            staging_starts[unique_index] = len(unique_page_ids)
+            page_ids[unique_index, :page_count] = emitted_pages
             unique_page_ids.extend(emitted_pages)
 
         cluster_ids_cpu = torch.tensor(cluster_ids, dtype=torch.int64)
-        metadata = self._materialize_cluster_block_metadata_cpu(
-            layer_name, cluster_ids_cpu, page_width=max_pages
+        slot.unique_staging_start_storage[:num_unique_misses].numpy()[:] = (
+            staging_starts
         )
-        staging_page_ids_cpu = torch.full_like(metadata.page_ids, -1)
-        for unique_index, page_count_value in enumerate(page_counts):
-            page_count = int(page_count_value)
-            staging_start = int(slot.unique_staging_start_storage[unique_index].item())
-            staging_page_ids_cpu[unique_index, :page_count] = torch.arange(
-                staging_start, staging_start + page_count, dtype=torch.int64
-            )
+        columns = np.arange(max_pages, dtype=np.int64)[None, :]
+        staging_page_ids = np.where(
+            columns < np.asarray(page_counts, dtype=np.int64)[:, None],
+            staging_starts[:, None] + columns,
+            -1,
+        )
 
         return (
             cluster_ids_cpu,
-            metadata.page_ids,
-            staging_page_ids_cpu,
+            torch.from_numpy(page_ids),
+            torch.from_numpy(staging_page_ids),
             torch.tensor(unique_page_ids, dtype=torch.int64),
         )
 

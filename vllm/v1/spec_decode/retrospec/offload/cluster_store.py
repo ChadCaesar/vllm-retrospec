@@ -9,6 +9,7 @@ from math import ceil
 from threading import Lock, RLock
 from time import perf_counter
 
+import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
@@ -389,12 +390,12 @@ class RetroSpecClusterPageStore(
 
         descriptors = self._cluster_block_descriptors[layer_name]
 
+        selected = [
+            descriptors[cluster_id] if cluster_id >= 0 else None
+            for cluster_id in cluster_ids_cpu.reshape(-1).tolist()
+        ]
         natural_page_width = max(
-            (
-                len(descriptors[cluster_id].page_ids)
-                for cluster_id in cluster_ids_cpu.reshape(-1).tolist()
-                if cluster_id >= 0
-            ),
+            (len(descriptor.page_ids) for descriptor in selected if descriptor),
             default=0,
         )
         if page_width is None:
@@ -407,41 +408,20 @@ class RetroSpecClusterPageStore(
             max_pages = page_width
         output_shape = (*cluster_ids_cpu.shape, max_pages)
 
-        page_ids_cpu = torch.full(
-            output_shape,
-            -1,
-            dtype=torch.int64,
-            device="cpu",
-        )
-        page_token_counts_cpu = torch.zeros(
-            output_shape,
-            dtype=torch.int32,
-            device="cpu",
-        )
-
-        flat_cluster_ids = cluster_ids_cpu.reshape(-1).tolist()
-        flat_page_ids = page_ids_cpu.reshape(len(flat_cluster_ids), max_pages)
-        flat_page_token_counts = page_token_counts_cpu.reshape(
-            len(flat_cluster_ids), max_pages
-        )
-
-        for row_index, cluster_id in enumerate(flat_cluster_ids):
-            if cluster_id < 0:
+        # Assign into CPU arrays without a Tensor allocation/dispatch per row.
+        # Each result owns its backing, including when selections repeat.
+        page_ids = np.full((len(selected), max_pages), -1, dtype=np.int64)
+        page_token_counts = np.zeros((len(selected), max_pages), dtype=np.int32)
+        for row_index, descriptor in enumerate(selected):
+            if descriptor is None:
                 continue
-
-            descriptor = descriptors[cluster_id]
             num_pages = len(descriptor.page_ids)
-
-            flat_page_ids[row_index, :num_pages] = torch.tensor(
-                descriptor.page_ids, dtype=torch.int64
-            )
-            flat_page_token_counts[row_index, :num_pages] = torch.tensor(
-                descriptor.page_token_counts, dtype=torch.int32
-            )
+            page_ids[row_index, :num_pages] = descriptor.page_ids
+            page_token_counts[row_index, :num_pages] = descriptor.page_token_counts
 
         return RetroSpecClusterBlockMetadata(
-            page_ids=page_ids_cpu,
-            page_token_counts=page_token_counts_cpu,
+            page_ids=torch.from_numpy(page_ids.reshape(output_shape)),
+            page_token_counts=torch.from_numpy(page_token_counts.reshape(output_shape)),
         )
 
     def _get_or_create_pool(

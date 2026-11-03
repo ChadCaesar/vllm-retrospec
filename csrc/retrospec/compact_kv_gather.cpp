@@ -5,11 +5,21 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
+
+#ifdef __linux__
+  #include <sched.h>
+  #include <sys/syscall.h>
+  #include <unistd.h>
+#endif
 
 namespace {
 
@@ -25,6 +35,118 @@ void copy_span(const CopySpan& span) {
   std::memcpy(span.key_destination, span.key_source, span.num_bytes);
   std::memcpy(span.value_destination, span.value_source, span.num_bytes);
 }
+
+// One synchronous service per submitting thread. Workers sleep between jobs
+// and retain the submitter's placement. A changed affinity or memory policy
+// replaces the service before any source/destination pointers are published.
+struct GatherPlacement {
+#ifdef __linux__
+  cpu_set_t cpus{};
+  int memory_mode = 0;
+  std::array<unsigned long, 1024 / (8 * sizeof(unsigned long))> nodes{};
+#endif
+  bool valid = false;
+
+  static GatherPlacement current() {
+    GatherPlacement placement;
+#ifdef __linux__
+    placement.valid =
+        sched_getaffinity(0, sizeof(placement.cpus), &placement.cpus) == 0 &&
+        syscall(SYS_get_mempolicy, &placement.memory_mode,
+                placement.nodes.data(), 1024, nullptr, 0) == 0;
+#endif
+    return placement;
+  }
+
+  bool operator==(const GatherPlacement& other) const {
+#ifdef __linux__
+    return valid && other.valid && CPU_EQUAL(&cpus, &other.cpus) &&
+           memory_mode == other.memory_mode && nodes == other.nodes;
+#else
+    return false;
+#endif
+  }
+};
+
+class GatherCopyService {
+ public:
+  explicit GatherCopyService(int64_t workers) {
+    try {
+      for (int64_t index = 1; index < workers; ++index) {
+        threads_.emplace_back([this] { serve(); });
+      }
+    } catch (...) {
+      stop();
+      throw;
+    }
+  }
+
+  ~GatherCopyService() { stop(); }
+
+  size_t workers() const { return threads_.size() + 1; }
+
+  void copy(const std::vector<CopySpan>& spans) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      spans_ = &spans;
+      next_span_.store(0, std::memory_order_relaxed);
+      completed_ = 0;
+      ++generation_;
+    }
+    available_.notify_all();
+    drain();
+    std::unique_lock<std::mutex> lock(mutex_);
+    finished_.wait(lock, [&] { return completed_ == threads_.size(); });
+    spans_ = nullptr;
+  }
+
+ private:
+  void drain() {
+    while (true) {
+      const size_t index = next_span_.fetch_add(1, std::memory_order_relaxed);
+      if (index >= spans_->size()) {
+        return;
+      }
+      copy_span((*spans_)[index]);
+    }
+  }
+
+  void serve() {
+    size_t seen = 0;
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (true) {
+      available_.wait(lock, [&] { return stopping_ || generation_ != seen; });
+      if (stopping_) {
+        return;
+      }
+      seen = generation_;
+      lock.unlock();
+      drain();
+      lock.lock();
+      ++completed_;
+      finished_.notify_one();
+    }
+  }
+
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    available_.notify_all();
+    for (auto& thread : threads_) {
+      thread.join();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable available_, finished_;
+  std::vector<std::thread> threads_;
+  const std::vector<CopySpan>* spans_ = nullptr;
+  std::atomic<size_t> next_span_{0};
+  size_t generation_ = 0, completed_ = 0;
+  bool stopping_ = false;
+};
 
 void parallel_copy_spans(const std::vector<CopySpan>& spans,
                          int64_t num_workers) {
@@ -42,36 +164,20 @@ void parallel_copy_spans(const std::vector<CopySpan>& spans,
     return;
   }
 
-  std::atomic<int64_t> next_span{0};
-  auto worker = [&]() {
-    while (true) {
-      const int64_t span_index =
-          next_span.fetch_add(1, std::memory_order_relaxed);
-      if (span_index >= static_cast<int64_t>(spans.size())) {
-        return;
-      }
-      copy_span(spans[span_index]);
-    }
-  };
-
-  std::vector<std::thread> threads;
-  threads.reserve(worker_count - 1);
-  try {
-    for (int64_t worker_index = 1; worker_index < worker_count;
-         ++worker_index) {
-      threads.emplace_back(worker);
-    }
-  } catch (...) {
-    for (std::thread& thread : threads) {
-      thread.join();
-    }
-    throw;
+  const GatherPlacement placement = GatherPlacement::current();
+  if (!placement.valid) {
+    // If policy queries are restricted, retain per-call inheritance.
+    GatherCopyService(worker_count).copy(spans);
+    return;
   }
-
-  worker();
-  for (std::thread& thread : threads) {
-    thread.join();
+  thread_local GatherPlacement previous_placement;
+  thread_local std::unique_ptr<GatherCopyService> service;
+  if (!service || service->workers() != static_cast<size_t>(worker_count) ||
+      !(placement == previous_placement)) {
+    service = std::make_unique<GatherCopyService>(worker_count);
+    previous_placement = placement;
   }
+  service->copy(spans);
 }
 
 void validate_slab_pair(const torch::Tensor& key_slab,
