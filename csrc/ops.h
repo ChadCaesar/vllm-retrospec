@@ -226,6 +226,19 @@ std::tuple<std::vector<int64_t>, std::vector<std::vector<int64_t>>,
 retrospec_parse_cluster_pages(const torch::Tensor& cluster_ids,
                              const torch::Tensor& page_ids);
 
+std::tuple<std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+           std::vector<torch::Tensor>, std::vector<torch::Tensor>>
+retrospec_prepare_verification_misses(
+    const std::vector<torch::Tensor>& cluster_ids,
+    const std::vector<torch::Tensor>& logical_page_ids,
+    const std::vector<torch::Tensor>& page_counts,
+    const std::vector<torch::Tensor>& staging_starts,
+    const std::vector<torch::Tensor>& descriptor_page_ids,
+    const std::vector<torch::Tensor>& descriptor_page_counts,
+    const std::vector<torch::Tensor>& descriptor_group_ids,
+    const std::vector<int64_t>& num_unique_misses,
+    const std::vector<int64_t>& max_pages);
+
 void retrospec_gather_cluster_pages(
     const std::vector<torch::Tensor>& key_slabs,
     const std::vector<torch::Tensor>& value_slabs,

@@ -37,6 +37,114 @@ void validate_cpu_contiguous(const torch::Tensor& tensor, at::ScalarType dtype,
 
 }  // namespace
 
+std::tuple<std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+           std::vector<torch::Tensor>, std::vector<torch::Tensor>>
+retrospec_prepare_verification_misses(
+    const std::vector<torch::Tensor>& cluster_ids,
+    const std::vector<torch::Tensor>& logical_page_ids,
+    const std::vector<torch::Tensor>& page_counts,
+    const std::vector<torch::Tensor>& staging_starts,
+    const std::vector<torch::Tensor>& descriptor_page_ids,
+    const std::vector<torch::Tensor>& descriptor_page_counts,
+    const std::vector<torch::Tensor>& descriptor_group_ids,
+    const std::vector<int64_t>& num_unique_misses,
+    const std::vector<int64_t>& max_pages) {
+  const size_t layers = cluster_ids.size();
+  TORCH_CHECK(
+      logical_page_ids.size() == layers && page_counts.size() == layers &&
+          staging_starts.size() == layers &&
+          descriptor_page_ids.size() == layers &&
+          descriptor_page_counts.size() == layers &&
+          descriptor_group_ids.size() == layers &&
+          num_unique_misses.size() == layers && max_pages.size() == layers,
+      "Verification metadata layer counts differ");
+  std::vector<torch::Tensor> ids_out, pages_out, staging_out, flat_out;
+  const auto options =
+      torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+  for (size_t layer = 0; layer < layers; ++layer) {
+    const auto& ids = cluster_ids[layer];
+    const auto& pages = logical_page_ids[layer];
+    const auto& counts = page_counts[layer];
+    const auto& starts = staging_starts[layer];
+    const auto& expected_pages = descriptor_page_ids[layer];
+    const auto& expected_counts = descriptor_page_counts[layer];
+    const auto& groups = descriptor_group_ids[layer];
+    validate_cpu_contiguous(ids, at::kLong, "Verification cluster IDs");
+    validate_cpu_contiguous(counts, at::kInt, "Verification page counts");
+    validate_cpu_contiguous(starts, at::kLong, "Verification staging starts");
+    validate_cpu_contiguous(expected_pages, at::kLong, "Descriptor pages");
+    validate_cpu_contiguous(expected_counts, at::kInt,
+                            "Descriptor page counts");
+    validate_cpu_contiguous(groups, at::kLong, "Descriptor groups");
+    TORCH_CHECK(pages.device().is_cpu() && pages.scalar_type() == at::kLong &&
+                    pages.dim() == 2 && pages.stride(1) == 1,
+                "Verification logical pages must be a CPU int64 row table");
+    const int64_t rows = num_unique_misses[layer], width = max_pages[layer];
+    TORCH_CHECK(ids.dim() == 1 && counts.dim() == 1 && starts.dim() == 1 &&
+                    rows >= 0 && rows <= ids.numel() &&
+                    rows <= counts.numel() && rows <= starts.numel() &&
+                    rows <= pages.size(0) && width >= 0 &&
+                    width <= pages.size(1),
+                "Verification metadata prefix is out of bounds");
+    TORCH_CHECK(expected_pages.dim() == 2 && expected_counts.dim() == 1 &&
+                    groups.dim() == 1 &&
+                    expected_pages.size(0) == expected_counts.numel() &&
+                    groups.numel() == expected_counts.numel(),
+                "Verification descriptor shapes differ");
+    const auto* id_data = ids.data_ptr<int64_t>();
+    const auto* page_data = pages.data_ptr<int64_t>();
+    const auto* count_data = counts.data_ptr<int32_t>();
+    auto* start_data = starts.data_ptr<int64_t>();
+    const auto* expected = expected_pages.data_ptr<int64_t>();
+    const auto* expected_count = expected_counts.data_ptr<int32_t>();
+    const auto* group_data = groups.data_ptr<int64_t>();
+    const int64_t expected_width = expected_pages.size(1);
+    int64_t total = 0;
+    for (int64_t row = 0; row < rows; ++row) {
+      const int64_t id = id_data[row], count = count_data[row];
+      TORCH_CHECK(
+          id >= 0 && id < expected_counts.numel() && group_data[id] >= 0,
+          "Verification selected stale cluster handle ", id);
+      TORCH_CHECK(
+          count >= 0 && count <= width,
+          "Verification descriptor exceeds the packed page-table width");
+      TORCH_CHECK(count == expected_count[id] && count <= expected_width,
+                  "Verification selected stale pages for cluster ", id);
+      for (int64_t col = 0; col < count; ++col) {
+        TORCH_CHECK(page_data[row * pages.stride(0) + col] ==
+                        expected[id * expected_width + col],
+                    "Verification selected stale pages for cluster ", id);
+      }
+      start_data[row] = total;
+      total += count;
+    }
+    // Admission outlives the pinned D2H slot. All returned tensors own storage.
+    auto out_ids = torch::empty({rows}, options);
+    auto out_pages = torch::full({rows, width}, -1, options);
+    auto out_staging = torch::full({rows, width}, -1, options);
+    auto out_flat = torch::empty({total}, options);
+    auto* out_id_data = out_ids.data_ptr<int64_t>();
+    auto* out_page_data = out_pages.data_ptr<int64_t>();
+    auto* out_staging_data = out_staging.data_ptr<int64_t>();
+    auto* out_flat_data = out_flat.data_ptr<int64_t>();
+    for (int64_t row = 0; row < rows; ++row) {
+      out_id_data[row] = id_data[row];
+      for (int64_t col = 0; col < count_data[row]; ++col) {
+        const int64_t page = page_data[row * pages.stride(0) + col];
+        out_page_data[row * width + col] = page;
+        out_staging_data[row * width + col] = start_data[row] + col;
+        out_flat_data[start_data[row] + col] = page;
+      }
+    }
+    ids_out.push_back(std::move(out_ids));
+    pages_out.push_back(std::move(out_pages));
+    staging_out.push_back(std::move(out_staging));
+    flat_out.push_back(std::move(out_flat));
+  }
+  return {std::move(ids_out), std::move(pages_out), std::move(staging_out),
+          std::move(flat_out)};
+}
+
 std::tuple<std::vector<int64_t>, std::vector<std::vector<int64_t>>,
            std::vector<std::vector<int64_t>>>
 retrospec_parse_cluster_pages(const torch::Tensor& cluster_ids,

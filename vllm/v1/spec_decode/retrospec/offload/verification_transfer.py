@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Condition, Lock
 from threading import Event as ThreadEvent
 from time import perf_counter
 
+import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
@@ -21,7 +22,7 @@ from .cluster_store_support import (
     _FullVerificationSourceSnapshot,
     _PinnedPageTransferSlot,
 )
-from .page_pool import _LayerClusterPagePool
+from .page_pool import _FullVerificationPageLease, _LayerClusterPagePool
 from .pinned_memory import RetroSpecPinnedMemoryManager
 
 
@@ -35,6 +36,44 @@ class _FullVerificationGPUArena:
     value_tokens: torch.Tensor | None = None
     token_offsets: torch.Tensor | None = None
     token_counts: torch.Tensor | None = None
+    metadata_layout: tuple[tuple[int, ...], ...] | None = None
+
+
+@dataclass(frozen=True)
+class _FullVerificationMetadata:
+    layout: tuple[tuple[int, ...], ...]
+    token_offsets: torch.Tensor
+    token_counts: torch.Tensor
+    num_tokens: int
+    max_tokens_per_head: int
+
+
+@dataclass
+class _CPUPageGatherTicket:
+    transfer_buffer: "_FullVerificationTransferBuffer"
+    lease: _FullVerificationPageLease
+    future: Future | None
+
+    def result(self) -> tuple[torch.Tensor, torch.Tensor, _PinnedPageTransferSlot]:
+        if self.future is None:
+            raise RuntimeError("CPU page gather was already consumed")
+        result = self.future.result()
+        self.future = None
+        return result
+
+    def close(self) -> None:
+        future = self.future
+        self.future = None
+        try:
+            if future is not None and not future.cancel():
+                try:
+                    _, _, slot = future.result()
+                except BaseException:
+                    pass
+                else:
+                    self.transfer_buffer.release_cpu_slot(slot, None)
+        finally:
+            self.lease.release()
 
 
 class _FullVerificationTransferBuffer:
@@ -42,6 +81,12 @@ class _FullVerificationTransferBuffer:
 
     _MIN_CAPACITY = 64
     _RESIDENT_PREFETCH_RING_SIZE = 2
+    # Small full-layer copies do not amortize waking the gather helpers. Keep
+    # the dedicated service thread, but avoid additional copy workers here.
+    _SINGLE_WORKER_MAX_BYTES = 4 * 1024 * 1024
+    # Page gathers often include only a few small spans. Waking the native
+    # helpers costs more than copying these payloads on the service thread.
+    _PAGE_SINGLE_WORKER_MAX_BYTES = 64 * 1024
 
     def __init__(
         self,
@@ -79,6 +124,7 @@ class _FullVerificationTransferBuffer:
             _FullVerificationGPUArena(),
         ]
         self._gpu_arena_cursor = 0
+        self._metadata: _FullVerificationMetadata | None = None
 
         self._transfer_stream = torch.cuda.Stream(device=device)
         self._cpu_slots: list[_PinnedPageTransferSlot] = []
@@ -143,6 +189,7 @@ class _FullVerificationTransferBuffer:
 
         arena.dtype = dtype
         arena.head_size = head_size
+        arena.metadata_layout = None
         arena.capacity = max(
             self._MIN_CAPACITY,
             self._next_power_of_two(required_tokens),
@@ -243,6 +290,7 @@ class _FullVerificationTransferBuffer:
         self._cpu_slots.clear()
         self._cpu_slot_layout = None
         self._cpu_slot_capacity = 0
+        self._metadata = None
 
     def _acquire_cpu_slot(self) -> _PinnedPageTransferSlot:
         with self._cpu_slot_available:
@@ -280,14 +328,29 @@ class _FullVerificationTransferBuffer:
         page_ids_cpu: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, _PinnedPageTransferSlot]:
         """Gather one bounded selection from pageable slabs into pinned CPU."""
+        ticket = self.submit_cpu_pages(pool, page_ids_cpu)
+        try:
+            return ticket.result()
+        finally:
+            ticket.close()
+
+    def submit_cpu_pages(
+        self,
+        pool: _LayerClusterPagePool,
+        page_ids_cpu: torch.Tensor,
+    ) -> _CPUPageGatherTicket:
         page_ids_cpu = page_ids_cpu.reshape(-1).contiguous()
+        lease = pool.lease_full_verification_sources()
         # Acquire the ring slot inside the service, not before enqueueing. A
         # queued page gather must not hold a slot needed by an active full job.
-        return self._gather_executor.submit(
-            self._gather_cpu_pages,
-            pool.snapshot_full_verification_sources(),
-            page_ids_cpu,
-        ).result()
+        try:
+            future = self._gather_executor.submit(
+                self._gather_cpu_pages, lease.source, page_ids_cpu
+            )
+        except BaseException:
+            lease.release()
+            raise
+        return _CPUPageGatherTicket(self, lease, future)
 
     def _gather_cpu_pages(
         self,
@@ -307,6 +370,14 @@ class _FullVerificationTransferBuffer:
         slot = self._acquire_cpu_slot()
         staged_keys = slot.key_pages[:num_pages]
         staged_values = slot.value_pages[:num_pages]
+        page_pair_bytes = (
+            2 * num_pages * self.page_size * source.head_size * source.dtype.itemsize
+        )
+        gather_workers = (
+            1
+            if page_pair_bytes <= self._PAGE_SINGLE_WORKER_MAX_BYTES
+            else self.gather_workers
+        )
         try:
             ops.retrospec_gather_cluster_pages(
                 source.key_slabs,
@@ -315,7 +386,7 @@ class _FullVerificationTransferBuffer:
                 self.page_size,
                 staged_keys,
                 staged_values,
-                self.gather_workers,
+                gather_workers,
             )
         except BaseException:
             self.release_cpu_slot(slot, None)
@@ -354,7 +425,12 @@ class _FullVerificationTransferBuffer:
                 token_start,
                 key_tokens,
                 value_tokens,
-                self.gather_workers,
+                (
+                    1
+                    if 2 * token_count * source.head_size * source.dtype.itemsize
+                    <= self._SINGLE_WORKER_MAX_BYTES
+                    else self.gather_workers
+                ),
             )
         except BaseException:
             self.release_cpu_slot(slot, None)
@@ -413,19 +489,31 @@ class _FullVerificationTransferBuffer:
         if any(descriptor.num_kv_heads != num_kv_heads for descriptor in descriptors):
             raise ValueError("Full-verification descriptors changed KV-head count")
 
-        token_counts_cpu = torch.stack(
-            tuple(descriptor.head_token_counts_tensor for descriptor in descriptors),
-            dim=0,
-        ).contiguous()
-        flat_counts = token_counts_cpu.reshape(-1).to(dtype=torch.int64)
-        flat_offsets = torch.zeros_like(flat_counts)
-        if flat_offsets.numel() > 1:
-            flat_offsets[1:] = flat_counts.cumsum(0)[:-1]
-        token_offsets_cpu = flat_offsets.view_as(token_counts_cpu).contiguous()
-        num_tokens = int(flat_counts.sum().item())
-        max_tokens_per_head = int(flat_counts.max().item()) if num_tokens else 0
-        if sum(descriptor.num_tokens for descriptor in descriptors) != num_tokens:
-            raise RuntimeError("Full-verification compact descriptor is inconsistent")
+        # Descriptors persist until the prefix changes. Equal head counts have
+        # the same layout across layers even when their source ranges differ.
+        # Retain only the last CPU layout, independently of all KV snapshots.
+        layout = tuple(descriptor.head_token_counts for descriptor in descriptors)
+        metadata = self._metadata
+        if metadata is None or metadata.layout != layout:
+            counts = np.asarray(layout, dtype=np.int32)
+            offsets = np.empty(counts.shape, dtype=np.int64)
+            flat_counts = counts.reshape(-1)
+            flat_offsets = offsets.reshape(-1)
+            if flat_offsets.size:
+                flat_offsets[0] = 0
+                np.cumsum(flat_counts[:-1], dtype=np.int64, out=flat_offsets[1:])
+            metadata = _FullVerificationMetadata(
+                layout=layout,
+                token_offsets=torch.from_numpy(offsets),
+                token_counts=torch.from_numpy(counts),
+                num_tokens=int(flat_counts.sum(dtype=np.int64)),
+                max_tokens_per_head=int(flat_counts.max(initial=0)),
+            )
+            self._metadata = metadata
+        token_offsets_cpu = metadata.token_offsets
+        token_counts_cpu = metadata.token_counts
+        num_tokens = metadata.num_tokens
+        max_tokens_per_head = metadata.max_tokens_per_head
 
         range_tables = tuple(descriptor.range_table for descriptor in descriptors)
         if cancel_event.is_set():
@@ -467,8 +555,14 @@ class _FullVerificationTransferBuffer:
                 staging_token_counts = arena.token_counts[
                     : token_counts_cpu.numel()
                 ].view(token_counts_cpu.shape)
-                staging_token_offsets.copy_(token_offsets_cpu)
-                staging_token_counts.copy_(token_counts_cpu)
+
+                if arena.metadata_layout != layout:
+                    arena.metadata_layout = None
+                    torch._foreach_copy_(
+                        (staging_token_offsets, staging_token_counts),
+                        (token_offsets_cpu, token_counts_cpu),
+                    )
+                    arena.metadata_layout = layout
 
             transfer_timer = None
             gather_elapsed = 0.0

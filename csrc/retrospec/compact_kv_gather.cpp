@@ -172,9 +172,12 @@ void parallel_copy_spans(const std::vector<CopySpan>& spans,
   }
   thread_local GatherPlacement previous_placement;
   thread_local std::unique_ptr<GatherCopyService> service;
-  if (!service || service->workers() != static_cast<size_t>(worker_count) ||
+  // Keep the configured capacity across layers with different span counts.
+  // Replacing the service for a short job also joins the previous helpers and
+  // creates them again for the next larger job, on the gather critical path.
+  if (!service || service->workers() != static_cast<size_t>(num_workers) ||
       !(placement == previous_placement)) {
-    service = std::make_unique<GatherCopyService>(worker_count);
+    service = std::make_unique<GatherCopyService>(num_workers);
     previous_placement = placement;
   }
   service->copy(spans);

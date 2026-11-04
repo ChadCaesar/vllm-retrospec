@@ -69,6 +69,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &retrospec_parse_cluster_pages);
 
   ops.def(
+      "retrospec_prepare_verification_misses("
+      "Tensor[] cluster_ids, Tensor[] logical_page_ids, Tensor[] page_counts, "
+      "Tensor[](a!) staging_starts, Tensor[] descriptor_page_ids, "
+      "Tensor[] descriptor_page_counts, Tensor[] descriptor_group_ids, "
+      "int[] num_unique_misses, int[] max_pages) "
+      "-> (Tensor[], Tensor[], Tensor[], Tensor[])");
+  ops.impl("retrospec_prepare_verification_misses", torch::kCPU,
+           &retrospec_prepare_verification_misses);
+
+  ops.def(
       "retrospec_gather_cluster_pages("
       "Tensor[] key_slabs, Tensor[] value_slabs, Tensor page_ids, "
       "int page_size, Tensor! key_output, Tensor! value_output, "

@@ -3,9 +3,11 @@
 
 from collections.abc import Sequence
 from time import perf_counter
+from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
+
+from vllm import _custom_ops as ops
 
 from .cluster_store_support import (
     RetroSpecClusterResolveMode,
@@ -35,6 +37,13 @@ from .resident_cache import (
 from .resident_kernels import (
     scatter_compact_staging_page_ids,
 )
+
+if TYPE_CHECKING:
+    from .verification_transfer import _CPUPageGatherTicket
+
+_VerificationMissMetadata = tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]
 
 
 class RetroSpecClusterVerificationMixin:
@@ -163,6 +172,7 @@ class RetroSpecClusterVerificationMixin:
         self,
         pool: _LayerClusterPagePool,
         page_ids_cpu: torch.Tensor,
+        first_gather: "_CPUPageGatherTicket | None" = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Event | None]:
         num_pages = page_ids_cpu.numel()
         if num_pages == 0:
@@ -198,9 +208,12 @@ class RetroSpecClusterVerificationMixin:
                 if self.performance_stats is not None and self.performance_stats.enabled
                 else None
             )
-            cpu_keys, cpu_values, cpu_slot = transfer_buffer.stage_cpu_pages(
-                pool, page_ids_cpu[page_start:page_end]
-            )
+            if page_start == 0 and first_gather is not None:
+                cpu_keys, cpu_values, cpu_slot = first_gather.result()
+            else:
+                cpu_keys, cpu_values, cpu_slot = transfer_buffer.stage_cpu_pages(
+                    pool, page_ids_cpu[page_start:page_end]
+                )
             if gather_started_at is not None:
                 self.performance_stats.record_cpu_time(
                     "verification_miss_cpu_gather",
@@ -254,68 +267,44 @@ class RetroSpecClusterVerificationMixin:
         torch.Tensor,
         torch.Tensor,
     ]:
-        if (
-            slot.unique_cluster_id_storage is None
-            or slot.unique_logical_page_id_storage is None
-            or slot.unique_page_count_storage is None
-            or slot.unique_staging_start_storage is None
-        ):
-            raise RuntimeError("Unique verification-miss CPU storage is unavailable")
+        return self._prepare_verification_miss_metadata(
+            ((layer_name, max_pages, slot, num_unique_misses),)
+        )[0]
 
-        cluster_ids = slot.unique_cluster_id_storage[:num_unique_misses].tolist()
-        page_counts = slot.unique_page_count_storage[:num_unique_misses].tolist()
-        logical_page_ids = slot.unique_logical_page_id_storage[
-            :num_unique_misses, :max_pages
-        ].tolist()
-
-        descriptors = self._cluster_block_descriptors.get(layer_name)
-        if descriptors is None:
-            raise RuntimeError(f"No cluster descriptors exist for {layer_name!r}")
-        allocated_cluster_ids = self._get_allocated_cluster_ids(layer_name)
-
-        # Build all admission metadata in one pass. The returned arrays own their
-        # storage: the pinned D2H slot can be reused before admission finishes.
-        page_ids = np.full((num_unique_misses, max_pages), -1, dtype=np.int64)
-        staging_starts = np.empty(num_unique_misses, dtype=np.int64)
-        unique_page_ids: list[int] = []
-        for unique_index, cluster_id_value in enumerate(cluster_ids):
-            cluster_id = int(cluster_id_value)
-            if cluster_id not in allocated_cluster_ids:
+    def _prepare_verification_miss_metadata(
+        self,
+        records: Sequence[tuple[str, int, _PinnedVerificationMissSlot, int]],
+    ) -> tuple[_VerificationMissMetadata, ...]:
+        if not records:
+            return ()
+        for _, _, slot, _ in records:
+            if (
+                slot.unique_cluster_id_storage is None
+                or slot.unique_logical_page_id_storage is None
+                or slot.unique_page_count_storage is None
+                or slot.unique_staging_start_storage is None
+            ):
                 raise RuntimeError(
-                    f"Verification selected stale cluster handle {cluster_id}"
+                    "Unique verification-miss CPU storage is unavailable"
                 )
-            descriptor = descriptors[cluster_id]
-            page_count = int(page_counts[unique_index])
-            if page_count < 0 or page_count > max_pages:
-                raise RuntimeError(
-                    "Verification descriptor exceeds the packed page-table width"
-                )
-            emitted_pages = tuple(logical_page_ids[unique_index][:page_count])
-            if descriptor.page_ids != emitted_pages:
-                raise RuntimeError(
-                    f"Verification selected stale pages for cluster {cluster_id}"
-                )
-            staging_starts[unique_index] = len(unique_page_ids)
-            page_ids[unique_index, :page_count] = emitted_pages
-            unique_page_ids.extend(emitted_pages)
-
-        cluster_ids_cpu = torch.tensor(cluster_ids, dtype=torch.int64)
-        slot.unique_staging_start_storage[:num_unique_misses].numpy()[:] = (
-            staging_starts
-        )
-        columns = np.arange(max_pages, dtype=np.int64)[None, :]
-        staging_page_ids = np.where(
-            columns < np.asarray(page_counts, dtype=np.int64)[:, None],
-            staging_starts[:, None] + columns,
-            -1,
-        )
-
-        return (
-            cluster_ids_cpu,
-            torch.from_numpy(page_ids),
-            torch.from_numpy(staging_page_ids),
-            torch.tensor(unique_page_ids, dtype=torch.int64),
-        )
+        # Publish/free update these dense arrays under the same lock. Validate
+        # the whole batch without boxing padded rows or per-cluster Python work.
+        with self._resident_state_lock:
+            arenas = [self._prefetch_descriptor_arenas.get(r[0]) for r in records]
+            if any(arena is None for arena in arenas):
+                raise RuntimeError("Verification CPU descriptors are unavailable")
+            outputs = ops.retrospec_prepare_verification_misses(
+                [r[2].unique_cluster_id_storage for r in records],
+                [r[2].unique_logical_page_id_storage for r in records],
+                [r[2].unique_page_count_storage for r in records],
+                [r[2].unique_staging_start_storage for r in records],
+                [arena.page_ids for arena in arenas],
+                [arena.page_counts for arena in arenas],
+                [arena.group_ids for arena in arenas],
+                [r[3] for r in records],
+                [r[1] for r in records],
+            )
+        return tuple(zip(*outputs))
 
     def close(self) -> None:
         if self._closed:
@@ -800,6 +789,8 @@ class RetroSpecClusterVerificationMixin:
         submission: _SubmittedVerificationResolve,
         num_misses: int,
         num_unique_misses: int,
+        prepared_metadata: _VerificationMissMetadata | None = None,
+        first_gather: "_CPUPageGatherTicket | None" = None,
     ) -> RetroSpecCompactVerificationResolvedPages:
         slot = submission.slot
         access = submission.access
@@ -820,52 +811,56 @@ class RetroSpecClusterVerificationMixin:
                 read_lease=access.read_lease,
             )
 
-        descriptor_started_at = (
-            perf_counter()
-            if self.performance_stats is not None and self.performance_stats.enabled
-            else None
-        )
+        if prepared_metadata is None:
+            prepared_metadata = self._validate_unique_verification_miss_metadata(
+                submission.layer_name,
+                submission.max_pages_per_cluster,
+                slot,
+                num_unique_misses,
+            )
         (
             miss_cluster_ids_cpu,
             miss_page_ids_cpu,
             miss_staging_page_ids_cpu,
             unique_page_ids_cpu,
-        ) = self._validate_unique_verification_miss_metadata(
-            layer_name=submission.layer_name,
-            max_pages=submission.max_pages_per_cluster,
-            slot=slot,
-            num_unique_misses=num_unique_misses,
-        )
-        if descriptor_started_at is not None:
-            self.performance_stats.record_cpu_time(
-                "verification_miss_descriptor_build",
-                perf_counter() - descriptor_started_at,
+        ) = prepared_metadata
+        transfer_buffer = self._get_full_verification_buffer(submission.pool)
+        page_capacity = transfer_buffer.cpu_slot_capacity(submission.pool)
+        gather_ticket = first_gather
+        try:
+            if gather_ticket is None and unique_page_ids_cpu.numel():
+                gather_ticket = transfer_buffer.submit_cpu_pages(
+                    submission.pool, unique_page_ids_cpu[:page_capacity]
+                )
+            assert submission.resolve_arena.unique_staging_starts is not None
+            assert slot.unique_staging_start_storage is not None
+            submission.resolve_arena.unique_staging_starts[:num_unique_misses].copy_(
+                slot.unique_staging_start_storage[:num_unique_misses],
+                non_blocking=self.pin_memory,
             )
+            scatter_compact_staging_page_ids(
+                miss_unique_indices=access.miss_unique_indices,
+                miss_output_page_offsets=access.miss_output_page_offsets,
+                unique_staging_starts=submission.resolve_arena.unique_staging_starts,
+                unique_page_counts=access.unique_page_counts,
+                num_misses=num_misses,
+                num_unique_misses=num_unique_misses,
+                max_pages=submission.max_pages_per_cluster,
+                output_page_ids=access.staging_page_ids,
+            )
+            current_stream = torch.cuda.current_stream(access.resident_page_ids.device)
+            slot_ready_event = torch.cuda.Event()
+            slot_ready_event.record(current_stream)
+            self._release_verification_miss_slot(slot, slot_ready_event)
 
-        assert submission.resolve_arena.unique_staging_starts is not None
-        assert slot.unique_staging_start_storage is not None
-        submission.resolve_arena.unique_staging_starts[:num_unique_misses].copy_(
-            slot.unique_staging_start_storage[:num_unique_misses],
-            non_blocking=self.pin_memory,
-        )
-        scatter_compact_staging_page_ids(
-            miss_unique_indices=access.miss_unique_indices,
-            miss_output_page_offsets=access.miss_output_page_offsets,
-            unique_staging_starts=submission.resolve_arena.unique_staging_starts,
-            unique_page_counts=access.unique_page_counts,
-            num_misses=num_misses,
-            num_unique_misses=num_unique_misses,
-            max_pages=submission.max_pages_per_cluster,
-            output_page_ids=access.staging_page_ids,
-        )
-        current_stream = torch.cuda.current_stream(access.resident_page_ids.device)
-        slot_ready_event = torch.cuda.Event()
-        slot_ready_event.record(current_stream)
-        self._release_verification_miss_slot(slot, slot_ready_event)
-
-        staging_key_pages, staging_value_pages, staging_ready_event = (
-            self._stage_verification_miss_pages(submission.pool, unique_page_ids_cpu)
-        )
+            staging_key_pages, staging_value_pages, staging_ready_event = (
+                self._stage_verification_miss_pages(
+                    submission.pool, unique_page_ids_cpu, first_gather=gather_ticket
+                )
+            )
+        finally:
+            if first_gather is None and gather_ticket is not None:
+                gather_ticket.close()
         if self.performance_stats is not None:
             self.performance_stats.add_counter(
                 "verification_unique_miss_clusters", num_unique_misses
@@ -897,6 +892,67 @@ class RetroSpecClusterVerificationMixin:
             read_lease=access.read_lease,
             miss_admission=admission,
         )
+
+    def _finalize_verification_batch(
+        self,
+        submissions: Sequence[_SubmittedVerificationResolve],
+        counts: dict[str, tuple[int, int]],
+        prepared_by_layer: dict[str, _VerificationMissMetadata],
+    ) -> dict[str, RetroSpecCompactVerificationResolvedPages]:
+        # Current and next missing layer share the existing two-slot ring.
+        # Only their first bounded chunks are queued; a large current layer
+        # can keep using one slot while the lookahead occupies the other.
+        pending: dict[str, _CPUPageGatherTicket] = {}
+        pending_layout = None
+        cursor = 0
+        resolved = {}
+
+        def prime_gathers() -> None:
+            nonlocal cursor, pending_layout
+            while cursor < len(submissions) and len(pending) < 2:
+                submission = submissions[cursor]
+                layer_name = submission.layer_name
+                if not counts[layer_name][0]:
+                    cursor += 1
+                    continue
+                pool = submission.pool
+                layout = (pool.dtype, pool.head_size)
+                # Changing a shared ring's layout requires its users to drain.
+                if pending and layout != pending_layout:
+                    break
+                transfer_buffer = self._get_full_verification_buffer(pool)
+                capacity = transfer_buffer.cpu_slot_capacity(pool)
+                page_ids = prepared_by_layer[layer_name][3]
+                if page_ids.numel():
+                    pending[layer_name] = transfer_buffer.submit_cpu_pages(
+                        pool, page_ids[:capacity]
+                    )
+                    pending_layout = layout
+                cursor += 1
+
+        try:
+            for submission in submissions:
+                prime_gathers()
+                ticket = pending.pop(submission.layer_name, None)
+                try:
+                    resolved[submission.layer_name] = (
+                        self._finalize_verification_cluster_blocks(
+                            submission,
+                            *counts[submission.layer_name],
+                            prepared_metadata=prepared_by_layer.get(
+                                submission.layer_name
+                            ),
+                            first_gather=ticket,
+                        )
+                    )
+                finally:
+                    if ticket is not None:
+                        ticket.close()
+            return resolved
+        finally:
+            # Also drain running reads and return unconsumed slots on failure.
+            for ticket in pending.values():
+                ticket.close()
 
     def resolve_verification_cluster_batch(
         self,
@@ -1031,12 +1087,34 @@ class RetroSpecClusterVerificationMixin:
                         perf_counter() - metadata_wait_started_at,
                     )
 
-            resolved = {
-                submission.layer_name: self._finalize_verification_cluster_blocks(
-                    submission, *counts[submission.layer_name]
+            prepared_by_layer = {}
+            if miss_submissions:
+                descriptor_started_at = perf_counter()
+                prepared = self._prepare_verification_miss_metadata(
+                    tuple(
+                        (
+                            s.layer_name,
+                            s.max_pages_per_cluster,
+                            s.slot,
+                            counts[s.layer_name][1],
+                        )
+                        for s in miss_submissions
+                    )
                 )
-                for submission in submissions
-            }
+                if (
+                    self.performance_stats is not None
+                    and self.performance_stats.enabled
+                ):
+                    self.performance_stats.record_cpu_time(
+                        "verification_miss_descriptor_build",
+                        perf_counter() - descriptor_started_at,
+                    )
+                prepared_by_layer = dict(
+                    zip((s.layer_name for s in miss_submissions), prepared, strict=True)
+                )
+            resolved = self._finalize_verification_batch(
+                submissions, counts, prepared_by_layer
+            )
             if self.performance_stats is not None:
                 self.performance_stats.add_counter(
                     "verification_miss_metadata_d2h_bytes", metadata_bytes

@@ -135,6 +135,32 @@ def retrospec_gather_cluster_pages(
     )
 
 
+def retrospec_prepare_verification_misses(
+    cluster_ids: list[torch.Tensor],
+    logical_page_ids: list[torch.Tensor],
+    page_counts: list[torch.Tensor],
+    staging_starts: list[torch.Tensor],
+    descriptor_page_ids: list[torch.Tensor],
+    descriptor_page_counts: list[torch.Tensor],
+    descriptor_group_ids: list[torch.Tensor],
+    num_unique_misses: list[int],
+    max_pages: list[int],
+) -> tuple[
+    list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]
+]:
+    return torch.ops._C.retrospec_prepare_verification_misses(
+        cluster_ids,
+        logical_page_ids,
+        page_counts,
+        staging_starts,
+        descriptor_page_ids,
+        descriptor_page_counts,
+        descriptor_group_ids,
+        num_unique_misses,
+        max_pages,
+    )
+
+
 if TYPE_CHECKING:
 
     def register_fake(fn):
