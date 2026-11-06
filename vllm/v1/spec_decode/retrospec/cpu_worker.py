@@ -234,7 +234,7 @@ def _cpu_target_main(
                         continue
                     if operation == "suspend":
                         checkpoint_started = time.monotonic()
-                        _, nonce, path, shape, saved_origin = command
+                        _, nonce, path, shape, saved_origin = command[:5]
                         if saved is not None:
                             raise RuntimeError("CPU continuous task already suspended")
                         saved_tail = mappings.attach_aux("continuous", path, shape)
@@ -277,6 +277,8 @@ def _cpu_target_main(
                                 model.config.num_hidden_layers,
                             )
                         )
+                        if len(command) > 5:
+                            pending_commands.appendleft(command[5])
                         continue
                     if operation == "restore":
                         restore_started = time.monotonic()
@@ -562,6 +564,7 @@ class RetroSpecCPUWorker:
         self.last_command = None
         self.released = None
         self.paused = None
+        self.suspended = None
         self.closed = False
         self.close_requested = False
         atexit.register(self.close)
@@ -584,6 +587,8 @@ class RetroSpecCPUWorker:
                 self.released = message[1:3]
             elif message[0] == "paused":
                 self.paused = message[1:3]
+            elif message[0] == "suspended":
+                self.suspended = message[3]
             self.last_progress = time.monotonic()
             if self.last_command is not None:
                 operation, session, epoch, limit = self.last_command
@@ -631,7 +636,11 @@ class RetroSpecCPUWorker:
                 self.last_command = (command[0], command[1], command[2], command[6])
             self.awaiting_progress = True
         elif command[0] == "suspend":
-            self.last_command = ("suspend", None, command[1], 0)
+            if len(command) > 5:
+                check = command[5]
+                self.last_command = ("check", check[1], check[2], check[-2] + 1)
+            else:
+                self.last_command = ("suspend", None, command[1], 0)
             self.awaiting_progress = True
         elif command[0] == "restore":
             self.last_command = None
@@ -642,6 +651,22 @@ class RetroSpecCPUWorker:
             self.released = None
             self.last_command = ("release", command[1], command[2], 0)
             self.awaiting_progress = True
+
+    def wait_for_suspension(self, nonce: int, timeout: float = 300):
+        """Fence the saved tail without losing results awaiting consumption."""
+        deadline = time.monotonic() + timeout
+        retained = []
+        try:
+            while True:
+                retained.extend(self.poll())
+                if self.suspended == nonce:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"CPU verifier did not suspend: nonce={nonce}")
+                self.connection.poll(min(0.1, remaining))
+        finally:
+            self.messages.extendleft(reversed(retained))
 
     def wait_for_release(self, session: int, epoch: int, timeout: float = 300):
         """Drain old results and fence a previously submitted release."""

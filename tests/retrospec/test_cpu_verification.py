@@ -901,7 +901,10 @@ def test_cpu_forward_continuation_matches_hf_without_repeating_layers(
 
 
 @pytest.mark.parametrize("action", ["resume", "full", "release", "full_current"])
-def test_cpu_worker_preserves_partial_continuation_or_invalidates_it(tmp_path, action):
+@pytest.mark.parametrize("fused", [False, True])
+def test_cpu_worker_preserves_partial_continuation_or_invalidates_it(
+    tmp_path, action, fused
+):
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(2)
     worker = storage = tail = None
@@ -950,23 +953,42 @@ def test_cpu_worker_preserves_partial_continuation_or_invalidates_it(tmp_path, a
                 serial = 1
             else:
                 tail = RetroSpecCPUStorage(shape, journal_tokens=0)
-                worker.send(("suspend", 2, tail.paths[0], shape, 5))
+                check = (
+                    "check_shared",
+                    1,
+                    2,
+                    tail.paths[0],
+                    shape,
+                    5,
+                    5,
+                    (seed + 1) % 128,
+                )
+                command = ("suspend", 2, tail.paths[0], shape, 5)
+                worker.send(command + (check,) if fused else command)
+                if fused:
+                    worker.wait_for_suspension(2, timeout=60)
                 messages = _wait_messages(
                     worker, lambda ms: any(m[0] == "suspended" for m in ms)
                 )
-                assert not any(m[0] in ("token", "interrupted") for m in messages)
+                assert not any(
+                    m[0] == "interrupted" or m[0] == "token" and m[2] == 1
+                    for m in messages
+                )
                 checkpoint = next(m for m in messages if m[0] == "suspended")
                 assert checkpoint[4] == 5 and checkpoint[8] == 6
                 cursor, serial = checkpoint[6], checkpoint[9]
                 assert 0 < cursor < config.num_hidden_layers
-                partial = storage.kv[..., 5:6, :].clone()
+                partial = (
+                    tail.kv[..., :1, :] if fused else storage.kv[..., 5:6, :]
+                ).clone()
                 assert torch.equal(tail.kv[..., :1, :], partial)
-                worker.send(
-                    ("check_shared", 1, 2, tail.paths[0], shape, 5, 5, (seed + 1) % 128)
-                )
-                _wait_messages(
-                    worker, lambda ms: any(m[0] == "token" and m[2] == 2 for m in ms)
-                )
+                if not fused:
+                    worker.send(check)
+                if not any(m[0] == "token" and m[2] == 2 for m in messages):
+                    _wait_messages(
+                        worker,
+                        lambda ms: any(m[0] == "token" and m[2] == 2 for m in ms),
+                    )
                 assert not torch.equal(
                     storage.kv[:, :cursor, :, 5:6], partial[:, :cursor]
                 )
@@ -1041,6 +1063,7 @@ def test_cpu_worker_preserves_partial_continuation_or_invalidates_it(tmp_path, a
         ("continuous", "pause"),
         ("continuous", "release"),
         ("continuous", "suspend_then_full"),
+        ("continuous", "fused_suspend_then_full"),
         ("risk", "pause_after_token"),
         ("risk", "release_after_token"),
         ("risk", "pause"),
@@ -1094,13 +1117,16 @@ def test_cpu_control_respects_signal_boundary_and_preserves_kv(tmp_path, task, c
                 "pause",
                 "release",
                 "suspend_then_full",
+                "fused_suspend_then_full",
                 "release_then_full",
             )
             release = control in ("release", "release_after_token", "release_then_full")
             ack_epoch = 2
-            if control in ("suspend", "suspend_then_full"):
+            if control in ("suspend", "suspend_then_full", "fused_suspend_then_full"):
                 tail = RetroSpecCPUStorage(shape, journal_tokens=0)
                 command = ("suspend", 2, tail.paths[0], shape, 5)
+                if control == "fused_suspend_then_full":
+                    command += (("check_shared", 1, 2, tail.paths[0], shape, 5, 5, 7),)
                 acknowledged = "suspended"
             elif release:
                 operation = (
@@ -1112,7 +1138,7 @@ def test_cpu_control_respects_signal_boundary_and_preserves_kv(tmp_path, task, c
                 command = (control, 2)
                 acknowledged = "paused"
             worker.send(command)
-            if control == "suspend_then_full":
+            if control in ("suspend_then_full", "fused_suspend_then_full"):
                 # Full cancellation must be found behind deferred risk work;
                 # its pause ACK must still fence the preceding restore.
                 worker.send(("restore", False))
@@ -1137,6 +1163,10 @@ def test_cpu_control_respects_signal_boundary_and_preserves_kv(tmp_path, task, c
                     assert [
                         value[0] for value in messages if value[0] != "resumed"
                     ] == ["interrupted", "suspended", "restored", "paused"]
+                elif control == "fused_suspend_then_full":
+                    kinds = [value[0] for value in messages]
+                    assert kinds.index("suspended") < kinds.index("restored")
+                    assert kinds.index("restored") < kinds.index("paused")
             else:
                 assert not any(value[0] == "interrupted" for value in messages)
                 token_index = next(

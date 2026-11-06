@@ -27,6 +27,7 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
         self._pause_epoch = None
         self._tail_installed = False
         self._suspend_nonce = 0
+        self._suspend_pending = None
         self.common_end = 0
         self._deferred_messages = []
         self._restore_pending = None
@@ -95,6 +96,7 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
         self.mode = "continuous"
         self._tail_installed = False
         self._pause_epoch = None
+        self._suspend_pending = None
         self.common_end = base_position
         self._allocate_tails()
         self.alert = False
@@ -169,14 +171,20 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
         )
         self._deferred_messages = []
         for message in messages:
-            if message[0] == "suspended" and message[3] == self._suspend_nonce:
+            if (
+                message[0] == "suspended"
+                and message[1:3] == (self.session, self._continuous_epoch)
+                and message[3] == self._suspend_nonce
+            ):
+                self._suspend_pending = None
+                self._tail_installed = True
                 if self.mode == "suspending":
                     self.mode = "risk"
-                    self.stats.add_counter("cpu_continuous_suspensions")
-                    if len(message) > 5:
-                        self.stats.record_cpu_time("cpu_tail_save_wall", message[5])
-                    if len(message) > 6 and message[6] is not None:
-                        self.stats.add_counter("cpu_continuation_saved")
+                self.stats.add_counter("cpu_continuous_suspensions")
+                if len(message) > 5:
+                    self.stats.record_cpu_time("cpu_tail_save_wall", message[5])
+                if len(message) > 6 and message[6] is not None:
+                    self.stats.add_counter("cpu_continuation_saved")
             elif message[0] == "restored" and message[1:3] == self._restore_pending:
                 self._restore_pending = None
                 if self.mode == "restoring":
@@ -272,49 +280,50 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
             self._ready_preparation = kv
             if kv.cancelled.is_set() or not self.queue or self.queue[0] is not task:
                 self.preparing = None
-            elif allow_start:
-                if self.mode == "continuous":
+            elif allow_start and self.mode in ("continuous", "risk"):
+                suspend = self.mode == "continuous"
+                if suspend:
                     self.epoch += 1
-                    self._suspend_nonce = self.epoch
-                    if self.worker is not None:
-                        self.worker.send(
-                            (
-                                "suspend",
-                                self.epoch,
-                                self.continuous_tail.paths[0],
-                                self.continuous_tail.shape,
-                                self.common_end,
-                            )
-                        )
-                    self.mode = "suspending"
-                elif self.mode == "risk":
-                    self.epoch += 1
-                    self.active = (task, self.epoch)
-                    self._tail_installed = True
-                    token = (
-                        self._seed
-                        if task.index == self._base
-                        else self.candidates[task.index - 1]
+                    self._suspend_nonce = self._suspend_pending = self.epoch
+                self.epoch += 1
+                self.active = (task, self.epoch)
+                token = (
+                    self._seed
+                    if task.index == self._base
+                    else self.candidates[task.index - 1]
+                )
+                command = (
+                    "check_shared",
+                    self.session,
+                    self.epoch,
+                    self.risk_tail.paths[0],
+                    self.risk_tail.shape,
+                    self.common_end,
+                    task.index,
+                    token,
+                )
+                if suspend:
+                    # The ready snapshot and its FIFO owner were checked
+                    # above. Let the worker install it immediately after
+                    # checkpointing, without waiting for a GPU-side poll.
+                    command = (
+                        "suspend",
+                        self._suspend_nonce,
+                        self.continuous_tail.paths[0],
+                        self.continuous_tail.shape,
+                        self.common_end,
+                        command,
                     )
-                    if self.worker is not None:
-                        self.worker.send(
-                            (
-                                "check_shared",
-                                self.session,
-                                self.epoch,
-                                self.risk_tail.paths[0],
-                                self.risk_tail.shape,
-                                self.common_end,
-                                task.index,
-                                token,
-                            )
-                        )
-                    self.preparing = None
-                    self._ready_preparation = self._local_preparation = None
-                    self.stats.add_counter("cpu_risk_started")
-                    self.stats.record_cpu_time(
-                        "cpu_risk_prepare_wall", perf_counter() - started
-                    )
+                    self.stats.add_counter("cpu_risk_fused_dispatches")
+                if self.worker is not None:
+                    self.worker.send(command)
+                self.mode = "suspending" if suspend else "risk"
+                self.preparing = None
+                self._ready_preparation = self._local_preparation = None
+                self.stats.add_counter("cpu_risk_started")
+                self.stats.record_cpu_time(
+                    "cpu_risk_prepare_wall", perf_counter() - started
+                )
         if (
             self.preparing is None
             and self.active is None
@@ -377,6 +386,29 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
 
     def synchronize(self, metadata, background=False):
         self.invalidate_kv(self.staged_length)
+        if (
+            self.authoritative_length > self.staged_length
+            and self._suspend_pending is not None
+        ):
+            # A continuous token can finish just before suspension. Risk may
+            # already overwrite the shared tail, so publish that token only
+            # after its immutable continuous copy has been acknowledged.
+            started = perf_counter()
+            error = None
+            if self.worker is not None:
+                try:
+                    self.worker.wait_for_suspension(self._suspend_pending)
+                except Exception as exc:
+                    error = str(exc)
+            error = self._control(error)
+            if error is not None:
+                raise RuntimeError(error)
+            self._suspend_pending = None
+            self._tail_installed = True
+            self.stats.add_counter("cpu_risk_publication_fences")
+            self.stats.record_cpu_time(
+                "cpu_risk_publication_fence_wall", perf_counter() - started
+            )
         storage = self.storage
         if self._tail_installed:
             storage = self.continuous_tail
