@@ -6,6 +6,62 @@
 import torch
 from transformers.cache_utils import DynamicCache, DynamicLayer
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.masking_utils import create_causal_mask
+
+
+class CPUForwardState:
+    """One Llama/Qwen2 decode token, resumable between decoder layers.
+
+    Keep the same masks, RoPE tensors, cache and hidden state for the entire
+    token. A layer pre-hook can yield control by raising before the next layer;
+    calling run() again starts at that layer without repeating completed work.
+    """
+
+    def __init__(self, model, input_ids, cache, position, serial=0, started_at=0.0):
+        if model.config.model_type not in ("llama", "qwen2"):
+            raise ValueError("CPU continuation requires a Llama/Qwen2 model")
+        self.model = model
+        self.cache = cache
+        self.serial = serial
+        self.started_at = started_at
+        self.resumes = 0
+        self.layer_index = 0
+        self.hidden_states = model.model.embed_tokens(input_ids)
+        self.cache_position = torch.tensor([position], dtype=torch.int64)
+        self.position_ids = self.cache_position.unsqueeze(0)
+        self.causal_mask = create_causal_mask(
+            config=model.config,
+            input_embeds=self.hidden_states,
+            attention_mask=None,
+            cache_position=self.cache_position,
+            past_key_values=cache,
+            position_ids=self.position_ids,
+        )
+        if getattr(model.model, "has_sliding_layers", False):
+            raise ValueError("CPU continuation does not support sliding attention")
+        self.position_embeddings = model.model.rotary_emb(
+            self.hidden_states, self.position_ids
+        )
+
+    def run(self):
+        # Mirrors the single-token HF LlamaModel/Qwen2Model forward. Store the
+        # cursor only after a layer has completed, so a pre-hook suspension
+        # leaves its input and all preceding layers intact.
+        layers = self.model.model.layers
+        while self.layer_index < self.model.config.num_hidden_layers:
+            kwargs = dict(
+                attention_mask=self.causal_mask,
+                position_ids=self.position_ids,
+                past_key_values=self.cache,
+                cache_position=self.cache_position,
+                position_embeddings=self.position_embeddings,
+            )
+            if self.model.config.model_type == "qwen2":
+                kwargs["use_cache"] = True
+            self.hidden_states = layers[self.layer_index](self.hidden_states, **kwargs)
+            self.layer_index += 1
+        hidden_states = self.model.model.norm(self.hidden_states)
+        return self.model.lm_head(hidden_states)[0, -1]
 
 
 def grouped_decode_attention(

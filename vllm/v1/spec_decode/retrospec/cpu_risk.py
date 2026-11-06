@@ -48,18 +48,31 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
         self.ready = False
         self.preparing = None
         self._mirror_dirty = None
+        self._release_interrupt_sent = False
 
     @property
     def stats(self):
         return self.proposer.performance_stats
 
-    def _cancel_active(self, completed=False):
+    def _cancel_active(self, completed=False, *, interrupt=False):
         if self.active is None:
+            # A candidate cancellation may already be waiting for its token
+            # boundary. GPU full must still interrupt that old reader now.
+            if (
+                interrupt
+                and self._pending_release is not None
+                and not self._release_interrupt_sent
+            ):
+                if self.worker is not None:
+                    self.worker.send(("release", *self._pending_release))
+                self._release_interrupt_sent = True
             return
         self.active = None
         if self.worker is not None:
-            self.worker.send(("release", self.session, self.epoch))
+            operation = "release" if interrupt else "release_after_token"
+            self.worker.send((operation, self.session, self.epoch))
         self._pending_release = (self.session, self.epoch)
+        self._release_interrupt_sent = interrupt
         if not completed:
             self.stats.add_counter("cpu_risk_cancelled")
 
@@ -143,6 +156,7 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
                 self.stats.record_cpu_time("cpu_risk_cancelled_forward", message[4])
             if message[0] == "released" and message[1:3] == self._pending_release:
                 self._pending_release = None
+                self._release_interrupt_sent = False
             if message[0] != "token":
                 continue
             if self.active is None or message[1:3] != self.active[1:3]:
@@ -396,7 +410,7 @@ class RetroSpecCPURiskCoordinator(RetroSpecCPUCoordinator):
     def finish_round(self):
         self.stats.add_counter("cpu_risk_full_covered", len(self.queue))
         self.queue.clear()
-        self._cancel_active()
+        self._cancel_active(interrupt=True)
         self._cancel_preparation()
 
     def close(self):

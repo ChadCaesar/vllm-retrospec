@@ -22,7 +22,12 @@ from vllm.config import SpeculativeConfig
 from vllm.v1.spec_decode.retrospec.cluster_store import RetroSpecClusterPageStore
 from vllm.v1.spec_decode.retrospec.cpu_bridge import RetroSpecCPUKVBridge
 from vllm.v1.spec_decode.retrospec.cpu_coordinator import RetroSpecCPUCoordinator
-from vllm.v1.spec_decode.retrospec.cpu_model import attach_cache, make_cache
+from vllm.v1.spec_decode.retrospec.cpu_model import (
+    CPUForwardState,
+    attach_cache,
+    make_cache,
+)
+from vllm.v1.spec_decode.retrospec.cpu_risk import RetroSpecCPURiskCoordinator
 from vllm.v1.spec_decode.retrospec.cpu_state import RetroSpecCPUWindow
 from vllm.v1.spec_decode.retrospec.cpu_worker import (
     RetroSpecCPUStorage,
@@ -665,6 +670,32 @@ def test_cpu_freeze_invalidates_inflight_result_without_waiting():
     assert cpu.authoritative_length == 11
 
 
+@pytest.mark.parametrize("cancel_candidate_first", [False, True])
+def test_gpu_full_interrupts_risk_reader_even_after_deferred_cancel(
+    cancel_candidate_first,
+):
+    cpu = RetroSpecCPURiskCoordinator.__new__(RetroSpecCPURiskCoordinator)
+    cpu.proposer = SimpleNamespace(performance_stats=Mock())
+    cpu.worker = Mock()
+    cpu.session, cpu.epoch = 1, 4
+    cpu.active = object()
+    cpu.queue = deque()
+    cpu.preparing = cpu._pending_release = None
+    cpu._release_interrupt_sent = False
+    if cancel_candidate_first:
+        cpu._cancel_active()
+        cpu.worker.send.assert_called_once_with(("release_after_token", 1, 4))
+        assert cpu.active is None
+        assert cpu._pending_release == (1, 4)
+    cpu.finish_round()
+    cpu.worker.send.assert_called_with(("release", 1, 4))
+    sent = cpu.worker.send.call_count
+    # Both proposal completion and the full context can finish the same round.
+    cpu.finish_round()
+    assert cpu.worker.send.call_count == sent
+    assert cpu._pending_release == (1, 4)
+
+
 def test_cpu_worker_reports_lost_progress():
     worker = RetroSpecCPUWorker.__new__(RetroSpecCPUWorker)
     worker.connection = Mock()
@@ -775,11 +806,252 @@ def _wait_messages(worker, predicate, timeout=60):
     raise AssertionError(f"CPU worker made no expected progress: {messages}")
 
 
-@pytest.mark.parametrize("control", ["pause", "release"])
-def test_cpu_partial_forward_can_be_cancelled_and_resumed(tmp_path, control):
+@pytest.mark.parametrize("config_class", [LlamaConfig, Qwen2Config])
+@pytest.mark.parametrize("boundaries", [(), (0,), (1,), (3,), (1, 3), (0, 1, 3)])
+def test_cpu_forward_continuation_matches_hf_without_repeating_layers(
+    config_class, boundaries
+):
+    class Suspend(Exception):
+        pass
+
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(2)
-    worker = storage = None
+    handles = []
+    try:
+        torch.manual_seed(9)
+        config = config_class(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+        )
+        config._attn_implementation = "sdpa"
+        model = AutoModelForCausalLM.from_config(config).bfloat16().eval()
+        with torch.inference_mode():
+            reference = make_cache(config, 16)
+            model(torch.tensor([[1, 2, 3, 4, 5]]), past_key_values=reference)
+            storage = torch.zeros(2, 4, 2, 16, 16, dtype=torch.bfloat16)
+            for i, layer in enumerate(reference.layers):
+                storage[0, i, :, :5].copy_(layer.keys[0, :, :5])
+                storage[1, i, :, :5].copy_(layer.values[0, :, :5])
+            expected = model(
+                torch.tensor([[6]]),
+                past_key_values=reference,
+                cache_position=torch.tensor([5]),
+                logits_to_keep=1,
+            ).logits[0, -1]
+            counts = [0] * 4
+            remaining = set(boundaries)
+            state = CPUForwardState(
+                model, torch.tensor([[6]]), attach_cache(config, storage, 5), 5
+            )
+
+            def before(index, _module, _args):
+                if index in remaining:
+                    remaining.remove(index)
+                    raise Suspend
+
+            def after(index, _module, _args, _output):
+                counts[index] += 1
+
+            for i, layer in enumerate(model.model.layers):
+                handles.append(
+                    layer.register_forward_pre_hook(
+                        lambda module, args, index=i: before(index, module, args)
+                    )
+                )
+                handles.append(
+                    layer.register_forward_hook(
+                        lambda module, args, output, index=i: after(
+                            index, module, args, output
+                        )
+                    )
+                )
+            while True:
+                try:
+                    actual = state.run()
+                    break
+                except Suspend:
+                    cursor = state.layer_index
+                    assert counts == [int(i < cursor) for i in range(4)]
+                    assert [layer.length for layer in state.cache.layers] == [
+                        6 if i < cursor else 5 for i in range(4)
+                    ]
+                    # A risk token overwrites the shared tail. Restoring its
+                    # complete snapshot must also recover the partial input row.
+                    tail = storage[..., 3:6, :].clone()
+                    storage[..., 3:6, :].fill_(-17)
+                    storage[..., 3:6, :].copy_(tail)
+            assert counts == [1] * 4
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            for i, layer in enumerate(reference.layers):
+                torch.testing.assert_close(
+                    storage[0, i, :, :6], layer.keys[0, :, :6], rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    storage[1, i, :, :6], layer.values[0, :, :6], rtol=0, atol=0
+                )
+    finally:
+        for handle in handles:
+            handle.remove()
+        torch.set_num_threads(previous_threads)
+
+
+@pytest.mark.parametrize("action", ["resume", "full", "release", "full_current"])
+def test_cpu_worker_preserves_partial_continuation_or_invalidates_it(tmp_path, action):
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(2)
+    worker = storage = tail = None
+    try:
+        torch.manual_seed(4)
+        config = LlamaConfig(
+            vocab_size=128,
+            hidden_size=1024,
+            intermediate_size=2048,
+            num_hidden_layers=16,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            max_position_embeddings=64,
+        )
+        config._attn_implementation = "sdpa"
+        model = AutoModelForCausalLM.from_config(config).bfloat16().eval()
+        model_path = tmp_path / "model"
+        model.save_pretrained(model_path)
+        shape = (2, 16, 4, 16, 64)
+        storage = RetroSpecCPUStorage(shape)
+        storage.kv.zero_()
+        with torch.inference_mode():
+            reference = make_cache(config, 16)
+            output = model(torch.tensor([[1, 2, 3, 4, 5]]), past_key_values=reference)
+            seed = int(output.logits[0, -1].argmax())
+            for i, layer in enumerate(reference.layers):
+                storage.kv[0, i, :, :5].copy_(layer.keys[0, :, :5])
+                storage.kv[1, i, :, :5].copy_(layer.values[0, :, :5])
+            prefix = storage.kv[..., :5, :].clone()
+            worker = RetroSpecCPUWorker(str(model_path), None, 1, resumable=True)
+            worker.send(("initialize", 1, 1, storage.paths, shape, 5, seed, 6, ()))
+            deadline = time.monotonic() + 60
+            while not storage.kv[0, 0, :, 5].count_nonzero():
+                worker.poll()
+                assert time.monotonic() < deadline
+                time.sleep(0.0001)
+            if action == "full_current":
+                worker.send(("pause", 2))
+                messages = _wait_messages(
+                    worker, lambda ms: any(m[0] == "paused" for m in ms)
+                )
+                assert not any(m[0] == "token" for m in messages)
+                assert any(
+                    m[0] == "interrupted" and m[5] == "full_cancel" for m in messages
+                )
+                serial = 1
+            else:
+                tail = RetroSpecCPUStorage(shape, journal_tokens=0)
+                worker.send(("suspend", 2, tail.paths[0], shape, 5))
+                messages = _wait_messages(
+                    worker, lambda ms: any(m[0] == "suspended" for m in ms)
+                )
+                assert not any(m[0] in ("token", "interrupted") for m in messages)
+                checkpoint = next(m for m in messages if m[0] == "suspended")
+                assert checkpoint[4] == 5 and checkpoint[8] == 6
+                cursor, serial = checkpoint[6], checkpoint[9]
+                assert 0 < cursor < config.num_hidden_layers
+                partial = storage.kv[..., 5:6, :].clone()
+                assert torch.equal(tail.kv[..., :1, :], partial)
+                worker.send(
+                    ("check_shared", 1, 2, tail.paths[0], shape, 5, 5, (seed + 1) % 128)
+                )
+                _wait_messages(
+                    worker, lambda ms: any(m[0] == "token" and m[2] == 2 for m in ms)
+                )
+                assert not torch.equal(
+                    storage.kv[:, :cursor, :, 5:6], partial[:, :cursor]
+                )
+                if action == "resume":
+                    worker.send(("restore", True))
+                    messages = _wait_messages(
+                        worker,
+                        lambda ms: any(m[0] == "token" and m[2] == 1 for m in ms),
+                    )
+                    restored = next(m for m in messages if m[0] == "restored")
+                    token = next(m for m in messages if m[0] == "token" and m[2] == 1)
+                    assert restored[4] == cursor and restored[6] == serial
+                    assert token[6:8] == (serial, 1)
+                    assert token[8] >= token[5]
+                    assert torch.equal(
+                        storage.kv[:, :cursor, :, 5:6], partial[:, :cursor]
+                    )
+                    expected = model(
+                        torch.tensor([[seed]]), past_key_values=reference
+                    ).logits
+                    assert token[4] == int(expected[0, -1].argmax())
+                    assert torch.equal(storage.kv[..., :5, :], prefix)
+                    return
+                if action == "full":
+                    worker.send(("restore", False))
+                    worker.send(("pause", 3))
+                    messages = _wait_messages(
+                        worker, lambda ms: any(m[0] == "paused" for m in ms)
+                    )
+                else:
+                    worker.send(("release", 1, 3))
+                    messages = _wait_messages(
+                        worker, lambda ms: any(m[0] == "released" for m in ms)
+                    )
+                    worker.wait_for_release(1, 3, timeout=1)
+                assert not any(m[0] == "token" for m in messages)
+                assert any(
+                    m[0] == "interrupted"
+                    and m[5:7] == ("continuation_discarded", serial)
+                    for m in messages
+                )
+            # An authoritative restart must not reuse the old token's hidden state.
+            seed = (seed + 2) % 128
+            if action == "release":
+                worker.send(("initialize", 2, 4, storage.paths, shape, 5, seed, 6, ()))
+            else:
+                worker.send(("resume", 1, 4, 5, 5, seed, 6))
+            messages = _wait_messages(
+                worker, lambda ms: any(m[0] == "token" and m[2] == 4 for m in ms)
+            )
+            token = next(m for m in messages if m[0] == "token" and m[2] == 4)
+            expected = model(torch.tensor([[seed]]), past_key_values=reference).logits
+            assert token[4] == int(expected[0, -1].argmax())
+            assert token[6] != serial and token[7] == 0
+            assert torch.equal(storage.kv[..., :5, :], prefix)
+    finally:
+        if worker is not None:
+            worker.close()
+        if storage is not None:
+            storage.close()
+        if tail is not None:
+            tail.close()
+        torch.set_num_threads(previous_threads)
+
+
+@pytest.mark.parametrize(
+    "task,control",
+    [
+        ("continuous", "suspend"),
+        ("continuous", "pause_after_token"),
+        ("continuous", "release_after_token"),
+        ("continuous", "pause"),
+        ("continuous", "release"),
+        ("continuous", "suspend_then_full"),
+        ("risk", "pause_after_token"),
+        ("risk", "release_after_token"),
+        ("risk", "pause"),
+        ("risk", "release"),
+        ("risk", "release_then_full"),
+    ],
+)
+def test_cpu_control_respects_signal_boundary_and_preserves_kv(tmp_path, task, control):
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(2)
+    worker = storage = tail = None
     try:
         torch.manual_seed(4)
         config = LlamaConfig(
@@ -809,24 +1081,82 @@ def test_cpu_partial_forward_can_be_cancelled_and_resumed(tmp_path, control):
                 storage.kv[1, i, :, :5].copy_(layer.values[0, :, :5])
             prefix = storage.kv[..., :5, :].clone()
             worker = RetroSpecCPUWorker(str(model_path), None, 1)
-            worker.send(("initialize", 1, 1, storage.paths, shape, 5, seed, 6, ()))
+            if task == "continuous":
+                worker.send(("initialize", 1, 1, storage.paths, shape, 5, seed, 6, ()))
+            else:
+                worker.send(("check", 1, 1, storage.paths, shape, 5, seed))
             deadline = time.monotonic() + 60
             while not storage.kv[0, 0, :, 5].count_nonzero():
                 worker.poll()
                 assert time.monotonic() < deadline, "CPU did not enter its first layer"
                 time.sleep(0.0001)
-            worker.send((control, 1, 2) if control == "release" else ("pause", 2))
-            acknowledged = "released" if control == "release" else "paused"
-            messages = _wait_messages(
-                worker, lambda values: any(value[0] == acknowledged for value in values)
+            interrupted = control in (
+                "pause",
+                "release",
+                "suspend_then_full",
+                "release_then_full",
             )
-            assert any(value[0] == "interrupted" for value in messages)
-            assert not any(value[0] == "token" for value in messages)
+            release = control in ("release", "release_after_token", "release_then_full")
+            ack_epoch = 2
+            if control in ("suspend", "suspend_then_full"):
+                tail = RetroSpecCPUStorage(shape, journal_tokens=0)
+                command = ("suspend", 2, tail.paths[0], shape, 5)
+                acknowledged = "suspended"
+            elif release:
+                operation = (
+                    "release_after_token" if control == "release_then_full" else control
+                )
+                command = (operation, 1, 2)
+                acknowledged = "released"
+            else:
+                command = (control, 2)
+                acknowledged = "paused"
+            worker.send(command)
+            if control == "suspend_then_full":
+                # Full cancellation must be found behind deferred risk work;
+                # its pause ACK must still fence the preceding restore.
+                worker.send(("restore", False))
+                worker.send(("pause", 3))
+                acknowledged, ack_epoch = "paused", 3
+            elif control == "release_then_full":
+                worker.send(("release", 1, 3))
+                ack_epoch = 3
+            messages = _wait_messages(
+                worker,
+                lambda values: any(
+                    value[0] == acknowledged
+                    and value[3 if acknowledged == "suspended" else 2] == ack_epoch
+                    for value in values
+                ),
+            )
+            completed = None
+            if interrupted:
+                assert any(value[0] == "interrupted" for value in messages)
+                assert not any(value[0] == "token" for value in messages)
+                if control == "suspend_then_full":
+                    assert [
+                        value[0] for value in messages if value[0] != "resumed"
+                    ] == ["interrupted", "suspended", "restored", "paused"]
+            else:
+                assert not any(value[0] == "interrupted" for value in messages)
+                token_index = next(
+                    i for i, value in enumerate(messages) if value[0] == "token"
+                )
+                ack_index = next(
+                    i for i, value in enumerate(messages) if value[0] == acknowledged
+                )
+                assert token_index < ack_index
+                completed = messages[token_index]
+                assert completed[1:4] == (1, 1, 6)
+                first_output = model(
+                    torch.tensor([[seed]]), past_key_values=cache, use_cache=True
+                )
+                assert completed[4] == int(first_output.logits[0, -1].argmax())
             assert torch.equal(storage.kv[..., :5, :], prefix)
 
-            if control == "release":
+            if release:
                 # The fence remains valid even when a poll already drained it.
-                worker.wait_for_release(1, 2, timeout=1)
+                worker.wait_for_release(1, ack_epoch, timeout=1)
                 storage.kv.fill_(-17)
                 cache = make_cache(config, 16)
                 output = model(
@@ -836,8 +1166,35 @@ def test_cpu_partial_forward_can_be_cancelled_and_resumed(tmp_path, control):
                 for i, layer in enumerate(cache.layers):
                     storage.kv[0, i, :, :3].copy_(layer.keys[0, :, :3])
                     storage.kv[1, i, :, :3].copy_(layer.values[0, :, :3])
-                worker.send(("initialize", 2, 3, storage.paths, shape, 3, seed, 4, ()))
+                worker.send(("initialize", 2, 4, storage.paths, shape, 3, seed, 4, ()))
+            elif control == "suspend":
+                assert messages[ack_index][4] == 6
+                continuous_kv = storage.kv[..., 5:6, :].clone()
+                assert torch.equal(tail.kv[..., :1, :], continuous_kv)
+                # A risk query overwrites the shared tail. Restoring must
+                # recover the completed continuous token and resume from it.
+                worker.send(("check_shared", 1, 2, tail.paths[0], shape, 5, 5, 7))
+                _wait_messages(
+                    worker,
+                    lambda values: any(
+                        value[0] == "token" and value[2] == 2 for value in values
+                    ),
+                )
+                worker.send(("restore", True))
+                _wait_messages(
+                    worker,
+                    lambda values: any(value[0] == "restored" for value in values),
+                )
+                assert torch.equal(storage.kv[..., 5:6, :], continuous_kv)
+                seed = completed[4]
+                worker.send(("resume", 1, 3, 6, 6, seed, 7))
+            elif task == "risk":
+                position = 5 if interrupted else 6
+                if completed is not None:
+                    seed = completed[4]
+                worker.send(("check", 1, 4, storage.paths, shape, position, seed))
             else:
+                cache.crop(5)
                 worker.send(("resume", 1, 3, 5, 5, seed, 6))
             messages = _wait_messages(
                 worker, lambda values: any(value[0] == "token" for value in values)
@@ -847,13 +1204,15 @@ def test_cpu_partial_forward_can_be_cancelled_and_resumed(tmp_path, control):
             )
             token = next(value[4] for value in messages if value[0] == "token")
             assert token == int(output.logits[0, -1].argmax())
-            if control == "release":
+            if release:
                 assert (storage.kv[..., 5:, :] == -17).all()
     finally:
         if worker is not None:
             worker.close()
         if storage is not None:
             storage.close()
+        if tail is not None:
+            tail.close()
         torch.set_num_threads(previous_threads)
 
 

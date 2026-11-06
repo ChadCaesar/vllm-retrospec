@@ -28,6 +28,10 @@ class _CPUForwardInterrupted(Exception):
     pass
 
 
+class _CPUForwardSuspended(Exception):
+    pass
+
+
 def map_cpu_kv(path: str, shape: tuple[int, ...]) -> torch.Tensor:
     import torch
 
@@ -95,6 +99,7 @@ def _cpu_target_main(
     threads: int,
     config_path=None,
     cpu_affinity: tuple[int, ...] | None = None,
+    resumable: bool = False,
 ):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     try:
@@ -107,9 +112,17 @@ def _cpu_target_main(
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
         if __package__:
-            from .cpu_model import attach_cache, grouped_decode_attention
+            from .cpu_model import (
+                CPUForwardState,
+                attach_cache,
+                grouped_decode_attention,
+            )
         else:
-            from cpu_model import attach_cache, grouped_decode_attention
+            from cpu_model import (
+                CPUForwardState,
+                attach_cache,
+                grouped_decode_attention,
+            )
 
         torch.set_num_threads(threads)
         torch.set_num_interop_threads(1)
@@ -141,33 +154,80 @@ def _cpu_target_main(
         saved = None
         saved_tail = None
         saved_origin = 0
-        pending_command = None
+        saved_end = 0
+        forward_state = saved_forward = None
+        forward_elapsed = saved_elapsed = 0.0
+        forward_serial = 0
+        task_kind = "continuous"
+        pending_commands = deque()
         eos_ids: set[int] = set()
 
         def check_control(_module, _inputs):
-            nonlocal pending_command
+            suspend = False
             while connection.poll():
                 command = connection.recv()
-                pending_command = command
-                raise _CPUForwardInterrupted
+                pending_commands.append(command)
+                if command[0] in ("pause", "release", "close"):
+                    raise _CPUForwardInterrupted
+                if (
+                    command[0] == "suspend"
+                    and resumable
+                    and task_kind == "continuous"
+                    and forward_state is not None
+                ):
+                    suspend = True
+            # Scan all available commands first: full can supersede a risk
+            # checkpoint. Risk forwards still finish before soft cancellation.
+            if suspend:
+                raise _CPUForwardSuspended
 
-        # Stop at a decoder-layer boundary instead of reading the remaining
-        # model weights while GPU full verification gathers its historical KV.
-        # No output is published for a partially executed CPU token.
+        def discard_forward(state, elapsed, task_session, task_epoch, task_position):
+            if state is not None:
+                for layer in state.cache.layers:
+                    layer.length = task_position
+                connection.send(
+                    (
+                        "interrupted",
+                        task_session,
+                        task_epoch,
+                        task_position,
+                        elapsed,
+                        "continuation_discarded",
+                        state.serial,
+                        time.monotonic() - state.started_at,
+                        state.resumes,
+                    )
+                )
+
         for layer in model.model.layers:
             layer.register_forward_pre_hook(check_control)
 
         with torch.inference_mode():
             while True:
-                if pending_command is not None or connection.poll() or not running:
-                    command = pending_command
-                    pending_command = None
-                    if command is None:
-                        command = connection.recv()
+                if pending_commands or connection.poll() or not running:
+                    command = (
+                        pending_commands.popleft()
+                        if pending_commands
+                        else connection.recv()
+                    )
                     operation = command[0]
                     if operation == "close":
                         return
-                    if operation == "pause":
+                    if operation in ("pause", "pause_after_token"):
+                        if operation == "pause":
+                            discard_forward(
+                                forward_state, forward_elapsed, session, epoch, position
+                            )
+                            forward_state, forward_elapsed = None, 0.0
+                            if saved_forward is not None:
+                                discard_forward(
+                                    saved_forward,
+                                    saved_elapsed,
+                                    saved[3],
+                                    saved[4],
+                                    saved[6],
+                                )
+                                saved_forward, saved_elapsed = None, 0.0
                         epoch = command[1]
                         running = False
                         connection.send(("paused", session, epoch))
@@ -178,11 +238,15 @@ def _cpu_target_main(
                         if saved is not None:
                             raise RuntimeError("CPU continuous task already suspended")
                         saved_tail = mappings.attach_aux("continuous", path, shape)
-                        count = position - saved_origin
+                        # Include the current input row for already completed
+                        # layers of a suspended token. Risk shares this backing
+                        # and may overwrite that row before restoration.
+                        saved_end = max(layer.length for layer in cache.layers)
+                        count = saved_end - saved_origin
                         if not 0 <= count <= saved_tail.shape[-2]:
                             raise RuntimeError("CPU continuous tail capacity exceeded")
                         saved_tail[..., :count, :].copy_(
-                            storage[..., saved_origin:position, :]
+                            storage[..., saved_origin:saved_end, :]
                         )
                         saved = (
                             cache,
@@ -195,6 +259,8 @@ def _cpu_target_main(
                             limit,
                             eos_ids,
                         )
+                        saved_forward, saved_elapsed = forward_state, forward_elapsed
+                        forward_state, forward_elapsed = None, 0.0
                         running = False
                         connection.send(
                             (
@@ -204,6 +270,11 @@ def _cpu_target_main(
                                 nonce,
                                 position,
                                 time.monotonic() - checkpoint_started,
+                                saved_forward.layer_index if saved_forward else None,
+                                saved_elapsed,
+                                saved_end,
+                                saved_forward.serial if saved_forward else None,
+                                model.config.num_hidden_layers,
                             )
                         )
                         continue
@@ -222,9 +293,19 @@ def _cpu_target_main(
                             limit,
                             eos_ids,
                         ) = saved
-                        storage[..., saved_origin:position, :].copy_(
-                            saved_tail[..., : position - saved_origin, :]
+                        storage[..., saved_origin:saved_end, :].copy_(
+                            saved_tail[..., : saved_end - saved_origin, :]
                         )
+                        forward_state, forward_elapsed = saved_forward, saved_elapsed
+                        saved_forward, saved_elapsed = None, 0.0
+                        task_kind = "continuous"
+                        if not command[1]:
+                            discard_forward(
+                                forward_state, forward_elapsed, session, epoch, position
+                            )
+                            forward_state, forward_elapsed = None, 0.0
+                        elif forward_state is not None:
+                            forward_state.resumes += 1
                         saved = saved_tail = None
                         running = (
                             command[1] and position < limit and token not in eos_ids
@@ -235,15 +316,31 @@ def _cpu_target_main(
                                 session,
                                 epoch,
                                 time.monotonic() - restore_started,
+                                forward_state.layer_index if forward_state else None,
+                                forward_elapsed,
+                                forward_state.serial if forward_state else None,
+                                model.config.num_hidden_layers,
                             )
                         )
                         continue
-                    if operation == "release":
+                    if operation in ("release", "release_after_token"):
+                        discard_forward(
+                            forward_state, forward_elapsed, session, epoch, position
+                        )
+                        if saved_forward is not None:
+                            discard_forward(
+                                saved_forward,
+                                saved_elapsed,
+                                saved[3],
+                                saved[4],
+                                saved[6],
+                            )
+                        forward_state = saved_forward = None
+                        forward_elapsed = saved_elapsed = 0.0
                         _, session, epoch = command[:3]
                         running = False
                         # All CPU kernels are synchronous. Reaching this point
-                        # after a layer-boundary interruption fences every old
-                        # KV access, including partially written token rows.
+                        # after a token/layer boundary fences every old KV access.
                         cache = storage = journal = output = saved = saved_tail = None
                         # Retaining an idle mapping does not access its pages.
                         # The producer still needs this ACK before overwriting.
@@ -252,6 +349,7 @@ def _cpu_target_main(
                         connection.send(("released", session, epoch))
                         continue
                     if operation == "check_shared":
+                        task_kind = "risk"
                         (_, session, epoch, path, shape, origin, position, token) = (
                             command
                         )
@@ -267,6 +365,7 @@ def _cpu_target_main(
                         limit = position + 1
                         eos_ids = set()
                     elif operation == "check":
+                        task_kind = "risk"
                         _, session, epoch, paths, shape, position, token = command
                         storage, journal = mappings.attach(
                             paths, shape, with_journal=False
@@ -275,6 +374,8 @@ def _cpu_target_main(
                         limit = position + 1
                         eos_ids = set()
                     elif operation == "initialize":
+                        task_kind = "continuous"
+                        forward_state, forward_elapsed = None, 0.0
                         _, session, epoch, paths, shape, position, token, limit, eos = (
                             command
                         )
@@ -284,6 +385,11 @@ def _cpu_target_main(
                         cache = attach_cache(model.config, storage, position)
                         eos_ids = set(eos)
                     elif operation == "resume":
+                        task_kind = "continuous"
+                        discard_forward(
+                            forward_state, forward_elapsed, session, epoch, position
+                        )
+                        forward_state, forward_elapsed = None, 0.0
                         _, session, epoch, start, position, token, limit = command[:7]
                         journal_origin = command[7] if len(command) > 7 else 0
                         if cache is None or cache.get_seq_length() < start:
@@ -308,27 +414,45 @@ def _cpu_target_main(
                 ids = torch.tensor([[token]], dtype=torch.int64)
                 started = time.monotonic()
                 try:
-                    output = model(
-                        input_ids=ids,
-                        past_key_values=cache,
-                        use_cache=True,
-                        cache_position=torch.tensor([position]),
-                        logits_to_keep=1,
-                    )
+                    if resumable and task_kind == "continuous":
+                        if forward_state is None:
+                            forward_serial += 1
+                            forward_state = CPUForwardState(
+                                model, ids, cache, position, forward_serial, started
+                            )
+                        logits = forward_state.run()
+                    else:
+                        output = model(
+                            input_ids=ids,
+                            past_key_values=cache,
+                            use_cache=True,
+                            cache_position=torch.tensor([position]),
+                            logits_to_keep=1,
+                        )
+                        logits = output.logits[0, -1]
+                except _CPUForwardSuspended:
+                    forward_elapsed += time.monotonic() - started
+                    continue
                 except _CPUForwardInterrupted:
-                    for index in range(len(cache.layers)):
-                        cache.layers[index].length = position
+                    for layer in cache.layers:
+                        layer.length = position
                     connection.send(
                         (
                             "interrupted",
                             session,
                             epoch,
                             position,
-                            time.monotonic() - started,
+                            forward_elapsed + time.monotonic() - started,
+                            "full_cancel",
+                            forward_state.serial if forward_state else None,
+                            time.monotonic() - forward_state.started_at
+                            if forward_state
+                            else time.monotonic() - started,
+                            forward_state.resumes if forward_state else 0,
                         )
                     )
+                    forward_state, forward_elapsed = None, 0.0
                     continue
-                logits = output.logits[0, -1]
                 if not torch.isfinite(logits).all():
                     raise RuntimeError("CPU verifier produced non-finite logits")
                 token = int(logits.argmax().item())
@@ -340,9 +464,16 @@ def _cpu_target_main(
                     epoch,
                     position,
                     token,
-                    finished - started,
+                    forward_elapsed + finished - started,
                 )
+                if forward_state is not None:
+                    message += (
+                        forward_state.serial,
+                        forward_state.resumes,
+                        finished - forward_state.started_at,
+                    )
                 connection.send(message)
+                forward_state, forward_elapsed = None, 0.0
                 running = position < limit and token not in eos_ids
     except (EOFError, ConnectionError):
         return
@@ -364,7 +495,9 @@ class RetroSpecCPUWorker:
         threads: int,
         config=None,
         cpu_affinity: tuple[int, ...] | None = None,
+        resumable: bool = False,
     ):
+        self.resumable = resumable
         # vLLM GPU workers can themselves be daemon processes, which cannot
         # create multiprocessing children. A fresh interpreter also keeps all
         # CUDA initialization and platform globals out of the CPU process.
@@ -394,6 +527,7 @@ class RetroSpecCPUWorker:
                 str(threads),
                 str(self.config_path) if config is not None else "",
                 ",".join(map(str, cpu_affinity)) if cpu_affinity is not None else "",
+                str(int(resumable)),
             ],
             env=environment,
         )
@@ -502,9 +636,9 @@ class RetroSpecCPUWorker:
         elif command[0] == "restore":
             self.last_command = None
             self.awaiting_progress = False
-        elif command[0] == "pause":
+        elif command[0] in ("pause", "pause_after_token"):
             self.last_command = ("pause", None, command[1], 0)
-        elif command[0] == "release":
+        elif command[0] in ("release", "release_after_token"):
             self.released = None
             self.last_command = ("release", command[1], command[2], 0)
             self.awaiting_progress = True
@@ -684,4 +818,5 @@ if __name__ == "__main__":
         int(sys.argv[4]),
         sys.argv[5] or None,
         tuple(map(int, sys.argv[6].split(","))) if sys.argv[6] else None,
+        bool(int(sys.argv[7])) if len(sys.argv) > 7 else False,
     )

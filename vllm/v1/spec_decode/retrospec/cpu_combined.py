@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""One CPU target: continuous authority, preempted by FIFO risk checks."""
+"""Save continuous layer progress for risk checks; cancel it on GPU full."""
 
 from collections import deque
 from time import perf_counter
@@ -30,6 +30,21 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
         self.common_end = 0
         self._deferred_messages = []
         self._restore_pending = None
+        self._ready_preparation = self._local_preparation = None
+        self._local_preparation_error = None
+
+    def _local_ready(self, kv):
+        if getattr(self, "_local_preparation", None) is not kv:
+            if not kv.future.done():
+                return False, None
+            error = None
+            try:
+                kv.future.result()
+            except Exception as exc:
+                error = str(exc)
+            self._local_preparation = kv
+            self._local_preparation_error = error
+        return True, self._local_preparation_error
 
     @property
     def stats(self):
@@ -76,6 +91,7 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
             # fences both the previous risk-tail reader and the journal import.
             self._restore_pending = None
         self._continuous_epoch = self.epoch
+        self._ready_preparation = self._local_preparation = None
         self.mode = "continuous"
         self._tail_installed = False
         self._pause_epoch = None
@@ -91,7 +107,7 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
         self.epoch += 1
         self._pause_epoch = self.epoch
         if self.worker is not None:
-            self.worker.send(("pause", self.epoch))
+            self.worker.send(("pause_after_token", self.epoch))
         self.stats.add_counter("cpu_risk_cancelled")
 
     def _cancel_preparation(self):
@@ -159,6 +175,8 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
                     self.stats.add_counter("cpu_continuous_suspensions")
                     if len(message) > 5:
                         self.stats.record_cpu_time("cpu_tail_save_wall", message[5])
+                    if len(message) > 6 and message[6] is not None:
+                        self.stats.add_counter("cpu_continuation_saved")
             elif message[0] == "restored" and message[1:3] == self._restore_pending:
                 self._restore_pending = None
                 if self.mode == "restoring":
@@ -167,6 +185,8 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
                     self.stats.add_counter("cpu_continuous_restores")
                     if len(message) > 3:
                         self.stats.record_cpu_time("cpu_tail_restore_wall", message[3])
+                    if len(message) > 4 and message[4] is not None:
+                        self.stats.add_counter("cpu_continuation_resumed")
             elif message[0] == "paused" and message[2] == self._pause_epoch:
                 self._pause_epoch = None
         continuous = [
@@ -225,18 +245,20 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
         if self.preparing is not None:
             task, kv, started = self.preparing
             error = None
-            done = kv.future.done()
-            if done:
-                try:
-                    kv.future.result()
-                except Exception as exc:
-                    error = str(exc)
-            status = torch.tensor([not done, error is not None], dtype=torch.int32)
-            if self.group.world_size > 1:
-                dist.all_reduce(
-                    status, op=dist.ReduceOp.MAX, group=self.group.cpu_group
-                )
-            if status[1].item():
+            failed = False
+            ready = self._ready_preparation is kv
+            if ready:
+                self.stats.add_counter("cpu_risk_ready_cache_hits")
+            else:
+                done, error = self._local_ready(kv)
+                status = torch.tensor([not done, error is not None], dtype=torch.int32)
+                if self.group.world_size > 1:
+                    dist.all_reduce(
+                        status, op=dist.ReduceOp.MAX, group=self.group.cpu_group
+                    )
+                ready = not status[0].item()
+                failed = bool(status[1].item())
+            if failed:
                 errors = [None] * self.group.world_size
                 if self.group.world_size > 1:
                     dist.all_gather_object(errors, error, group=self.group.cpu_group)
@@ -245,8 +267,9 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
                 raise RuntimeError(
                     "CPU risk preparation failed: " + next(e for e in errors if e)
                 )
-            if status[0].item():
+            if not ready:
                 return self.alert
+            self._ready_preparation = kv
             if kv.cancelled.is_set() or not self.queue or self.queue[0] is not task:
                 self.preparing = None
             elif allow_start:
@@ -287,6 +310,7 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
                             )
                         )
                     self.preparing = None
+                    self._ready_preparation = self._local_preparation = None
                     self.stats.add_counter("cpu_risk_started")
                     self.stats.record_cpu_time(
                         "cpu_risk_prepare_wall", perf_counter() - started
@@ -403,6 +427,7 @@ class RetroSpecCPUCombinedCoordinator(RetroSpecCPUCoordinator):
         super().release()
 
     def close(self):
+        self._ready_preparation = self._local_preparation = None
         self._cancel_preparation()
         try:
             super().close()

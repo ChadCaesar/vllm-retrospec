@@ -260,7 +260,7 @@ class SpeculativeConfig:
     retrospec_cpu_risk_margin_threshold: float = Field(default=0.5, ge=0)
     """Queue draft tokens whose raw top-1/top-2 logit margin is strictly lower
     than this threshold. Independent of GPU stage-transition thresholds."""
-    retrospec_cpu_threads: int = Field(default=16, gt=0)
+    retrospec_cpu_threads: int = Field(default=24, gt=0)
     """Intra-op threads reserved for the independent CPU verifier."""
     retrospec_cpu_numa_binding: bool = True
     """Place CPU verification and GPU launch threads on separate NUMA nodes

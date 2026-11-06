@@ -30,6 +30,10 @@ class RetroSpecCPUCoordinator:
                     proposer.speculative_config.retrospec_cpu_threads,
                     self.config,
                     cpu_affinity=self.affinity.cpu_cpus,
+                    resumable=(
+                        proposer.speculative_config.retrospec_cpu_verify
+                        and proposer.speculative_config.retrospec_cpu_risk_check
+                    ),
                 )
                 if self.group.rank_in_group == 0
                 else None
@@ -257,6 +261,10 @@ class RetroSpecCPUCoordinator:
         for message in messages:
             if message[0] == "interrupted":
                 self.proposer.performance_stats.add_counter("cpu_cancelled_forwards")
+                if len(message) > 5 and message[5] == "continuation_discarded":
+                    self.proposer.performance_stats.add_counter(
+                        "cpu_continuation_discarded"
+                    )
             if message[0] != "token":
                 continue
             session, epoch, position, token = message[1:5]
