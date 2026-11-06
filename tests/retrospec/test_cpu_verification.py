@@ -228,11 +228,26 @@ def test_cpu_export_gathers_directly_into_shared_head_slots(
         store.close()
 
 
-@pytest.mark.parametrize("quality_trigger", [None, 7, 19])
+@pytest.mark.parametrize(
+    "quality_source,quality_threshold,quality_trigger",
+    [
+        ("none", None, None),
+        ("margin", 0.0, None),
+        ("attention", 0.0, None),
+        ("margin", 0.5, 7),
+        ("margin", 0.5, 19),
+        ("attention", 0.5, 7),
+        ("attention", 0.5, 19),
+    ],
+)
 @pytest.mark.parametrize("cpu_during_verification", [False, True])
 @pytest.mark.parametrize("execution_slice", [False, True])
 def test_cpu_refills_only_length_triggered_verification(
-    quality_trigger, cpu_during_verification, execution_slice
+    quality_source,
+    quality_threshold,
+    quality_trigger,
+    cpu_during_verification,
+    execution_slice,
 ):
     class CPU:
         stop_ids = set()
@@ -262,8 +277,14 @@ def test_cpu_refills_only_length_triggered_verification(
 
     class Proposer(RetroSpecCPUProposalMixin):
         def _run_draft_step(self, batch, slot, metadata, active, sampling):
-            margin = 0.0 if slot == quality_trigger else 1.0
-            return torch.tensor([slot + 1]), torch.tensor([margin]), torch.ones(1)
+            low = 0.0 if slot == quality_trigger else 1.0
+            margin = low if quality_source == "margin" else 1.0
+            mass = low if quality_source == "attention" else 1.0
+            return (
+                torch.tensor([slot + 1]),
+                torch.tensor([margin]),
+                torch.tensor([mass]),
+            )
 
         def _verify_draft_tokens(
             self,
@@ -300,9 +321,16 @@ def test_cpu_refills_only_length_triggered_verification(
         method="retrospec",
         num_speculative_tokens=16,
         retrospec_max_draft_tokens=8,
-        retrospec_draft_margin_threshold=0.5 if quality_trigger is not None else None,
+        retrospec_draft_margin_threshold=(
+            quality_threshold if quality_source == "margin" else None
+        ),
+        retrospec_hit_attn_threshold=(
+            quality_threshold if quality_source == "attention" else None
+        ),
+        retrospec_cpu_risk_check=True,
     )
     proposer.policy = RetroSpecDecisionPolicy(proposer.speculative_config)
+    proposer.policy.evaluate = Mock(wraps=proposer.policy.evaluate)
     proposer.num_speculative_tokens = 32
     proposer.max_model_len = 1000
     proposer._proposal_token_budgets = SimpleNamespace(
@@ -329,6 +357,10 @@ def test_cpu_refills_only_length_triggered_verification(
     result = proposer._propose_with_cpu(
         ["r"], [100], None, None, remaining_generation_budget=24
     )
+    if quality_source == "none":
+        proposer.policy.evaluate.assert_not_called()
+    else:
+        assert proposer.policy.evaluate.call_count > 0
     if quality_trigger == 7:
         assert proposer.cpu_coordinator.committed == [1, 2]
         assert proposer.ranges == [(3, 8)]

@@ -45,6 +45,25 @@ class RetroSpecCPUProposalMixin:
                     target[:1].copy_(saved)
             index._selection_plan_written_layers.add(name)
 
+    def _cpu_draft_quality_triggered(self, active, margin, mass):
+        # CPU windows already enforce length and execution limits on the host.
+        # No quality bit can be set when both optional thresholds are disabled.
+        if (
+            self.policy.draft_margin_threshold is None
+            and self.policy.hit_attn_threshold is None
+        ):
+            return False
+        decision = self.policy.evaluate(
+            current_stage=RetroSpecStage.DRAFT,
+            request_stages=self.state.stage,
+            metrics=RetroSpecMetrics(draft_margin=margin, hit_attn=mass),
+            draft_counts=self.state.draft_counts,
+            pending_counts=self.state.pending_counts,
+            active_mask=active,
+        )
+        quality_reasons = int(RetroSpecReason.DRAFT_MARGIN | RetroSpecReason.HIT_ATTN)
+        return bool(int(decision.reasons[0].item()) & quality_reasons)
+
     def _cpu_request_supported(self, request_ids, sampling_metadata):
         if getattr(self, "cpu_coordinator", None) is None or len(request_ids) != 1:
             return False
@@ -321,20 +340,9 @@ class RetroSpecCPUProposalMixin:
                 self.performance_stats.add_gpu_counter("draft_tokens", 1)
                 self.state.draft_counts.fill_(window.sparse_pending)
                 self.state.pending_counts.fill_(window.full_pending)
-                decision = self.policy.evaluate(
-                    current_stage=RetroSpecStage.DRAFT,
-                    request_stages=self.state.stage,
-                    metrics=RetroSpecMetrics(draft_margin=margin, hit_attn=mass),
-                    draft_counts=self.state.draft_counts,
-                    pending_counts=self.state.pending_counts,
-                    active_mask=active,
-                )
                 # Length limits are recomputed after CPU progress, so they can
                 # be refilled. Quality triggers remain latched for verification.
-                quality_reasons = int(
-                    RetroSpecReason.DRAFT_MARGIN | RetroSpecReason.HIT_ATTN
-                )
-                force_sparse = bool(int(decision.reasons[0].item()) & quality_reasons)
+                force_sparse = self._cpu_draft_quality_triggered(active, margin, mass)
                 if risk is not None:
                     risk.draft(window, risk_margin)
                 if window.confirmed:
