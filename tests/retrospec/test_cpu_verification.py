@@ -35,11 +35,12 @@ from vllm.v1.spec_decode.retrospec.cpu_worker import (
 )
 from vllm.v1.spec_decode.retrospec.decision import (
     RetroSpecDecisionPolicy,
+    RetroSpecMetrics,
     RetroSpecReason,
 )
 from vllm.v1.spec_decode.retrospec.numa import RetroSpecHostPlacement
 from vllm.v1.spec_decode.retrospec.runtime.proposer_cpu import RetroSpecCPUProposalMixin
-from vllm.v1.spec_decode.retrospec.state import RetroSpecBatchState
+from vllm.v1.spec_decode.retrospec.state import RetroSpecBatchState, RetroSpecStage
 
 
 def test_cpu_storage_unlinks_paths_before_releasing_large_mappings():
@@ -389,6 +390,64 @@ def test_cpu_refills_only_length_triggered_verification(
         assert proposer.cpu_coordinator.committed == [1, 2]
         assert proposer.ranges == [(3, 10), (11, 18)]
         assert result == [list(range(3, 19))]
+
+
+@pytest.mark.parametrize("threshold", [None, 0.0, 0.5])
+@pytest.mark.parametrize("quality_source", ["margin", "attention"])
+@pytest.mark.parametrize("draft_count,pending_count", [(1, 3), (8, 10), (2, 64)])
+def test_cpu_quality_decision_publishes_current_host_window_only_when_needed(
+    threshold, quality_source, draft_count, pending_count
+):
+    proposer = RetroSpecCPUProposalMixin()
+    config = SpeculativeConfig(
+        method="retrospec",
+        num_speculative_tokens=64,
+        retrospec_draft_margin_threshold=(
+            threshold if quality_source == "margin" else None
+        ),
+        retrospec_hit_attn_threshold=(
+            threshold if quality_source == "attention" else None
+        ),
+        retrospec_cpu_risk_check=True,
+        retrospec_cpu_risk_margin_threshold=0.5,
+    )
+    proposer.policy = RetroSpecDecisionPolicy(config)
+    proposer.state = RetroSpecBatchState(1, torch.device("cpu"))
+    proposer.state.begin_batch(1)
+    state = proposer.state
+    # A sparse result or CPU progress may leave different GPU counters behind.
+    state.set_stage(state.active_mask, RetroSpecStage.SPARSE_VERIFY)
+    state.draft_counts.fill_(29)
+    state.pending_counts.fill_(31)
+    before = [
+        t.clone() for t in (state.stage, state.draft_counts, state.pending_counts)
+    ]
+    margin = mass = torch.tensor([0.25])
+    expected = proposer.policy.evaluate(
+        current_stage=RetroSpecStage.DRAFT,
+        request_stages=torch.tensor([int(RetroSpecStage.DRAFT)], dtype=torch.int8),
+        metrics=RetroSpecMetrics(draft_margin=margin, hit_attn=mass),
+        draft_counts=torch.tensor([draft_count], dtype=torch.int32),
+        pending_counts=torch.tensor([pending_count], dtype=torch.int32),
+        active_mask=state.active_mask,
+    )
+    proposer.policy.evaluate = Mock(wraps=proposer.policy.evaluate)
+    actual = proposer._cpu_draft_quality_triggered(
+        state.active_mask, margin, mass, draft_count, pending_count
+    )
+    quality_bits = int(RetroSpecReason.DRAFT_MARGIN | RetroSpecReason.HIT_ATTN)
+    assert actual == bool(int(expected.reasons[0]) & quality_bits)
+    if threshold is None:
+        proposer.policy.evaluate.assert_not_called()
+        for previous, current in zip(
+            before, (state.stage, state.draft_counts, state.pending_counts)
+        ):
+            assert torch.equal(previous, current)
+    else:
+        proposer.policy.evaluate.assert_called_once()
+        assert int(state.stage[0]) == int(RetroSpecStage.DRAFT)
+        assert int(state.draft_counts[0]) == draft_count
+        assert int(state.pending_counts[0]) == pending_count
 
 
 def test_cpu_confirmation_slides_both_windows():

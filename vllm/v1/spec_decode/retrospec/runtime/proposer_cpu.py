@@ -45,7 +45,9 @@ class RetroSpecCPUProposalMixin:
                     target[:1].copy_(saved)
             index._selection_plan_written_layers.add(name)
 
-    def _cpu_draft_quality_triggered(self, active, margin, mass):
+    def _cpu_draft_quality_triggered(
+        self, active, margin, mass, draft_count, pending_count
+    ):
         # CPU windows already enforce length and execution limits on the host.
         # No quality bit can be set when both optional thresholds are disabled.
         if (
@@ -53,6 +55,11 @@ class RetroSpecCPUProposalMixin:
             and self.policy.hit_attn_threshold is None
         ):
             return False
+        # Draft forward does not read these tensors. Publish the host window
+        # only when a quality decision needs it; sparse sets its own snapshot.
+        self.state.set_stage(active, RetroSpecStage.DRAFT)
+        self.state.draft_counts.fill_(draft_count)
+        self.state.pending_counts.fill_(pending_count)
         decision = self.policy.evaluate(
             current_stage=RetroSpecStage.DRAFT,
             request_stages=self.state.stage,
@@ -319,8 +326,6 @@ class RetroSpecCPUProposalMixin:
                 slot = window.draft_end
                 self.positions[0] = base + slot
                 self.input_ids[0] = seed if slot == 0 else window.tokens[-1]
-                self.state.set_stage(active, RetroSpecStage.DRAFT)
-                self.state.draft_counts.fill_(window.sparse_pending)
                 sampled, margin, mass = self._run_draft_step(
                     1,
                     slot,
@@ -338,11 +343,11 @@ class RetroSpecCPUProposalMixin:
                 window.tokens.append(token)
                 self._draft_token_ids[0, slot] = token
                 self.performance_stats.add_gpu_counter("draft_tokens", 1)
-                self.state.draft_counts.fill_(window.sparse_pending)
-                self.state.pending_counts.fill_(window.full_pending)
                 # Length limits are recomputed after CPU progress, so they can
                 # be refilled. Quality triggers remain latched for verification.
-                force_sparse = self._cpu_draft_quality_triggered(active, margin, mass)
+                force_sparse = self._cpu_draft_quality_triggered(
+                    active, margin, mass, window.sparse_pending, window.full_pending
+                )
                 if risk is not None:
                     risk.draft(window, risk_margin)
                 if window.confirmed:
